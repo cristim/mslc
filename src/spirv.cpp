@@ -42,6 +42,29 @@ namespace {
 			case OpLabel:
 				return Section::Functions;
 
+			// Annotations have their own section, and it comes after the entry
+			// points. Emitting a decoration into whatever section the caller
+			// happens to be in puts it ahead of OpEntryPoint, which the logical
+			// layout forbids and spirv-val rejects as an invalid section.
+			case OpDecorate:
+			case OpMemberDecorate:
+			case OpDecorationGroup:
+			case OpGroupDecorate:
+			case OpGroupMemberDecorate:
+			case OpDecorateId:
+			case OpDecorateString:
+			case OpMemberDecorateString:
+				return Section::Annotations;
+
+			// Debug names, which likewise have a fixed section.
+			case OpName:
+			case OpMemberName:
+			case OpSource:
+			case OpSourceContinued:
+			case OpSourceExtension:
+			case OpModuleProcessed:
+				return Section::Debug;
+
 			default:
 				return Section::Invalid;
 		}

@@ -235,7 +235,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
 		static_cast<uint32_t>(spirv::Decoration::ArrayStride), stride });
 
-	const Id structure = _builder.emitDecl(spirv::OpTypeStruct, { 1, runtimeArray });
+	// The member count is not a word in the binary: SPIR-V derives it from the
+	// instruction's word count, so passing one would be read as a second member.
+	const Id structure = _builder.emitDecl(spirv::OpTypeStruct, { runtimeArray });
 
 	// Block is what makes the struct a valid descriptor payload in Vulkan.
 	_builder.emit(spirv::OpDecorate, { structure, static_cast<uint32_t>(spirv::Decoration::Block) });
@@ -348,7 +350,9 @@ Id TypeTable::namedStruct(const std::string& name) {
 	}
 
 
-	std::vector<uint32_t> operands = { static_cast<uint32_t>(fieldTypes.size()) };
+	// Members only. The count is implied by the instruction's word count, and
+	// writing it as an operand would be read as one extra member.
+	std::vector<uint32_t> operands;
 	for (Id fieldType: fieldTypes) {
 		operands.push_back(fieldType);
 	}
@@ -1154,7 +1158,10 @@ namespace {
 		// last decoration left behind. It also has to come after the types it
 		// names, which it does because the parameters declared theirs already.
 		_builder.setSection(spirv::Section::TypesGlobals);
-		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType, 0u });
+		// No parameter count: like OpTypeStruct, the trailing variadic count is
+		// derived from the instruction's word count and is not in the binary.
+		// Writing one is read as a parameter type, which shows up as "Id is 0".
+		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType });
 
 		_builder.setSection(spirv::Section::EntryPoints);
 		{
