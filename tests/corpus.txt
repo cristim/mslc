@@ -1,0 +1,10 @@
+# The MSL corpus, taken from indium's test suite. Each .metal file is paired
+# with a .metallib that Iridium already translates to GPU-verified SPIR-V, so
+# mslc's output has a reference to be compared against.
+/home/cristi/src/indium-pr-opaque-pointers/test/basic-compute/shadersrc/add.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal
+/home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal
