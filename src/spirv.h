@@ -84,17 +84,21 @@ public:
 	// every value-producing instruction takes.
 	Id emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands);
 
-	// Emits a declaration: an instruction whose first operand is its own result
-	// id, with no result type. Types, constants, global and function
-	// variables, labels and extended-instruction-set imports are all this form.
-	// Nothing is recorded in the value table, because a declaration's result is
-	// a type or a module-scope object rather than a value.
+	// Emits a declaration that has no result type: the grammar's first operand
+	// is IdResult, so the result id goes first and the caller supplies the rest.
+	// OpTypeVoid, OpTypeFloat, OpTypeStruct, OpTypePointer, OpTypeFunction,
+	// OpLabel and OpExtInstImport are this form. Nothing is recorded in the
+	// value table, because a type, a label or a set id is not a value.
+	//
+	// Anything the grammar gives IdResultType, which includes every OpConstant
+	// form, is emitDeclTyped instead. Prepending the id ahead of a result type
+	// the caller already passed emits the two swapped, which reads as the
+	// result type defining the result id.
 	Id emitDecl(uint16_t opcode, std::vector<uint32_t> operands = {});
 
 	// A declaration that also carries a result type, laid out as
-	// [result type, result id, operands...]. OpVariable and OpFunction are
-	// these: their object is typed, unlike a type or a constant, which is only
-	// named by its own id.
+	// [result type, result id, operands...]. OpVariable, OpFunction and the
+	// OpConstant family are these.
 	Id emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands);
 
 	// As emitDeclTyped, but with a result id the caller already allocated. An

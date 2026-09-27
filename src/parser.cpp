@@ -23,6 +23,18 @@ namespace {
 			{ "half", ScalarKind::Half },
 			{ "float", ScalarKind::Float },
 			{ "double", ScalarKind::Double },
+
+			// The fixed-width typedefs MSL supplies. Blender's shaders use these
+			// spellings without including a header, since MSL makes <cstdint>
+			// available on its own.
+			{ "int8_t", ScalarKind::Char },
+			{ "uint8_t", ScalarKind::UChar },
+			{ "int16_t", ScalarKind::Short },
+			{ "uint16_t", ScalarKind::UShort },
+			{ "int32_t", ScalarKind::Int },
+			{ "uint32_t", ScalarKind::UInt },
+			{ "int64_t", ScalarKind::Long },
+			{ "uint64_t", ScalarKind::ULong },
 		};
 
 		return table;
@@ -64,35 +76,35 @@ namespace {
 		return std::nullopt;
 	}
 
-	bool isBuiltinName(std::string_view name) {
-		static const char* const names[] = {
-			"thread_position_in_grid",
-			"threadgroup_position_in_grid",
-			"thread_position_in_threadgroup",
-			"thread_index_in_threadgroup",
-			"vertex_id",
-			"instance_id",
-			"position",
-			"frag_coord",
-			"front_facing",
-			"threadgroups_per_grid",
-			"threads_per_threadgroup",
-		};
-
-		for (const char* candidate: names) {
-			if (name == candidate) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
 	// Cast targets the subset accepts in an explicit cast expression.
 	bool isCastTypeName(std::string_view name) {
 		return scalarTypeNames().count(name) > 0;
 	}
 
+}
+
+bool isMSLBuiltinName(std::string_view name) {
+	static const char* const names[] = {
+		"thread_position_in_grid",
+		"threadgroup_position_in_grid",
+		"thread_position_in_threadgroup",
+		"thread_index_in_threadgroup",
+		"vertex_id",
+		"instance_id",
+		"position",
+		"frag_coord",
+		"front_facing",
+		"threadgroups_per_grid",
+		"threads_per_threadgroup",
+	};
+
+	for (const char* candidate: names) {
+		if (name == candidate) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 const Token& Parser::lookahead(size_t offset) const {
@@ -464,7 +476,7 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			attributes.stageIn = true;
 		} else if (auto builtin = builtinFromName(name)) {
 			attributes.builtin = builtin;
-		} else if (isBuiltinName(name)) {
+		} else if (isMSLBuiltinName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is recognised but not "
 				"supported yet; mslc reports it rather than ignoring it");
 		} else {
@@ -915,10 +927,9 @@ ExpressionPtr Parser::parsePrimary() {
 			return expression;
 		}
 
-		if (isBuiltinName(text)) {
-			throw CompileError("builtin function \"" + std::string(text) + "\" is not supported yet");
-		}
-
+		// A name that is also an MSL builtin is a plain identifier here. Whether
+		// it is the builtin or a parameter that shadows one is a question about
+		// scope, which the parser has no answer for, so the emitter decides.
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::Identifier;
 		expression->line = line();

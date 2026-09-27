@@ -1,6 +1,7 @@
 #include "sema.h"
 
 #include "lexer.h"
+#include "parser.h"
 
 #include <algorithm>
 #include <cstring>
@@ -514,7 +515,7 @@ namespace {
 	// builder, and moving the current section would strand the caller's next
 	// instruction in the wrong block.
 	Id Emitter::constantU32(uint32_t value) {
-		return _builder.emitDecl(spirv::OpConstant, { _uintType, value });
+		return _builder.emitDeclTyped(spirv::OpConstant, _uintType, { value });
 	}
 
 	Id Emitter::declaredTypeOf(const Type& type) {
@@ -555,6 +556,14 @@ namespace {
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		const auto it = _bindings.find(expression.name);
 		if (it == _bindings.end()) {
+			// A parameter is free to be named after an MSL builtin: Blender's
+			// compute_buffer_clear names one "position". Reporting the collision
+			// here rather than in the parser is what lets the declaration win.
+			if (isMSLBuiltinName(expression.name)) {
+				throw CompileError("builtin function \"" + expression.name
+					+ "\" is not supported yet");
+			}
+
 			throw CompileError("\"" + expression.name + "\" is not a parameter, local or builtin "
 				"mslc knows about");
 		}
@@ -677,8 +686,14 @@ namespace {
 				+ expression.memberName + "\"");
 		}
 
+		// The result type is a pointer to the field, not to the struct the
+		// parameter names. Indexing a struct yields the field, so a chain
+		// typed as a pointer to the struct does not match what the base
+		// indexes to, and spirv-val rejects it.
+		const Id fieldType = _types.scalar(decl->fields[fieldIndex].type.scalar);
+
 		return _builder.emitTyped(spirv::OpAccessChain,
-			_types.pointer(it->second.storageClass, it->second.pointeeType),
+			_types.pointer(it->second.storageClass, fieldType),
 			{ it->second.id, constantU32(static_cast<uint32_t>(fieldIndex)) });
 	}
 
@@ -769,9 +784,8 @@ namespace {
 	Id Emitter::emitExpression(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
-				_builder.setSection(spirv::Section::TypesGlobals);
-				return _builder.emit(spirv::OpConstant,
-					{ _uintType, static_cast<uint32_t>(expression.intValue) });
+				return _builder.emitDeclTyped(spirv::OpConstant, _uintType,
+					{ static_cast<uint32_t>(expression.intValue) });
 			}
 
 			case ExpressionKind::FloatLiteral: {
@@ -779,13 +793,14 @@ namespace {
 				uint32_t bits = 0;
 				static_assert(sizeof(bits) == sizeof(value), "float is not 32 bits");
 				std::memcpy(&bits, &value, sizeof(bits));
-				return _builder.emitDecl(spirv::OpConstant, { _types.scalar(ScalarKind::Float), bits });
+				return _builder.emitDeclTyped(spirv::OpConstant,
+					_types.scalar(ScalarKind::Float), { bits });
 			}
 
 			case ExpressionKind::BoolLiteral: {
 				return expression.boolValue
-					? _builder.emitDecl(spirv::OpConstantTrue, { _boolType })
-					: _builder.emitDecl(spirv::OpConstantFalse, { _boolType });
+					? _builder.emitDeclTyped(spirv::OpConstantTrue, _boolType, { })
+					: _builder.emitDeclTyped(spirv::OpConstantFalse, _boolType, { });
 			}
 
 			case ExpressionKind::Identifier: return emitIdentifier(expression);
@@ -946,7 +961,15 @@ namespace {
 			binding.structType = structType;
 			binding.isBuffer = isBuffer;
 			_bindings[parameter.name] = binding;
-			_interface.push_back(id);
+			// SPIR-V 1.3 restricts the entry point's interface list to Input and
+			// Output variables; 1.4 widened it to every global the entry point
+			// statically uses. kSpirvVersion is 1.3, so a descriptor stays out of
+			// the list and is reached through its DescriptorSet and Binding
+			// decorations instead. Listing one is what spirv-val rejects.
+			if (*storageClass == spirv::StorageClass::Input
+				|| *storageClass == spirv::StorageClass::Output) {
+				_interface.push_back(id);
+			}
 
 			_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 				+ std::to_string(bindingIndex)
@@ -968,8 +991,7 @@ namespace {
 			const Id initializer = emitExpression(*declaration.initializer);
 			initial = convert(initializer, _builder.typeOf(initializer), typeId);
 		} else {
-			_builder.setSection(spirv::Section::TypesGlobals);
-			initial = _builder.emitDecl(spirv::OpConstant, { typeId, 0u });
+			initial = _builder.emitDeclTyped(spirv::OpConstant, typeId, { 0u });
 		}
 
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);

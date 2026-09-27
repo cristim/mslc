@@ -33,6 +33,17 @@ namespace {
 		return true;
 	}
 
+	// A relative manifest entry names a file next to the manifest, not one
+	// relative to whatever directory the runner happens to be started from.
+	std::string resolve(const std::string& manifestPath, const std::string& entry) {
+		if (entry.empty() || entry[0] == '/') {
+			return entry;
+		}
+
+		const size_t slash = manifestPath.find_last_of('/');
+		return slash == std::string::npos ? entry : manifestPath.substr(0, slash + 1) + entry;
+	}
+
 	bool validateWithSpirvVal(const std::string& spvPath, std::string& detail) {
 		const std::string command = "spirv-val --target-env vulkan1.2 " + spvPath
 			+ " 2>&1 >/dev/null";
@@ -85,10 +96,10 @@ int main(int argc, char** argv) {
 		}
 
 		Result result;
-		result.path = line;
+		result.path = resolve(manifestPath, line);
 
 		std::string source;
-		if (!readFile(line, source)) {
+		if (!readFile(result.path, source)) {
 			result.diagnostic = "cannot read file";
 			results.push_back(result);
 			continue;

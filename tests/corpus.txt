@@ -1,6 +1,11 @@
 # The MSL corpus, taken from indium's test suite. Each .metal file is paired
 # with a .metallib that Iridium already translates to GPU-verified SPIR-V, so
 # mslc's output has a reference to be compared against.
+#
+# A second group is the subset of Metal that Blender 4.5.14's
+# gpu/metal/mtl_context.mm actually calls through newLibraryWithSource:, frozen
+# here verbatim so mslc's progress on real shaders is measured too.
+compute_buffer_clear.metal
 /home/cristi/src/indium-pr-opaque-pointers/test/basic-compute/shadersrc/add.metal
 /home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal
 /home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal

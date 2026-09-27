@@ -3,9 +3,15 @@
 #include "ast.h"
 
 #include <initializer_list>
+#include <string_view>
 #include <utility>
 
 namespace mslc {
+
+// True when a name is one of MSL's builtin attribute or builtin function names.
+// Exposed because whether such a name is an error depends on scope, which only
+// the emitter knows: a parameter is free to be called "position".
+bool isMSLBuiltinName(std::string_view name);
 
 // Parses an MSL token stream into a translation unit.
 //
