@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -74,7 +75,20 @@ int main(int argc, char** argv) {
 	}
 
 	const std::string manifestPath = argv[1];
-	std::string outputDirectory = "/tmp/mslc-corpus";
+
+	// Default into TMPDIR rather than a fixed /tmp path, so the scratch output
+	// follows the caller's idea of where temporary files belong.
+	const char* tmpdir = std::getenv("TMPDIR");
+	std::string outputDirectory = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/mslc-corpus";
+
+	// Without this a missing directory turns every shader into "INVALID", which
+	// reads like a compiler regression rather than a missing scratch dir.
+	std::error_code ec;
+	std::filesystem::create_directories(outputDirectory, ec);
+	if (ec) {
+		std::fprintf(stderr, "mslc-corpus: cannot create %s: %s\n", outputDirectory.c_str(), ec.message().c_str());
+		return 2;
+	}
 
 	for (int i = 2; i + 1 < argc; ++i) {
 		if (std::strcmp(argv[i], "--keep-output") == 0) {
