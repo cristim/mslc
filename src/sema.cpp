@@ -260,6 +260,41 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	return structure;
 }
 
+Id TypeTable::sampledImage(ScalarKind component, TextureDim dim) {
+	const auto key = std::make_pair(static_cast<uint32_t>(component), static_cast<uint32_t>(dim));
+	const auto cached = _images.find(key);
+	if (cached != _images.end()) {
+		return cached->second;
+	}
+
+	// OpTypeImage spells its middle operands as 0 or 1 rather than naming them,
+	// and the grammar has no enumerants for them, so they are written out here:
+	// Depth, Arrayed, Multisampled, then Sampled.
+	constexpr uint32_t kNotDepth = 0;
+	constexpr uint32_t kNotArrayed = 0;
+	constexpr uint32_t kNotMultisampled = 0;
+	constexpr uint32_t kSampled = 1;
+
+	const uint32_t spirvDim = [&]() {
+		switch (dim) {
+			case TextureDim::D2: return static_cast<uint32_t>(spirv::Dim::Dim2D);
+			case TextureDim::None: break;
+		}
+
+		throw CompileError("this texture shape has no SPIR-V mapping");
+	}();
+
+	// A Metal texture is declared as an image type, and the sampled-operand of
+	// 1 is what makes it a sampled image: read through a sampler, with the
+	// result being a texel value rather than the texel itself.
+	const Id id = _builder.emitDecl(spirv::OpTypeImage, { scalar(component), spirvDim, kNotDepth,
+		kNotArrayed, kNotMultisampled, kSampled,
+		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+
+	_images.emplace(key, id);
+	return id;
+}
+
 spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 	for (const auto& [key, id]: _pointers) {
 		if (id == pointerType) {
@@ -949,9 +984,47 @@ namespace {
 				continue;
 			}
 
-			if (parameter.attributes.textureIndex || parameter.attributes.samplerIndex) {
-				throw CompileError("texture and sampler parameters are not lowered yet (parameter \""
-					+ parameter.name + "\")");
+			// A texture parameter is a descriptor of its own rather than a
+			// pointer, and its Metal index is its binding as it is for a buffer.
+			if (parameter.attributes.textureIndex) {
+				if (parameter.type.textureDim == TextureDim::None) {
+					throw CompileError("parameter \"" + parameter.name + "\" has [[texture("
+						+ std::to_string(*parameter.attributes.textureIndex)
+						+ ")]] but is not a texture type");
+				}
+
+				const Id imageType = _types.sampledImage(parameter.type.scalar, parameter.type.textureDim);
+
+				_builder.setSection(spirv::Section::TypesGlobals);
+				const Id pointerType = _types.pointer(spirv::StorageClass::UniformConstant, imageType);
+				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+					{ static_cast<uint32_t>(spirv::StorageClass::UniformConstant) });
+
+				_builder.setSection(spirv::Section::Annotations);
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::DescriptorSet), 0u });
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::Binding), *parameter.attributes.textureIndex });
+
+				Binding binding;
+				binding.id = id;
+				binding.isPointer = true;
+				binding.pointeeType = imageType;
+				binding.storageClass = spirv::StorageClass::UniformConstant;
+				_bindings[parameter.name] = binding;
+
+				_reflection += "\t\t{ \"kind\": \"Texture\", \"metal_index\": "
+					+ std::to_string(*parameter.attributes.textureIndex)
+					+ ", \"descriptor\": { \"set\": 0, \"binding\": "
+					+ std::to_string(*parameter.attributes.textureIndex) + " }"
+					+ ", \"param_index\": " + std::to_string(index)
+					+ ", \"name\": \"" + parameter.name + "\" },\n";
+				continue;
+			}
+
+			if (parameter.attributes.samplerIndex) {
+				throw CompileError("a sampler parameter is not lowered yet (parameter \""
+					+ parameter.name + "\"); a sampler state declared in the shader is");
 			}
 
 			// An unbinding parameter takes the next index among the binding

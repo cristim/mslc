@@ -27,6 +27,13 @@ enum class Stage {
 	Kernel,
 };
 
+// The shape part of a Metal texture type name, as in texture2d<float>. None is
+// not a texture.
+enum class TextureDim {
+	None,
+	D2,
+};
+
 // Scalar type kinds. Width is in bits; vectors are a count of one of these.
 enum class ScalarKind {
 	Void,
@@ -66,6 +73,11 @@ struct Type {
 	// A sampler, as in "constexpr sampler s {}". SPIR-V models one as a
 	// descriptor rather than a value, so it is not a scalar or a struct.
 	bool isSampler = false;
+
+	// Set for a Metal texture type such as texture2d<float>: the component type
+	// is the scalar above and the shape is this. SPIR-V calls the equivalent a
+	// sampled image, and takes the sampler separately.
+	TextureDim textureDim = TextureDim::None;
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }

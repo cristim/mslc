@@ -13,18 +13,16 @@ namespace {
 	// block, ahead of the function. Routing here rather than at each call site
 	// means the caller cannot get it wrong.
 	Section sectionForOpcode(uint16_t opcode) {
+		// Every type declaration in the core grammar sits in one contiguous
+		// block, from OpTypeVoid to OpTypeForwardPointer, so the block is checked
+		// as a range. Listing the opcodes one by one meant a type the emitter
+		// had not used yet was emitted into whatever section the caller was last
+		// in, which put it ahead of the ids it names and spirv-val rejected.
+		if (opcode >= OpTypeVoid && opcode <= OpTypeForwardPointer) {
+			return Section::TypesGlobals;
+		}
+
 		switch (opcode) {
-			case OpTypeVoid:
-			case OpTypeBool:
-			case OpTypeInt:
-			case OpTypeFloat:
-			case OpTypeVector:
-			case OpTypeMatrix:
-			case OpTypeArray:
-			case OpTypeRuntimeArray:
-			case OpTypeStruct:
-			case OpTypePointer:
-			case OpTypeFunction:
 			case OpConstant:
 			case OpConstantTrue:
 			case OpConstantFalse:

@@ -81,6 +81,17 @@ namespace {
 		return scalarTypeNames().count(name) > 0;
 	}
 
+	// Metal spells a texture type as "texture" followed by its shape, with the
+	// component type in angle brackets: texture2d<float>. The shapes the subset
+	// lowers are named here; anything else is reported rather than guessed at.
+	std::optional<TextureDim> textureDimFromName(std::string_view name) {
+		if (name == "texture2d") {
+			return TextureDim::D2;
+		}
+
+		return std::nullopt;
+	}
+
 }
 
 bool isMSLBuiltinName(std::string_view name) {
@@ -426,6 +437,21 @@ Type Parser::parseType() {
 		if (name == "sampler") {
 			advance();
 			type.isSampler = true;
+		} else if (const auto dim = textureDimFromName(name)) {
+			advance();
+			type.textureDim = *dim;
+
+			expect(TokenKind::Less, "to open a texture type's component type");
+
+			ScalarKind component;
+			if (kind() != TokenKind::Identifier || !isScalarTypeName(current().text, component)) {
+				throw CompileError("a texture type's component type must be a scalar, found "
+					+ std::string(current().text));
+			}
+			advance();
+			type.scalar = component;
+
+			expect(TokenKind::Greater, "to close a texture type");
 		} else {
 			type.namedType = std::string(name);
 			advance();

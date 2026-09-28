@@ -24,6 +24,7 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfVector;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
+	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 
 	spirv::Id _voidType = spirv::InvalidId;
@@ -53,6 +54,12 @@ public:
 	bool isFloat(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
+
+	// The sampled image a Metal texture type maps onto: the component type is
+	// the scalar, and the Sampled operand is 1 because a Metal texture is read
+	// through a sampler rather than stored to directly. Idempotent per
+	// component type and shape.
+	spirv::Id sampledImage(ScalarKind component, TextureDim dim);
 
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
