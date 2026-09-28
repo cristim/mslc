@@ -112,8 +112,10 @@ public:
 
 	// The section an opcode belongs in, given where the caller is emitting. An
 	// opcode with a required section ignores the current one, so a constant
-	// emitted from inside a function body still lands in the types block.
-	Section pickSection(uint16_t opcode) const;
+	// emitted from inside a function body still lands in the types block. The
+	// operands matter for OpVariable, whose storage class decides whether it
+	// is a global or part of the body it is emitted in.
+	Section pickSection(uint16_t opcode, const std::vector<uint32_t>& operands) const;
 
 	// Records a type for an id that was not produced by an instruction, such as
 	// a function or a label.

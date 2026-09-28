@@ -24,6 +24,7 @@ namespace {
 
 		switch (opcode) {
 			case OpConstant:
+			case OpConstantNull:
 			case OpConstantTrue:
 			case OpConstantFalse:
 			case OpConstantComposite:
@@ -87,17 +88,29 @@ namespace {
 
 // The section an opcode belongs in, given where the caller is emitting. A
 // member because it reads the current section.
-Section Builder::pickSection(uint16_t opcode) const {
+Section Builder::pickSection(uint16_t opcode, const std::vector<uint32_t>& operands) const {
+	// A Function-storage variable is part of the body it is declared in: the
+	// specification allows one nowhere else, so it stays in the section the
+	// caller is emitting rather than joining the module's global variables. Its
+	// storage class is its first operand, which is why the section is decided
+	// before the result type and id are prepended.
+	if (opcode == OpVariable && !operands.empty()
+		&& operands.front() == static_cast<uint32_t>(StorageClass::Function)) {
+		return _currentSection;
+	}
+
 	const Section forced = sectionForOpcode(opcode);
 	return forced != Section::Invalid ? forced : _currentSection;
 }
 
 Id Builder::emit(uint16_t opcode, std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
+
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
 
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[section].push_back(std::move(instruction));
 
 	// Ids are allocated independently of emission, so the caller decides which
 	// value to return. Returning the next id keeps call sites terse.
@@ -105,6 +118,8 @@ Id Builder::emit(uint16_t opcode, std::vector<uint32_t> operands) {
 }
 
 Id Builder::emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
+
 	// A value-producing instruction is laid out as
 	// [result type, result id, operands...]. Both leading words are needed:
 	// omitting the id makes the first real operand be read as the result, which
@@ -116,12 +131,13 @@ Id Builder::emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> oper
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[section].push_back(std::move(instruction));
 	_valueTypes[id] = resultType;
 	return id;
 }
 
 Id Builder::emitDecl(uint16_t opcode, std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
 	const Id id = _nextId++;
 
 	// The result id is the first operand of every declaration.
@@ -130,12 +146,13 @@ Id Builder::emitDecl(uint16_t opcode, std::vector<uint32_t> operands) {
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[section].push_back(std::move(instruction));
 
 	return id;
 }
 
 Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
 	const Id id = _nextId++;
 
 	operands.insert(operands.begin(), id);
@@ -145,7 +162,7 @@ Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> 
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
 
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[section].push_back(std::move(instruction));
 
 	// The object a variable names is a value the body can load from, so record
 	// its type the same way a value-producing instruction would.
@@ -156,6 +173,7 @@ Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> 
 
 void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
 
 	operands.insert(operands.begin(), resultId);
 	operands.insert(operands.begin(), resultType);
@@ -163,7 +181,7 @@ void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[section].push_back(std::move(instruction));
 
 	_valueTypes[resultId] = resultType;
 }

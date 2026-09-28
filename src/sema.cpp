@@ -1117,17 +1117,22 @@ namespace {
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
 		const Id typeId = declaredTypeOf(declaration.type);
 
+		// A function's variables have to be the first instructions of its first
+		// block, so the variable is declared before its initialiser is computed.
+		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
+		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+
 		Id initial = InvalidId;
 		if (declaration.initializer) {
 			const Id initializer = emitExpression(*declaration.initializer);
 			initial = convert(initializer, _builder.typeOf(initializer), typeId);
 		} else {
-			initial = _builder.emitDeclTyped(spirv::OpConstant, typeId, { 0u });
+			// OpConstantNull rather than an OpConstant of zero, which takes a
+			// scalar only and so cannot spell the zero of a vector or a struct.
+			initial = _builder.emitDeclTyped(spirv::OpConstantNull, typeId, { });
 		}
 
-		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
-		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
-			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
 		_builder.emit(spirv::OpStore, { id, initial });
 
 		Binding binding;
