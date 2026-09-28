@@ -2234,10 +2234,19 @@ namespace {
 	}
 
 	// A sampler declared in the shader has no Metal argument index, since it is
-	// not a parameter of anything, so it shares no index with the resources
-	// that are. It therefore gets its own descriptor set, numbered in
-	// declaration order. Set 0 is what an entry point's own bindings use.
+	// not a parameter of anything, so it shares no index with the resources that
+	// are. Set 0 is what an entry point's own bindings use.
 	constexpr uint32_t kSamplerSet = 1;
+
+	// A sampler *parameter* does have a Metal index, and it is the index of the
+	// texture it reads: [[texture(0)]] and [[sampler(0)]] are both 0. A Vulkan
+	// descriptor set has one binding per index, so the two cannot share one, and
+	// spirv-val does not notice two variables claiming the same set and binding,
+	// so a collision here would be a module that validates and a pipeline that
+	// does not behave. A third set separates them. Each kind of resource is
+	// numbered by its own Metal index within its own set, and no two kinds can
+	// land on the same one.
+	constexpr uint32_t kSamplerParameterSet = 2;
 
 	// A sampler state declared at file scope. Metal has no way to write a
 	// sampler as a constant in a shader, so the descriptor stands in for the
@@ -2543,9 +2552,37 @@ namespace {
 				continue;
 			}
 
+			// A sampler parameter is a descriptor of its own, exactly as a texture
+			// parameter is, in a set of its own because it shares a Metal index with
+			// the texture it goes with.
 			if (parameter.attributes.samplerIndex) {
-				throw CompileError("a sampler parameter is not lowered yet (parameter \""
-					+ parameter.name + "\"); a sampler state declared in the shader is");
+				_builder.setSection(spirv::Section::TypesGlobals);
+				const Id samplerType = _types.sampler();
+				const Id pointerType = _types.pointer(spirv::StorageClass::UniformConstant, samplerType);
+				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+					{ static_cast<uint32_t>(spirv::StorageClass::UniformConstant) });
+
+				_builder.setSection(spirv::Section::Annotations);
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::DescriptorSet), kSamplerParameterSet });
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::Binding),
+					*parameter.attributes.samplerIndex });
+
+				Binding binding;
+				binding.id = id;
+				binding.isPointer = true;
+				binding.pointeeType = samplerType;
+				binding.storageClass = spirv::StorageClass::UniformConstant;
+				_bindings[parameter.name] = binding;
+
+				_entryBindings += "\t\t{ \"kind\": \"Sampler\", \"metal_index\": "
+					+ std::to_string(*parameter.attributes.samplerIndex)
+					+ ", \"descriptor\": { \"set\": " + std::to_string(kSamplerParameterSet)
+					+ ", \"binding\": " + std::to_string(*parameter.attributes.samplerIndex) + " }"
+					+ ", \"param_index\": " + std::to_string(index)
+					+ ", \"name\": \"" + parameter.name + "\" },\n";
+				continue;
 			}
 
 			// An unbinding parameter takes the next index among the binding

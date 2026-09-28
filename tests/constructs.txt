@@ -18,3 +18,4 @@ constructs/local_assignment.metal expect=valid
 constructs/structured_control_flow.metal expect=valid
 constructs/scalar_promotion.metal expect=valid
 constructs/builtin_math.metal expect=valid
+constructs/sampler_parameter.metal expect=valid
