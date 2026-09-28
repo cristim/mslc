@@ -81,6 +81,14 @@ struct Type {
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
+
+	// True for the bare "void", which is the only spelling of it MSL has. A
+	// named type, a pointer or a resource is not void even though its scalar
+	// kind is left at the default.
+	bool isVoid() const {
+		return scalar == ScalarKind::Void && namedType.empty() && !isPointer
+			&& !isSampler && textureDim == TextureDim::None;
+	}
 };
 
 const char* scalarKindName(ScalarKind kind);

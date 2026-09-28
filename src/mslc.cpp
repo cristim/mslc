@@ -103,7 +103,7 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		mslc::Parser parser(tokens);
 		const mslc::TranslationUnit unit = parser.parse();
 
-		const mslc::FunctionDecl* entryPoint = mslc::selectEntryPoint(unit,
+		const std::vector<const mslc::FunctionDecl*> entryPoints = mslc::selectEntryPoints(unit,
 			stageFromApi(effective.stage));
 
 		mslc::ModuleOptions moduleOptions;
@@ -113,24 +113,39 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
 
 		mslc::spirv::Builder builder;
-		std::string reflection = mslc::emitModule(builder, unit, *entryPoint, moduleOptions);
+		const mslc::EmittedModule emitted
+			= mslc::emitModule(builder, unit, entryPoints, moduleOptions);
 
 		std::vector<uint8_t> module;
 		if (!builder.finalize(module)) {
 			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
 		}
 
-		// Wrap the reflection fragments in a document now that the entry point
-		// is known.
+		// A Metal source is a library, so the document reports the module and
+		// then each entry point in it, with the bindings that entry point's own
+		// resources were given.
 		std::string document = "{\n";
 		document += "\t\"reflection_version\": 1,\n";
-		document += std::string("\t\"stage\": \"") + stageName(entryPoint->stage) + "\",\n";
-		document += "\t\"entry_point\": \"" + entryPoint->name + "\",\n";
-		document += "\t\"local_size\": [" + std::to_string(moduleOptions.localSizeX) + ", "
-			+ std::to_string(moduleOptions.localSizeY) + ", "
-			+ std::to_string(moduleOptions.localSizeZ) + "],\n";
-		document += "\t\"bindings\": [\n";
-		document += reflection;
+		document += "\t\"module_bindings\": [\n";
+		document += emitted.moduleBindings;
+		document += "\t],\n";
+		document += "\t\"entries\": [\n";
+
+		for (size_t i = 0; i < emitted.entries.size(); ++i) {
+			const mslc::EmittedEntryPoint& entry = emitted.entries[i];
+
+			document += "\t\t{\n";
+			document += std::string("\t\t\t\"stage\": \"") + stageName(entry.stage) + "\",\n";
+			document += "\t\t\t\"entry_point\": \"" + entry.name + "\",\n";
+			document += "\t\t\t\"local_size\": [" + std::to_string(moduleOptions.localSizeX) + ", "
+				+ std::to_string(moduleOptions.localSizeY) + ", "
+				+ std::to_string(moduleOptions.localSizeZ) + "],\n";
+			document += "\t\t\t\"bindings\": [\n";
+			document += entry.bindings;
+			document += "\t\t\t]\n";
+			document += i + 1 == emitted.entries.size() ? "\t\t}\n" : "\t\t},\n";
+		}
+
 		document += "\t]\n}\n";
 
 		auto* buffer = static_cast<uint8_t*>(std::malloc(module.size()));

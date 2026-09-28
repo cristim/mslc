@@ -260,6 +260,30 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	return structure;
 }
 
+Id TypeTable::functionType(Id returnType, const std::vector<Id>& parameterTypes) {
+	// Keyed on the return type followed by the parameter types, which is the
+	// order the operands are in.
+	const std::vector<Id> key = [returnType, &parameterTypes]() {
+		std::vector<Id> all = { returnType };
+		all.insert(all.end(), parameterTypes.begin(), parameterTypes.end());
+		return all;
+	}();
+
+	const auto cached = _functionTypes.find(key);
+	if (cached != _functionTypes.end()) {
+		return cached->second;
+	}
+
+	// No parameter count: like OpTypeStruct, the trailing count is derived from
+	// the instruction's word count and is not in the binary. Writing one is read
+	// as a parameter type, which shows up as "Id is 0".
+	std::vector<uint32_t> operands(key.begin(), key.end());
+	const Id id = _builder.emitDecl(spirv::OpTypeFunction, operands);
+
+	_functionTypes.emplace(key, id);
+	return id;
+}
+
 Id TypeTable::sampledImage(ScalarKind component, TextureDim dim) {
 	const auto key = std::make_pair(static_cast<uint32_t>(component), static_cast<uint32_t>(dim));
 	const auto cached = _images.find(key);
@@ -440,34 +464,34 @@ std::optional<spirv::StorageClassValue> storageClassForAddressSpace(AddressSpace
 	return std::nullopt;
 }
 
-const FunctionDecl* selectEntryPoint(const TranslationUnit& unit, Stage requested) {
+std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, Stage requested) {
+	std::vector<const FunctionDecl*> found;
+
 	if (requested != Stage::None) {
 		for (const FunctionDecl& function: unit.functions) {
 			if (function.stage == requested) {
-				return &function;
+				found.push_back(&function);
 			}
 		}
 
-		throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"
-			: requested == Stage::Vertex ? "vertex" : "fragment")
-			+ " entry point in this source");
+		if (found.empty()) {
+			throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"
+				: requested == Stage::Vertex ? "vertex" : "fragment")
+				+ " entry point in this source");
+		}
+
+		return found;
 	}
 
-	const FunctionDecl* found = nullptr;
+	// Declaration order, so a caller that asked for no stage gets the source's
+	// own order back.
 	for (const FunctionDecl& function: unit.functions) {
-		if (function.stage == Stage::None) {
-			continue;
+		if (function.stage != Stage::None) {
+			found.push_back(&function);
 		}
-
-		if (found) {
-			throw CompileError("source declares more than one entry point (\"" + found->name
-				+ "\" and \"" + function.name + "\"); pass an explicit stage");
-		}
-
-		found = &function;
 	}
 
-	if (!found) {
+	if (found.empty()) {
 		throw CompileError("source declares no kernel, vertex or fragment entry point");
 	}
 
@@ -503,39 +527,43 @@ namespace {
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
-		const FunctionDecl& _entryPoint;
+		const std::vector<const FunctionDecl*>& _entryPoints;
 		const ModuleOptions& _options;
 		TypeTable& _types;
 
+		// Per entry point: the names in scope are the entry point's own
+		// parameters and locals, and its interface and its bindings are its own.
 		std::map<std::string, Binding> _bindings;
-		std::map<spirv::Id, const StructDecl*> _structByValue;
+		std::vector<Id> _interface;
+		std::string _entryBindings;
 
+		// Per module: the scalar types and the GLSL set are named once however
+		// many entry points refer to them.
 		Id _uintType = InvalidId;
 		Id _intType = InvalidId;
 		Id _boolType = InvalidId;
 		Id _voidType = InvalidId;
-		Id _functionId = InvalidId;
-		Id _entryPointId = InvalidId;
 		bool _glslImported = false;
 		spirv::Id _glslSet = InvalidId;
 
-		std::string _reflection;
-		// Ids the entry point lists as its interface, in declaration order.
-		std::vector<Id> _interface;
+		// Per module: a sampler declared in the shader belongs to the module
+		// rather than to any one entry point, since more than one can use it.
+		std::string _moduleBindings;
 
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
-			const FunctionDecl& entryPoint, const ModuleOptions& options, TypeTable& types):
-			_builder(builder), _unit(unit), _entryPoint(entryPoint),
+			const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options, TypeTable& types):
+			_builder(builder), _unit(unit), _entryPoints(entryPoints),
 			_options(options), _types(types) {}
 
-		std::string run();
+		EmittedModule run();
 
 	private:
 		Id constantU32(uint32_t value);
 		Id declaredTypeOf(const Type& type);
 		void declareGlobals();
-		void declareParameters();
+		void declareParameters(const FunctionDecl& entryPoint);
+		EmittedEntryPoint emitEntryPoint(const FunctionDecl& entryPoint);
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
@@ -913,7 +941,8 @@ namespace {
 			_builder.emit(spirv::OpDecorate, { id,
 				static_cast<uint32_t>(spirv::Decoration::DescriptorSet), kSamplerSet });
 			_builder.emit(spirv::OpDecorate, { id,
-				static_cast<uint32_t>(spirv::Decoration::Binding), index });
+				static_cast<uint32_t>(spirv::Decoration::Binding),
+				static_cast<uint32_t>(index) });
 
 			Binding binding;
 			binding.id = id;
@@ -922,7 +951,7 @@ namespace {
 			binding.storageClass = spirv::StorageClass::UniformConstant;
 			_bindings[global.name] = binding;
 
-			_reflection += "\t\t{ \"kind\": \"Sampler\", \"descriptor\": { \"set\": "
+			_moduleBindings += "\t\t{ \"kind\": \"Sampler\", \"descriptor\": { \"set\": "
 				+ std::to_string(kSamplerSet) + ", \"binding\": " + std::to_string(index) + " }"
 				+ ", \"name\": \"" + global.name + "\""
 				+ ", \"state\": { \"filter\": \"nearest\", \"mip_filter\": \"none\""
@@ -931,11 +960,11 @@ namespace {
 		}
 	}
 
-	void Emitter::declareParameters() {
-		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(_entryPoint);
+	void Emitter::declareParameters(const FunctionDecl& entryPoint) {
+		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(entryPoint);
 
-		for (size_t index = 0; index < _entryPoint.parameters.size(); ++index) {
-			const Parameter& parameter = _entryPoint.parameters[index];
+		for (size_t index = 0; index < entryPoint.parameters.size(); ++index) {
+			const Parameter& parameter = entryPoint.parameters[index];
 
 			if (parameter.attributes.builtin) {
 				const spirv::BuiltInValue spvBuiltin = [&]() {
@@ -1013,7 +1042,7 @@ namespace {
 				binding.storageClass = spirv::StorageClass::UniformConstant;
 				_bindings[parameter.name] = binding;
 
-				_reflection += "\t\t{ \"kind\": \"Texture\", \"metal_index\": "
+				_entryBindings += "\t\t{ \"kind\": \"Texture\", \"metal_index\": "
 					+ std::to_string(*parameter.attributes.textureIndex)
 					+ ", \"descriptor\": { \"set\": 0, \"binding\": "
 					+ std::to_string(*parameter.attributes.textureIndex) + " }"
@@ -1102,7 +1131,7 @@ namespace {
 				_interface.push_back(id);
 			}
 
-			_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
+			_entryBindings += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 				+ std::to_string(bindingIndex)
 				+ ", \"descriptor\": { \"set\": 0, \"binding\": "
 				+ std::to_string(bindingIndex) + " }"
@@ -1285,7 +1314,7 @@ namespace {
 		emitStatement(statement);
 	}
 
-	std::string Emitter::run() {
+	EmittedModule Emitter::run() {
 		_builder.setSection(spirv::Section::Capabilities);
 		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Shader) });
 
@@ -1300,66 +1329,97 @@ namespace {
 		_voidType = _types.voidType();
 
 		declareGlobals();
-		declareParameters();
+
+		EmittedModule module;
+		for (const FunctionDecl* entryPoint: _entryPoints) {
+			module.entries.push_back(emitEntryPoint(*entryPoint));
+		}
+
+		module.moduleBindings = _moduleBindings;
+		return module;
+	}
+
+	// Vulkan's entry points all return void: what a Metal entry point returns
+	// becomes an output variable, which is the next step. Rejecting it here
+	// keeps the module honest rather than emitting a return value no Vulkan
+	// pipeline would accept.
+	EmittedEntryPoint Emitter::emitEntryPoint(const FunctionDecl& entryPoint) {
+		_bindings.clear();
+		_interface.clear();
+		_entryBindings.clear();
+
+		if (!entryPoint.returnType.isVoid()) {
+			throw CompileError("an entry point returning a value is not lowered yet (\""
+				+ entryPoint.name + "\")");
+		}
 
 		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
-		if (_entryPoint.stage == Stage::Vertex) {
+		if (entryPoint.stage == Stage::Vertex) {
 			model = spirv::ExecutionModel::Vertex;
-		} else if (_entryPoint.stage == Stage::Fragment) {
+		} else if (entryPoint.stage == Stage::Fragment) {
 			model = spirv::ExecutionModel::Fragment;
 		}
 
+		declareParameters(entryPoint);
+
 		// The entry point's own id has to exist before it is named in
 		// OpEntryPoint, so it is allocated here rather than after.
-		_entryPointId = _builder.nextId();
+		const Id entryPointId = _builder.nextId();
 
-		// A type declaration, so TypesGlobals rather than whatever section the
-		// last decoration left behind. It also has to come after the types it
-		// names, which it does because the parameters declared theirs already.
+		// An entry point's parameters are globals rather than function
+		// parameters, so the signature is the return type alone.
 		_builder.setSection(spirv::Section::TypesGlobals);
-		// No parameter count: like OpTypeStruct, the trailing variadic count is
-		// derived from the instruction's word count and is not in the binary.
-		// Writing one is read as a parameter type, which shows up as "Id is 0".
-		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType });
+		const Id functionType = _types.functionType(_voidType, { });
 
 		_builder.setSection(spirv::Section::EntryPoints);
 		{
 			std::vector<uint32_t> operands = {
-				static_cast<uint32_t>(model), _entryPointId
+				static_cast<uint32_t>(model), entryPointId
 			};
-			spirv::Builder::appendString(operands, _entryPoint.name);
+			spirv::Builder::appendString(operands, entryPoint.name);
 			for (Id id: _interface) {
 				operands.push_back(id);
 			}
 			_builder.emit(spirv::OpEntryPoint, operands);
 		}
 
-		if (_entryPoint.stage == Stage::Kernel) {
+		if (entryPoint.stage == Stage::Kernel) {
 			_builder.setSection(spirv::Section::ExecutionModes);
-			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+			_builder.emit(spirv::OpExecutionMode, { entryPointId,
 				static_cast<uint32_t>(spirv::ExecutionMode::LocalSize),
 				_options.localSizeX, _options.localSizeY, _options.localSizeZ });
+		} else if (entryPoint.stage == Stage::Fragment) {
+			// A fragment entry point with no origin is not loadable. Metal's
+			// fragment stage has a fixed origin and no counterpart to the MSL
+			// argument that would move it, so this is the only origin mslc emits.
+			_builder.setSection(spirv::Section::ExecutionModes);
+			_builder.emit(spirv::OpExecutionMode, { entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
 		}
 
 		_builder.setSection(spirv::Section::Functions);
 		// The function's own id has to be the one the entry point names, so it
 		// is written explicitly rather than taken from the emit's return.
-		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
+		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, entryPointId,
 			{ _intType, functionType });
 		_builder.emitDecl(spirv::OpLabel, { });
-		emitFunctionBody(*_entryPoint.body);
+		emitFunctionBody(*entryPoint.body);
 		_builder.emit(spirv::OpReturn, { });
 		_builder.emit(spirv::OpFunctionEnd, { });
 
-		return _reflection;
+		EmittedEntryPoint result;
+		result.stage = entryPoint.stage;
+		result.name = entryPoint.name;
+		result.bindings = _entryBindings;
+		return result;
 	}
 
 }
 
-std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
-	const FunctionDecl& entryPoint, const ModuleOptions& options) {
+EmittedModule emitModule(spirv::Builder& builder, const TranslationUnit& unit,
+	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options) {
 	TypeTable types(builder, unit);
-	Emitter emitter(builder, unit, entryPoint, options, types);
+	Emitter emitter(builder, unit, entryPoints, options, types);
 	return emitter.run();
 }
 

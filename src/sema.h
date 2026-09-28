@@ -25,6 +25,7 @@ class TypeTable {
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
+	std::map<std::vector<spirv::Id>, spirv::Id> _functionTypes;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 
 	spirv::Id _voidType = spirv::InvalidId;
@@ -60,6 +61,11 @@ public:
 	// through a sampler rather than stored to directly. Idempotent per
 	// component type and shape.
 	spirv::Id sampledImage(ScalarKind component, TextureDim dim);
+
+	// The type of a function, declared once per distinct signature: a module may
+	// declare a non-aggregate type only once, and every entry point with the
+	// same signature shares one.
+	spirv::Id functionType(spirv::Id returnType, const std::vector<spirv::Id>& parameterTypes);
 
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
@@ -100,11 +106,13 @@ struct ResolvedEntryPoint {
 	spirv::Id returnType = spirv::InvalidId;
 };
 
-// Finds the entry point to compile: the one matching the requested stage, or the
-// single entry point in the unit when the stage is unspecified. Returns nullptr
-// when the choice is ambiguous, which is an error the caller must report rather
-// than guess at.
-const FunctionDecl* selectEntryPoint(const TranslationUnit& unit, Stage requested);
+// Finds the entry points to compile: the one matching the requested stage, or
+// every entry point in the unit when the stage is unspecified. A Metal source
+// is a library rather than a function, so a shader that declares a vertex and a
+// fragment function produces one module with both, which is what compiling
+// through newLibraryWithSource: yields. Throws CompileError when a requested
+// stage is absent or the source declares no entry point at all.
+std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, Stage requested);
 
 // Options that affect code generation rather than parsing.
 struct ModuleOptions {
@@ -114,9 +122,26 @@ struct ModuleOptions {
 	bool separateImageSet = false;
 };
 
-// Emits the module for one entry point. Throws CompileError for anything the
-// subset cannot represent, naming the construct.
-std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
-	const FunctionDecl& entryPoint, const ModuleOptions& options);
+// One entry point as mslc reports it: its stage, its name, and the descriptor
+// bindings its own resources were given. A module has as many of these as its
+// source declared entry points.
+struct EmittedEntryPoint {
+	Stage stage = Stage::None;
+	std::string name;
+	std::string bindings;
+};
+
+// What to report about a module: the bindings the module itself owns, and its
+// entry points in order.
+struct EmittedModule {
+	std::string moduleBindings;
+	std::vector<EmittedEntryPoint> entries;
+};
+
+// Emits a module holding every given entry point, and returns what to report
+// about it. Throws CompileError for anything the subset cannot represent,
+// naming the construct.
+EmittedModule emitModule(spirv::Builder& builder, const TranslationUnit& unit,
+	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options);
 
 }
