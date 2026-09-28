@@ -53,6 +53,11 @@ public:
 	// store's value must have.
 	spirv::Id pointeeOf(spirv::Id pointerType) const;
 
+	// The scalar a vector type is built from, or ScalarKind::Void when the id is
+	// not a vector this table created. A swizzle's result type follows from it,
+	// since a component of a uint vector is a uint.
+	ScalarKind componentKind(spirv::Id vectorType) const;
+
 	bool isFloat(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;

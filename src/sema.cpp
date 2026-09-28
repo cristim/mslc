@@ -50,6 +50,31 @@ namespace {
 		return mappingFor(kind).isFloat;
 	}
 
+	// MSL spells the components of a vector as field-like names, and the colour
+	// sets are the same components under other letters. Returns the component
+	// indices a name selects, or nothing when the name is not one.
+	std::optional<std::vector<uint32_t>> swizzleIndices(const std::string& name) {
+		if (name.empty() || name.size() > 4) {
+			return std::nullopt;
+		}
+
+		std::vector<uint32_t> indices;
+		for (const char letter: name) {
+			uint32_t index;
+			switch (letter) {
+				case 'x': case 'r': case 's': index = 0; break;
+				case 'y': case 'g': case 't': index = 1; break;
+				case 'z': case 'b': case 'p': index = 2; break;
+				case 'w': case 'a': case 'q': index = 3; break;
+				default: return std::nullopt;
+			}
+
+			indices.push_back(index);
+		}
+
+		return indices;
+	}
+
 	// Whether an operator produces a bool rather than its operand's type.
 	bool isComparisonOperator(BinaryOperator op) {
 		switch (op) {
@@ -327,6 +352,16 @@ spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 	}
 
 	return spirv::InvalidId;
+}
+
+ScalarKind TypeTable::componentKind(spirv::Id vectorType) const {
+	for (const auto& [key, id]: _vectors) {
+		if (id == vectorType) {
+			return static_cast<ScalarKind>(key.first);
+		}
+	}
+
+	return ScalarKind::Void;
 }
 
 bool TypeTable::isFloat(spirv::Id type) const {
@@ -655,6 +690,13 @@ namespace {
 		Id emitIndex(const Expression& expression, bool asAddress);
 		Id emitMember(const Expression& expression);
 		Id emitMemberAddress(const Expression& expression);
+		Id addressOf(const Expression& expression);
+		const Binding& bindingFor(const Expression& expression);
+		Id readSwizzle(Id vector, const std::string& name);
+		std::vector<uint32_t> swizzleFor(Id vector, const std::string& name);
+		void writeSwizzle(const Expression& target, Id value);
+		Id fieldOf(const StructDecl& decl, const std::string& name);
+		bool isStructObject(const Expression& expression) const;
 		Id emitCall(const Expression& expression);
 		Id emitCast(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
@@ -810,65 +852,171 @@ namespace {
 		return asAddress ? address : loadFrom(address, binding.pointeeType);
 	}
 
-	Id Emitter::emitMember(const Expression& expression) {
-		const Id address = emitMemberAddress(expression);
-
-		// As with indexing, a member read yields the field and a member write
-		// needs its address, so the address form does the work and this loads.
-		auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end() || !it->second.structType) {
-			throw CompileError("\"" + expression.left->name + "\" has no struct type");
-		}
-
-		const StructDecl* decl = it->second.structType;
-		for (const StructField& field: decl->fields) {
-			if (field.name == expression.memberName) {
-				return loadFrom(address, _types.scalar(field.type.scalar));
+	Id Emitter::fieldOf(const StructDecl& decl, const std::string& name) {
+		for (size_t i = 0; i < decl.fields.size(); ++i) {
+			if (decl.fields[i].name == name) {
+				return static_cast<Id>(i);
 			}
 		}
 
-		throw CompileError("struct \"" + decl->name + "\" has no member \""
-			+ expression.memberName + "\"");
+		throw CompileError("struct \"" + decl.name + "\" has no member \"" + name + "\"");
+	}
+
+	// The binding an lvalue starts from. A member chain stays in the storage
+	// class of the variable or parameter it is rooted at, so an access chain
+	// along it is typed with that one's storage class.
+	const Binding& Emitter::bindingFor(const Expression& expression) {
+		const Expression* current = &expression;
+		while (current->kind == ExpressionKind::Member) {
+			current = current->left.get();
+		}
+
+		if (current->kind != ExpressionKind::Identifier) {
+			throw CompileError("this expression is not rooted at a name, so it has no storage");
+		}
+
+		const auto it = _bindings.find(current->name);
+		if (it == _bindings.end()) {
+			throw CompileError("\"" + current->name + "\" is not a parameter or local");
+		}
+
+		return it->second;
+	}
+
+	// The address a name or a member chain denotes, for a store to write through.
+	Id Emitter::addressOf(const Expression& expression) {
+		if (expression.kind == ExpressionKind::Member) {
+			return emitMemberAddress(expression);
+		}
+
+		if (expression.kind != ExpressionKind::Identifier) {
+			throw CompileError("this expression cannot be assigned to");
+		}
+
+		const Binding& binding = bindingFor(expression);
+		if (!binding.isPointer) {
+			throw CompileError("\"" + expression.name + "\" is not a place, so it cannot "
+				"be assigned to");
+		}
+
+		return binding.id;
 	}
 
 	Id Emitter::emitMemberAddress(const Expression& expression) {
-		if (expression.left->kind != ExpressionKind::Identifier) {
-			throw CompileError("member access on an expression is not supported yet");
-		}
-
-		const auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end()) {
-			throw CompileError("\"" + expression.left->name + "\" is not a parameter or local");
-		}
-
-		const StructDecl* decl = it->second.structType;
-		if (!decl) {
+		const Binding& binding = bindingFor(expression);
+		if (!binding.structType) {
 			throw CompileError("\"" + expression.left->name + "\" is not a struct, so \"."
 				+ expression.memberName + "\" is not a member of it");
 		}
 
-		size_t fieldIndex = decl->fields.size();
-		for (size_t i = 0; i < decl->fields.size(); ++i) {
-			if (decl->fields[i].name == expression.memberName) {
-				fieldIndex = i;
-				break;
+		const Id fieldIndex = fieldOf(*binding.structType, expression.memberName);
+		const Id fieldType = declaredTypeOf(binding.structType->fields[fieldIndex].type);
+
+		// The result type is a pointer to the field, not to the struct the chain
+		// starts from. A chain typed as a pointer to the struct does not match
+		// what the base indexes to, and spirv-val rejects it.
+		return _builder.emitTyped(spirv::OpAccessChain,
+			_types.pointer(binding.storageClass, fieldType),
+			{ addressOf(*expression.left), constantU32(fieldIndex) });
+	}
+
+	// A swizzle naming a component the vector does not have is a mistake worth
+	// naming, rather than an out-of-range index for the validator to find.
+	std::vector<uint32_t> Emitter::swizzleFor(Id vector, const std::string& name) {
+		const std::vector<uint32_t> indices = *swizzleIndices(name);
+		const uint32_t width = _types.vectorWidth(_builder.typeOf(vector));
+
+		for (const uint32_t index: indices) {
+			if (index >= width) {
+				throw CompileError("a vector of " + std::to_string(width)
+					+ " components has no component \"" + name + "\"");
 			}
 		}
 
-		if (fieldIndex == decl->fields.size()) {
-			throw CompileError("struct \"" + decl->name + "\" has no member \""
-				+ expression.memberName + "\"");
+		return indices;
+	}
+
+	// A component or a set of components of a vector, read as a value.
+	Id Emitter::readSwizzle(Id vector, const std::string& name) {
+		const std::vector<uint32_t> indices = swizzleFor(vector, name);
+		const ScalarKind component = _types.componentKind(_builder.typeOf(vector));
+
+		// One component is an extract; several are a shuffle, which takes the
+		// vector twice, once for the components and once for the result.
+		if (indices.size() == 1) {
+			return _builder.emitTyped(spirv::OpCompositeExtract, _types.scalar(component),
+				{ vector, indices.front() });
 		}
 
-		// The result type is a pointer to the field, not to the struct the
-		// parameter names. Indexing a struct yields the field, so a chain
-		// typed as a pointer to the struct does not match what the base
-		// indexes to, and spirv-val rejects it.
-		const Id fieldType = _types.scalar(decl->fields[fieldIndex].type.scalar);
+		std::vector<uint32_t> operands = { vector, vector };
+		for (const uint32_t index: indices) {
+			operands.push_back(index);
+		}
 
-		return _builder.emitTyped(spirv::OpAccessChain,
-			_types.pointer(it->second.storageClass, fieldType),
-			{ it->second.id, constantU32(static_cast<uint32_t>(fieldIndex)) });
+		return _builder.emitTyped(spirv::OpVectorShuffle,
+			_types.vector(component, static_cast<uint32_t>(indices.size())), operands);
+	}
+
+	// A write to one component of a vector. A component has no address of its
+	// own to chain to, so the vector is read, the component replaced in it and
+	// the result written back over the whole thing.
+	void Emitter::writeSwizzle(const Expression& target, Id value) {
+		const Id object = addressOf(*target.left);
+		const std::vector<uint32_t> indices = swizzleFor(loadFrom(object,
+			_types.pointeeOf(_builder.typeOf(object))), target.memberName);
+
+		if (indices.size() != 1) {
+			throw CompileError("writing \"" + target.memberName + "\" would write "
+				+ std::to_string(indices.size()) + " components at once, which mslc does not do; "
+				"assign each component on its own");
+		}
+
+		const Id type = _types.pointeeOf(_builder.typeOf(object));
+		const Id loaded = loadFrom(object, type);
+		// Operand order is the vector, then the component, then its index.
+		const Id inserted = _builder.emitTyped(spirv::OpVectorInsertDynamic, type,
+			{ loaded, value, constantU32(indices.front()) });
+
+		_builder.emit(spirv::OpStore, { object,
+			convert(inserted, _builder.typeOf(inserted), type) });
+	}
+
+	// A struct's fields are named whatever the source called them, and the
+	// component letters are ordinary enough as field names that "p" is both a
+	// component and a plausible field, so an object that is a struct is a field
+	// access whatever the name is.
+	bool Emitter::isStructObject(const Expression& expression) const {
+		if (expression.kind != ExpressionKind::Identifier) {
+			return false;
+		}
+
+		const auto it = _bindings.find(expression.name);
+		return it != _bindings.end() && it->second.structType != nullptr;
+	}
+
+	Id Emitter::emitMember(const Expression& expression) {
+		// A component or a set of components of a vector is read out of the
+		// value it is applied to; anything else names a field of a struct and is
+		// read through its address.
+		if (!isStructObject(*expression.left) && swizzleIndices(expression.memberName)) {
+			const Id object = emitExpression(*expression.left);
+			if (_types.componentKind(_builder.typeOf(object)) != ScalarKind::Void) {
+				return readSwizzle(object, expression.memberName);
+			}
+		}
+
+		// As with indexing, a member read yields the field and a member write
+		// needs its address, so the address form does the work and this loads.
+		const Binding& binding = bindingFor(expression);
+		if (!binding.structType) {
+			throw CompileError("\"" + expression.left->name + "\" is not a struct, so \"."
+				+ expression.memberName + "\" is not a member of it");
+		}
+
+		const Id fieldIndex = fieldOf(*binding.structType, expression.memberName);
+		const Id fieldType = declaredTypeOf(binding.structType->fields[fieldIndex].type);
+
+		return loadFrom(emitMemberAddress(expression), fieldType);
 	}
 
 	Id Emitter::emitCast(const Expression& expression) {
@@ -1355,6 +1503,13 @@ namespace {
 		binding.isPointer = true;
 		binding.pointeeType = typeId;
 		binding.storageClass = spirv::StorageClass::Function;
+
+		// A local of a struct type, so a member of it can be resolved the way
+		// one of a parameter's is.
+		if (!declaration.type.namedType.empty()) {
+			binding.structType = _unit.findStruct(declaration.type.namedType);
+		}
+
 		_bindings[declaration.name] = binding;
 	}
 
@@ -1373,6 +1528,18 @@ namespace {
 					if (statement.expression->kind == ExpressionKind::Assign) {
 						const Expression& assign = *statement.expression;
 
+						const Id value = emitExpression(*assign.right);
+
+						// A component of a vector has no address of its own, so a
+						// write to one replaces the component in the vector
+						// rather than storing through a pointer.
+						if (assign.left->kind == ExpressionKind::Member
+							&& !isStructObject(*assign.left->left)
+							&& swizzleIndices(assign.left->memberName)) {
+							writeSwizzle(*assign.left, value);
+							return;
+						}
+
 						// The left side is a place, so it is emitted as an
 						// address rather than loaded.
 						Id address = InvalidId;
@@ -1383,8 +1550,6 @@ namespace {
 						} else {
 							address = emitExpression(*assign.left);
 						}
-
-						const Id value = emitExpression(*assign.right);
 
 						// A store's value has the type the address points at, not
 						// the type of the address, so the pointee is what the
