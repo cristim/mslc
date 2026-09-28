@@ -2514,28 +2514,23 @@ namespace {
 							return;
 						}
 
-						// The left side is a place, so it is emitted as an
-						// address rather than loaded.
-						Id address = InvalidId;
-						if (assign.left->kind == ExpressionKind::Index) {
-							address = emitIndex(*assign.left, true);
-						} else if (assign.left->kind == ExpressionKind::Member) {
-							address = emitMemberAddress(*assign.left);
-						} else {
-							address = emitExpression(*assign.left);
-						}
+					// The left side is a place, so it is emitted as an address rather
+					// than loaded. addressOf is what says what a place is: an index
+					// chains through the buffer, a member through the struct, and a
+					// name is its own variable. Emitting the expression instead
+					// would load a plain name and leave nothing to store through.
+					const Id address = addressOf(*assign.left);
+					const Id value = emitExpression(*assign.right);
 
-						const Id value = emitExpression(*assign.right);
+					// A store's value has the type the address points at, not the type
+					// of the address, so the pointee is what the value is converted
+					// to.
+					const Id pointeeType = _types.pointeeOf(_builder.typeOf(address));
+					if (pointeeType == spirv::InvalidId) {
+						throw CompileError("cannot determine what this assignment writes "
+							"through, so the store cannot be typed");
+					}
 
-						// A store's value has the type the address points at, not
-						// the type of the address, so the pointee is what the
-						// value is converted to.
-						const Id addressType = _builder.typeOf(address);
-						const Id pointeeType = _types.pointeeOf(addressType);
-						if (pointeeType == spirv::InvalidId) {
-							throw CompileError("cannot determine what \""
-								+ assign.left->name + "\" points at, so the store cannot be typed");
-						}
 
 						_builder.emit(spirv::OpStore, { address,
 							convert(value, _builder.typeOf(value), pointeeType) });
