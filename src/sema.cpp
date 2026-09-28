@@ -2745,7 +2745,15 @@ namespace {
 		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, entryPointId,
 			{ _intType, functionType });
 		emitLabel(_builder.nextId());
+
+		// A function's variables are only valid among the first instructions of
+		// its first block, and a body discovers one at its declaration, so the
+		// variables are buffered while the body is emitted and spliced in behind
+		// the opening label. Only an entry point's own body is lowered, so the
+		// prologue is opened and closed around it rather than per function.
+		_builder.openPrologue();
 		emitFunctionBody(*entryPoint.body);
+		_builder.closePrologue();
 
 		// A body that returns on every path has already ended the block, and a
 		// terminator after one belongs to no block at all.

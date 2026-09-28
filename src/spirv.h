@@ -65,6 +65,21 @@ class Builder {
 
 	Section _currentSection = Section::TypesGlobals;
 
+	// A function's variables are only valid among the first instructions of its
+	// first block, and a variable is discovered at its declaration, which is
+	// after the instructions computing its initialiser. So between openPrologue
+	// and closePrologue a Function-storage variable is buffered rather than
+	// appended, and closing splices the buffer in behind the function's opening
+	// label. _prologueAt is the count of instructions already in the Functions
+	// section, which is where the opening label sits.
+	std::vector<Instruction> _prologue;
+	size_t _prologueAt = 0;
+	bool _prologueOpen = false;
+
+	// Appends an instruction, or buffers it when it is a variable that belongs at
+	// the top of the function's first block.
+	void place(Section section, Instruction instruction, uint16_t opcode);
+
 public:
 	Id nextId() { return _nextId++; }
 
@@ -130,6 +145,17 @@ public:
 	// Emits a NUL-terminated string literal and returns its id, reusing an
 	// identical literal if one already exists.
 	Id stringLiteral(const std::string& text);
+
+	// A function's variables are only valid among the first instructions of its
+	// first block, and a variable is discovered at its declaration, which is
+	// after the instructions computing its initialiser. So between these two
+	// calls a Function-storage variable is buffered rather than appended, and
+	// closing the prologue splices the buffer in behind the function's opening
+	// label. Ids are allocated as work is discovered rather than as it is
+	// emitted, so a variable is named before the instruction declaring it
+	// appears, and no other instruction in the body moves.
+	void openPrologue();
+	void closePrologue();
 
 	// Packs a string into SPIR-V literal words and appends them. Instructions
 	// such as OpEntryPoint and OpName take the name inline rather than by id,

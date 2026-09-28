@@ -13,3 +13,4 @@ constructs/matrix_column.metal expect=valid
 constructs/vector_splat.metal expect=valid
 constructs/vector_constructor.metal expect=valid
 constructs/unlocated_interface.metal expect=valid
+constructs/local_variables.metal expect=valid

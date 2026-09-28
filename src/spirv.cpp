@@ -139,7 +139,7 @@ Id Builder::emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> oper
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[section].push_back(std::move(instruction));
+	place(section, std::move(instruction), opcode);
 	_valueTypes[id] = resultType;
 	return id;
 }
@@ -154,7 +154,7 @@ Id Builder::emitDecl(uint16_t opcode, std::vector<uint32_t> operands) {
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[section].push_back(std::move(instruction));
+	place(section, std::move(instruction), opcode);
 
 	return id;
 }
@@ -169,8 +169,7 @@ Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> 
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-
-	_sections[section].push_back(std::move(instruction));
+	place(section, std::move(instruction), opcode);
 
 	// The object a variable names is a value the body can load from, so record
 	// its type the same way a value-producing instruction would.
@@ -189,7 +188,7 @@ void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
-	_sections[section].push_back(std::move(instruction));
+	place(section, std::move(instruction), opcode);
 
 	_valueTypes[resultId] = resultType;
 }
@@ -202,7 +201,43 @@ void Builder::emitDeclAt(uint16_t opcode, Id resultId, std::vector<uint32_t> ope
 	Instruction instruction;
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
+	place(section, std::move(instruction), opcode);
+}
+
+// A variable belongs at the top of the function's first block, and an
+// instruction is written as [result type, result id, operands...], so an
+// OpVariable's storage class is its third word. Only a Function-storage one is
+// buffered: a descriptor or an interface variable is a module global and goes
+// where it was emitted.
+void Builder::place(Section section, Instruction instruction, uint16_t opcode) {
+	if (_prologueOpen && opcode == OpVariable && instruction.words.size() > 2
+		&& instruction.words[2] == static_cast<uint32_t>(StorageClass::Function)) {
+		_prologue.push_back(std::move(instruction));
+		return;
+	}
+
 	_sections[section].push_back(std::move(instruction));
+}
+
+// Opened with the function's opening label already emitted, so _prologueAt is
+// that label's position in the Functions section and the buffer lands directly
+// behind it.
+void Builder::openPrologue() {
+	_prologueOpen = true;
+	_prologueAt = _sections[Section::Functions].size();
+}
+
+void Builder::closePrologue() {
+	if (!_prologueOpen) {
+		return;
+	}
+
+	_prologueOpen = false;
+
+	std::vector<Instruction>& functions = _sections[Section::Functions];
+	functions.insert(functions.begin() + static_cast<long>(_prologueAt),
+		_prologue.begin(), _prologue.end());
+	_prologue.clear();
 }
 
 Id Builder::typeOf(Id value) const {
