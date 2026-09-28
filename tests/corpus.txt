@@ -15,7 +15,12 @@
 #
 #   expect=unsupported:WHAT   the file has to fail, and its diagnostic has to
 #                             mention WHAT, which is the construct currently in
-#                             the way. This is what keeps the list honest in
+#                             the way. A file blocked on the preprocessor says so:
+#                             its attributes are named by enumerants a shared
+#                             header declares, its types are typedefs and
+#                             simd's vector_uint2, and reading a header and
+#                             expanding its macros is a larger piece than the rest
+#                             of this list together. This is what keeps the list honest in
 #                             both directions: a supported fixture cannot stop
 #                             compiling unnoticed, and an unsupported one cannot
 #                             quietly change what it is blocked on. When a
@@ -38,9 +43,9 @@
 compute_buffer_clear.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/basic-compute/shadersrc/add.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal expect=valid
-/home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
+/home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal expect=unsupported:no preprocessor
 /home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal expect=invalid:uniform buffer layout
-/home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
+/home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal expect=unsupported:no preprocessor
 /home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal expect=invalid:uniform buffer layout
 /home/cristi/src/mslc/tests/blender/mtl_context-5.1.2.metal expect=valid

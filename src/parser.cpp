@@ -816,6 +816,19 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		std::optional<uint32_t> argument;
 		if (at(TokenKind::LParen)) {
 			advance();
+
+			// An attribute's argument is very often the name of an enumerant a
+			// shared header declares, as in [[buffer(AAPLVertexInputIndexVertices)]],
+			// and mslc has no preprocessor to read the header and expand it. An
+			// identifier where the argument should be is that, so it is named as
+			// such rather than as a constant that happens to be missing: the
+			// construct in the way is the preprocessor, not the attribute.
+			if (at(TokenKind::Identifier)) {
+				throw CompileError("attribute \"" + name + "\" takes \"" + std::string(current().text)
+					+ "\", an enumerant from an included header, and mslc has no preprocessor "
+					"to read the header and expand it");
+			}
+
 			if (!at(TokenKind::IntegerLiteral)) {
 				throw CompileError("attribute \"" + name + "\" needs a constant integer argument");
 			}
