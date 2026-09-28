@@ -75,6 +75,7 @@ def main():
         "BuiltIn": "BuiltIn",
         "Capability": "Capability",
         "ExecutionModel": "ExecutionModel",
+        "ExecutionMode": "ExecutionMode",
         "AddressingModel": "AddressingModel",
         "MemoryModel": "MemoryModel",
         "Dim": "Dim",

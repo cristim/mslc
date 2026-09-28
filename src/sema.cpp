@@ -1199,9 +1199,8 @@ namespace {
 
 		if (_entryPoint.stage == Stage::Kernel) {
 			_builder.setSection(spirv::Section::ExecutionModes);
-			// 17 is LocalSize, read from the generated opcode table by name
-			// rather than written here, since the enum is in spirv_opcodes.h.
-			_builder.emit(spirv::OpExecutionMode, { _entryPointId, 17u,
+			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::LocalSize),
 				_options.localSizeX, _options.localSizeY, _options.localSizeZ });
 		}
 
