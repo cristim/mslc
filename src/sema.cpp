@@ -912,6 +912,7 @@ namespace {
 		bool isStructObject(const Expression& expression) const;
 		const Binding* findBinding(const std::string& name) const;
 		void spreadScalar(Id& value, Id& type, Id vectorType);
+		Id spreadScalarTo(Id value, Id vectorType);
 		Id emitCall(const Expression& expression);
 		Id emitSample(const Expression& expression);
 		Id emitCast(const Expression& expression);
@@ -1347,9 +1348,24 @@ namespace {
 	}
 
 	Id Emitter::emitCast(const Expression& expression) {
+		const Type& target = *expression.castType;
 		const Id value = emitExpression(*expression.left);
 		const Id fromType = _builder.typeOf(value);
-		const Id toType = declaredTypeOf(*expression.castType);
+		const Id toType = declaredTypeOf(target);
+
+		// A scalar spread across a vector, which is what "float4(0.5)" means:
+		// every component takes the value. Metal spells the same thing with a
+		// constructor rather than a cast, so this is reached from both.
+		if (target.vectorWidth > 1) {
+			if (fromType != _types.scalar(_types.componentKind(toType))) {
+				throw CompileError(std::string("a vector is built from its own component type, "
+					"and this is a ") + (_types.isFloat(fromType) ? "float" : "integer")
+					+ " where the components are a different kind");
+			}
+
+			return spreadScalarTo(value, toType);
+		}
+
 		return convert(value, fromType, toType);
 	}
 
@@ -1384,10 +1400,15 @@ namespace {
 				"its own component type, which mslc does not do");
 		}
 
-		const uint32_t width = _types.vectorWidth(vectorType);
-		value = _builder.emitTyped(spirv::OpCompositeConstruct, vectorType,
-			std::vector<uint32_t>(width, value));
+		value = spreadScalarTo(value, vectorType);
 		type = vectorType;
+	}
+
+	// The same spread as a value, for the callers that build a vector rather
+	// than widen an operand.
+	Id Emitter::spreadScalarTo(Id value, Id vectorType) {
+		return _builder.emitTyped(spirv::OpCompositeConstruct, vectorType,
+			std::vector<uint32_t>(_types.vectorWidth(vectorType), value));
 	}
 
 	// A product with a matrix operand, which SPIR-V spells with an instruction
