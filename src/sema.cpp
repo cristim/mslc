@@ -1523,12 +1523,23 @@ namespace {
 	// operation needs: SPIR-V's binary arithmetic has no mixed form, so both
 	// sides have to be the same type. This is what makes "v * 0.5" and
 	// "v + 0.5" mean in Metal what they mean here.
+	//
+	// The usual arithmetic conversions come first, and they are the same rule the
+	// two-scalar case follows: a scalar of another type becomes one of the vector's
+	// own component type, so "v * 2" is a float4 times a float4 rather than a
+	// shape mismatch.
 	void Emitter::spreadScalar(Id& value, Id& type, Id vectorType) {
-		const ScalarKind component = _types.componentKind(vectorType);
-		if (type != _types.scalar(component)) {
-			throw CompileError("this operator mixes a vector of "
-				+ std::to_string(_types.vectorWidth(vectorType)) + " with something that is not "
-				"its own component type, which mslc does not do");
+		const Id component = _types.scalar(_types.componentKind(vectorType));
+		if (type != component) {
+			if (_types.vectorWidth(type) > 1 || _types.isFloat(type) == _types.isFloat(component)) {
+				throw CompileError("this operator mixes a vector of "
+					+ std::to_string(_types.vectorWidth(vectorType)) + " with something that is not "
+					"one of its own components, or is of a type it does not convert to, which "
+					"mslc does not do");
+			}
+
+			value = convert(value, type, component);
+			type = component;
 		}
 
 		value = spreadScalarTo(value, vectorType);
@@ -1613,12 +1624,35 @@ namespace {
 			return emitMatrixProduct(left, right, leftType, rightType);
 		}
 
+		// Two operand types that differ have to become one before the operation has
+		// an instruction: SPIR-V's binary arithmetic is typed on both sides being
+		// the same type and converts neither. A vector and a scalar is a spread,
+		// which is the mixed form it does have. Two scalars of different types is
+		// what MSL's usual arithmetic conversions resolve instead, and the float
+		// wins: a float compared against an integer literal is a floating-point
+		// comparison against a widened zero, not an integer one, which is what
+		// "intensity > 0" means.
 		if (leftType != rightType) {
-			if (_types.vectorWidth(leftType) > 1) {
-				spreadScalar(right, rightType, leftType);
+			const uint32_t leftWidth = _types.vectorWidth(leftType);
+			const uint32_t rightWidth = _types.vectorWidth(rightType);
+
+			if (leftWidth > 1 || rightWidth > 1) {
+				if (leftWidth > 1) {
+					spreadScalar(right, rightType, leftType);
+				} else {
+					spreadScalar(left, leftType, rightType);
+					leftType = rightType;
+				}
+			} else if (_types.isFloat(leftType) != _types.isFloat(rightType)) {
+				if (_types.isFloat(leftType)) {
+					right = convert(right, rightType, leftType);
+				} else {
+					left = convert(left, leftType, rightType);
+					leftType = rightType;
+				}
 			} else {
-				spreadScalar(left, leftType, rightType);
-				leftType = rightType;
+				throw CompileError("this operator's two operands are of different types, "
+					"which mslc does not resolve to a common one");
 			}
 		}
 

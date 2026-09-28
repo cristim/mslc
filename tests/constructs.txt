@@ -16,3 +16,4 @@ constructs/unlocated_interface.metal expect=valid
 constructs/local_variables.metal expect=valid
 constructs/local_assignment.metal expect=valid
 constructs/structured_control_flow.metal expect=valid
+constructs/scalar_promotion.metal expect=valid
