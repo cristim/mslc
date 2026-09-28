@@ -615,6 +615,12 @@ namespace {
 		// True when the name is a descriptor over a wrapped buffer, so indexing
 		// it needs a struct member index before the element index.
 		bool isBuffer = false;
+		// For a [[stage_in]] parameter, the variable of each member. SPIR-V
+		// gives every member of an interface struct its own variable, since a
+		// struct may not mix a builtin member with a located one, so there is no
+		// struct to reach a member of.
+		bool isStageIn = false;
+		std::vector<Id> stageInMembers;
 	};
 
 	class Emitter {
@@ -786,6 +792,13 @@ namespace {
 
 		const Binding& binding = it->second;
 
+		// A [[stage_in]] parameter is an interface, not a value: SPIR-V has no
+		// struct holding the members, so there is nothing to load.
+		if (binding.isStageIn) {
+			throw CompileError("\"" + expression.name + "\" is a [[stage_in]] parameter, which "
+				"is its members rather than a value; name one of them");
+		}
+
 		if (!binding.isPointer) {
 			return binding.id;
 		}
@@ -911,6 +924,12 @@ namespace {
 
 		const Id fieldIndex = fieldOf(*binding.structType, expression.memberName);
 		const Id fieldType = declaredTypeOf(binding.structType->fields[fieldIndex].type);
+
+		// Each member of a [[stage_in]] struct is its own variable, so a member
+		// of one is that variable rather than anything reached from it.
+		if (binding.isStageIn) {
+			return binding.stageInMembers[fieldIndex];
+		}
 
 		// The result type is a pointer to the field, not to the struct the chain
 		// starts from. A chain typed as a pointer to the struct does not match
@@ -1344,6 +1363,64 @@ namespace {
 				binding.scalarComponentOfVector = parameter.type.isScalar();
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
+				continue;
+			}
+
+			// A [[stage_in]] parameter is the interface a stage receives, and
+			// each of its members is a variable of its own placed by the
+			// attribute on that member. The struct itself is not a value, since
+			// SPIR-V has no interface struct to hold them.
+			if (parameter.attributes.stageIn) {
+				if (parameter.type.namedType.empty()) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[stage_in]] but "
+						"is not a struct type");
+				}
+
+				const StructDecl* decl = _unit.findStruct(parameter.type.namedType);
+				if (!decl) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[stage_in]] on \""
+						+ parameter.type.namedType + "\", which is not a struct this source declares");
+				}
+
+				if (entryPoint.stage != Stage::Fragment) {
+					throw CompileError("a [[stage_in]] parameter is what a fragment entry point "
+						"receives, and \"" + entryPoint.name + "\" is not one");
+				}
+
+				Binding binding;
+				binding.storageClass = spirv::StorageClass::Input;
+
+				for (const StructField& field: decl->fields) {
+					const Id type = declaredTypeOf(field.type);
+
+					_builder.setSection(spirv::Section::TypesGlobals);
+					const Id pointerType = _types.pointer(spirv::StorageClass::Input, type);
+					const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+						{ static_cast<uint32_t>(spirv::StorageClass::Input) });
+
+					_builder.setSection(spirv::Section::Annotations);
+					if (field.attributes.position) {
+						// The position a fragment receives is its own coordinate,
+						// not the position builtin, which the specification
+						// reserves for the stages that produce one.
+						_builder.emit(spirv::OpDecorate, { id,
+							static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+							static_cast<uint32_t>(spirv::BuiltIn::FragCoord) });
+					} else if (field.attributes.attributeIndex) {
+						_builder.emit(spirv::OpDecorate, { id,
+							static_cast<uint32_t>(spirv::Decoration::Location), *field.attributes.attributeIndex });
+					} else {
+						throw CompileError("field \"" + field.name + "\" of the [[stage_in]] struct "
+							"\"" + decl->name + "\" has no [[position]] or [[attribute(n)]], so mslc "
+							"cannot say where it comes from");
+					}
+
+					_interface.push_back(id);
+					binding.stageInMembers.push_back(id);
+				}
+
+				binding.isStageIn = true;
+				_bindings[parameter.name] = binding;
 				continue;
 			}
 
