@@ -242,6 +242,15 @@ void Parser::parsePreprocessorDirective() {
 
 	if (atKeyword("include")) {
 		advance();
+
+		// A header name is either <angled> or "quoted", and the lexer makes the
+		// quoted one a single token. Scanning for the closing '>' would run past
+		// it and swallow the rest of the file, so it is consumed as it stands.
+		if (at(TokenKind::StringLiteral)) {
+			advance();
+			return;
+		}
+
 		match(TokenKind::Less);
 
 		// Skip to the end of the header name.

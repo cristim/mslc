@@ -13,6 +13,10 @@ enum class TokenKind {
 	Identifier,
 	IntegerLiteral,
 	FloatLiteral,
+	// A string literal. MSL has no use for one in an expression, but an
+	// #include's header name is written as one, so it has to be recognisable
+	// rather than lexed as the identifier it looks like.
+	StringLiteral,
 
 	// punctuation and operators
 	LBrace, RBrace,
