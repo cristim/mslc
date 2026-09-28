@@ -5,12 +5,32 @@
 # A second group is the subset of Metal that Blender 4.5.14's
 # gpu/metal/mtl_context.mm actually calls through newLibraryWithSource:, frozen
 # here verbatim so mslc's progress on real shaders is measured too.
-compute_buffer_clear.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/basic-compute/shadersrc/add.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal
-/home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal
-/home/cristi/src/mslc/tests/blender/mtl_context-5.1.2.metal
+#
+# Every entry says what is expected of it, and that is what the corpus test
+# asserts:
+#
+#   expect=valid              the file has to compile to spirv-val-valid SPIR-V.
+#                             Not merely to return success: compiling to
+#                             something spirv-val rejects fails here too.
+#
+#   expect=unsupported:WHAT   the file has to fail, and its diagnostic has to
+#                             mention WHAT, which is the construct currently in
+#                             the way. This is what keeps the list honest in
+#                             both directions: a supported fixture cannot stop
+#                             compiling unnoticed, and an unsupported one cannot
+#                             quietly change what it is blocked on. When a
+#                             construct is implemented, the entry that names it
+#                             fails until it is edited here to expect=valid,
+#                             which is the only way the count moves.
+#
+# The "N of M compile" line below the table is the measurement. It is expected
+# to be below M, and that is not a failure of the test.
+compute_buffer_clear.metal expect=valid
+/home/cristi/src/indium-pr-opaque-pointers/test/basic-compute/shadersrc/add.metal expect=valid
+/home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal expect=unsupported:float4x4
+/home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
+/home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal expect=unsupported:matrix type
+/home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal expect=unsupported:matrix type
+/home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
+/home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal expect=unsupported:matrix type
+/home/cristi/src/mslc/tests/blender/mtl_context-5.1.2.metal expect=valid

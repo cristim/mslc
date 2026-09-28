@@ -36,4 +36,15 @@ add_executable(mslc-corpus tools/corpus.cpp)
 target_link_libraries(mslc-corpus PRIVATE mslc)
 
 enable_testing()
-add_test(NAME corpus COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus.txt)
+
+# The corpus: other people's shaders, each with what it is expected to do. A
+# fixture mslc supports has to keep compiling, and one it does not support yet
+# has to keep saying which construct is in the way, so the test fails for a
+# regression in either direction rather than asserting that everything compiles.
+add_test(NAME corpus
+	COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus.txt)
+
+# One fixture per construct, all of them expected to compile. This is the
+# regression guard on mslc's own work rather than on the corpus.
+add_test(NAME constructs
+	COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/constructs.txt)

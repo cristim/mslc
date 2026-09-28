@@ -37,11 +37,11 @@ class TypeTable {
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _samplerType = spirv::InvalidId;
 
-	// A struct's member types, where each one starts in a buffer, and the size
-	// of the struct, which is how far an array of it steps. False when the name
-	// is not a struct this source declares.
+	// A struct's member types and where each one starts in a buffer. outSize, when
+	// given, receives the size of the struct, which is how far an array of it
+	// steps. False when the name is not a struct this source declares.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
+		std::vector<uint32_t>& outOffsets, uint32_t* outSize);
 
 	// How many bytes one scalar of a kind occupies.
 	uint32_t fieldTypeSize(ScalarKind kind);

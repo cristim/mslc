@@ -1,0 +1,9 @@
+# One fixture per construct mslc has gained, each of them valid. Where the
+# corpus above measures progress on other people's shaders, this is the
+# regression guard on mslc's own: a construct that stops working has to fail
+# here, whether or not any corpus file happens to use it.
+#
+# Expectation syntax is the corpus's; see tests/corpus.txt.
+constructs/pointer_parameters.metal expect=valid
+constructs/file_scope_constants.metal expect=valid
+constructs/quoted_include.metal expect=valid

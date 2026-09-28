@@ -76,6 +76,44 @@ namespace {
 		return true;
 	}
 
+	// Whether a name is a scalar or a vector type, for a caller that only needs
+	// to know which it is.
+	bool isTypeName(std::string_view text) {
+		ScalarKind kind;
+		uint32_t width = 0;
+		return isTypeName(text, kind, width);
+	}
+
+	// Whether a name is a matrix type, which is its scalar or vector type with
+	// the rows and columns after it: "float4x4", "float3x3". The subset has no
+	// matrices, but a name that is one has to be recognised as one to be
+	// reported as one.
+	bool isMatrixTypeName(std::string_view name) {
+		const size_t x = name.find('x');
+		if (x == std::string_view::npos || x == 0 || x + 1 >= name.size()) {
+			return false;
+		}
+
+		if (!isTypeName(name.substr(0, x))) {
+			return false;
+		}
+
+		// A vector type name is one of these too, since "float4x4" is two of them
+		// back to back, so the digits have to be the whole name around the 'x' for
+		// it to be a matrix.
+		if (name.size() != x + 2) {
+			return false;
+		}
+
+		for (const size_t at: { x - 1, x + 1 }) {
+			if (name[at] < '2' || name[at] > '9') {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	// Keywords that may appear before a type and are not address spaces.
 	bool isTypeQualifier(std::string_view text) {
 		return text == "const" || text == "static" || text == "constexpr"
@@ -570,6 +608,17 @@ Type Parser::parseType() {
 			type.scalar = component;
 
 			expect(TokenKind::Greater, "to close a texture type");
+		} else if (isMatrixTypeName(name)) {
+			// A matrix is spelled as its scalar type with the shape after it, so
+			// "float4x4" is one name rather than a type and a number. Reading it as
+			// a struct's field type would report a struct that is not there.
+			throw CompileError("the matrix type \"" + std::string(name)
+				+ "\" is not supported yet");
+		} else if (name.rfind("texture", 0) == 0) {
+			// A texture of a shape mslc does not lower, named as such rather than
+			// left to be read as a struct.
+			throw CompileError("the texture type \"" + std::string(name)
+				+ "\" is not supported yet");
 		} else {
 			type.namedType = std::string(name);
 			advance();

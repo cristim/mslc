@@ -494,7 +494,7 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 // both starts and steps 16 bytes, which is what a float2 field after it has to
 // account for.
 bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
-	std::vector<uint32_t>& outOffsets, uint32_t& outSize) {
+	std::vector<uint32_t>& outOffsets, uint32_t* outSize) {
 
 	const StructDecl* decl = _unit.findStruct(name);
 	if (!decl) {
@@ -530,7 +530,10 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		offset += size;
 	}
 
-	outSize = offset;
+	if (outSize) {
+		*outSize = offset;
+	}
+
 	return true;
 }
 
@@ -551,8 +554,7 @@ Id TypeTable::namedStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+	if (!structMembersFor(name, fieldTypes, offsets, nullptr)) {
 		return InvalidId;
 	}
 
@@ -580,7 +582,7 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
 	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+	if (!structMembersFor(name, fieldTypes, offsets, &size)) {
 		return InvalidId;
 	}
 
@@ -611,8 +613,7 @@ Id TypeTable::blockStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+	if (!structMembersFor(name, fieldTypes, offsets, nullptr)) {
 		return InvalidId;
 	}
 
@@ -1425,8 +1426,6 @@ namespace {
 		if (folded.isComposite) {
 			return _builder.emitDeclTyped(spirv::OpConstantComposite, folded.type, folded.parts);
 		}
-
-		_builder.setSection(spirv::Section::TypesGlobals);
 
 		if (folded.scalar == ScalarKind::Bool) {
 			return folded.boolean

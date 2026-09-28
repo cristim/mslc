@@ -1,8 +1,12 @@
 // Corpus runner: compiles every .metal file listed in a manifest and reports
 // which reach structurally valid SPIR-V.
 //
-// The point is measurement. Progress on the MSL subset is "N of these files
-// compile", not a claim, and a regression is visible immediately.
+// The count is the measurement, not the assertion: progress on the MSL subset
+// is "N of these files compile", not a claim. The assertion is per entry, and
+// the manifest says what is expected of each one, so a fixture mslc supports
+// has to keep compiling and one it does not support yet has to keep saying why.
+// That way the test cannot pass by having fewer fixtures in it, and progress
+// has to be recorded in the manifest rather than absorbed by it.
 
 #include "mslc/mslc.h"
 
@@ -11,10 +15,21 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace {
+
+	// What a manifest entry says should happen to its file.
+	struct Expectation {
+		// The file has to compile and reach spirv-val-valid SPIR-V.
+		bool valid = false;
+
+		// The file has to fail to compile, and the diagnostic has to mention this.
+		// Empty when it is expected to compile.
+		std::string blocker;
+	};
 
 	struct Result {
 		std::string path;
@@ -22,6 +37,8 @@ namespace {
 		bool valid = false;
 		size_t spirvSize = 0;
 		std::string diagnostic;
+		bool met = false;
+		std::string note;
 	};
 
 	bool readFile(const std::string& path, std::string& out) {
@@ -66,6 +83,64 @@ namespace {
 		return status == 0;
 	}
 
+	// Reads a manifest entry: a path, then what is expected of it. An entry
+	// without an expectation is an error rather than a fixture measured and
+	// forgotten, since an unasserted entry is one that cannot fail.
+	// The expectation runs to the end of the line, so the text of a blocker may
+	// contain spaces. Returns false when the line cannot be read.
+	bool parseEntry(const std::string& line, std::string& outPath, Expectation& outExpectation,
+		std::string& outError) {
+
+		std::istringstream stream(line);
+		if (!(stream >> outPath)) {
+			outError = "expected a path";
+			return false;
+		}
+
+		const size_t at = line.find("expect=");
+		if (at == std::string::npos) {
+			outError = "no expectation given, so the entry could not fail";
+			return false;
+		}
+
+		const std::string value = line.substr(at + std::string("expect=").size());
+		if (value == "valid") {
+			outExpectation.valid = true;
+			return true;
+		}
+
+		constexpr const char* kUnsupported = "unsupported:";
+		if (value.rfind(kUnsupported, 0) == 0) {
+			// A fixture mslc cannot handle has to say which construct is in the
+			// way, so that moving the frontier is a deliberate edit to this file
+			// rather than a fixture quietly going green.
+			outExpectation.blocker = value.substr(std::string(kUnsupported).size());
+			if (outExpectation.blocker.empty()) {
+				outError = "expect=unsupported: has to name what is in the way";
+				return false;
+			}
+
+			return true;
+		}
+
+		outError = "expect= takes valid or unsupported:<what is in the way>, found " + value;
+		return false;
+	}
+
+	// A name for the scratch file that says which fixture it is. Three of the
+	// corpus files are called shaders.metal, so the basename alone would have
+	// them overwrite each other.
+	std::string scratchName(const std::string& path) {
+		std::string name = path;
+		for (char& c: name) {
+			if (c == '/' || c == '.') {
+				c = '_';
+			}
+		}
+
+		return name;
+	}
+
 }
 
 int main(int argc, char** argv) {
@@ -104,17 +179,29 @@ int main(int argc, char** argv) {
 
 	std::vector<Result> results;
 	std::string line;
+	size_t lineNumber = 0;
 	while (std::getline(manifest, line)) {
+		++lineNumber;
 		if (line.empty() || line[0] == '#') {
 			continue;
 		}
 
 		Result result;
-		result.path = resolve(manifestPath, line);
+		Expectation expectation;
+		std::string problem;
+		std::string entry;
+		if (!parseEntry(line, entry, expectation, problem)) {
+			std::fprintf(stderr, "mslc-corpus: %s:%zu: %s\n", manifestPath.c_str(),
+				lineNumber, problem.c_str());
+			return 2;
+		}
+
+		result.path = resolve(manifestPath, entry);
 
 		std::string source;
 		if (!readFile(result.path, source)) {
 			result.diagnostic = "cannot read file";
+			result.note = "the file could not be read, so nothing was checked";
 			results.push_back(result);
 			continue;
 		}
@@ -132,6 +219,18 @@ int main(int argc, char** argv) {
 		if (status != 0) {
 			result.diagnostic = error ? error : "unknown error";
 			mslc_free(error);
+
+			// Expected to fail: the diagnostic has to name the construct that is in
+			// the way, so a fixture that starts failing for a different reason, or
+			// stops failing at all, is visible here.
+			result.met = !expectation.valid
+				&& result.diagnostic.find(expectation.blocker) != std::string::npos;
+			if (!result.met) {
+				result.note = expectation.valid
+					? "expected to compile"
+					: "expected to be blocked on \"" + expectation.blocker + "\"";
+			}
+
 			results.push_back(result);
 			continue;
 		}
@@ -141,9 +240,7 @@ int main(int argc, char** argv) {
 
 		// Write the module out so spirv-val can check it, which is a stronger
 		// statement than "the compiler returned success".
-		const size_t slash = line.find_last_of('/');
-		const std::string name = slash == std::string::npos ? line : line.substr(slash + 1);
-		const std::string spvPath = outputDirectory + "/" + name + ".spv";
+		const std::string spvPath = outputDirectory + "/" + scratchName(result.path) + ".spv";
 
 		FILE* out = std::fopen(spvPath.c_str(), "wb");
 		if (out) {
@@ -159,12 +256,21 @@ int main(int argc, char** argv) {
 			result.diagnostic = "cannot write " + spvPath;
 		}
 
+		// A fixture expected to compile has to reach valid SPIR-V, not merely
+		// return success: compiling to something spirv-val rejects is a failure.
+		result.met = expectation.valid && result.valid;
+		if (!result.met && !expectation.valid) {
+			result.note = "expected to be blocked on \"" + expectation.blocker
+				+ "\", but it compiled";
+		}
+
 		mslc_free(spirv);
 		results.push_back(result);
 	}
 
 	size_t compiled = 0;
 	size_t valid = 0;
+	size_t unmet = 0;
 
 	for (const Result& result: results) {
 		std::printf("%-34s ", result.path.substr(result.path.find_last_of('/') + 1).c_str());
@@ -180,10 +286,21 @@ int main(int argc, char** argv) {
 		} else {
 			std::printf("FAIL    %s\n", result.diagnostic.c_str());
 		}
+
+		if (!result.met) {
+			++unmet;
+			std::printf("%-34s   UNMET: %s\n", "", result.note.c_str());
+		}
 	}
 
 	std::printf("\n%zu of %zu compile, %zu of %zu reach spirv-val-valid SPIR-V\n",
 		compiled, results.size(), valid, results.size());
 
-	return valid == results.size() ? 0 : 1;
+	if (unmet == 0) {
+		std::printf("every entry is as the manifest says it is\n");
+		return 0;
+	}
+
+	std::printf("%zu of %zu entries are not what the manifest says\n", unmet, results.size());
+	return 1;
 }
