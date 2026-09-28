@@ -63,6 +63,10 @@ struct Type {
 	// Set for an array type; the element type is described by the rest.
 	std::optional<uint32_t> arrayLength;
 
+	// A sampler, as in "constexpr sampler s {}". SPIR-V models one as a
+	// descriptor rather than a value, so it is not a scalar or a struct.
+	bool isSampler = false;
+
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
 };
@@ -249,6 +253,10 @@ struct FunctionDecl {
 struct TranslationUnit {
 	std::vector<StructDecl> structs;
 	std::vector<FunctionDecl> functions;
+
+	// Variables declared at file scope. Metal allows a sampler state to be
+	// declared and defined in the shader itself, which is what these are.
+	std::vector<VariableDeclaration> globals;
 
 	// MSL entry points, keyed by function name.
 	const FunctionDecl* findFunction(const std::string& name) const;

@@ -27,12 +27,17 @@ class TypeTable {
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 
 	spirv::Id _voidType = spirv::InvalidId;
+	spirv::Id _samplerType = spirv::InvalidId;
 
 public:
 	TypeTable(spirv::Builder& builder, const TranslationUnit& unit):
 		_builder(builder), _unit(unit) {}
 
 	spirv::Id voidType();
+
+	// SPIR-V's sampler type. Declared once however many samplers the source
+	// names, since a module may only declare a non-aggregate type once.
+	spirv::Id sampler();
 	spirv::Id scalar(ScalarKind kind);
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);

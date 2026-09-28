@@ -240,6 +240,14 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
+	// A sampler state declared and defined in the shader. The type qualifier is
+	// what marks a file-scope declaration, since a bare "sampler s" there would
+	// be a function's return type spelling.
+	if (at(TokenKind::Identifier) && isTypeQualifier(current().text)) {
+		_unit.globals.push_back(parseGlobalDeclaration());
+		return;
+	}
+
 	if (matchIdentifier("struct")) {
 		_unit.structs.push_back(parseStructDeclaration());
 		return;
@@ -269,6 +277,36 @@ void Parser::parseDeclaration() {
 
 	throw CompileError("unexpected \"" + std::string(current().text) + "\" at top level; "
 		"expected a struct, kernel, vertex or fragment declaration");
+}
+
+VariableDeclaration Parser::parseGlobalDeclaration() {
+	VariableDeclaration declaration;
+
+	declaration.type = parseType();
+
+	if (!declaration.type.isSampler) {
+		throw CompileError("only a sampler can be declared at file scope");
+	}
+
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+	}
+
+	declaration.name = std::string(advance().text);
+
+	// "constexpr sampler s {}" spells the state as a braced list, empty meaning
+	// the default. Only the empty form is representable, so a state that says
+	// something is reported rather than dropped.
+	expect(TokenKind::LBrace, "to open a sampler's state");
+	if (!at(TokenKind::RBrace)) {
+		throw CompileError("only the default sampler state, written \"{}\", is supported; "
+			"a state of \"" + std::string(current().text) + "\" is not");
+	}
+	advance();
+
+	expect(TokenKind::Semicolon, "after a file-scope declaration");
+
+	return declaration;
 }
 
 StructDecl Parser::parseStructDeclaration() {
@@ -375,17 +413,23 @@ Type Parser::parseType() {
 			const char last = base.back();
 			if (last >= '2' && last <= '9') {
 				type.vectorWidth = static_cast<uint32_t>(last - '0');
-				type.scalar = scalarKind;
 				// Re-derive the base name without the digits.
-				std::string_view trimmed = base.substr(0, base.size() - 1);
-				if (!isScalarTypeName(trimmed, scalarKind)) {
+				if (!isScalarTypeName(base.substr(0, base.size() - 1), scalarKind)) {
 					throw CompileError("unknown type \"" + std::string(base) + "\"");
 				}
 				type.scalar = scalarKind;
 			}
 		}
 	} else if (kind() == TokenKind::Identifier) {
-		type.namedType = std::string(advance().text);
+		const std::string_view name = current().text;
+
+		if (name == "sampler") {
+			advance();
+			type.isSampler = true;
+		} else {
+			type.namedType = std::string(name);
+			advance();
+		}
 	} else {
 		throw CompileError("expected a type, found " + std::string(tokenKindName(kind()))
 			+ " \"" + std::string(current().text) + "\"");

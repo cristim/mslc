@@ -53,6 +53,7 @@ private:
 	// Top-level declarations
 	void parseDeclaration();
 	void parsePreprocessorDirective();
+	VariableDeclaration parseGlobalDeclaration();
 	StructDecl parseStructDeclaration();
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 

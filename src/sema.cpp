@@ -145,6 +145,15 @@ Id TypeTable::voidType() {
 	return _voidType;
 }
 
+Id TypeTable::sampler() {
+	if (_samplerType != InvalidId) {
+		return _samplerType;
+	}
+
+	_samplerType = _builder.emitDecl(spirv::OpTypeSampler);
+	return _samplerType;
+}
+
 Id TypeTable::scalar(ScalarKind kind) {
 	const auto cached = _scalars.find(static_cast<uint32_t>(kind));
 	if (cached != _scalars.end()) {
@@ -490,6 +499,7 @@ namespace {
 	private:
 		Id constantU32(uint32_t value);
 		Id declaredTypeOf(const Type& type);
+		void declareGlobals();
 		void declareParameters();
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
@@ -838,6 +848,54 @@ namespace {
 		return bound;
 	}
 
+	// A sampler declared in the shader has no Metal argument index, since it is
+	// not a parameter of anything, so it shares no index with the resources
+	// that are. It therefore gets its own descriptor set, numbered in
+	// declaration order. Set 0 is what an entry point's own bindings use.
+	constexpr uint32_t kSamplerSet = 1;
+
+	// A sampler state declared at file scope. Metal has no way to write a
+	// sampler as a constant in a shader, so the descriptor stands in for the
+	// state and the state itself has to reach the runtime: this reports the
+	// state a default-constructed MSL sampler has, which is what the parser
+	// accepts today. Everything else a VkSampler needs is either Vulkan's own
+	// default or unreachable under clamp-to-edge, which is the address mode
+	// reported here, so the border colour is the only one left out.
+	void Emitter::declareGlobals() {
+		for (size_t index = 0; index < _unit.globals.size(); ++index) {
+			const VariableDeclaration& global = _unit.globals[index];
+
+			// Before the type is asked for, since a type declaration is emitted
+			// into whichever section is current.
+			_builder.setSection(spirv::Section::TypesGlobals);
+			const Id samplerType = _types.sampler();
+
+			const Id pointerType = _types.pointer(spirv::StorageClass::UniformConstant, samplerType);
+			const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+				{ static_cast<uint32_t>(spirv::StorageClass::UniformConstant) });
+
+			_builder.setSection(spirv::Section::Annotations);
+			_builder.emit(spirv::OpDecorate, { id,
+				static_cast<uint32_t>(spirv::Decoration::DescriptorSet), kSamplerSet });
+			_builder.emit(spirv::OpDecorate, { id,
+				static_cast<uint32_t>(spirv::Decoration::Binding), index });
+
+			Binding binding;
+			binding.id = id;
+			binding.isPointer = true;
+			binding.pointeeType = samplerType;
+			binding.storageClass = spirv::StorageClass::UniformConstant;
+			_bindings[global.name] = binding;
+
+			_reflection += "\t\t{ \"kind\": \"Sampler\", \"descriptor\": { \"set\": "
+				+ std::to_string(kSamplerSet) + ", \"binding\": " + std::to_string(index) + " }"
+				+ ", \"name\": \"" + global.name + "\""
+				+ ", \"state\": { \"filter\": \"nearest\", \"mip_filter\": \"none\""
+				+ ", \"address_mode\": { \"u\": \"clamp_to_edge\", \"v\": \"clamp_to_edge\""
+				+ ", \"w\": \"clamp_to_edge\" } } },\n";
+		}
+	}
+
 	void Emitter::declareParameters() {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(_entryPoint);
 
@@ -1163,6 +1221,7 @@ namespace {
 		_boolType = _types.scalar(ScalarKind::Bool);
 		_voidType = _types.voidType();
 
+		declareGlobals();
 		declareParameters();
 
 		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
