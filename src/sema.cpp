@@ -195,6 +195,38 @@ namespace {
 		throw CompileError("this comparison is recognised but not lowered yet");
 	}
 
+	// One of MSL's builtin math functions and the GLSL.std.450 instruction it
+	// lowers to. Each is spelled the same way in both, with the operands in the
+	// same order, so the lowering is the source's arguments passed through behind
+	// the instruction set.
+	//
+	// The instruction numbers are generated from the extended instruction grammar
+	// rather than written out here, because a wrong one is a module that validates
+	// and computes the wrong thing: GLSL.std.450 has both FMin and FMax, and
+	// swapping the two names is silent.
+	struct BuiltinMath {
+		spirv::InstructionValue instruction;
+		size_t arguments;
+	};
+
+	std::optional<BuiltinMath> builtinMathFor(const std::string& name) {
+		static const std::map<std::string, BuiltinMath> table = {
+			{ "min", { spirv::glsl450::FMin, 2 } },
+			{ "max", { spirv::glsl450::FMax, 2 } },
+			{ "normalize", { spirv::glsl450::Normalize, 1 } },
+			{ "pow", { spirv::glsl450::Pow, 2 } },
+			{ "reflect", { spirv::glsl450::Reflect, 2 } },
+			{ "refract", { spirv::glsl450::Refract, 3 } },
+		};
+
+		const auto found = table.find(name);
+		if (found == table.end()) {
+			return std::nullopt;
+		}
+
+		return found->second;
+	}
+
 }
 
 //
@@ -915,6 +947,9 @@ namespace {
 		void spreadScalar(Id& value, Id& type, Id vectorType);
 		Id spreadScalarTo(Id value, Id vectorType);
 		Id emitCall(const Expression& expression);
+		Id emitBuiltin(const Expression& expression);
+		Id glslSet();
+		Id floatConstant(double value);
 		Id emitSample(const Expression& expression);
 		Id emitCast(const Expression& expression);
 		Id buildComposite(const Type& target, Id toType, const Expression& expression);
@@ -1700,29 +1735,110 @@ namespace {
 			throw CompileError("only a direct function call is supported");
 		}
 
-		// The few intrinsics the corpus needs: min and max on scalars, which
-		// are GLSL.std.450 rather than core opcodes.
-		if (expression.left->name == "min" || expression.left->name == "max") {
-			if (expression.arguments.size() != 2) {
-				throw CompileError(expression.left->name + " takes two arguments");
-			}
+		return emitBuiltin(expression);
+	}
 
-			const Id left = emitExpression(*expression.arguments[0]);
-			const Id right = emitExpression(*expression.arguments[1]);
-			const Id type = _builder.typeOf(left);
+	// The GLSL.std.450 set, imported once however many builtins a source calls,
+	// since a module may declare it only once. The set's name is a literal operand
+	// of the import rather than the id of an OpString, so it is packed straight
+	// into the instruction.
+	Id Emitter::glslSet() {
+		if (!_glslImported) {
+			_glslImported = true;
 
-			if (!_glslImported) {
-				_glslImported = true;
-				_glslSet = _builder.emitDecl(spirv::OpExtInstImport,
-					{ _builder.stringLiteral("GLSL.std.450") });
-			}
-
-			return _builder.emitTyped(spirv::OpExtInst, type,
-				{ left, _glslSet, expression.left->name == "min" ? 40u : 37u, right });
+			std::vector<uint32_t> operands;
+			spirv::Builder::appendString(operands, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, operands);
 		}
 
-		throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
-			"recognises, and user functions are not lowered yet");
+		return _glslSet;
+	}
+
+	Id Emitter::floatConstant(double value) {
+		return _builder.emitDeclTyped(spirv::OpConstant,
+			_types.scalar(ScalarKind::Float), { constantBits(ScalarKind::Float, value) });
+	}
+
+	Id Emitter::emitBuiltin(const Expression& expression) {
+		const std::string& name = expression.left->name;
+		const std::vector<ExpressionPtr>& arguments = expression.arguments;
+
+		const auto arity = [&](size_t expected) {
+			if (arguments.size() != expected) {
+				throw CompileError(name + " takes " + std::to_string(expected)
+					+ (expected == 1 ? " argument" : " arguments") + ", found "
+					+ std::to_string(arguments.size()));
+			}
+		};
+
+		// dot is a core instruction rather than an extended one, because
+		// GLSL.std.450 has no Dot. Its result is a scalar of the operands'
+		// component type, which is the one thing about it the first operand's type
+		// does not already say.
+		if (name == "dot") {
+			arity(2);
+
+			const Id left = emitExpression(*arguments[0]);
+			const Id right = emitExpression(*arguments[1]);
+			const Id type = _builder.typeOf(left);
+
+			if (type != _builder.typeOf(right) || _types.vectorWidth(type) < 2) {
+				throw CompileError("dot takes two vectors of the same type, and the arguments "
+					"are not that");
+			}
+
+			return _builder.emitTyped(spirv::OpDot,
+				_types.scalar(_types.componentKind(type)), { left, right });
+		}
+
+		// Metal's saturate is a clamp between zero and one, so the bounds are not
+		// in the source at all: FClamp with the operand's own zero and one. The
+		// bounds take the operand's shape, since FClamp requires all three of its
+		// operands to have the result type, and a scalar is already that shape. Only
+		// the float form is lowered: GLSL.std.450 has a separate instruction per
+		// element type, and using the float one on an integer would be a module
+		// that validates and clamps wrongly.
+		if (name == "saturate") {
+			arity(1);
+
+			const Id value = emitExpression(*arguments[0]);
+			const Id type = _builder.typeOf(value);
+
+			if (!_types.isFloat(type)) {
+				throw CompileError("saturate of a non-float is not lowered yet");
+			}
+
+			const Id zero = floatConstant(0.0);
+			const Id one = floatConstant(1.0);
+			const Id low = _types.vectorWidth(type) == 1 ? zero : spreadScalarTo(zero, type);
+			const Id high = _types.vectorWidth(type) == 1 ? one : spreadScalarTo(one, type);
+
+			// The instruction set and the instruction come before the arguments,
+			// which is the order OpExtInst takes them in.
+			return _builder.emitTyped(spirv::OpExtInst, type,
+				{ glslSet(), static_cast<uint32_t>(spirv::glsl450::FClamp), value, low, high });
+		}
+
+		const std::optional<BuiltinMath> builtin = builtinMathFor(name);
+		if (!builtin) {
+			throw CompileError("function \"" + name + "\" is not a builtin mslc recognises, "
+				"and user functions are not lowered yet");
+		}
+
+		arity(builtin->arguments);
+
+		// Operand order: the instruction set, the instruction, then the source's
+		// arguments in the order they were written, which is the order GLSL.std.450
+		// takes them in. The result has the first argument's type, which is what
+		// each of these returns, so that one is emitted first and its type kept.
+		const Id first = emitExpression(*arguments[0]);
+		std::vector<uint32_t> operands = { glslSet(),
+			static_cast<uint32_t>(builtin->instruction), first };
+		for (size_t i = 1; i < arguments.size(); ++i) {
+			operands.push_back(emitExpression(*arguments[i]));
+		}
+
+		return _builder.emitTyped(spirv::OpExtInst, _builder.typeOf(first), operands);
 	}
 
 	Id Emitter::emitSample(const Expression& expression) {

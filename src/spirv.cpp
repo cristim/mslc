@@ -23,6 +23,14 @@ namespace {
 		}
 
 		switch (opcode) {
+			// An extended instruction set is imported before the memory model, and
+			// a builtin is only discovered where it is called, which is inside a
+			// function body. Left to the current section the import lands among
+			// the body it is used in, and the logical layout rejects it as an
+			// invalid section.
+			case OpExtInstImport:
+				return Section::ExtInstImports;
+
 			// A capability has its own section, and which one is emitted depends on
 			// the types a shader turns out to use rather than on where the emitter
 			// is when it finds out. Float16, Int64 and Matrix are all discovered
@@ -89,7 +97,6 @@ namespace {
 		Section::Annotations,
 		Section::TypesGlobals,
 		Section::Functions,
-		Section::Literals,
 	};
 
 }
@@ -260,27 +267,6 @@ void Builder::appendString(std::vector<uint32_t>& words, const std::string& text
 	std::memcpy(bytes, text.data(), text.size());
 }
 
-Id Builder::stringLiteral(const std::string& text) {
-	std::vector<uint32_t> words;
-	appendString(words, text);
-
-	auto it = _literalIds.find(words);
-	if (it != _literalIds.end()) {
-		return it->second;
-	}
-
-	const Id id = _nextId++;
-
-	Instruction instruction;
-	instruction.opcode = OpString;
-	instruction.words = std::move(words);
-	_literals.push_back(std::move(instruction));
-
-	// Keyed on the words before the move above.
-	_literalIds.emplace(std::move(words), id);
-
-	return id;
-}
 
 bool Builder::finalize(std::vector<uint8_t>& out) const {
 	if (!hasEntryPoint()) {
@@ -307,14 +293,6 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 				| instruction.opcode);
 			words.insert(words.end(), instruction.words.begin(), instruction.words.end());
 		}
-	}
-
-	// The literal section is emitted as instructions too, but it is built in a
-	// separate list so it can be appended last.
-	for (const Instruction& instruction: _literals) {
-		words.push_back((static_cast<uint32_t>(instruction.words.size() + 1) << 16)
-			| instruction.opcode);
-		words.insert(words.end(), instruction.words.begin(), instruction.words.end());
 	}
 
 	words[3] = _nextId; // bound: one past the highest id handed out

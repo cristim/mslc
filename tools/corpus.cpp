@@ -26,6 +26,14 @@ namespace {
 		// The file has to compile and reach spirv-val-valid SPIR-V.
 		bool valid = false;
 
+		// The file has to compile, and spirv-val has to reject the result with a
+		// diagnostic naming this. A construct mslc lowers to something Vulkan's own
+		// rules refuse is a third thing between the two: the source is understood
+		// and the module is emitted, but the module is not one a pipeline would
+		// accept. That still has to be asserted, and asserted by name, or the entry
+		// cannot fail in either direction.
+		bool invalid = false;
+
 		// The file has to fail to compile, and the diagnostic has to mention this.
 		// Empty when it is expected to compile.
 		std::string blocker;
@@ -123,7 +131,20 @@ namespace {
 			return true;
 		}
 
-		outError = "expect= takes valid or unsupported:<what is in the way>, found " + value;
+		constexpr const char* kInvalid = "invalid:";
+		if (value.rfind(kInvalid, 0) == 0) {
+			outExpectation.invalid = true;
+			outExpectation.blocker = value.substr(std::string(kInvalid).size());
+			if (outExpectation.blocker.empty()) {
+				outError = "expect=invalid: has to name why the module is rejected";
+				return false;
+			}
+
+			return true;
+		}
+
+		outError = "expect= takes valid, unsupported:<what is in the way> or "
+			"invalid:<why spirv-val rejects the module>, found " + value;
 		return false;
 	}
 
@@ -222,13 +243,20 @@ int main(int argc, char** argv) {
 
 			// Expected to fail: the diagnostic has to name the construct that is in
 			// the way, so a fixture that starts failing for a different reason, or
-			// stops failing at all, is visible here.
-			result.met = !expectation.valid
+			// stops failing at all, is visible here. A fixture expected to compile
+			// cannot be met by failing.
+			result.met = !expectation.valid && !expectation.invalid
 				&& result.diagnostic.find(expectation.blocker) != std::string::npos;
 			if (!result.met) {
-				result.note = expectation.valid
-					? "expected to compile"
-					: "expected to be blocked on \"" + expectation.blocker + "\"";
+				if (expectation.valid) {
+					result.note = "expected to compile";
+				} else if (expectation.invalid) {
+					result.note = "expected to compile and then be rejected because \""
+						+ expectation.blocker + "\", but it did not compile: "
+						+ result.diagnostic;
+				} else {
+					result.note = "expected to be blocked on \"" + expectation.blocker + "\"";
+				}
 			}
 
 			results.push_back(result);
@@ -258,8 +286,23 @@ int main(int argc, char** argv) {
 
 		// A fixture expected to compile has to reach valid SPIR-V, not merely
 		// return success: compiling to something spirv-val rejects is a failure.
-		result.met = expectation.valid && result.valid;
-		if (!result.met && !expectation.valid) {
+		// One expected to be rejected has to be rejected for the named reason,
+		// which is the same assertion pointed the other way: a fix that makes it
+		// valid is as visible here as a regression that changes the reason.
+		if (expectation.valid) {
+			result.met = result.valid;
+			if (!result.met) {
+				result.note = "expected to compile";
+			}
+		} else if (expectation.invalid) {
+			result.met = !result.valid
+				&& result.diagnostic.find(expectation.blocker) != std::string::npos;
+			if (!result.met) {
+				result.note = "expected to be rejected because \"" + expectation.blocker
+					+ (result.valid ? "\", but it is valid" : "\", but not for that reason");
+			}
+		} else {
+			result.met = false;
 			result.note = "expected to be blocked on \"" + expectation.blocker
 				+ "\", but it compiled";
 		}

@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Generates src/spirv_opcodes.h from the Khronos SPIR-V grammar.
+"""Generates src/spirv_opcodes.h from the Khronos SPIR-V grammars.
 
 The opcode numbers and enumerant values are not worth keeping in anyone's head:
 a wrong constant produces a module that fails validation, or worse, one that
 validates and computes the wrong thing. So they are generated from the same
-grammar SPIRV-Tools uses.
+grammar SPIRV-Tools uses. That covers the GLSL.std.450 extended instructions too,
+which are constants of exactly the same kind and are just as easy to get wrong:
+a min lowered to FMax and a max to FMin is a module that validates perfectly
+and returns the wrong number.
 
 Usage:
-    python3 scripts/gen_spirv_opcodes.py <spirv.core.grammar.json> <out.h>
+    python3 scripts/gen_spirv_opcodes.py <spirv.core.grammar.json> <out.h> \
+        [extinst.glsl.std.450.grammar.json]
 
-The grammar is vendored by SPIRV-Headers at
-include/spirv/unified1/spirv.core.grammar.json.
+The grammars are vendored by SPIRV-Headers at
+include/spirv/unified1/spirv.core.grammar.json and
+include/spirv/unified1/extinst.glsl.std.450.grammar.json.
 """
 
 import json
@@ -38,7 +43,7 @@ def sanitise(name, prefix=""):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
 
     grammar = json.load(open(sys.argv[1]))
@@ -66,6 +71,24 @@ def main():
 
     lines.append("};")
     lines.append("")
+
+    # The GLSL.std.450 extended instructions, named by the same grammar
+    # SPIRV-Tools uses. They are the operand of an OpExtInst rather than an
+    # opcode of their own, so they get their own namespace instead of the
+    # Opcode enum: an extended instruction and a core one that happen to share
+    # a number are not the same thing, and the spelling should say which.
+    if len(sys.argv) == 4:
+        extinst = json.load(open(sys.argv[3]))
+
+        lines.append("namespace glsl450 {")
+        lines.append("\tenum Instruction : uint32_t {")
+        for instruction in sorted(extinst["instructions"], key=lambda i: i["opcode"]):
+            lines.append("\t\t%s = %d," % (sanitise(instruction["opname"], "Ext"), instruction["opcode"]))
+        lines.append("\t};")
+        lines.append("}")
+        lines.append("")
+        lines.append("using InstructionValue = glsl450::Instruction;")
+        lines.append("")
 
     # Enumerants the emitter needs, with the categories named in the grammar.
     # Kind names in the grammar, not the prose names used in the spec.

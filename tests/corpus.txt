@@ -23,6 +23,16 @@
 #                             fails until it is edited here to expect=valid,
 #                             which is the only way the count moves.
 #
+#   expect=invalid:WHAT       the file has to compile, and spirv-val has to
+#                             reject the module with a diagnostic mentioning
+#                             WHAT. This is the third thing between the two above:
+#                             mslc understands the source and emits a module, but
+#                             Vulkan's own rules refuse that module, so it is
+#                             neither a fixture mslc supports nor one it refuses.
+#                             The entry is asserted by name in the same way, so a
+#                             fix that makes the module valid is as visible as a
+#                             regression that changes the reason it is rejected.
+#
 # The "N of M compile" line below the table is the measurement. It is expected
 # to be below M, and that is not a failure of the test.
 compute_buffer_clear.metal expect=valid
@@ -30,7 +40,7 @@ compute_buffer_clear.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/cube/shadersrc/shaders.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/triangle/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
 /home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal expect=unsupported:texturecube
-/home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal expect=unsupported:normalize
+/home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal expect=invalid:uniform buffer layout
 /home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
 /home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal expect=unsupported:field whose type is itself a struct
 /home/cristi/src/mslc/tests/blender/mtl_context-5.1.2.metal expect=valid

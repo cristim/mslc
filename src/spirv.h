@@ -31,7 +31,6 @@ enum class Section {
 	Annotations,
 	TypesGlobals,
 	Functions,
-	Literals,
 
 	// Not a real section: the sentinel sectionForOpcode returns for an opcode
 	// that goes wherever the caller is currently emitting.
@@ -51,13 +50,9 @@ class Builder {
 	Id _nextId = 1;
 
 	std::map<Section, std::vector<Instruction>> _sections;
-	std::vector<Instruction> _literals;
-
-	// Literal pool, keyed by the word sequence, so an identical literal is
-	// stored once.
-	std::map<std::vector<uint32_t>, Id> _literalIds;
 
 	// The SPIR-V type of every value id handed out. Tracking it here rather
+
 	// than threading an out-parameter through every expression means the
 	// emitter never has to re-derive a type it already knew, and it removes
 	// the confusion between a pointer's own type and its pointee.
@@ -142,10 +137,6 @@ public:
 	// a function or a label.
 	void setType(Id value, Id type);
 
-	// Emits a NUL-terminated string literal and returns its id, reusing an
-	// identical literal if one already exists.
-	Id stringLiteral(const std::string& text);
-
 	// A function's variables are only valid among the first instructions of its
 	// first block, and a variable is discovered at its declaration, which is
 	// after the instructions computing its initialiser. So between these two
@@ -157,9 +148,9 @@ public:
 	void openPrologue();
 	void closePrologue();
 
-	// Packs a string into SPIR-V literal words and appends them. Instructions
-	// such as OpEntryPoint and OpName take the name inline rather than by id,
-	// so they need the words rather than a literal reference.
+	// Packs a string into SPIR-V literal words and appends them. An instruction
+	// whose name is an operand takes it inline rather than by the id of an
+	// OpString, so the words go straight into the instruction.
 	static void appendString(std::vector<uint32_t>& words, const std::string& text);
 
 	// Serialises to a SPIR-V module. Returns false when no entry point was
