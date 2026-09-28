@@ -444,7 +444,15 @@ Id TypeTable::functionType(Id returnType, const std::vector<Id>& parameterTypes)
 }
 
 Id TypeTable::sampledImage(ScalarKind component, TextureDim dim) {
-	const auto key = std::make_pair(static_cast<uint32_t>(component), static_cast<uint32_t>(dim));
+	// Vulkan admits only a 32-bit int, a 64-bit int or a 32-bit float as a
+	// sampled type, so a half texture is declared as the float one and its read
+	// produces a float4. The texels are the same either way; what differs is that
+	// the sampling is done in float and narrowed afterwards, and a shader that
+	// wants a half4 back converts it where it uses it. Resolved before the cache
+	// is keyed, so a half and a float texture of one shape are one type rather
+	// than two types that are the same.
+	const ScalarKind sampled = component == ScalarKind::Half ? ScalarKind::Float : component;
+	const auto key = std::make_pair(static_cast<uint32_t>(sampled), static_cast<uint32_t>(dim));
 	const auto cached = _images.find(key);
 	if (cached != _images.end()) {
 		return cached->second;
@@ -471,7 +479,7 @@ Id TypeTable::sampledImage(ScalarKind component, TextureDim dim) {
 	// A Metal texture is declared as an image type, and the sampled-operand of
 	// 1 is what makes it a sampled image: read through a sampler, with the
 	// result being a texel value rather than the texel itself.
-	const Id id = _builder.emitDecl(spirv::OpTypeImage, { scalar(component), spirvDim, kNotDepth,
+	const Id id = _builder.emitDecl(spirv::OpTypeImage, { scalar(sampled), spirvDim, kNotDepth,
 		kNotArrayed, kNotMultisampled, kSampled,
 		static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 
