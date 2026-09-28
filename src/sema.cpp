@@ -280,6 +280,25 @@ Id TypeTable::vector(ScalarKind kind, uint32_t width) {
 	return id;
 }
 
+Id TypeTable::matrix(ScalarKind kind, uint32_t columns, uint32_t rows) {
+	const auto key = std::make_tuple(static_cast<uint32_t>(kind), rows, columns);
+	const auto cached = _matrices.find(key);
+	if (cached != _matrices.end()) {
+		return cached->second;
+	}
+
+	const Id column = vector(kind, rows);
+
+	// A module may declare an aggregate type only once, and OpTypeMatrix takes
+	// the column type and the count of columns: the members are not listed, so a
+	// count written as a trailing word would be read as one.
+	_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Matrix) });
+	const Id id = _builder.emitDecl(spirv::OpTypeMatrix, { column, columns });
+
+	_matrices.emplace(key, id);
+	return id;
+}
+
 spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	const auto cached = _blockStructs.find(elementType);
 	if (cached != _blockStructs.end()) {
@@ -494,7 +513,7 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 // both starts and steps 16 bytes, which is what a float2 field after it has to
 // account for.
 bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
-	std::vector<uint32_t>& outOffsets, uint32_t* outSize) {
+	std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride, uint32_t* outSize) {
 
 	const StructDecl* decl = _unit.findStruct(name);
 	if (!decl) {
@@ -511,7 +530,14 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 
 		Id fieldType;
 		uint32_t size;
-		if (field.type.vectorWidth > 1) {
+		// A matrix's rows are a vector's width, so the stride between its columns
+		// is that vector's size, which is what SPIR-V's MatrixStride has to say.
+		uint32_t stride = 0;
+		if (field.type.isMatrix()) {
+			fieldType = matrix(field.type.scalar, field.type.matrixColumns, field.type.matrixRows);
+			stride = fieldTypeSize(field.type.scalar) * field.type.matrixRows;
+			size = stride * field.type.matrixColumns;
+		} else if (field.type.vectorWidth > 1) {
 			fieldType = vector(field.type.scalar, field.type.vectorWidth);
 			size = fieldTypeSize(field.type.scalar) * field.type.vectorWidth;
 		} else {
@@ -527,6 +553,9 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 
 		outTypes.push_back(fieldType);
 		outOffsets.push_back(offset);
+		if (outStride) {
+			outStride->push_back(stride);
+		}
 		offset += size;
 	}
 
@@ -546,6 +575,23 @@ uint32_t TypeTable::fieldTypeSize(ScalarKind kind) {
 	return mapping.width / 8;
 }
 
+void TypeTable::decorateMatrixStride(Id structure, size_t member, uint32_t stride) {
+	if (stride == 0) {
+		return;
+	}
+
+	// ColMajor on the member, not on the struct: SPIR-V takes the row-major or
+	// column-major of a matrix as a member decoration, and rejects the struct
+	// form outright. Metal lays a matrix out in columns, which is also SPIR-V's
+	// own default, so saying it explicitly is what satisfies Vulkan's demand
+	// that a struct in a Block holding a matrix state its layout.
+	_builder.emit(spirv::OpMemberDecorate, { structure, static_cast<uint32_t>(member),
+		static_cast<uint32_t>(spirv::Decoration::ColMajor) });
+
+	_builder.emit(spirv::OpMemberDecorate, { structure, static_cast<uint32_t>(member),
+		static_cast<uint32_t>(spirv::Decoration::MatrixStride), stride });
+}
+
 Id TypeTable::namedStruct(const std::string& name) {
 	const auto cached = _valueStructs.find(name);
 	if (cached != _valueStructs.end()) {
@@ -554,7 +600,7 @@ Id TypeTable::namedStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	if (!structMembersFor(name, fieldTypes, offsets, nullptr)) {
+	if (!structMembersFor(name, fieldTypes, offsets, nullptr, nullptr)) {
 		return InvalidId;
 	}
 
@@ -581,8 +627,9 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
+	std::vector<uint32_t> strides;
 	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, &size)) {
+	if (!structMembersFor(name, fieldTypes, offsets, &strides, &size)) {
 		return InvalidId;
 	}
 
@@ -598,6 +645,7 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
 			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+		decorateMatrixStride(id, i, strides[i]);
 	}
 
 	_elementStructs.emplace(name, id);
@@ -613,7 +661,8 @@ Id TypeTable::blockStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	if (!structMembersFor(name, fieldTypes, offsets, nullptr)) {
+	std::vector<uint32_t> strides;
+	if (!structMembersFor(name, fieldTypes, offsets, &strides, nullptr)) {
 		return InvalidId;
 	}
 
@@ -631,6 +680,7 @@ Id TypeTable::blockStruct(const std::string& name) {
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
 			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+		decorateMatrixStride(id, i, strides[i]);
 	}
 
 	_structs.emplace(name, id);
@@ -881,6 +931,10 @@ namespace {
 			}
 
 			return id;
+		}
+
+		if (type.isMatrix()) {
+			return _types.matrix(type.scalar, type.matrixColumns, type.matrixRows);
 		}
 
 		if (type.vectorWidth > 1) {

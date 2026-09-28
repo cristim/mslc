@@ -23,6 +23,14 @@ namespace {
 		}
 
 		switch (opcode) {
+			// A capability has its own section, and which one is emitted depends on
+			// the types a shader turns out to use rather than on where the emitter
+			// is when it finds out. Float16, Int64 and Matrix are all discovered
+			// mid-stream, so without this they land wherever the last instruction
+			// went and spirv-val rejects the module as an invalid section.
+			case OpCapability:
+				return Section::Capabilities;
+
 			case OpConstant:
 			case OpConstantNull:
 			case OpConstantTrue:

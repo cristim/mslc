@@ -84,17 +84,20 @@ namespace {
 		return isTypeName(text, kind, width);
 	}
 
-	// Whether a name is a matrix type, which is its scalar or vector type with
-	// the rows and columns after it: "float4x4", "float3x3". The subset has no
-	// matrices, but a name that is one has to be recognised as one to be
-	// reported as one.
-	bool isMatrixTypeName(std::string_view name) {
+	// A matrix type name, which is its scalar type with the columns and rows
+	// after it: "float4x4" is four columns of four rows. Returns false for a
+	// name that is not one.
+	bool isMatrixTypeName(std::string_view name, ScalarKind& outKind,
+		uint32_t& outColumns, uint32_t& outRows) {
 		const size_t x = name.find('x');
 		if (x == std::string_view::npos || x == 0 || x + 1 >= name.size()) {
 			return false;
 		}
 
-		if (!isTypeName(name.substr(0, x))) {
+		// The prefix before the 'x' names the scalar type; the digits around it are
+		// the shapes, so a width the prefix may have carried is not the shape.
+		uint32_t prefixWidth = 0;
+		if (!isTypeName(name.substr(0, x), outKind, prefixWidth)) {
 			return false;
 		}
 
@@ -111,7 +114,18 @@ namespace {
 			}
 		}
 
+		outColumns = static_cast<uint32_t>(name[x - 1] - '0');
+		outRows = static_cast<uint32_t>(name[x + 1] - '0');
 		return true;
+	}
+
+	// Whether a name is a matrix type, for a caller that only needs to know
+	// which it is.
+	bool isMatrixTypeName(std::string_view name) {
+		ScalarKind kind;
+		uint32_t columns = 0;
+		uint32_t rows = 0;
+		return isMatrixTypeName(name, kind, columns, rows);
 	}
 
 	// Keywords that may appear before a type and are not address spaces.
@@ -608,12 +622,13 @@ Type Parser::parseType() {
 			type.scalar = component;
 
 			expect(TokenKind::Greater, "to close a texture type");
-		} else if (isMatrixTypeName(name)) {
+		} else if (ScalarKind matrixScalar; isMatrixTypeName(name, matrixScalar,
+			type.matrixColumns, type.matrixRows)) {
 			// A matrix is spelled as its scalar type with the shape after it, so
 			// "float4x4" is one name rather than a type and a number. Reading it as
 			// a struct's field type would report a struct that is not there.
-			throw CompileError("the matrix type \"" + std::string(name)
-				+ "\" is not supported yet");
+			type.scalar = matrixScalar;
+			advance();
 		} else if (name.rfind("texture", 0) == 0) {
 			// A texture of a shape mslc does not lower, named as such rather than
 			// left to be read as a struct.

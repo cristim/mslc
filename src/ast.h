@@ -59,6 +59,14 @@ struct Type {
 	// 0 for a scalar, 2/3/4/8/16 for a vector.
 	uint32_t vectorWidth = 0;
 
+	// A matrix is a scalar type spelled with both its shapes in one name:
+	// "float4x4" is four columns of four rows. Metal calls the first count the
+	// columns and SPIR-V calls it the column count, so the names agree. Both
+	// are zero unless this is a matrix, which is why a matrix is not a vector
+	// of width 0.
+	uint32_t matrixColumns = 0;
+	uint32_t matrixRows = 0;
+
 	// Set for a type referred to by name, such as a struct. Resolved during
 	// semantic analysis.
 	std::string namedType;
@@ -81,6 +89,10 @@ struct Type {
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
+
+	// A matrix is neither, despite being spelled from the same pieces a vector
+	// is: SPIR-V makes it a type of its own rather than a wide vector.
+	bool isMatrix() const { return matrixColumns > 0; }
 
 	// True for the bare "void", which is the only spelling of it MSL has. A
 	// named type, a pointer or a resource is not void even though its scalar

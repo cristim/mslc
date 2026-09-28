@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace mslc {
@@ -22,6 +23,9 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfScalar;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _vectors;
 	std::map<spirv::Id, uint32_t> _widthOfVector;
+	// Keyed by the component, the column width and the column count, in that
+	// order, so a float4x4 and a float4x3 do not collide.
+	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, spirv::Id> _matrices;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -37,14 +41,24 @@ class TypeTable {
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _samplerType = spirv::InvalidId;
 
-	// A struct's member types and where each one starts in a buffer. outSize, when
-	// given, receives the size of the struct, which is how far an array of it
-	// steps. False when the name is not a struct this source declares.
+	// A struct's member types and where each one starts in a buffer. outSize,
+	// when given, receives the size of the struct, which is how far an array of it
+	// steps. outStride, when given, receives for each member the stride between
+	// its own columns, which SPIR-V requires as a MatrixStride for a member that
+	// is or holds a matrix. False when the name is not a struct this source
+	// declares.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets, uint32_t* outSize);
+		std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride, uint32_t* outSize);
 
 	// How many bytes one scalar of a kind occupies.
 	uint32_t fieldTypeSize(ScalarKind kind);
+
+	// The decorations a laid-out struct's matrix member needs, or nothing when
+	// the member is not a matrix. SPIR-V rejects a laid-out struct with a matrix
+	// member that has neither: the stride between its columns is what tells the
+	// runtime how to step through it, and the row-major or column-major is what
+	// says which way it steps.
+	void decorateMatrixStride(spirv::Id structure, size_t member, uint32_t stride);
 
 public:
 	TypeTable(spirv::Builder& builder, const TranslationUnit& unit):
@@ -58,6 +72,13 @@ public:
 	spirv::Id scalar(ScalarKind kind);
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
+
+	// A matrix, as SPIR-V spells one: a vector-typed column and a count of them.
+	// Metal and SPIR-V are both column-major, so a column is the unit a matrix
+	// is built and read in, and the mapping is the identity on the order the
+	// columns are given in. Emits the Matrix capability, which a MatrixStride
+	// decoration needs and OpTypeMatrix does not.
+	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
 
 	// What kind of type an id is. The table knows these because it created
 	// them, which is why they are asked here rather than inferred at each use
