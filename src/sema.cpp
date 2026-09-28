@@ -763,7 +763,7 @@ namespace {
 		const Binding& bindingFor(const Expression& expression);
 		Id readSwizzle(Id vector, const std::string& name);
 		std::vector<uint32_t> swizzleFor(Id vectorType, const std::string& name);
-		void writeSwizzle(const Expression& target, Id value);
+		void writeSwizzleComponent(Id object, const std::string& name, Id value);
 		Id fieldOf(const StructDecl& decl, const std::string& name);
 		bool isStructObject(const Expression& expression) const;
 		const Binding* findBinding(const std::string& name) const;
@@ -1057,14 +1057,14 @@ namespace {
 
 	// A write to one component of a vector. A component has no address of its
 	// own to chain to, so the vector is read, the component replaced in it and
-	// the result written back over the whole thing.
-	void Emitter::writeSwizzle(const Expression& target, Id value) {
-		const Id object = addressOf(*target.left);
+	// the result written back over the whole thing. Given the vector's address,
+	// which the caller has already emitted.
+	void Emitter::writeSwizzleComponent(Id object, const std::string& name, Id value) {
 		const Id type = _types.pointeeOf(_builder.typeOf(object));
-		const std::vector<uint32_t> indices = swizzleFor(type, target.memberName);
+		const std::vector<uint32_t> indices = swizzleFor(type, name);
 
 		if (indices.size() != 1) {
-			throw CompileError("writing \"" + target.memberName + "\" would write "
+			throw CompileError("writing \"" + name + "\" would write "
 				+ std::to_string(indices.size()) + " components at once, which mslc does not do; "
 				"assign each component on its own");
 		}
@@ -1755,15 +1755,15 @@ namespace {
 					if (statement.expression->kind == ExpressionKind::Assign) {
 						const Expression& assign = *statement.expression;
 
-						const Id value = emitExpression(*assign.right);
-
 						// A component of a vector has no address of its own, so a
 						// write to one replaces the component in the vector
 						// rather than storing through a pointer.
 						if (assign.left->kind == ExpressionKind::Member
 							&& !isStructObject(*assign.left->left)
 							&& swizzleIndices(assign.left->memberName)) {
-							writeSwizzle(*assign.left, value);
+							const Id object = addressOf(*assign.left->left);
+							writeSwizzleComponent(object, assign.left->memberName,
+								emitExpression(*assign.right));
 							return;
 						}
 
@@ -1777,6 +1777,8 @@ namespace {
 						} else {
 							address = emitExpression(*assign.left);
 						}
+
+						const Id value = emitExpression(*assign.right);
 
 						// A store's value has the type the address points at, not
 						// the type of the address, so the pointee is what the
