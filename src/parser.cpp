@@ -614,12 +614,15 @@ StatementPtr Parser::parseStatement() {
 
 	// A declaration statement starts with a type. Distinguish it from an
 	// expression by looking for a bare type keyword or a known address space
-	// before anything that could begin an expression.
+	// before anything that could begin an expression. A struct declared
+	// earlier in the unit counts, since "Vertex vtx;" is a declaration and
+	// nothing else could start with those two words.
 	{
 		ScalarKind scalarKind;
 		const bool looksLikeType =
 			(kind() == TokenKind::Identifier && (isScalarTypeName(current().text, scalarKind)
-				|| isTypeQualifier(current().text)))
+				|| isTypeQualifier(current().text)
+				|| _unit.findStruct(current().text)))
 			|| atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 

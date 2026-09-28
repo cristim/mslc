@@ -53,6 +53,18 @@ const FunctionDecl* TranslationUnit::findFunction(const std::string& name) const
 }
 
 const StructDecl* TranslationUnit::findStruct(const std::string& name) const {
+	for (const StructDecl& decl: structs) {
+		if (decl.name == name) {
+			return &decl;
+		}
+	}
+
+	return nullptr;
+}
+
+// The parser holds a name as a string_view into the source, so a struct it has
+// already declared is looked up by that view rather than by a copy.
+const StructDecl* TranslationUnit::findStruct(std::string_view name) const {
 	for (const auto& decl: structs) {
 		if (decl.name == name) {
 			return &decl;

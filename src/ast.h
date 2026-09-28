@@ -253,6 +253,7 @@ struct TranslationUnit {
 	// MSL entry points, keyed by function name.
 	const FunctionDecl* findFunction(const std::string& name) const;
 	const StructDecl* findStruct(const std::string& name) const;
+	const StructDecl* findStruct(std::string_view name) const;
 };
 
 }
