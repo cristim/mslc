@@ -974,8 +974,11 @@ namespace {
 			return value;
 		}
 
-		// Integer and float conversions have their own opcodes; a bitcast
-		// covers a reinterpretation of the same width.
+		// Integer and float conversions have their own opcodes; a bitcast covers
+		// a reinterpretation of the same width, and is only a bitcast at that
+		// width. Two floats of different widths are a narrowing, which is a
+		// convert: "half4(aFloat4)" narrows each component rather than
+		// reinterpreting four floats as two halves.
 		const bool fromFloat = _types.isFloat(fromType);
 		const bool toFloat = _types.isFloat(toType);
 
@@ -986,6 +989,29 @@ namespace {
 
 		if (!fromFloat && toFloat) {
 			return _builder.emitTyped(spirv::OpConvertUToF, toType, { value });
+		}
+
+		// FConvert is scalar-only in SPIR-V, so a vector of one float width
+		// becoming a vector of another is converted a component at a time and put
+		// back together. The components keep their positions, which is what
+		// "half4(aFloat4)" means: a narrowing of each one.
+		if (fromFloat && toFloat) {
+			if (_types.vectorWidth(toType) == 1) {
+				return _builder.emitTyped(spirv::OpFConvert, toType, { value });
+			}
+
+			const Id fromScalar = _types.scalar(_types.componentKind(fromType));
+			const Id toScalar = _types.scalar(_types.componentKind(toType));
+			const uint32_t width = _types.vectorWidth(toType);
+
+			std::vector<uint32_t> operands;
+			for (uint32_t i = 0; i < width; ++i) {
+				const Id part = _builder.emitTyped(spirv::OpCompositeExtract, fromScalar,
+					{ value, i });
+				operands.push_back(_builder.emitTyped(spirv::OpFConvert, toScalar, { part }));
+			}
+
+			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, operands);
 		}
 
 		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
@@ -1364,7 +1390,11 @@ namespace {
 		// A scalar spread across a vector, which is what "float4(0.5)" means:
 		// every component takes the value. Metal spells the same thing with a
 		// constructor rather than a cast, so this is reached from both.
-		if (target.vectorWidth > 1) {
+		//
+		// A vector into a vector is not a spread at all: "half4(aFloat4)" keeps
+		// each component where it is and converts it, so it goes down the ordinary
+		// conversion path and only a scalar is spread.
+		if (target.vectorWidth > 1 && _types.vectorWidth(fromType) == 1) {
 			// The value is converted to the component type first, which is what
 			// makes "float3(0)" a splat of zero rather than a mistake: the integer
 			// literal widens to a float, as it does for a scalar.
@@ -1397,10 +1427,17 @@ namespace {
 		// than two, and a count alone does not have to be guessed at.
 		if (!isMatrix && expression.arguments.size() == 2) {
 			const Id first = emitExpression(*expression.arguments[0]);
-			if (_types.vectorWidth(_builder.typeOf(first)) == expected - 1) {
+			const Id firstType = _builder.typeOf(first);
+			if (_types.vectorWidth(firstType) == expected - 1) {
 				const Id last = emitExpression(*expression.arguments[1]);
+				const Id lastType = _builder.typeOf(last);
+
+				// The wide argument converts to the component type at its own
+				// width, since that is the vector it becomes: "half4(aFloat3, 1)"
+				// narrows the three and then widens one scalar beside them.
 				return _builder.emitTyped(spirv::OpCompositeConstruct, toType,
-					{ first, convert(last, _builder.typeOf(last), element) });
+					{ convert(first, firstType, _types.vector(target.scalar, expected - 1)),
+					  convert(last, lastType, element) });
 			}
 		}
 
@@ -2143,9 +2180,12 @@ namespace {
 				_builder.emit(spirv::OpDecorate, { id,
 					static_cast<uint32_t>(spirv::Decoration::Location), *field.attributes.attributeIndex });
 			} else {
-				throw CompileError("field \"" + field.name + "\" of the struct \"" + decl->name
-					+ "\" that \"" + entryPoint.name + "\" returns has no [[position]] or "
-					"[[attribute(n)]], so mslc cannot say where it goes");
+				// Metal gives a member with no attribute the next free location
+				// rather than making it an error, so a struct's members are laid
+				// out in declaration order across the locations a [[position]] and
+				// the explicit attributes did not take.
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::Location), nextLocation++ });
 			}
 
 			_interface.push_back(id);
@@ -2231,6 +2271,10 @@ namespace {
 				binding.storageClass = spirv::StorageClass::Input;
 				binding.structType = decl;
 
+				// The same counter the output side uses, so a member with no
+				// attribute of its own lands where the producing stage put it.
+				uint32_t nextLocation = 0;
+
 				for (const StructField& field: decl->fields) {
 					const Id type = declaredTypeOf(field.type);
 
@@ -2251,9 +2295,14 @@ namespace {
 						_builder.emit(spirv::OpDecorate, { id,
 							static_cast<uint32_t>(spirv::Decoration::Location), *field.attributes.attributeIndex });
 					} else {
-						throw CompileError("field \"" + field.name + "\" of the [[stage_in]] struct "
-							"\"" + decl->name + "\" has no [[position]] or [[attribute(n)]], so mslc "
-							"cannot say where it comes from");
+						// As with an output, Metal gives a member with no attribute the
+						// next free location rather than making it an error, and the
+						// two sides of an interface have to agree on which member is
+						// which. Both count up in declaration order, so the same
+						// struct received and returned lands the same way round.
+						_builder.emit(spirv::OpDecorate, { id,
+							static_cast<uint32_t>(spirv::Decoration::Location),
+							nextLocation++ });
 					}
 
 					_interface.push_back(id);
