@@ -42,5 +42,5 @@ compute_buffer_clear.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/cubemap/shadersrc/shaders.metal expect=valid
 /home/cristi/src/indium-pr-opaque-pointers/test/lighting/shadersrc/shaders.metal expect=invalid:uniform buffer layout
 /home/cristi/src/indium-pr-opaque-pointers/test/sampler/shadersrc/AAPLShaders.metal expect=unsupported:constant integer argument
-/home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal expect=unsupported:field whose type is itself a struct
+/home/cristi/src/indium-pr-opaque-pointers/test/texturing/shadersrc/shaders.metal expect=invalid:uniform buffer layout
 /home/cristi/src/mslc/tests/blender/mtl_context-5.1.2.metal expect=valid

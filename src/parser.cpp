@@ -66,10 +66,33 @@ namespace {
 	// width (0 for a scalar). Every place that has to tell a type from a value
 	// asks here, since "float" and "float4" are both types and only differ in
 	// the last character.
+	// Metal's packed vector types, packed_float4 and packed_char3 and the rest.
+	// A packed vector holds no padding, which is what distinguishes it from a
+	// plain vector: float4 in Metal occupies four floats, where float3 occupies
+	// four as well. SPIR-V has one vector type either way, laid out by the
+	// ArrayStride of whatever holds it, so a packed vector is the plain vector of
+	// the same element and width. The name is a prefix rather than a vector suffix
+	// because that is how it is spelled.
+	bool unpackPackedTypeName(std::string_view text, ScalarKind& outKind, uint32_t& outWidth) {
+		constexpr std::string_view kPacked = "packed_";
+		if (text.rfind(kPacked, 0) != 0) {
+			return false;
+		}
+
+		const std::string_view rest = text.substr(kPacked.size());
+		const uint32_t width = vectorTypeWidth(rest);
+		if (width < 2 || !isScalarTypeName(width ? rest.substr(0, rest.size() - 1) : rest, outKind)) {
+			return false;
+		}
+
+		outWidth = width;
+		return true;
+	}
+
 	bool isTypeName(std::string_view text, ScalarKind& outKind, uint32_t& outWidth) {
 		const uint32_t width = vectorTypeWidth(text);
 		if (!isScalarTypeName(width ? text.substr(0, text.size() - 1) : text, outKind)) {
-			return false;
+			return unpackPackedTypeName(text, outKind, outWidth);
 		}
 
 		outWidth = width;
