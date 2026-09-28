@@ -461,6 +461,7 @@ Id TypeTable::sampledImage(ScalarKind component, TextureDim dim) {
 	const uint32_t spirvDim = [&]() {
 		switch (dim) {
 			case TextureDim::D2: return static_cast<uint32_t>(spirv::Dim::Dim2D);
+			case TextureDim::Cube: return static_cast<uint32_t>(spirv::Dim::Cube);
 			case TextureDim::None: break;
 		}
 
@@ -2446,10 +2447,17 @@ namespace {
 				continue;
 			}
 
-			// A [[stage_in]] parameter is the interface a stage receives, and
-			// each of its members is a variable of its own placed by the
-			// attribute on that member. The struct itself is not a value, since
-			// SPIR-V has no interface struct to hold them.
+			// A [[stage_in]] parameter is the interface a stage receives, and each
+			// of its members is a variable of its own placed by the attribute on
+			// that member. The struct itself is not a value, since SPIR-V has no
+			// interface struct to hold them.
+			//
+			// A fragment stage receives its [[position]] as FragCoord, which is the
+			// position a fragment is at rather than the one the specification
+			// reserves for the stages that produce it. A vertex stage's stage_in is
+			// the other thing: it is how a vertex function is handed the attributes
+			// of the vertex it is drawing, placed by [[attribute(n)]], so there is
+			// no FragCoord to substitute there.
 			if (parameter.attributes.stageIn) {
 				if (parameter.type.namedType.empty()) {
 					throw CompileError("parameter \"" + parameter.name + "\" is [[stage_in]] but "
@@ -2460,11 +2468,6 @@ namespace {
 				if (!decl) {
 					throw CompileError("parameter \"" + parameter.name + "\" is [[stage_in]] on \""
 						+ parameter.type.namedType + "\", which is not a struct this source declares");
-				}
-
-				if (entryPoint.stage != Stage::Fragment) {
-					throw CompileError("a [[stage_in]] parameter is what a fragment entry point "
-						"receives, and \"" + entryPoint.name + "\" is not one");
 				}
 
 				Binding binding;
@@ -2484,10 +2487,7 @@ namespace {
 						{ static_cast<uint32_t>(spirv::StorageClass::Input) });
 
 					_builder.setSection(spirv::Section::Annotations);
-					if (field.attributes.position) {
-						// The position a fragment receives is its own coordinate,
-						// not the position builtin, which the specification
-						// reserves for the stages that produce one.
+					if (entryPoint.stage == Stage::Fragment && field.attributes.position) {
 						_builder.emit(spirv::OpDecorate, { id,
 							static_cast<uint32_t>(spirv::Decoration::BuiltIn),
 							static_cast<uint32_t>(spirv::BuiltIn::FragCoord) });

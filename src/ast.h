@@ -32,6 +32,10 @@ enum class Stage {
 enum class TextureDim {
 	None,
 	D2,
+	// A cube, which is six faces addressed by a direction rather than by a pair
+	// of coordinates. SPIR-V calls the shape Dim and takes the same sample
+	// instruction for it, so this is a value of the same kind as D2.
+	Cube,
 };
 
 // Scalar type kinds. Width is in bits; vectors are a count of one of these.

@@ -181,6 +181,9 @@ namespace {
 		if (name == "texture2d") {
 			return TextureDim::D2;
 		}
+		if (name == "texturecube") {
+			return TextureDim::Cube;
+		}
 
 		return std::nullopt;
 	}
