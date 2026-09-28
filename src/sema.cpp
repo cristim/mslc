@@ -296,7 +296,23 @@ Id TypeTable::matrix(ScalarKind kind, uint32_t columns, uint32_t rows) {
 	const Id id = _builder.emitDecl(spirv::OpTypeMatrix, { column, columns });
 
 	_matrices.emplace(key, id);
+	_columnTypeOfMatrix.emplace(id, column);
 	return id;
+}
+
+uint32_t TypeTable::matrixColumnCount(Id matrixType) const {
+	for (const auto& [key, id]: _matrices) {
+		if (id == matrixType) {
+			return std::get<2>(key);
+		}
+	}
+
+	return 0;
+}
+
+Id TypeTable::matrixColumnType(Id matrixType) const {
+	const auto it = _columnTypeOfMatrix.find(matrixType);
+	return it == _columnTypeOfMatrix.end() ? InvalidId : it->second;
 }
 
 spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
@@ -881,6 +897,7 @@ namespace {
 		// the caller loads from it.
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
+		Id emitMatrixProduct(Id left, Id right, Id leftType, Id rightType);
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		Id emitMember(const Expression& expression);
@@ -1319,11 +1336,76 @@ namespace {
 		type = vectorType;
 	}
 
+	// A product with a matrix operand, which SPIR-V spells with an instruction
+	// per shape of the other operand rather than with one binary multiply: a
+	// matrix times a vector, a vector times a matrix and a matrix times a
+	// matrix are three different products, not one commutative operation. The
+	// operand order picks which, so it is read rather than normalised: "v * m"
+	// is not "m * v".
+	//
+	// The result of a product with a vector is the matrix's column type, since
+	// a column is one component of the result. The arithmetic itself is left to
+	// the instruction, which reads the matrix in the column-major order Metal
+	// wrote it in, so the only way to get this wrong here is to pick the
+	// instruction whose operand order does not match the source.
+	Id Emitter::emitMatrixProduct(Id left, Id right, Id leftType, Id rightType) {
+		const Id leftColumn = _types.matrixColumnType(leftType);
+		const Id rightColumn = _types.matrixColumnType(rightType);
+
+		if (leftColumn != InvalidId && rightColumn != InvalidId) {
+			if (leftType != rightType) {
+				throw CompileError("a product of two matrices has to be of the same shape, found "
+					+ std::to_string(_types.matrixColumnCount(leftType)) + " columns of "
+					+ std::to_string(_types.vectorWidth(leftColumn)) + " and "
+					+ std::to_string(_types.matrixColumnCount(rightType)) + " columns of "
+					+ std::to_string(_types.vectorWidth(rightColumn)));
+			}
+
+			return _builder.emitTyped(spirv::OpMatrixTimesMatrix, leftType, { left, right });
+		}
+
+		if (leftColumn != InvalidId) {
+			if (rightType != leftColumn) {
+				throw CompileError("a matrix of " + std::to_string(_types.vectorWidth(leftColumn))
+					+ " rows times a vector of " + std::to_string(_types.vectorWidth(rightType))
+					+ " components is a shape mismatch");
+			}
+
+			return _builder.emitTyped(spirv::OpMatrixTimesVector, leftColumn, { left, right });
+		}
+
+		// A vector on the left, so the matrix is the second operand: SPIR-V
+		// spells this with its own instruction rather than by reversing the
+		// operands of the matrix-on-the-left form, because the two products are
+		// not the same product.
+		if (leftType != rightColumn) {
+			throw CompileError("a vector of " + std::to_string(_types.vectorWidth(leftType))
+				+ " components times a matrix of " + std::to_string(_types.vectorWidth(rightColumn))
+				+ " rows is a shape mismatch");
+		}
+
+		return _builder.emitTyped(spirv::OpVectorTimesMatrix, leftType, { left, right });
+	}
+
 	Id Emitter::emitBinary(const Expression& expression) {
 		Id left = emitExpression(*expression.left);
 		Id right = emitExpression(*expression.right);
 		Id leftType = _builder.typeOf(left);
 		Id rightType = _builder.typeOf(right);
+
+		// A matrix is not a vector of its own component type, so the mixed-form
+		// path below would try to spread one across the other. It has its own
+		// instructions instead.
+		if (_types.matrixColumnType(leftType) != InvalidId
+			|| _types.matrixColumnType(rightType) != InvalidId) {
+
+			if (expression.binaryOperator != BinaryOperator::Multiply) {
+				throw CompileError("a matrix operand of a binary operator is recognised only for "
+					"the product, which is the only form with an instruction for it");
+			}
+
+			return emitMatrixProduct(left, right, leftType, rightType);
+		}
 
 		if (leftType != rightType) {
 			if (_types.vectorWidth(leftType) > 1) {

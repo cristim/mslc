@@ -26,6 +26,9 @@ class TypeTable {
 	// Keyed by the component, the column width and the column count, in that
 	// order, so a float4x4 and a float4x3 do not collide.
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, spirv::Id> _matrices;
+	// The column type of each matrix, which is also the type its rows are a
+	// vector of: "float4x4" is four columns of float4.
+	std::map<spirv::Id, spirv::Id> _columnTypeOfMatrix;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -79,6 +82,17 @@ public:
 	// columns are given in. Emits the Matrix capability, which a MatrixStride
 	// decoration needs and OpTypeMatrix does not.
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
+
+	// The column type a matrix type is made of, which is also what a product of
+	// that matrix with a vector comes out as. InvalidId when the id is not a
+	// matrix this table created, which is how a matrix is told apart from a
+	// vector or a struct.
+	spirv::Id matrixColumnType(spirv::Id matrixType) const;
+
+	// How many columns a matrix type has, or 0 when the id is not a matrix. A
+	// matrix is declared as a column and a count of them, so this is what
+	// distinguishes a float4x4 from a float3x4.
+	uint32_t matrixColumnCount(spirv::Id matrixType) const;
 
 	// What kind of type an id is. The table knows these because it created
 	// them, which is why they are asked here rather than inferred at each use
