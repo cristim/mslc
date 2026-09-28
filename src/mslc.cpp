@@ -39,6 +39,19 @@ namespace {
 		return buffer;
 	}
 
+	// The binding entries are accumulated with a trailing comma, so each can be
+	// appended as it is found, but a JSON array cannot end with one.
+	std::string jsonArray(const std::string& entries) {
+		constexpr const char* trailing = ",\n";
+
+		if (entries.size() >= 2
+			&& entries.compare(entries.size() - 2, 2, trailing) == 0) {
+			return entries.substr(0, entries.size() - 2);
+		}
+
+		return entries;
+	}
+
 	const char* stageName(mslc::Stage stage) {
 		switch (stage) {
 			case mslc::Stage::Vertex: return "vertex";
@@ -127,7 +140,7 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		std::string document = "{\n";
 		document += "\t\"reflection_version\": 1,\n";
 		document += "\t\"module_bindings\": [\n";
-		document += emitted.moduleBindings;
+		document += jsonArray(emitted.moduleBindings);
 		document += "\t],\n";
 		document += "\t\"entries\": [\n";
 
@@ -141,7 +154,7 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 				+ std::to_string(moduleOptions.localSizeY) + ", "
 				+ std::to_string(moduleOptions.localSizeZ) + "],\n";
 			document += "\t\t\t\"bindings\": [\n";
-			document += entry.bindings;
+			document += jsonArray(entry.bindings);
 			document += "\t\t\t]\n";
 			document += i + 1 == emitted.entries.size() ? "\t\t}\n" : "\t\t},\n";
 		}
