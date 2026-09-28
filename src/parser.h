@@ -60,6 +60,11 @@ private:
 	// Reads a bare identifier used as a name, such as a struct field's.
 	void expectFieldName(std::string& out);
 
+	// An initialiser, which is an expression or a braced list. A list is only
+	// spelled in an initialiser, so it is not a primary expression.
+	ExpressionPtr parseInitializer();
+	ExpressionPtr parseInitializerList();
+
 	// Types
 	Type parseType();
 	bool parseAddressSpace(AddressSpace& space);

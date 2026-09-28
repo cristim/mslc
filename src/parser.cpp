@@ -117,6 +117,31 @@ namespace {
 		return std::nullopt;
 	}
 
+	// The address space a name spells, or nothing when it spells none. Shared by
+	// the type parser and the top-level declaration dispatch, so the two agree on
+	// which names are address spaces.
+	std::optional<AddressSpace> addressSpaceFor(std::string_view name) {
+		if (name == "device") { return AddressSpace::Device; }
+		if (name == "constant") { return AddressSpace::Constant; }
+		if (name == "threadgroup") { return AddressSpace::Threadgroup; }
+		if (name == "thread") { return AddressSpace::Thread; }
+
+		return std::nullopt;
+	}
+
+	// The name a diagnostic uses for an address space.
+	const char* addressSpaceName(AddressSpace space) {
+		switch (space) {
+			case AddressSpace::Device: return "device";
+			case AddressSpace::Constant: return "constant";
+			case AddressSpace::Threadgroup: return "threadgroup";
+			case AddressSpace::Thread: return "thread";
+			case AddressSpace::None: break;
+		}
+
+		return "none";
+	}
+
 }
 
 bool isMSLBuiltinName(std::string_view name) {
@@ -276,10 +301,12 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
-	// A sampler state declared and defined in the shader. The type qualifier is
-	// what marks a file-scope declaration, since a bare "sampler s" there would
+	// A file-scope declaration: a sampler state, or a constant. An address space
+	// or a type qualifier ahead of the type is what marks one, since a bare
+	// "float x" at file scope is not valid MSL and a bare "sampler s" there would
 	// be a function's return type spelling.
-	if (at(TokenKind::Identifier) && isTypeQualifier(current().text)) {
+	if (at(TokenKind::Identifier)
+		&& (isTypeQualifier(current().text) || addressSpaceFor(current().text))) {
 		_unit.globals.push_back(parseGlobalDeclaration());
 		return;
 	}
@@ -320,29 +347,80 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 
 	declaration.type = parseType();
 
-	if (!declaration.type.isSampler) {
-		throw CompileError("only a sampler can be declared at file scope");
-	}
-
 	if (kind() != TokenKind::Identifier) {
 		throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 	}
 
 	declaration.name = std::string(advance().text);
 
-	// "constexpr sampler s {}" spells the state as a braced list, empty meaning
-	// the default. Only the empty form is representable, so a state that says
-	// something is reported rather than dropped.
-	expect(TokenKind::LBrace, "to open a sampler's state");
-	if (!at(TokenKind::RBrace)) {
-		throw CompileError("only the default sampler state, written \"{}\", is supported; "
-			"a state of \"" + std::string(current().text) + "\" is not");
+	if (declaration.type.isSampler) {
+		// "constexpr sampler s {}" spells the state as a braced list, empty
+		// meaning the default. Only the empty form is representable, so a state
+		// that says something is reported rather than dropped.
+		expect(TokenKind::LBrace, "to open a sampler's state");
+		if (!at(TokenKind::RBrace)) {
+			throw CompileError("only the default sampler state, written \"{}\", is supported; "
+				"a state of \"" + std::string(current().text) + "\" is not");
+		}
+		advance();
+
+		expect(TokenKind::Semicolon, "after a file-scope declaration");
+		return declaration;
 	}
-	advance();
+
+	if (declaration.type.addressSpace != AddressSpace::Constant) {
+		throw CompileError("only a sampler or a constant can be declared at file scope, and a "
+			+ std::string(addressSpaceName(declaration.type.addressSpace))
+			+ (declaration.type.isPointer ? " pointer" : " value") + " is neither");
+	}
+
+	if (!match(TokenKind::Assign)) {
+		throw CompileError("a constant declared at file scope needs an initialiser, found "
+			+ std::string(tokenKindName(kind())));
+	}
+
+	declaration.initializer = parseInitializer();
 
 	expect(TokenKind::Semicolon, "after a file-scope declaration");
-
 	return declaration;
+}
+
+ExpressionPtr Parser::parseInitializer() {
+	if (at(TokenKind::LBrace)) {
+		return parseInitializerList();
+	}
+
+	return parseExpression();
+}
+
+ExpressionPtr Parser::parseInitializerList() {
+	auto list = std::make_unique<Expression>();
+	list->kind = ExpressionKind::InitList;
+	list->line = line();
+
+	expect(TokenKind::LBrace, "to open a braced initialiser");
+
+	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		InitializerElement element;
+
+		// A struct's fields are written by name, ".direction = { ... }". A vector's
+		// components are not: they are positional, like any other initialiser.
+		if (at(TokenKind::Dot)) {
+			advance();
+			expectFieldName(element.fieldName);
+			expect(TokenKind::Assign, "after a field name in a braced initialiser");
+		}
+
+		element.value = parseInitializer();
+		list->elements.push_back(std::move(element));
+
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+	}
+
+	expect(TokenKind::RBrace, "to close a braced initialiser");
+	return list;
 }
 
 StructDecl Parser::parseStructDeclaration() {
@@ -397,12 +475,12 @@ void Parser::expectFieldName(std::string& out) {
 }
 
 bool Parser::parseAddressSpace(AddressSpace& space) {
-	if (atKeyword("device")) { space = AddressSpace::Device; }
-	else if (atKeyword("constant")) { space = AddressSpace::Constant; }
-	else if (atKeyword("threadgroup")) { space = AddressSpace::Threadgroup; }
-	else if (atKeyword("thread")) { space = AddressSpace::Thread; }
-	else { return false; }
+	const auto found = addressSpaceFor(current().text);
+	if (!found) {
+		return false;
+	}
 
+	space = *found;
 	advance();
 	return true;
 }

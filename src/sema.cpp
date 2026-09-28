@@ -725,6 +725,25 @@ namespace {
 		std::vector<Id> stageInMembers;
 	};
 
+	// A constant a file-scope "constant" declaration was folded to. SPIR-V takes
+	// only constants as a constant's operands, so an initialiser that refers to
+	// an earlier constant or does arithmetic has to be folded into a value here
+	// rather than emitted as the expression it was written as.
+	struct FoldedConstant {
+		// A composite: the type it was declared as, and the constants making it
+		// up, which have already been emitted.
+		bool isComposite = false;
+		Id type = InvalidId;
+		std::vector<Id> parts;
+
+		// A scalar: the kind to declare it as, and its value. A double holds
+		// every 32-bit integer and every float exactly, which is the whole range
+		// of the scalar types a constant here can have.
+		ScalarKind scalar = ScalarKind::Void;
+		double number = 0.0;
+		bool boolean = false;
+	};
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -772,6 +791,10 @@ namespace {
 		// rather than to any one entry point, since more than one can use it.
 		std::string _moduleBindings;
 
+		// Per module: what each file-scope constant folded to, so a later one can
+		// refer to it by name and a use in a body can read it.
+		std::map<std::string, FoldedConstant> _constants;
+
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
 			const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options, TypeTable& types):
@@ -786,6 +809,15 @@ namespace {
 		void emitLabel(Id id);
 		void emitTerminator(uint16_t opcode, std::vector<uint32_t> operands);
 		void declareGlobals();
+		Id declareGlobalConstant(const VariableDeclaration& declaration);
+		Id emitConstant(const FoldedConstant& folded);
+		uint32_t constantBits(ScalarKind kind, double value);
+		FoldedConstant foldInitializer(const Type& type, const Expression& initializer);
+		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
+			const Expression& initializer);
+		FoldedConstant foldExpression(const Expression& expression);
+		FoldedConstant foldBinary(const Expression& expression);
+		FoldedConstant foldUnary(const Expression& expression);
 		void declareParameters(const FunctionDecl& entryPoint);
 		std::vector<Output> declareOutputs(const FunctionDecl& entryPoint);
 		EmittedEntryPoint emitEntryPoint(const FunctionDecl& entryPoint);
@@ -885,8 +917,10 @@ namespace {
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {
-		const auto it = _bindings.find(expression.name);
-		if (it == _bindings.end()) {
+		// The entry point's own names, then the module's: a constant declared at
+		// file scope is not a parameter of the entry point that reads it.
+		const Binding* found = findBinding(expression.name);
+		if (!found) {
 			// A parameter is free to be named after an MSL builtin: Blender's
 			// compute_buffer_clear names one "position". Reporting the collision
 			// here rather than in the parser is what lets the declaration win.
@@ -899,7 +933,7 @@ namespace {
 				"mslc knows about");
 		}
 
-		const Binding& binding = it->second;
+		const Binding& binding = *found;
 
 		// A [[stage_in]] parameter is an interface, not a value: SPIR-V has no
 		// struct holding the members, so there is nothing to load.
@@ -1174,6 +1208,15 @@ namespace {
 		const Id fieldIndex = fieldOf(*binding.structType, expression.memberName);
 		const Id fieldType = declaredTypeOf(binding.structType->fields[fieldIndex].type);
 
+		// A module-scope constant is a value rather than a place, so there is no
+		// address to load through and the field is taken from the value. Every
+		// other struct-valued name is a place, a [[stage_in]] parameter included:
+		// its member is an interface variable of its own.
+		if (!binding.isPointer && !binding.isStageIn) {
+			return _builder.emitTyped(spirv::OpCompositeExtract, fieldType,
+				{ emitExpression(*expression.left), fieldIndex });
+		}
+
 		return loadFrom(emitMemberAddress(expression), fieldType);
 	}
 
@@ -1365,6 +1408,7 @@ namespace {
 			case ExpressionKind::Member: return emitMember(expression);
 			case ExpressionKind::Call: return emitCall(expression);
 			case ExpressionKind::Cast: return emitCast(expression);
+			case ExpressionKind::InitList:
 			case ExpressionKind::Assign: break;
 		}
 
@@ -1373,6 +1417,308 @@ namespace {
 		throw CompileError("an assignment cannot be used as a value");
 	}
 
+
+	// The constant a folded value becomes: a scalar as an OpConstant of its kind,
+	// a bool as OpConstantTrue or OpConstantFalse, and a composite as the
+	// constants making it up.
+	Id Emitter::emitConstant(const FoldedConstant& folded) {
+		if (folded.isComposite) {
+			return _builder.emitDeclTyped(spirv::OpConstantComposite, folded.type, folded.parts);
+		}
+
+		_builder.setSection(spirv::Section::TypesGlobals);
+
+		if (folded.scalar == ScalarKind::Bool) {
+			return folded.boolean
+				? _builder.emitDeclTyped(spirv::OpConstantTrue, _boolType, { })
+				: _builder.emitDeclTyped(spirv::OpConstantFalse, _boolType, { });
+		}
+
+		const uint32_t bits = constantBits(folded.scalar, folded.number);
+		return _builder.emitDeclTyped(spirv::OpConstant,
+			_types.scalar(folded.scalar), { bits });
+	}
+
+	// A struct's fields are initialised by name in Metal, and every one of them has
+	// to be given, so the list is checked against the declaration field by field
+	// rather than taken positionally.
+	void Emitter::foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
+		const Expression& initializer) {
+
+		if (initializer.elements.size() != decl.fields.size()) {
+			throw CompileError("struct \"" + decl.name + "\" is initialised with "
+				+ std::to_string(initializer.elements.size()) + " values, and it has "
+				+ std::to_string(decl.fields.size()) + " fields");
+		}
+
+		for (size_t i = 0; i < decl.fields.size(); ++i) {
+			const InitializerElement& element = initializer.elements[i];
+
+			if (element.fieldName.empty()) {
+				throw CompileError("struct \"" + decl.name + "\" is initialised by field name, so \""
+					+ decl.fields[i].name + "\" has to be named rather than given in place");
+			}
+
+			if (element.fieldName != decl.fields[i].name) {
+				throw CompileError("struct \"" + decl.name + "\" has no field \""
+					+ element.fieldName + "\" where \"" + decl.fields[i].name + "\" goes");
+			}
+
+			folded.parts.push_back(emitConstant(
+				foldInitializer(decl.fields[i].type, *element.value)));
+		}
+	}
+
+	// An initialiser that is not a list, so a single value. Only what can be
+	// worked out from the declarations before it is folded; anything else is
+	// reported, since a constant has to be constant.
+	FoldedConstant Emitter::foldExpression(const Expression& expression) {
+		FoldedConstant folded;
+
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+				// An integer literal is an int, as it is in C++, rather than the
+				// uint an emitted literal happens to be declared as.
+				folded.scalar = ScalarKind::Int;
+				folded.number = static_cast<double>(expression.intValue);
+				return folded;
+
+			case ExpressionKind::FloatLiteral:
+				folded.scalar = ScalarKind::Float;
+				folded.number = expression.floatValue;
+				return folded;
+
+			case ExpressionKind::BoolLiteral:
+				folded.scalar = ScalarKind::Bool;
+				folded.boolean = expression.boolValue;
+				return folded;
+
+			case ExpressionKind::Identifier: {
+				// Declaration order is what makes this resolvable, and the module's
+				// constants are declared in the order the source declares them.
+				const auto found = _constants.find(expression.name);
+				if (found == _constants.end()) {
+					throw CompileError("\"" + expression.name + "\" is not a constant this source "
+						"declares before this one");
+				}
+
+				if (found->second.isComposite) {
+					throw CompileError("\"" + expression.name + "\" is a composite constant, and "
+						"composites are not folded into a value");
+				}
+
+				return found->second;
+			}
+
+			case ExpressionKind::Binary: return foldBinary(expression);
+			case ExpressionKind::Unary: return foldUnary(expression);
+			default: break;
+		}
+
+		throw CompileError("a constant's initialiser has to be a value that can be worked out "
+			"from the declarations before it, and this is not one");
+	}
+
+	FoldedConstant Emitter::foldUnary(const Expression& expression) {
+		FoldedConstant folded = foldExpression(*expression.left);
+
+		if (folded.isComposite) {
+			throw CompileError("a composite constant cannot have a unary operator applied to it");
+		}
+
+		switch (expression.unaryOperator) {
+			case UnaryOperator::Plus: return folded;
+			case UnaryOperator::Negate:
+				folded.number = -folded.number;
+				return folded;
+			default: break;
+		}
+
+		throw CompileError("this unary operator is recognised but not folded yet");
+	}
+
+	FoldedConstant Emitter::foldBinary(const Expression& expression) {
+		const FoldedConstant left = foldExpression(*expression.left);
+		const FoldedConstant right = foldExpression(*expression.right);
+
+		if (left.isComposite || right.isComposite) {
+			throw CompileError("a composite constant cannot be an operand of a binary operator");
+		}
+
+		if (left.scalar != right.scalar) {
+			throw CompileError("a constant's operands have to be of the same type, found "
+				+ std::string(scalarKindName(left.scalar)) + " and "
+				+ std::string(scalarKindName(right.scalar)));
+		}
+
+		const BinaryOperator op = expression.binaryOperator;
+
+		if (isFloatKind(left.scalar)) {
+			FoldedConstant folded = left;
+
+			switch (op) {
+				case BinaryOperator::Add: folded.number = left.number + right.number; break;
+				case BinaryOperator::Subtract: folded.number = left.number - right.number; break;
+				case BinaryOperator::Multiply: folded.number = left.number * right.number; break;
+				// A float division by zero is infinity, which is what the language
+				// says, so it is not treated as a mistake here.
+				case BinaryOperator::Divide: folded.number = left.number / right.number; break;
+				default:
+					throw CompileError("this operator is recognised but not folded yet");
+			}
+
+			return folded;
+		}
+
+		// Integer arithmetic at the width the operands have, so a constant that
+		// overflows wraps the way it would at run time rather than in the double it
+		// was folded through.
+		const auto l = static_cast<uint32_t>(static_cast<int64_t>(left.number));
+		const auto r = static_cast<uint32_t>(static_cast<int64_t>(right.number));
+
+		uint32_t value = 0;
+		switch (op) {
+			case BinaryOperator::Add: value = l + r; break;
+			case BinaryOperator::Subtract: value = l - r; break;
+			case BinaryOperator::Multiply: value = l * r; break;
+			case BinaryOperator::Modulo: value = l % r; break;
+			case BinaryOperator::Divide:
+				if (r == 0) {
+					throw CompileError("an integer constant divides by zero");
+				}
+				value = l / r;
+				break;
+			case BinaryOperator::ShiftLeft: value = l << (r & 31u); break;
+			case BinaryOperator::ShiftRight: value = l >> (r & 31u); break;
+			case BinaryOperator::BitAnd: value = l & r; break;
+			case BinaryOperator::BitOr: value = l | r; break;
+			case BinaryOperator::BitXor: value = l ^ r; break;
+			default:
+				throw CompileError("this operator is recognised but not folded yet");
+		}
+
+		FoldedConstant folded = left;
+		folded.number = value;
+		return folded;
+	}
+
+	// A file-scope "constant" is a compile-time constant, so its initialiser is
+	// folded and the result declared as one of the module's constants. The folded
+	// value is kept as well as the id, since a later constant referring to this
+	// one needs the value rather than a reference to a constant.
+	Id Emitter::declareGlobalConstant(const VariableDeclaration& declaration) {
+		if (!declaration.initializer) {
+			throw CompileError("the constant \"" + declaration.name
+				+ "\" was declared without an initialiser");
+		}
+
+		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
+		const Id id = emitConstant(folded);
+		_constants[declaration.name] = folded;
+		return id;
+	}
+
+	// The bits of a scalar constant of the given kind. A float is narrowed to its
+	// own width here, since the value was folded as a double and OpConstant takes
+	// the bits of the type it declares.
+	uint32_t Emitter::constantBits(ScalarKind kind, double value) {
+		// A 64-bit constant's literal is two words, which mslc does not write, so
+		// one of those is reported rather than emitted with half of it.
+		if (scalarBitWidth(kind) > 32) {
+			throw CompileError("a constant of " + std::string(scalarKindName(kind))
+				+ " is not lowered yet");
+		}
+
+		if (isFloatKind(kind)) {
+			const auto narrowed = static_cast<float>(value);
+			uint32_t bits = 0;
+			static_assert(sizeof(bits) == sizeof(narrowed), "float is not 32 bits");
+			std::memcpy(&bits, &narrowed, sizeof(bits));
+			return bits;
+		}
+
+		return static_cast<uint32_t>(static_cast<int64_t>(value));
+	}
+
+	// Folds an initialiser of the given declared type. A list of values for a
+	// vector or a struct is a composite, and anything else is a scalar, so the
+	// declared type is what says which the source wrote.
+	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer) {
+		if (initializer.kind != ExpressionKind::InitList) {
+			if (!type.namedType.empty()) {
+				throw CompileError("the struct \"" + type.namedType + "\" is initialised with a "
+					"braced list naming its fields, not with a single value");
+			}
+
+			if (type.vectorWidth > 1) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
+					"list of its components, not with a single value");
+			}
+
+			FoldedConstant folded = foldExpression(initializer);
+			if (folded.isComposite) {
+				throw CompileError("a composite cannot initialise a scalar");
+			}
+
+			// The declared type is what the constant is. An integer literal may
+			// initialise a float, since that is a widening; the other direction
+			// would have to round, which is not something to do silently.
+			if (folded.scalar == ScalarKind::Bool) {
+				throw CompileError("a bool constant is initialised with true or false, found "
+					+ std::string(scalarKindName(folded.scalar)));
+			}
+
+			if (isFloatKind(folded.scalar) && !isFloatKind(type.scalar)) {
+				throw CompileError("a float cannot initialise a "
+					+ std::string(scalarKindName(type.scalar)));
+			}
+
+			if (type.scalar == ScalarKind::Bool) {
+				throw CompileError("a bool constant is initialised with true or false");
+			}
+
+			folded.scalar = type.scalar;
+			return folded;
+		}
+
+		FoldedConstant folded;
+		folded.isComposite = true;
+		folded.type = declaredTypeOf(type);
+
+		if (type.vectorWidth > 1) {
+			// A vector's components are positional, so the list is the vector in
+			// order and each element is the vector's own component type.
+			if (initializer.elements.size() != type.vectorWidth) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ std::to_string(type.vectorWidth) + " constant takes "
+					+ std::to_string(type.vectorWidth) + " values, found "
+					+ std::to_string(initializer.elements.size()));
+			}
+
+			for (const InitializerElement& element: initializer.elements) {
+				if (!element.fieldName.empty()) {
+					throw CompileError("a vector's components are given in order, but \""
+						+ element.fieldName + "\" names one");
+				}
+
+				Type component = type;
+				component.vectorWidth = 0;
+				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value)));
+			}
+
+			return folded;
+		}
+
+		const StructDecl* decl = _unit.findStruct(type.namedType);
+		if (!decl) {
+			throw CompileError("a constant of \"" + type.namedType
+				+ "\" is not a struct this source declares");
+		}
+
+		foldStructInitializer(folded, *decl, initializer);
+		return folded;
+	}
 
 	// MSL does not require [[buffer(n)]] on an entry point's device or
 	// constant parameters: an unbinding parameter's index is its position
@@ -1410,8 +1756,29 @@ namespace {
 	// default or unreachable under clamp-to-edge, which is the address mode
 	// reported here, so the border colour is the only one left out.
 	void Emitter::declareGlobals() {
-		for (size_t index = 0; index < _unit.globals.size(); ++index) {
-			const VariableDeclaration& global = _unit.globals[index];
+		uint32_t samplers = 0;
+
+		for (const VariableDeclaration& global: _unit.globals) {
+			if (!global.type.isSampler) {
+				// A file-scope "constant" is a compile-time constant, not a
+				// descriptor, so it is declared among the module's constants with
+				// no binding of its own.
+				_builder.setSection(spirv::Section::TypesGlobals);
+				const Id id = declareGlobalConstant(global);
+
+				// A value rather than a place, so a use of the name is the
+				// constant itself and its members are extracted from it.
+				Binding binding;
+				binding.id = id;
+				binding.pointeeType = id;
+				if (!global.type.namedType.empty()) {
+					binding.structType = _unit.findStruct(global.type.namedType);
+				}
+				_globalBindings[global.name] = binding;
+				continue;
+			}
+
+			const size_t index = samplers++;
 
 			// Before the type is asked for, since a type declaration is emitted
 			// into whichever section is current.
