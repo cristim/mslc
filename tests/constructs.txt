@@ -9,3 +9,4 @@ constructs/file_scope_constants.metal expect=valid
 constructs/quoted_include.metal expect=valid
 constructs/matrix_type.metal expect=valid
 constructs/matrix_product.metal expect=valid
+constructs/matrix_column.metal expect=valid

@@ -900,6 +900,7 @@ namespace {
 		Id emitMatrixProduct(Id left, Id right, Id leftType, Id rightType);
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
+		Id emitValueIndex(const Expression& expression);
 		Id emitMember(const Expression& expression);
 		Id emitMemberAddress(const Expression& expression);
 		Id addressOf(const Expression& expression);
@@ -1042,9 +1043,17 @@ namespace {
 	// "a[i] + b[i]" would be pointers, and the addition would be typed as
 	// integer.
 	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
+		if (expression.arguments.size() != 1) {
+			throw CompileError("expected exactly one index, found "
+				+ std::to_string(expression.arguments.size()));
+		}
+
+		// A value rather than a place: "m[0]" where m is a matrix or a vector in
+		// hand is a component or a column, and there is no address to chain to,
+		// so the element is taken out of the value. This is what reaches a
+		// matrix member of a buffer, which loads before it can be indexed.
 		if (expression.left->kind != ExpressionKind::Identifier) {
-			throw CompileError("indexing an expression is not supported yet; index a parameter "
-				"or local directly");
+			return emitValueIndex(expression);
 		}
 
 		const auto it = _bindings.find(expression.left->name);
@@ -1054,11 +1063,6 @@ namespace {
 		}
 
 		const Binding& binding = it->second;
-
-		if (expression.arguments.size() != 1) {
-			throw CompileError("expected exactly one index, found " +
-				std::to_string(expression.arguments.size()));
-		}
 
 		const Id index = emitExpression(*expression.arguments[0]);
 		_builder.setType(index, _uintType);
@@ -1078,6 +1082,56 @@ namespace {
 			{ binding.id, index });
 
 		return asAddress ? address : loadFrom(address, binding.pointeeType);
+	}
+
+	// "object[index]" where the object is a value rather than a place: a column
+	// of a matrix, or a component of a vector. There is no address to chain to
+	// for either, since SPIR-V has no pointer to a matrix's column, so the
+	// element is taken out of the value. This is what reaches a member of a
+	// buffer, which has to be loaded before it can be indexed, and it is what
+	// makes "m[0][1]" and "m[0].xy" work by indexing twice and swizzling once.
+	Id Emitter::emitValueIndex(const Expression& expression) {
+		const Id object = emitExpression(*expression.left);
+		const Id objectType = _builder.typeOf(object);
+		const Id column = _types.matrixColumnType(objectType);
+		const uint32_t width = _types.vectorWidth(objectType);
+
+		if (column == InvalidId && width < 2) {
+			throw CompileError("this expression is not a matrix or a vector, and neither has "
+				"anything to index");
+		}
+
+		const Expression& index = *expression.arguments[0];
+		const uint32_t count = column == InvalidId ? width : _types.matrixColumnCount(objectType);
+		const Id element = column == InvalidId
+			? _types.scalar(_types.componentKind(objectType))
+			: column;
+
+		// A literal index goes into the instruction as a literal, not as the id of
+		// a constant, which is the whole difference between the static and the
+		// dynamic form of an extract.
+		if (index.kind == ExpressionKind::IntLiteral) {
+			if (index.intValue >= count) {
+				throw CompileError("an index of " + std::to_string(index.intValue)
+					+ " is past the end of " + std::to_string(count)
+					+ (column == InvalidId ? " components" : " columns"));
+			}
+
+			return _builder.emitTyped(spirv::OpCompositeExtract, element,
+				{ object, static_cast<uint32_t>(index.intValue) });
+		}
+
+		if (column != InvalidId) {
+			throw CompileError("only a literal index reaches a matrix's column, since SPIR-V has "
+				"no instruction for a column at an index the shader computes");
+		}
+
+		// A component of a vector at a computed index, which SPIR-V does have an
+		// instruction for. The index is a value here rather than a literal.
+		Id at = emitExpression(index);
+		_builder.setType(at, _uintType);
+
+		return _builder.emitTyped(spirv::OpVectorExtractDynamic, element, { object, at });
 	}
 
 	Id Emitter::fieldOf(const StructDecl& decl, const std::string& name) {
