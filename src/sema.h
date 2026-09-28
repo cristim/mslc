@@ -33,6 +33,14 @@ class TypeTable {
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _samplerType = spirv::InvalidId;
 
+	// A struct's member types and their offsets. Throws for a field whose type
+	// mslc cannot represent.
+	void structMembers(const StructDecl& decl, std::vector<spirv::Id>& outTypes,
+		std::vector<uint32_t>& outOffsets);
+
+	// How many bytes one scalar of a kind occupies.
+	uint32_t fieldTypeSize(ScalarKind kind);
+
 public:
 	TypeTable(spirv::Builder& builder, const TranslationUnit& unit):
 		_builder(builder), _unit(unit) {}
@@ -94,14 +102,6 @@ public:
 	// and what Metal's own layout has to be expressed as. A distinct type from
 	// namedStruct, since the decorations cannot be undone.
 	spirv::Id blockStruct(const std::string& name);
-
-	// A struct's member types and their offsets. Throws for a field whose type
-	// mslc cannot represent.
-	bool structMembers(const StructDecl& decl, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets);
-
-	// How many bytes one scalar of a kind occupies.
-	uint32_t fieldTypeSize(ScalarKind kind);
 
 	// The Block-decorated struct that wraps a buffer's elements, as
 	// { T runtime_array[] }. Vulkan only accepts a struct for a StorageBuffer or

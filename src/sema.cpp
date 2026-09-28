@@ -486,7 +486,7 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 // struct out with every member at the next multiple of its own size, so a
 // float4 member both starts and steps 16 bytes, which is what a float2 field
 // after it has to account for.
-bool TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
+void TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
 	std::vector<uint32_t>& outOffsets) {
 
 	uint32_t offset = 0;
@@ -517,8 +517,6 @@ bool TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
 		outOffsets.push_back(offset);
 		offset += size;
 	}
-
-	return true;
 }
 
 uint32_t TypeTable::fieldTypeSize(ScalarKind kind) {
@@ -1173,7 +1171,7 @@ namespace {
 				spreadScalar(right, rightType, leftType);
 			} else {
 				spreadScalar(left, leftType, rightType);
-				leftType = leftType == rightType ? leftType : _builder.typeOf(left);
+				leftType = rightType;
 			}
 		}
 
@@ -1944,6 +1942,7 @@ namespace {
 		_bindings.clear();
 		_interface.clear();
 		_entryBindings.clear();
+		_outputs.clear();
 		_blockTerminated = false;
 
 		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
