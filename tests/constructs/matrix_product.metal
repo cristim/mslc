@@ -32,3 +32,17 @@ kernel void project(device Composed *composed [[buffer(0)]],
     out[index * 2 + 1] = uniforms.position * uniforms.modelViewProjection;
     composed[index].product = uniforms.modelViewProjection * uniforms.modelViewProjection;
 }
+
+// A matrix rebuilt from its columns, which is the constructor form of the same
+// value: a matrix is built one column at a time, not one scalar at a time, so
+// "float4x4(c0, c1, c2, c3)" is the whole of it.
+kernel void rebuild(device Composed *out [[buffer(0)]],
+                    constant Uniforms &uniforms [[buffer(1)]],
+                    uint index [[thread_position_in_grid]])
+{
+    out[index].product = float4x4(uniforms.modelViewProjection[0],
+        uniforms.modelViewProjection[1],
+        uniforms.modelViewProjection[2],
+        uniforms.modelViewProjection[3]);
+    out[index].scale = 1.0;
+}

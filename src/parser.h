@@ -65,6 +65,12 @@ private:
 	ExpressionPtr parseInitializer();
 	ExpressionPtr parseInitializerList();
 
+	// The arguments between a call's parentheses, up to but not including the
+	// closing one, which the caller consumes so it can name the context. An
+	// empty list is allowed, since a constructor taking nothing is written with
+	// none.
+	std::vector<ExpressionPtr> parseCallArguments();
+
 	// Types
 	Type parseType();
 	bool parseAddressSpace(AddressSpace& space);

@@ -916,6 +916,7 @@ namespace {
 		Id emitCall(const Expression& expression);
 		Id emitSample(const Expression& expression);
 		Id emitCast(const Expression& expression);
+		Id buildComposite(const Type& target, Id toType, const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id convert(Id value, Id fromType, Id toType);
@@ -1349,24 +1350,76 @@ namespace {
 
 	Id Emitter::emitCast(const Expression& expression) {
 		const Type& target = *expression.castType;
-		const Id value = emitExpression(*expression.left);
-		const Id fromType = _builder.typeOf(value);
 		const Id toType = declaredTypeOf(target);
+
+		// Metal spells a cast and a constructor the same way, so the argument
+		// list is what tells them apart: one argument converts, several build.
+		if (expression.arguments.size() != 1) {
+			return buildComposite(target, toType, expression);
+		}
+
+		const Id value = emitExpression(*expression.arguments[0]);
+		const Id fromType = _builder.typeOf(value);
 
 		// A scalar spread across a vector, which is what "float4(0.5)" means:
 		// every component takes the value. Metal spells the same thing with a
 		// constructor rather than a cast, so this is reached from both.
 		if (target.vectorWidth > 1) {
-			if (fromType != _types.scalar(_types.componentKind(toType))) {
-				throw CompileError(std::string("a vector is built from its own component type, "
-					"and this is a ") + (_types.isFloat(fromType) ? "float" : "integer")
-					+ " where the components are a different kind");
-			}
+			// The value is converted to the component type first, which is what
+			// makes "float3(0)" a splat of zero rather than a mistake: the integer
+			// literal widens to a float, as it does for a scalar.
+			const Id component = _types.scalar(_types.componentKind(toType));
+			return spreadScalarTo(convert(value, fromType, component), toType);
+		}
 
-			return spreadScalarTo(value, toType);
+		if (target.isMatrix()) {
+			throw CompileError("a matrix is built from one value per column, so a single value "
+				"cannot be spread across its columns the way one is across a vector's");
 		}
 
 		return convert(value, fromType, toType);
+	}
+
+	// A vector or a matrix built from a list of values: "float4(1, 2, 3, 4)" and
+	// "float4x4(c0, c1, c2, c3)". The values are positional and each is one
+	// element, which is a scalar for a vector and a whole column for a matrix.
+	Id Emitter::buildComposite(const Type& target, Id toType, const Expression& expression) {
+		const bool isMatrix = target.isMatrix();
+		const uint32_t expected = isMatrix ? target.matrixColumns : target.vectorWidth;
+		const Id element = isMatrix
+			? _types.vector(target.scalar, target.matrixRows)
+			: _types.scalar(target.scalar);
+
+		// A vector leaves room for one more value rather than being all of them
+		// at once, which is how "float4(aFloat3, 1.0)" fills the fourth
+		// component. The first argument's own width says whether that is what
+		// was written, so a three-wide vector and a scalar is one form rather
+		// than two, and a count alone does not have to be guessed at.
+		if (!isMatrix && expression.arguments.size() == 2) {
+			const Id first = emitExpression(*expression.arguments[0]);
+			if (_types.vectorWidth(_builder.typeOf(first)) == expected - 1) {
+				const Id last = emitExpression(*expression.arguments[1]);
+				return _builder.emitTyped(spirv::OpCompositeConstruct, toType,
+					{ first, convert(last, _builder.typeOf(last), element) });
+			}
+		}
+
+		if (expression.arguments.size() != expected) {
+			throw CompileError(std::string(scalarKindName(target.scalar))
+				+ (isMatrix ? std::to_string(expected) + "x" + std::to_string(target.matrixRows)
+					: std::to_string(expected))
+				+ " takes " + std::to_string(expected)
+				+ (isMatrix ? " columns" : " values") + ", found "
+				+ std::to_string(expression.arguments.size()));
+		}
+
+		std::vector<uint32_t> operands;
+		for (const ExpressionPtr& argument: expression.arguments) {
+			const Id part = emitExpression(*argument);
+			operands.push_back(convert(part, _builder.typeOf(part), element));
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, operands);
 	}
 
 	Id Emitter::emitUnary(const Expression& expression) {

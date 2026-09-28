@@ -202,7 +202,9 @@ struct Expression {
 	ExpressionPtr left;
 	ExpressionPtr right;
 
-	// Cast target
+	// Cast target. A cast and a constructor are the same expression in Metal:
+	// "float(x)" converts and "float4(1, 2, 3, 4)" builds, and the spelling is
+	// the same, so the arguments decide which it is rather than the keyword.
 	std::optional<Type> castType;
 
 	// Line the expression started on, for diagnostics.

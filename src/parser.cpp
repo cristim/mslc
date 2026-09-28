@@ -119,13 +119,29 @@ namespace {
 		return true;
 	}
 
-	// Whether a name is a matrix type, for a caller that only needs to know
-	// which it is.
-	bool isMatrixTypeName(std::string_view name) {
+	// Reads a name that is a scalar, a vector or a matrix type into a Type, and
+	// says whether it was one. The three spellings differ only in what the name
+	// carries, so the places that accept a type name take this rather than each
+	// working out the shapes for itself.
+	bool parseTypeNameInExpression(std::string_view text, Type& out) {
 		ScalarKind kind;
+		uint32_t width = 0;
+		if (isTypeName(text, kind, width)) {
+			out.scalar = kind;
+			out.vectorWidth = width;
+			return true;
+		}
+
 		uint32_t columns = 0;
 		uint32_t rows = 0;
-		return isMatrixTypeName(name, kind, columns, rows);
+		if (isMatrixTypeName(text, kind, columns, rows)) {
+			out.scalar = kind;
+			out.matrixColumns = columns;
+			out.matrixRows = rows;
+			return true;
+		}
+
+		return false;
 	}
 
 	// Keywords that may appear before a type and are not address spaces.
@@ -452,6 +468,19 @@ ExpressionPtr Parser::parseInitializer() {
 	}
 
 	return parseExpression();
+}
+
+std::vector<ExpressionPtr> Parser::parseCallArguments() {
+	std::vector<ExpressionPtr> arguments;
+
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		arguments.push_back(parseExpression());
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+	}
+
+	return arguments;
 }
 
 ExpressionPtr Parser::parseInitializerList() {
@@ -889,6 +918,20 @@ StatementPtr Parser::parseStatement() {
 
 			if (match(TokenKind::Assign)) {
 				declaration.initializer = parseExpression();
+			} else if (at(TokenKind::LParen)) {
+				// Direct initialisation: "float3 specularTerm(0)", which builds
+				// the value through a constructor rather than converting one. It
+				// is the same expression as "float3(0)" written on the right of
+				// an '=', so it is read as that expression rather than as a
+				// separate form.
+				advance();
+				auto constructed = std::make_unique<Expression>();
+				constructed->kind = ExpressionKind::Cast;
+				constructed->line = line();
+				constructed->castType = declaration.type;
+				constructed->arguments = parseCallArguments();
+				expect(TokenKind::RParen, "to close a constructor's arguments");
+				declaration.initializer = std::move(constructed);
 			}
 
 			expect(TokenKind::Semicolon, "after a declaration");
@@ -1136,12 +1179,7 @@ ExpressionPtr Parser::parsePostfix() {
 			call->kind = ExpressionKind::Call;
 			call->line = expression->line;
 			call->left = std::move(expression);
-			while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
-				call->arguments.push_back(parseExpression());
-				if (!match(TokenKind::Comma)) {
-					break;
-				}
-			}
+			call->arguments = parseCallArguments();
 			expect(TokenKind::RParen, "to close an argument list");
 			expression = std::move(call);
 			continue;
@@ -1187,26 +1225,23 @@ ExpressionPtr Parser::parsePrimary() {
 	if (kind() == TokenKind::Identifier) {
 		std::string_view text = current().text;
 
-		ScalarKind scalarKind;
-		uint32_t vectorWidth = 0;
-		if (isTypeName(text, scalarKind, vectorWidth)) {
-			// A type name in expression position is a cast: float(x), uint3(y).
+		// A type name in expression position is a cast or a constructor: float(x),
+		// uint3(y), float4(1, 2, 3, 4), float4x4(c0, c1, c2, c3). Metal spells
+		// both the same way, so the arguments are what tell them apart, and the
+		// emitter decides from how many there are.
+		if (Type type; parseTypeNameInExpression(text, type)) {
 			const std::string_view name = advance().text;
 
 			if (!at(TokenKind::LParen)) {
 				throw CompileError("expected '(' after cast type \"" + std::string(name) + "\"");
 			}
 
-			Type type;
-			type.scalar = scalarKind;
-			type.vectorWidth = vectorWidth;
-
 			advance();
 			auto expression = std::make_unique<Expression>();
 			expression->kind = ExpressionKind::Cast;
 			expression->line = line();
-			expression->castType = type;
-			expression->left = parseExpression();
+			expression->castType = std::move(type);
+			expression->arguments = parseCallArguments();
 			expect(TokenKind::RParen, "to close a cast");
 			return expression;
 		}
