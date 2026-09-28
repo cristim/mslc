@@ -26,6 +26,7 @@ class TypeTable {
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
+	std::map<spirv::Id, spirv::Id> _sampledImages;
 	std::map<std::vector<spirv::Id>, spirv::Id> _functionTypes;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 
@@ -61,6 +62,16 @@ public:
 	bool isFloat(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
+
+	// The component type an image yields, or ScalarKind::Void when the id is not
+	// an image this table created. A read of a sampled image is a whole texel,
+	// so a float texture's is four components whatever the shader keeps of it.
+	ScalarKind imageComponent(spirv::Id imageType) const;
+
+	// The type combining an image with a sampler, which is what a sample reads
+	// through. Declared once per image type, since a module may declare a
+	// non-aggregate type only once.
+	spirv::Id sampledImageOf(spirv::Id imageType);
 
 	// The sampled image a Metal texture type maps onto: the component type is
 	// the scalar, and the Sampled operand is 1 because a Metal texture is read

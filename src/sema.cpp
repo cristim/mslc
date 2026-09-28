@@ -75,6 +75,46 @@ namespace {
 		return indices;
 	}
 
+	// What a builtin parameter is declared as: the SPIR-V builtin, and the type
+	// it has to be declared with. Vulkan fixes the width of each and rejects it
+	// at any other, so a workgroup or invocation id is three components while a
+	// vertex or instance index is one.
+	struct BuiltinInput {
+		spirv::BuiltInValue builtin;
+		ScalarKind scalar;
+		uint32_t width;
+	};
+
+	BuiltinInput builtinInputFor(ParameterAttributes::Builtin builtin) {
+		switch (builtin) {
+			case ParameterAttributes::Builtin::ThreadPositionInGrid:
+				return { spirv::BuiltIn::GlobalInvocationId, ScalarKind::UInt, 3 };
+			case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
+				return { spirv::BuiltIn::LocalInvocationId, ScalarKind::UInt, 3 };
+			case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
+				return { spirv::BuiltIn::WorkgroupId, ScalarKind::UInt, 3 };
+
+			// VertexIndex rather than VertexId, and InstanceIndex rather than
+			// InstanceId: Vulkan reserves the two with the Id ending for mesh
+			// shaders and rejects them anywhere else.
+			case ParameterAttributes::Builtin::VertexID:
+				return { spirv::BuiltIn::VertexIndex, ScalarKind::UInt, 1 };
+			case ParameterAttributes::Builtin::InstanceID:
+				return { spirv::BuiltIn::InstanceIndex, ScalarKind::UInt, 1 };
+
+			case ParameterAttributes::Builtin::FragCoord:
+				return { spirv::BuiltIn::FragCoord, ScalarKind::Float, 4 };
+			case ParameterAttributes::Builtin::FrontFacing:
+				return { spirv::BuiltIn::FrontFacing, ScalarKind::Bool, 1 };
+
+			case ParameterAttributes::Builtin::Position:
+			case ParameterAttributes::Builtin::None:
+				break;
+		}
+
+		throw CompileError("this builtin is recognised but not lowered yet");
+	}
+
 	// Whether an operator produces a bool rather than its operand's type.
 	bool isComparisonOperator(BinaryOperator op) {
 		switch (op) {
@@ -283,6 +323,27 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 
 	_blockStructs.emplace(elementType, structure);
 	return structure;
+}
+
+ScalarKind TypeTable::imageComponent(spirv::Id imageType) const {
+	for (const auto& [key, id]: _images) {
+		if (id == imageType) {
+			return static_cast<ScalarKind>(key.first);
+		}
+	}
+
+	return ScalarKind::Void;
+}
+
+Id TypeTable::sampledImageOf(Id imageType) {
+	const auto cached = _sampledImages.find(imageType);
+	if (cached != _sampledImages.end()) {
+		return cached->second;
+	}
+
+	const Id id = _builder.emitDecl(spirv::OpTypeSampledImage, { imageType });
+	_sampledImages.emplace(imageType, id);
+	return id;
 }
 
 Id TypeTable::functionType(Id returnType, const std::vector<Id>& parameterTypes) {
@@ -636,6 +697,10 @@ namespace {
 		std::vector<Id> _interface;
 		std::string _entryBindings;
 
+		// Per module: a sampler declared in the shader, which any entry point may
+		// use and so is not among an entry point's own names.
+		std::map<std::string, Binding> _globalBindings;
+
 		// Where the entry point's returned value goes, one entry per output
 		// variable. A returned struct has one output per member, since SPIR-V
 		// will not let a struct mix builtin and location members.
@@ -699,11 +764,14 @@ namespace {
 		Id addressOf(const Expression& expression);
 		const Binding& bindingFor(const Expression& expression);
 		Id readSwizzle(Id vector, const std::string& name);
-		std::vector<uint32_t> swizzleFor(Id vector, const std::string& name);
+		std::vector<uint32_t> swizzleFor(Id vectorType, const std::string& name);
 		void writeSwizzle(const Expression& target, Id value);
 		Id fieldOf(const StructDecl& decl, const std::string& name);
 		bool isStructObject(const Expression& expression) const;
+		const Binding* findBinding(const std::string& name) const;
+		void spreadScalar(Id& value, Id& type, Id vectorType);
 		Id emitCall(const Expression& expression);
+		Id emitSample(const Expression& expression);
 		Id emitCast(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
@@ -888,12 +956,23 @@ namespace {
 			throw CompileError("this expression is not rooted at a name, so it has no storage");
 		}
 
-		const auto it = _bindings.find(current->name);
-		if (it == _bindings.end()) {
-			throw CompileError("\"" + current->name + "\" is not a parameter or local");
+		if (const Binding* binding = findBinding(current->name)) {
+			return *binding;
 		}
 
-		return it->second;
+		throw CompileError("\"" + current->name + "\" is not a parameter or local");
+	}
+
+	// An entry point's own names, then the module's: a sampler declared in the
+	// shader is not a parameter of the entry point that reads it.
+	const Binding* Emitter::findBinding(const std::string& name) const {
+		const auto own = _bindings.find(name);
+		if (own != _bindings.end()) {
+			return &own->second;
+		}
+
+		const auto global = _globalBindings.find(name);
+		return global == _globalBindings.end() ? nullptr : &global->second;
 	}
 
 	// The address a name or a member chain denotes, for a store to write through.
@@ -940,10 +1019,11 @@ namespace {
 	}
 
 	// A swizzle naming a component the vector does not have is a mistake worth
-	// naming, rather than an out-of-range index for the validator to find.
-	std::vector<uint32_t> Emitter::swizzleFor(Id vector, const std::string& name) {
+	// naming, rather than an out-of-range index for the validator to find. Given
+	// the type rather than a value, so that checking a name costs no load.
+	std::vector<uint32_t> Emitter::swizzleFor(Id vectorType, const std::string& name) {
 		const std::vector<uint32_t> indices = *swizzleIndices(name);
-		const uint32_t width = _types.vectorWidth(_builder.typeOf(vector));
+		const uint32_t width = _types.vectorWidth(vectorType);
 
 		for (const uint32_t index: indices) {
 			if (index >= width) {
@@ -957,8 +1037,9 @@ namespace {
 
 	// A component or a set of components of a vector, read as a value.
 	Id Emitter::readSwizzle(Id vector, const std::string& name) {
-		const std::vector<uint32_t> indices = swizzleFor(vector, name);
-		const ScalarKind component = _types.componentKind(_builder.typeOf(vector));
+		const Id type = _builder.typeOf(vector);
+		const std::vector<uint32_t> indices = swizzleFor(type, name);
+		const ScalarKind component = _types.componentKind(type);
 
 		// One component is an extract; several are a shuffle, which takes the
 		// vector twice, once for the components and once for the result.
@@ -981,8 +1062,8 @@ namespace {
 	// the result written back over the whole thing.
 	void Emitter::writeSwizzle(const Expression& target, Id value) {
 		const Id object = addressOf(*target.left);
-		const std::vector<uint32_t> indices = swizzleFor(loadFrom(object,
-			_types.pointeeOf(_builder.typeOf(object))), target.memberName);
+		const Id type = _types.pointeeOf(_builder.typeOf(object));
+		const std::vector<uint32_t> indices = swizzleFor(type, target.memberName);
 
 		if (indices.size() != 1) {
 			throw CompileError("writing \"" + target.memberName + "\" would write "
@@ -990,7 +1071,6 @@ namespace {
 				"assign each component on its own");
 		}
 
-		const Id type = _types.pointeeOf(_builder.typeOf(object));
 		const Id loaded = loadFrom(object, type);
 		// Operand order is the vector, then the component, then its index.
 		const Id inserted = _builder.emitTyped(spirv::OpVectorInsertDynamic, type,
@@ -1009,8 +1089,8 @@ namespace {
 			return false;
 		}
 
-		const auto it = _bindings.find(expression.name);
-		return it != _bindings.end() && it->second.structType != nullptr;
+		const Binding* binding = findBinding(expression.name);
+		return binding && binding->structType != nullptr;
 	}
 
 	Id Emitter::emitMember(const Expression& expression) {
@@ -1064,10 +1144,38 @@ namespace {
 		}
 	}
 
+	// A scalar spread across a vector, which is what a mixed scalar and vector
+	// operation needs: SPIR-V's binary arithmetic has no mixed form, so both
+	// sides have to be the same type. This is what makes "v * 0.5" and
+	// "v + 0.5" mean in Metal what they mean here.
+	void Emitter::spreadScalar(Id& value, Id& type, Id vectorType) {
+		const ScalarKind component = _types.componentKind(vectorType);
+		if (type != _types.scalar(component)) {
+			throw CompileError("this operator mixes a vector of "
+				+ std::to_string(_types.vectorWidth(vectorType)) + " with something that is not "
+				"its own component type, which mslc does not do");
+		}
+
+		const uint32_t width = _types.vectorWidth(vectorType);
+		value = _builder.emitTyped(spirv::OpCompositeConstruct, vectorType,
+			std::vector<uint32_t>(width, value));
+		type = vectorType;
+	}
+
 	Id Emitter::emitBinary(const Expression& expression) {
-		const Id left = emitExpression(*expression.left);
-		const Id right = emitExpression(*expression.right);
-		const Id leftType = _builder.typeOf(left);
+		Id left = emitExpression(*expression.left);
+		Id right = emitExpression(*expression.right);
+		Id leftType = _builder.typeOf(left);
+		Id rightType = _builder.typeOf(right);
+
+		if (leftType != rightType) {
+			if (_types.vectorWidth(leftType) > 1) {
+				spreadScalar(right, rightType, leftType);
+			} else {
+				spreadScalar(left, leftType, rightType);
+				leftType = leftType == rightType ? leftType : _builder.typeOf(left);
+			}
+		}
 
 		const bool isFloat = _types.isFloat(leftType);
 		const bool isSigned = _types.isSignedInt(leftType);
@@ -1078,6 +1186,13 @@ namespace {
 		// type; an arithmetic one yields its operand type.
 		const bool isComparison = !isLogical && leftType != _boolType
 			&& isComparisonOperator(expression.binaryOperator);
+
+		// Neither yields a scalar bool, so a vector operand would need a
+		// comparison per component, which this does not lower.
+		if ((isLogical || isComparison) && _types.vectorWidth(leftType) > 1) {
+			throw CompileError("a vector operand of a comparison or logical operator is not "
+				"lowered yet");
+		}
 
 		if (isLogical || isComparison) {
 			const uint16_t opcode = isLogical
@@ -1093,6 +1208,15 @@ namespace {
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
+		// A texture read. Metal writes it as a method on the texture taking the
+		// sampler as an argument; SPIR-V takes the image and the sampler
+		// separately and combines them into something a read can be made
+		// through.
+		if (expression.left->kind == ExpressionKind::Member
+			&& expression.left->memberName == "sample") {
+			return emitSample(expression);
+		}
+
 		if (expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError("only a direct function call is supported");
 		}
@@ -1120,6 +1244,37 @@ namespace {
 
 		throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
 			"recognises, and user functions are not lowered yet");
+	}
+
+	Id Emitter::emitSample(const Expression& expression) {
+		if (expression.arguments.size() != 2) {
+			throw CompileError("sample takes a sampler and a coordinate, found "
+				+ std::to_string(expression.arguments.size()) + " arguments");
+		}
+
+		const Binding& texture = bindingFor(*expression.left->left);
+		const ScalarKind component = _types.imageComponent(texture.pointeeType);
+		if (component == ScalarKind::Void) {
+			throw CompileError("\"sample\" is a method on a texture, and what it is called on "
+				"is not one");
+		}
+
+		const Binding& sampler = bindingFor(*expression.arguments[0]);
+		if (sampler.pointeeType != _types.sampler()) {
+			throw CompileError("sample's first argument has to be a sampler, and what was given "
+				"is not one");
+		}
+
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage,
+			_types.sampledImageOf(texture.pointeeType),
+			{ loadFrom(texture.id, texture.pointeeType), loadFrom(sampler.id, sampler.pointeeType) });
+
+		// A read of a sampled texture is implicit-LOD, since the stage before
+		// chose the level.
+		const Id coordinate = emitExpression(*expression.arguments[1]);
+
+		return _builder.emitTyped(spirv::OpImageSampleImplicitLod,
+			_types.vector(component, 4), { combined, coordinate });
 	}
 
 	Id Emitter::emitExpression(const Expression& expression) {
@@ -1217,7 +1372,7 @@ namespace {
 			binding.isPointer = true;
 			binding.pointeeType = samplerType;
 			binding.storageClass = spirv::StorageClass::UniformConstant;
-			_bindings[global.name] = binding;
+			_globalBindings[global.name] = binding;
 
 			_moduleBindings += "\t\t{ \"kind\": \"Sampler\", \"descriptor\": { \"set\": "
 				+ std::to_string(kSamplerSet) + ", \"binding\": " + std::to_string(index) + " }"
@@ -1320,31 +1475,19 @@ namespace {
 			const Parameter& parameter = entryPoint.parameters[index];
 
 			if (parameter.attributes.builtin) {
-				const spirv::BuiltInValue spvBuiltin = [&]() {
-					switch (*parameter.attributes.builtin) {
-						case ParameterAttributes::Builtin::ThreadPositionInGrid:
-							return spirv::BuiltIn::GlobalInvocationId;
-						case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
-							return spirv::BuiltIn::LocalInvocationId;
-						case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
-							return spirv::BuiltIn::WorkgroupId;
-						case ParameterAttributes::Builtin::VertexID:
-							return spirv::BuiltIn::VertexId;
-						case ParameterAttributes::Builtin::InstanceID:
-							return spirv::BuiltIn::InstanceId;
-						case ParameterAttributes::Builtin::FragCoord:
-							return spirv::BuiltIn::FragCoord;
-						case ParameterAttributes::Builtin::FrontFacing:
-							return spirv::BuiltIn::FrontFacing;
-						default:
-							throw CompileError("this builtin is recognised but not lowered yet");
-					}
-				}();
+				const BuiltinInput input = builtinInputFor(*parameter.attributes.builtin);
+				const Id typeId = input.width > 1
+					? _types.vector(input.scalar, input.width)
+					: _types.scalar(input.scalar);
 
-				// The SPIR-V builtin is always a vector, but MSL declares it
-				// with the width the shader actually uses, so the width is
-				// recorded and a narrower declaration extracts a component.
-				const Id typeId = _types.vector(ScalarKind::UInt, 3);
+				// A builtin that is one scalar has no component to extract, so a
+				// vector declared for one would be a type the source never asked
+				// for and the body could not use.
+				if (input.width == 1 && !parameter.type.isScalar()) {
+					throw CompileError("parameter \"" + parameter.name + "\" is declared as a "
+						"vector, but the builtin it takes is a single value");
+				}
+
 				_builder.setSection(spirv::Section::TypesGlobals);
 				const Id pointerType = _types.pointer(spirv::StorageClass::Input, typeId);
 				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
@@ -1353,14 +1496,19 @@ namespace {
 				_builder.setSection(spirv::Section::Annotations);
 				_builder.emit(spirv::OpDecorate, { id,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
-					static_cast<uint32_t>(spvBuiltin) });
+					static_cast<uint32_t>(input.builtin) });
 
 				Binding binding;
 				binding.id = id;
 				binding.isPointer = true;
 				binding.pointeeType = typeId;
 				binding.storageClass = spirv::StorageClass::Input;
-				binding.scalarComponentOfVector = parameter.type.isScalar();
+
+				// A three-component builtin declared as a scalar in MSL is that
+				// builtin's first component: "uint index [[thread_position_in_grid]]"
+				// is GlobalInvocationId.x, not the whole vector.
+				binding.scalarComponentOfVector = input.width > 1 && parameter.type.isScalar();
+
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
 				continue;
@@ -1389,6 +1537,7 @@ namespace {
 
 				Binding binding;
 				binding.storageClass = spirv::StorageClass::Input;
+				binding.structType = decl;
 
 				for (const StructField& field: decl->fields) {
 					const Id type = declaredTypeOf(field.type);
