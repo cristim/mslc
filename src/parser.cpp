@@ -426,13 +426,31 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 Type Parser::parseType() {
 	Type type;
 
-	AddressSpace space;
-	if (parseAddressSpace(space)) {
-		type.addressSpace = space;
-	}
+	// MSL writes the address space and the const qualifier in either order, and
+	// both orders are ordinary: "device const float*" and "const device Vertex *"
+	// are the same declaration spelled two ways.
+	while (kind() == TokenKind::Identifier) {
+		const std::string_view text = current().text;
 
-	while (kind() == TokenKind::Identifier && isTypeQualifier(current().text)) {
-		if (current().text == "const") {
+		AddressSpace space;
+		if (parseAddressSpace(space)) {
+			// A second address space is a mistake rather than an alternative
+			// spelling, and which one it meant decides which storage class a
+			// buffer binding lands in, so it is reported rather than resolved.
+			if (type.addressSpace != AddressSpace::None) {
+				throw CompileError("a type has one address space, found \"" + std::string(text)
+					+ "\" after another");
+			}
+
+			type.addressSpace = space;
+			continue;
+		}
+
+		if (!isTypeQualifier(text)) {
+			break;
+		}
+
+		if (text == "const") {
 			type.isConst = true;
 		}
 		advance();
@@ -491,12 +509,10 @@ Parameter Parser::parseParameter() {
 
 	param.type = parseType();
 
-	// "constant BufferClearParams &params" is a reference, which MSL allows in
-	// place of a pointer for constant address space.
-	if (at(TokenKind::Ampersand)) {
-		advance();
-		param.isConstReference = true;
-	}
+	// "constant BufferClearParams &params" and "constant BufferClearParams
+	// *params" name the same buffer and lower to the same descriptor, so a
+	// reference is consumed and nothing more is recorded for it.
+	match(TokenKind::Ampersand);
 
 	if (kind() != TokenKind::Identifier) {
 		throw CompileError("expected a parameter name, found " + std::string(tokenKindName(kind())));
@@ -947,10 +963,12 @@ ExpressionPtr Parser::parsePostfix() {
 			continue;
 		}
 
-		if (at(TokenKind::Dot)) {
-			advance();
+		// "->" reaches a member of what a pointer points at, which for the
+		// emitter is the same member access the pointer itself would give.
+		if (at(TokenKind::Dot) || at(TokenKind::Arrow)) {
+			const std::string op(advance().text);
 			if (kind() != TokenKind::Identifier) {
-				throw CompileError("expected a member name after '.'");
+				throw CompileError("expected a member name after '" + op + "'");
 			}
 			auto member = std::make_unique<Expression>();
 			member->kind = ExpressionKind::Member;

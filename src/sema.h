@@ -25,6 +25,10 @@ class TypeTable {
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
+	std::map<std::string, spirv::Id> _elementStructs;
+	// The size in bytes of each struct, which is the stride an array of that
+	// struct has.
+	std::map<spirv::Id, uint32_t> _structSizes;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
 	std::map<spirv::Id, spirv::Id> _sampledImages;
 	std::map<std::vector<spirv::Id>, spirv::Id> _functionTypes;
@@ -33,10 +37,11 @@ class TypeTable {
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _samplerType = spirv::InvalidId;
 
-	// A struct's member types and their offsets. Throws for a field whose type
-	// mslc cannot represent.
-	void structMembers(const StructDecl& decl, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets);
+	// A struct's member types, where each one starts in a buffer, and the size
+	// of the struct, which is how far an array of it steps. False when the name
+	// is not a struct this source declares.
+	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
+		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
 
 	// How many bytes one scalar of a kind occupies.
 	uint32_t fieldTypeSize(ScalarKind kind);
@@ -96,6 +101,13 @@ public:
 	// It carries no buffer layout, since a value is not laid out in a buffer.
 	// Returns InvalidId when the name is not declared in the unit.
 	spirv::Id namedStruct(const std::string& name);
+
+	// The struct an array of this struct holds. A third form, laid out but not
+	// Block-decorated: Vulkan requires a struct nested inside a Block to be
+	// explicitly laid out, and rejects one that is Block-decorated inside an
+	// array, so neither of the other two forms can be the element. Returns
+	// InvalidId when the name is not declared in the unit.
+	spirv::Id arrayElementStruct(const std::string& name);
 
 	// The same struct as a descriptor payload: Block-decorated with a per-member
 	// Offset, which is what Vulkan requires of a struct behind a buffer binding

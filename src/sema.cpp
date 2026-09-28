@@ -290,8 +290,11 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	// Metal buffer whose size is not known when the shader is compiled.
 	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { elementType });
 
-	// The stride is the element's own size, taken from the scalar width, since
-	// an array of a vector has the vector's size.
+	// The stride is how far apart two elements are, which for a scalar or a
+	// vector is its own size and for a struct is the struct's. Metal rounds a
+	// struct's size up to its alignment, and the largest alignment a member
+	// can carry here is a vector's 16 bytes, so that is what an array of a
+	// smaller struct steps by.
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
@@ -305,6 +308,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 			}
 		}
 		stride = ((width + 7) / 8) * it->second;
+	} else if (const auto it = _structSizes.find(elementType); it != _structSizes.end()) {
+		constexpr uint32_t kMaxAlignment = 16;
+		stride = (it->second + kMaxAlignment - 1) / kMaxAlignment * kMaxAlignment;
 	}
 
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
@@ -482,18 +488,24 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 	return id;
 }
 
-// A struct's member types, and where each one starts in a buffer. Metal lays a
-// struct out with every member at the next multiple of its own size, so a
-// float4 member both starts and steps 16 bytes, which is what a float2 field
-// after it has to account for.
-void TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
-	std::vector<uint32_t>& outOffsets) {
+// A struct's member types, where each one starts in a buffer, and the size of
+// the struct, which is how far an array of it steps. Metal lays a struct out
+// with every member at the next multiple of its own size, so a float4 member
+// both starts and steps 16 bytes, which is what a float2 field after it has to
+// account for.
+bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
+	std::vector<uint32_t>& outOffsets, uint32_t& outSize) {
+
+	const StructDecl* decl = _unit.findStruct(name);
+	if (!decl) {
+		return false;
+	}
 
 	uint32_t offset = 0;
 
-	for (const StructField& field: decl.fields) {
+	for (const StructField& field: decl->fields) {
 		if (!field.type.isPointer && !field.type.namedType.empty()) {
-			throw CompileError("struct \"" + decl.name + "\" has a field whose type is itself "
+			throw CompileError("struct \"" + decl->name + "\" has a field whose type is itself "
 				"a struct, which mslc cannot represent yet (\"" + field.name + "\")");
 		}
 
@@ -508,7 +520,7 @@ void TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
 		}
 
 		if (size == 0) {
-			throw CompileError("struct \"" + decl.name + "\" has a field mslc cannot represent "
+			throw CompileError("struct \"" + decl->name + "\" has a field mslc cannot represent "
 				"yet (\"" + std::string(scalarKindName(field.type.scalar))
 				+ (field.type.isPointer ? "*" : "") + " " + field.name + "\")");
 		}
@@ -517,6 +529,9 @@ void TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
 		outOffsets.push_back(offset);
 		offset += size;
 	}
+
+	outSize = offset;
+	return true;
 }
 
 uint32_t TypeTable::fieldTypeSize(ScalarKind kind) {
@@ -534,14 +549,12 @@ Id TypeTable::namedStruct(const std::string& name) {
 		return cached->second;
 	}
 
-	const StructDecl* decl = _unit.findStruct(name);
-	if (!decl) {
-		return InvalidId;
-	}
-
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	structMembers(*decl, fieldTypes, offsets);
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+		return InvalidId;
+	}
 
 	// Members only. The count is implied by the instruction's word count, and
 	// writing it as an operand would be read as one extra member.
@@ -558,20 +571,50 @@ Id TypeTable::namedStruct(const std::string& name) {
 	return id;
 }
 
+Id TypeTable::arrayElementStruct(const std::string& name) {
+	const auto cached = _elementStructs.find(name);
+	if (cached != _elementStructs.end()) {
+		return cached->second;
+	}
+
+	std::vector<Id> fieldTypes;
+	std::vector<uint32_t> offsets;
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+		return InvalidId;
+	}
+
+	std::vector<uint32_t> operands;
+	for (Id fieldType: fieldTypes) {
+		operands.push_back(fieldType);
+	}
+
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, operands);
+
+	// Laid out, because Vulkan requires a struct nested inside a Block to be,
+	// and not Block-decorated, because a Block inside an array is rejected.
+	for (size_t i = 0; i < fieldTypes.size(); ++i) {
+		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
+			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+	}
+
+	_elementStructs.emplace(name, id);
+	_structSizes.emplace(id, size);
+	return id;
+}
+
 Id TypeTable::blockStruct(const std::string& name) {
 	const auto cached = _structs.find(name);
 	if (cached != _structs.end()) {
 		return cached->second;
 	}
 
-	const StructDecl* decl = _unit.findStruct(name);
-	if (!decl) {
-		return InvalidId;
-	}
-
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	structMembers(*decl, fieldTypes, offsets);
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+		return InvalidId;
+	}
 
 	std::vector<uint32_t> operands;
 	for (Id fieldType: fieldTypes) {
@@ -943,10 +986,12 @@ namespace {
 
 	// The binding an lvalue starts from. A member chain stays in the storage
 	// class of the variable or parameter it is rooted at, so an access chain
-	// along it is typed with that one's storage class.
+	// along it is typed with that one's storage class. An index is part of the
+	// chain rather than the end of it, since a buffer element's member is
+	// reached as "buffer[index].field".
 	const Binding& Emitter::bindingFor(const Expression& expression) {
 		const Expression* current = &expression;
-		while (current->kind == ExpressionKind::Member) {
+		while (current->kind == ExpressionKind::Member || current->kind == ExpressionKind::Index) {
 			current = current->left.get();
 		}
 
@@ -979,6 +1024,12 @@ namespace {
 			return emitMemberAddress(expression);
 		}
 
+		// An element of a pointer, which is how a buffer element's member is
+		// reached: "vertices[vid].color".
+		if (expression.kind == ExpressionKind::Index) {
+			return emitIndex(expression, true);
+		}
+
 		if (expression.kind != ExpressionKind::Identifier) {
 			throw CompileError("this expression cannot be assigned to");
 		}
@@ -987,6 +1038,16 @@ namespace {
 		if (!binding.isPointer) {
 			throw CompileError("\"" + expression.name + "\" is not a place, so it cannot "
 				"be assigned to");
+		}
+
+		// A buffer of values is a wrapper struct holding a runtime array, so the
+		// first element is two steps in: into the member, then into the array at
+		// index zero. Both indices are constants, since a struct may only be
+		// indexed by one.
+		if (binding.isBuffer) {
+			return _builder.emitTyped(spirv::OpAccessChain,
+				_types.pointer(binding.storageClass, binding.pointeeType),
+				{ binding.id, constantU32(0), constantU32(0) });
 		}
 
 		return binding.id;
@@ -1638,30 +1699,37 @@ namespace {
 					"or threadgroup address space to be a buffer binding");
 			}
 
-			Id pointeeType = InvalidId;
-			const StructDecl* structType = nullptr;
+		Id pointeeType = InvalidId;
+		const StructDecl* structType = nullptr;
 
-			if (!parameter.type.namedType.empty()) {
-				pointeeType = _types.blockStruct(parameter.type.namedType);
-				if (pointeeType == InvalidId) {
-					throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
-						"type \"" + parameter.type.namedType + "\"");
-				}
-				structType = _unit.findStruct(parameter.type.namedType);
-			} else {
-				pointeeType = declaredTypeOf(parameter.type);
+		if (!parameter.type.namedType.empty()) {
+			structType = _unit.findStruct(parameter.type.namedType);
+			if (!structType) {
+				throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
+					"type \"" + parameter.type.namedType + "\"");
 			}
 
-			// A pointer parameter is a whole buffer, and Vulkan only accepts a
-			// Block-decorated struct for a descriptor, so the element type is
-			// wrapped in { T runtime_array[] } and the parameter indexes through
-			// that.
-			Id descriptorType = pointeeType;
-			bool isBuffer = false;
-			if (parameter.type.isPointer && structType == nullptr) {
-				descriptorType = _types.blockStructFor(pointeeType);
-				isBuffer = true;
-			}
+			// A pointer to a struct is a buffer of that struct, so its element is
+			// the struct laid out for an array and the wrapper below is what
+			// carries the buffer. A struct reached directly is the buffer itself,
+			// so it is the Block-decorated form.
+			pointeeType = parameter.type.isPointer
+				? _types.arrayElementStruct(parameter.type.namedType)
+				: _types.blockStruct(parameter.type.namedType);
+		} else {
+			pointeeType = declaredTypeOf(parameter.type);
+		}
+
+		// A pointer parameter is a whole buffer, and Vulkan only accepts a
+		// Block-decorated struct for a descriptor, so the element type is
+		// wrapped in { T runtime_array[] } and the parameter indexes through
+		// that.
+		Id descriptorType = pointeeType;
+		bool isBuffer = false;
+		if (parameter.type.isPointer) {
+			descriptorType = _types.blockStructFor(pointeeType);
+			isBuffer = true;
+		}
 
 			_builder.setSection(spirv::Section::TypesGlobals);
 			const Id pointerType = _types.pointer(*storageClass, descriptorType);
