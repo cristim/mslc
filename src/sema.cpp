@@ -891,6 +891,7 @@ namespace {
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		bool emitStore(const Expression& expression);
 
 		// Every expression returns a value id whose type the builder knows.
 		// For an lvalue such as "buffer[index]" the result is a pointer, and
@@ -1160,6 +1161,46 @@ namespace {
 		_builder.setType(at, _uintType);
 
 		return _builder.emitTyped(spirv::OpVectorExtractDynamic, element, { object, at });
+	}
+
+	// A write through a place. An assignment yields an address rather than a
+	// value, so it never goes through emitExpression, and a for loop's increment
+	// is a statement like any other, so it reaches this too rather than the
+	// expression path. Returns false for anything that is not an assignment.
+	bool Emitter::emitStore(const Expression& expression) {
+		if (expression.kind != ExpressionKind::Assign) {
+			return false;
+		}
+
+		// A component of a vector has no address of its own, so a write to one
+		// replaces the component in the vector rather than storing through a
+		// pointer.
+		if (expression.left->kind == ExpressionKind::Member
+			&& !isStructObject(*expression.left->left)
+			&& swizzleIndices(expression.left->memberName)) {
+			const Id object = addressOf(*expression.left->left);
+			writeSwizzleComponent(object, expression.left->memberName,
+				emitExpression(*expression.right));
+			return true;
+		}
+
+		// The target is a place, so it is emitted as an address rather than
+		// loaded. addressOf is what says what a place is: an index chains through
+		// the buffer, a member through the struct, and a name is its own variable.
+		const Id address = addressOf(*expression.left);
+		const Id value = emitExpression(*expression.right);
+
+		// A store's value has the type the address points at, not the type of the
+		// address, so the pointee is what the value is converted to.
+		const Id pointeeType = _types.pointeeOf(_builder.typeOf(address));
+		if (pointeeType == spirv::InvalidId) {
+			throw CompileError("cannot determine what this assignment writes through, "
+				"so the store cannot be typed");
+		}
+
+		_builder.emit(spirv::OpStore, { address,
+			convert(value, _builder.typeOf(value), pointeeType) });
+		return true;
 	}
 
 	Id Emitter::fieldOf(const StructDecl& decl, const std::string& name) {
@@ -2496,47 +2537,7 @@ namespace {
 				return;
 
 			case StatementKind::ExpressionStatement:
-				if (statement.expression) {
-					// An assignment yields an address rather than a value, so it
-					// is handled here rather than through emitExpression.
-					if (statement.expression->kind == ExpressionKind::Assign) {
-						const Expression& assign = *statement.expression;
-
-						// A component of a vector has no address of its own, so a
-						// write to one replaces the component in the vector
-						// rather than storing through a pointer.
-						if (assign.left->kind == ExpressionKind::Member
-							&& !isStructObject(*assign.left->left)
-							&& swizzleIndices(assign.left->memberName)) {
-							const Id object = addressOf(*assign.left->left);
-							writeSwizzleComponent(object, assign.left->memberName,
-								emitExpression(*assign.right));
-							return;
-						}
-
-					// The left side is a place, so it is emitted as an address rather
-					// than loaded. addressOf is what says what a place is: an index
-					// chains through the buffer, a member through the struct, and a
-					// name is its own variable. Emitting the expression instead
-					// would load a plain name and leave nothing to store through.
-					const Id address = addressOf(*assign.left);
-					const Id value = emitExpression(*assign.right);
-
-					// A store's value has the type the address points at, not the type
-					// of the address, so the pointee is what the value is converted
-					// to.
-					const Id pointeeType = _types.pointeeOf(_builder.typeOf(address));
-					if (pointeeType == spirv::InvalidId) {
-						throw CompileError("cannot determine what this assignment writes "
-							"through, so the store cannot be typed");
-					}
-
-
-						_builder.emit(spirv::OpStore, { address,
-							convert(value, _builder.typeOf(value), pointeeType) });
-						return;
-					}
-
+				if (statement.expression && !emitStore(*statement.expression)) {
 					emitExpression(*statement.expression);
 				}
 				return;
@@ -2576,7 +2577,16 @@ namespace {
 				const Id elseLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
+				// A selection is only valid when the header declares the block it
+				// joins, which is what makes the control flow structured rather than
+				// a graph the validator cannot check. The declaration is the second
+				// to last instruction of the header, so it goes before the branch
+				// rather than after it. Zero is the selection control, the
+				// enumerant for "none of it": a shader has no flat shading to
+				// select.
+				_builder.emit(spirv::OpSelectionMerge, { mergeLabel, 0u });
 				emitTerminator(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+
 				emitLabel(thenLabel);
 				emitStatement(*statement.thenBranch);
 				emitTerminator(spirv::OpBranch, { mergeLabel });
@@ -2604,8 +2614,23 @@ namespace {
 				emitTerminator(spirv::OpBranch, { condLabel });
 				emitLabel(condLabel);
 
+				// The loop header declares the block it leaves to and the block the
+				// back edge runs through, again as the second to last instruction.
+				// The continue block is the label the increment runs in, which is
+				// what makes the back edge a continue rather than a branch that
+				// skips it. Zero is the loop control, the enumerant for "none of
+				// it": mslc does not unroll.
+				// The condition is computed before the declaration rather than
+				// after it, since the declaration has to be the second to last
+				// instruction of the header and therefore immediately before the
+				// branch.
+				Id condition = InvalidId;
 				if (statement.forCondition) {
-					const Id condition = emitExpression(*statement.forCondition);
+					condition = emitExpression(*statement.forCondition);
+				}
+
+				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, 0u });
+				if (statement.forCondition) {
 					emitTerminator(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
 				} else {
 					emitTerminator(spirv::OpBranch, { bodyLabel });
@@ -2616,7 +2641,7 @@ namespace {
 				emitTerminator(spirv::OpBranch, { continueLabel });
 
 				emitLabel(continueLabel);
-				if (statement.forIncrement) {
+				if (statement.forIncrement && !emitStore(*statement.forIncrement)) {
 					emitExpression(*statement.forIncrement);
 				}
 				emitTerminator(spirv::OpBranch, { condLabel });
@@ -2628,15 +2653,27 @@ namespace {
 			case StatementKind::While: {
 				const Id condLabel = _builder.nextId();
 				const Id bodyLabel = _builder.nextId();
+				// A while loop needs a continue block of its own even though the
+				// source has nothing to run at the end of an iteration: a loop's
+				// back edge has to run through the block the header declared as
+				// the continue, or the body is not structured.
+				const Id continueLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
 				emitTerminator(spirv::OpBranch, { condLabel });
 				emitLabel(condLabel);
+
 				const Id condition = emitExpression(*statement.whileCondition);
+				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, 0u });
 				emitTerminator(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
+
 				emitLabel(bodyLabel);
 				emitStatement(*statement.whileBody);
+				emitTerminator(spirv::OpBranch, { continueLabel });
+
+				emitLabel(continueLabel);
 				emitTerminator(spirv::OpBranch, { condLabel });
+
 				emitLabel(mergeLabel);
 				return;
 			}
