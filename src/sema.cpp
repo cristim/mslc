@@ -386,7 +386,85 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 	return id;
 }
 
+// A struct's member types, and where each one starts in a buffer. Metal lays a
+// struct out with every member at the next multiple of its own size, so a
+// float4 member both starts and steps 16 bytes, which is what a float2 field
+// after it has to account for.
+bool TypeTable::structMembers(const StructDecl& decl, std::vector<Id>& outTypes,
+	std::vector<uint32_t>& outOffsets) {
+
+	uint32_t offset = 0;
+
+	for (const StructField& field: decl.fields) {
+		if (!field.type.isPointer && !field.type.namedType.empty()) {
+			throw CompileError("struct \"" + decl.name + "\" has a field whose type is itself "
+				"a struct, which mslc cannot represent yet (\"" + field.name + "\")");
+		}
+
+		Id fieldType;
+		uint32_t size;
+		if (field.type.vectorWidth > 1) {
+			fieldType = vector(field.type.scalar, field.type.vectorWidth);
+			size = fieldTypeSize(field.type.scalar) * field.type.vectorWidth;
+		} else {
+			fieldType = scalar(field.type.scalar);
+			size = fieldTypeSize(field.type.scalar);
+		}
+
+		if (size == 0) {
+			throw CompileError("struct \"" + decl.name + "\" has a field mslc cannot represent "
+				"yet (\"" + std::string(scalarKindName(field.type.scalar))
+				+ (field.type.isPointer ? "*" : "") + " " + field.name + "\")");
+		}
+
+		outTypes.push_back(fieldType);
+		outOffsets.push_back(offset);
+		offset += size;
+	}
+
+	return true;
+}
+
+uint32_t TypeTable::fieldTypeSize(ScalarKind kind) {
+	const ScalarMapping mapping = mappingFor(kind);
+	if (!mapping.supported) {
+		throw CompileError(std::string("type ") + scalarKindName(kind) + " has no SPIR-V mapping");
+	}
+
+	return mapping.width / 8;
+}
+
 Id TypeTable::namedStruct(const std::string& name) {
+	const auto cached = _valueStructs.find(name);
+	if (cached != _valueStructs.end()) {
+		return cached->second;
+	}
+
+	const StructDecl* decl = _unit.findStruct(name);
+	if (!decl) {
+		return InvalidId;
+	}
+
+	std::vector<Id> fieldTypes;
+	std::vector<uint32_t> offsets;
+	structMembers(*decl, fieldTypes, offsets);
+
+	// Members only. The count is implied by the instruction's word count, and
+	// writing it as an operand would be read as one extra member.
+	std::vector<uint32_t> operands;
+	for (Id fieldType: fieldTypes) {
+		operands.push_back(fieldType);
+	}
+
+	// No Block and no member offsets: that is the layout of a buffer, and a
+	// struct used as a value is laid out by the function it is declared in.
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, operands);
+
+	_valueStructs.emplace(name, id);
+	return id;
+}
+
+Id TypeTable::blockStruct(const std::string& name) {
 	const auto cached = _structs.find(name);
 	if (cached != _structs.end()) {
 		return cached->second;
@@ -399,28 +477,8 @@ Id TypeTable::namedStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	uint32_t offset = 0;
+	structMembers(*decl, fieldTypes, offsets);
 
-	for (const StructField& field: decl->fields) {
-		if (!field.type.isScalar() || !field.type.namedType.empty()) {
-			throw CompileError("struct \"" + name + "\" has a field mslc cannot represent yet ("
-				+ std::string(scalarKindName(field.type.scalar))
-				+ (field.type.isPointer ? "*" : "")
-				+ (field.type.isConst ? " const" : "")
-				+ " " + field.name + ")");
-		}
-
-		const Id fieldType = scalar(field.type.scalar);
-		const uint32_t size = mappingFor(field.type.scalar).width / 8;
-
-		fieldTypes.push_back(fieldType);
-		offsets.push_back(offset);
-		offset += size;
-	}
-
-
-	// Members only. The count is implied by the instruction's word count, and
-	// writing it as an operand would be read as one extra member.
 	std::vector<uint32_t> operands;
 	for (Id fieldType: fieldTypes) {
 		operands.push_back(fieldType);
@@ -429,8 +487,8 @@ Id TypeTable::namedStruct(const std::string& name) {
 	const Id id = _builder.emitDecl(spirv::OpTypeStruct, operands);
 
 	// A struct reached through a buffer binding is an interface block, so it
-	// needs Block and per-member Offset. std140 rules apply, which for the
-	// scalar members in the corpus is just their natural size and alignment.
+	// needs Block and a per-member Offset, which is what tells the runtime
+	// where each field sits in the buffer Metal laid out.
 	_builder.emit(spirv::OpDecorate, { id, static_cast<uint32_t>(spirv::Decoration::Block) });
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
@@ -592,6 +650,15 @@ namespace {
 	}
 
 	Id Emitter::declaredTypeOf(const Type& type) {
+		if (!type.namedType.empty()) {
+			const Id id = _types.namedStruct(type.namedType);
+			if (id == InvalidId) {
+				throw CompileError("\"" + type.namedType + "\" is not a type this source declares");
+			}
+
+			return id;
+		}
+
 		if (type.vectorWidth > 1) {
 			return _types.vector(type.scalar, type.vectorWidth);
 		}
@@ -1081,7 +1148,7 @@ namespace {
 			const StructDecl* structType = nullptr;
 
 			if (!parameter.type.namedType.empty()) {
-				pointeeType = _types.namedStruct(parameter.type.namedType);
+				pointeeType = _types.blockStruct(parameter.type.namedType);
 				if (pointeeType == InvalidId) {
 					throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
 						"type \"" + parameter.type.namedType + "\"");

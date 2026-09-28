@@ -24,6 +24,7 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfVector;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
+	std::map<std::string, spirv::Id> _valueStructs;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
 	std::map<std::vector<spirv::Id>, spirv::Id> _functionTypes;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
@@ -67,9 +68,24 @@ public:
 	// same signature shares one.
 	spirv::Id functionType(spirv::Id returnType, const std::vector<spirv::Id>& parameterTypes);
 
-	// A struct by name. Returns InvalidId when the name is not declared in the
-	// unit.
+	// A struct by name, as a value: a local or the contents of another struct.
+	// It carries no buffer layout, since a value is not laid out in a buffer.
+	// Returns InvalidId when the name is not declared in the unit.
 	spirv::Id namedStruct(const std::string& name);
+
+	// The same struct as a descriptor payload: Block-decorated with a per-member
+	// Offset, which is what Vulkan requires of a struct behind a buffer binding
+	// and what Metal's own layout has to be expressed as. A distinct type from
+	// namedStruct, since the decorations cannot be undone.
+	spirv::Id blockStruct(const std::string& name);
+
+	// A struct's member types and their offsets. Throws for a field whose type
+	// mslc cannot represent.
+	bool structMembers(const StructDecl& decl, std::vector<spirv::Id>& outTypes,
+		std::vector<uint32_t>& outOffsets);
+
+	// How many bytes one scalar of a kind occupies.
+	uint32_t fieldTypeSize(ScalarKind kind);
 
 	// The Block-decorated struct that wraps a buffer's elements, as
 	// { T runtime_array[] }. Vulkan only accepts a struct for a StorageBuffer or
