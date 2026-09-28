@@ -1323,8 +1323,11 @@ namespace {
 		std::vector<const Parameter*> bound;
 
 		for (const Parameter& parameter: entryPoint.parameters) {
+			// A stage interface is not a resource, so it takes no binding index
+			// of its own any more than a builtin does.
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
-				|| parameter.attributes.samplerIndex || parameter.attributes.builtin) {
+				|| parameter.attributes.samplerIndex || parameter.attributes.builtin
+				|| parameter.attributes.stageIn) {
 				continue;
 			}
 
