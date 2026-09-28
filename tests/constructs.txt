@@ -20,3 +20,4 @@ constructs/scalar_promotion.metal expect=valid
 constructs/builtin_math.metal expect=valid
 constructs/sampler_parameter.metal expect=valid
 constructs/vertex_stage_in.metal expect=valid
+constructs/cube_texture.metal expect=valid
