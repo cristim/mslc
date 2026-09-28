@@ -186,6 +186,17 @@ void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	_valueTypes[resultId] = resultType;
 }
 
+void Builder::emitDeclAt(uint16_t opcode, Id resultId, std::vector<uint32_t> operands) {
+	const Section section = pickSection(opcode, operands);
+
+	operands.insert(operands.begin(), resultId);
+
+	Instruction instruction;
+	instruction.opcode = opcode;
+	instruction.words = std::move(operands);
+	_sections[section].push_back(std::move(instruction));
+}
+
 Id Builder::typeOf(Id value) const {
 	auto it = _valueTypes.find(value);
 	return it == _valueTypes.end() ? InvalidId : it->second;

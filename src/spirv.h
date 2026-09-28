@@ -107,6 +107,12 @@ public:
 	void emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 		std::vector<uint32_t> operands);
 
+	// As emitDecl, but with a result id the caller already allocated. An
+	// OpLabel needs this: a branch names the label it jumps to before the label
+	// itself is emitted. A label has no result type, so unlike the form above
+	// this takes none.
+	void emitDeclAt(uint16_t opcode, Id resultId, std::vector<uint32_t> operands);
+
 	// The recorded type of a value, or InvalidId when the id is unknown.
 	Id typeOf(Id value) const;
 

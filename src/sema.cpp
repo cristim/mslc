@@ -595,6 +595,23 @@ namespace {
 		std::vector<Id> _interface;
 		std::string _entryBindings;
 
+		// Where the entry point's returned value goes, one entry per output
+		// variable. A returned struct has one output per member, since SPIR-V
+		// will not let a struct mix builtin and location members.
+		struct Output {
+			Id variable = InvalidId;
+			Id type = InvalidId;
+			// The member of the returned struct this output takes, or -1 when the
+			// whole value is the output.
+			int member = -1;
+		};
+		std::vector<Output> _outputs;
+
+		// Whether the block being emitted already has a terminator. A block
+		// ends at its terminator, so anything after one belongs to no block at
+		// all until a label opens the next.
+		bool _blockTerminated = false;
+
 		// Per module: the scalar types and the GLSL set are named once however
 		// many entry points refer to them.
 		Id _uintType = InvalidId;
@@ -619,8 +636,11 @@ namespace {
 	private:
 		Id constantU32(uint32_t value);
 		Id declaredTypeOf(const Type& type);
+		void emitLabel(Id id);
+		void emitTerminator(uint16_t opcode, std::vector<uint32_t> operands);
 		void declareGlobals();
 		void declareParameters(const FunctionDecl& entryPoint);
+		std::vector<Output> declareOutputs(const FunctionDecl& entryPoint);
 		EmittedEntryPoint emitEntryPoint(const FunctionDecl& entryPoint);
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
@@ -641,6 +661,20 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id convert(Id value, Id fromType, Id toType);
 	};
+
+	void Emitter::emitLabel(Id id) {
+		// With the id the caller allocated rather than one the builder picks, so
+		// a branch can be emitted naming a label that does not exist yet.
+		_builder.emitDeclAt(spirv::OpLabel, id, { });
+		_blockTerminated = false;
+	}
+
+	// A block ends at its terminator, which is tracked so a body that already
+	// returned is not given a second, unreachable one after it.
+	void Emitter::emitTerminator(uint16_t opcode, std::vector<uint32_t> operands) {
+		_builder.emit(opcode, std::move(operands));
+		_blockTerminated = true;
+	}
 
 	// No setSection here: OpConstant is routed to the types block by the
 	// builder, and moving the current section would strand the caller's next
@@ -1027,6 +1061,91 @@ namespace {
 		}
 	}
 
+	// A Metal entry point returns what it produces; a Vulkan one has no return
+	// value and writes to an output variable instead, which the pipeline reads.
+	// A returned struct becomes one output variable per member, each placed by
+	// the attribute on that member, since that is the interface the struct
+	// describes. Anything else becomes a single output.
+	std::vector<Emitter::Output> Emitter::declareOutputs(const FunctionDecl& entryPoint) {
+		std::vector<Output> outputs;
+		const Type& returnType = entryPoint.returnType;
+
+		if (returnType.isVoid()) {
+			return outputs;
+		}
+
+		if (returnType.isSampler || returnType.textureDim != TextureDim::None
+			|| returnType.isPointer) {
+			throw CompileError("\"" + entryPoint.name + "\" returns a resource, which is not "
+				"an output");
+		}
+
+		// The location an output without an attribute of its own takes. Counted
+		// rather than fixed at zero so a source with more than one gets distinct
+		// locations.
+		uint32_t nextLocation = 0;
+
+		if (returnType.namedType.empty()) {
+			const Id type = declaredTypeOf(returnType);
+
+			_builder.setSection(spirv::Section::TypesGlobals);
+			const Id pointerType = _types.pointer(spirv::StorageClass::Output, type);
+			const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+				{ static_cast<uint32_t>(spirv::StorageClass::Output) });
+
+			_builder.setSection(spirv::Section::Annotations);
+			_builder.emit(spirv::OpDecorate, { id,
+				static_cast<uint32_t>(spirv::Decoration::Location), nextLocation++ });
+
+			_interface.push_back(id);
+
+			Output output;
+			output.variable = id;
+			output.type = type;
+			outputs.push_back(output);
+			return outputs;
+		}
+
+		const StructDecl* decl = _unit.findStruct(returnType.namedType);
+		if (!decl) {
+			throw CompileError("\"" + entryPoint.name + "\" returns \""
+				+ returnType.namedType + "\", which is not a struct this source declares");
+		}
+
+		for (const StructField& field: decl->fields) {
+			const Id type = declaredTypeOf(field.type);
+
+			_builder.setSection(spirv::Section::TypesGlobals);
+			const Id pointerType = _types.pointer(spirv::StorageClass::Output, type);
+			const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+				{ static_cast<uint32_t>(spirv::StorageClass::Output) });
+
+			_builder.setSection(spirv::Section::Annotations);
+			if (field.attributes.position) {
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::Position) });
+			} else if (field.attributes.attributeIndex) {
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::Location), *field.attributes.attributeIndex });
+			} else {
+				throw CompileError("field \"" + field.name + "\" of the struct \"" + decl->name
+					+ "\" that \"" + entryPoint.name + "\" returns has no [[position]] or "
+					"[[attribute(n)]], so mslc cannot say where it goes");
+			}
+
+			_interface.push_back(id);
+
+			Output output;
+			output.variable = id;
+			output.type = type;
+			output.member = static_cast<int>(&field - decl->fields.data());
+			outputs.push_back(output);
+		}
+
+		return outputs;
+	}
+
 	void Emitter::declareParameters(const FunctionDecl& entryPoint) {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(entryPoint);
 
@@ -1292,10 +1411,27 @@ namespace {
 
 			case StatementKind::Return:
 				if (statement.expression) {
-					_builder.emit(spirv::OpReturnValue, { emitExpression(*statement.expression) });
-				} else {
-					_builder.emit(spirv::OpReturn, { });
+					// The value an entry point returns is written to its outputs,
+					// since it has no return value of its own. A returned struct
+					// supplies one member per output.
+					const Id value = emitExpression(*statement.expression);
+					for (const Output& output: _outputs) {
+						const Id member = output.member < 0
+							? value
+							: _builder.emitTyped(spirv::OpCompositeExtract, output.type,
+								{ value, static_cast<uint32_t>(output.member) });
+
+						_builder.emit(spirv::OpStore, { output.variable,
+							convert(member, _builder.typeOf(member), output.type) });
+					}
+
+					if (_outputs.empty()) {
+						throw CompileError("a return with a value needs an entry point that "
+							"returns one");
+					}
 				}
+
+				emitTerminator(spirv::OpReturn, { });
 				return;
 
 			case StatementKind::If: {
@@ -1304,16 +1440,16 @@ namespace {
 				const Id elseLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
-				_builder.emit(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
-				_builder.emitDecl(spirv::OpLabel, { thenLabel });
+				emitTerminator(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+				emitLabel(thenLabel);
 				emitStatement(*statement.thenBranch);
-				_builder.emit(spirv::OpBranch, { mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { elseLabel });
+				emitTerminator(spirv::OpBranch, { mergeLabel });
+				emitLabel(elseLabel);
 				if (statement.elseBranch) {
 					emitStatement(*statement.elseBranch);
 				}
-				_builder.emit(spirv::OpBranch, { mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
+				emitTerminator(spirv::OpBranch, { mergeLabel });
+				emitLabel(mergeLabel);
 				return;
 			}
 
@@ -1329,27 +1465,27 @@ namespace {
 				const Id continueLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { condLabel });
+				emitTerminator(spirv::OpBranch, { condLabel });
+				emitLabel(condLabel);
 
 				if (statement.forCondition) {
 					const Id condition = emitExpression(*statement.forCondition);
-					_builder.emit(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
+					emitTerminator(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
 				} else {
-					_builder.emit(spirv::OpBranch, { bodyLabel });
+					emitTerminator(spirv::OpBranch, { bodyLabel });
 				}
 
-				_builder.emitDecl(spirv::OpLabel, { bodyLabel });
+				emitLabel(bodyLabel);
 				emitStatement(*statement.forBody);
-				_builder.emit(spirv::OpBranch, { continueLabel });
+				emitTerminator(spirv::OpBranch, { continueLabel });
 
-				_builder.emitDecl(spirv::OpLabel, { continueLabel });
+				emitLabel(continueLabel);
 				if (statement.forIncrement) {
 					emitExpression(*statement.forIncrement);
 				}
-				_builder.emit(spirv::OpBranch, { condLabel });
+				emitTerminator(spirv::OpBranch, { condLabel });
 
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
+				emitLabel(mergeLabel);
 				return;
 			}
 
@@ -1358,14 +1494,14 @@ namespace {
 				const Id bodyLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { condLabel });
+				emitTerminator(spirv::OpBranch, { condLabel });
+				emitLabel(condLabel);
 				const Id condition = emitExpression(*statement.whileCondition);
-				_builder.emit(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { bodyLabel });
+				emitTerminator(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
+				emitLabel(bodyLabel);
 				emitStatement(*statement.whileBody);
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
+				emitTerminator(spirv::OpBranch, { condLabel });
+				emitLabel(mergeLabel);
 				return;
 			}
 
@@ -1414,11 +1550,7 @@ namespace {
 		_bindings.clear();
 		_interface.clear();
 		_entryBindings.clear();
-
-		if (!entryPoint.returnType.isVoid()) {
-			throw CompileError("an entry point returning a value is not lowered yet (\""
-				+ entryPoint.name + "\")");
-		}
+		_blockTerminated = false;
 
 		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
 		if (entryPoint.stage == Stage::Vertex) {
@@ -1428,6 +1560,7 @@ namespace {
 		}
 
 		declareParameters(entryPoint);
+		_outputs = declareOutputs(entryPoint);
 
 		// The entry point's own id has to exist before it is named in
 		// OpEntryPoint, so it is allocated here rather than after.
@@ -1469,9 +1602,15 @@ namespace {
 		// is written explicitly rather than taken from the emit's return.
 		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, entryPointId,
 			{ _intType, functionType });
-		_builder.emitDecl(spirv::OpLabel, { });
+		emitLabel(_builder.nextId());
 		emitFunctionBody(*entryPoint.body);
-		_builder.emit(spirv::OpReturn, { });
+
+		// A body that returns on every path has already ended the block, and a
+		// terminator after one belongs to no block at all.
+		if (!_blockTerminated) {
+			emitTerminator(spirv::OpReturn, { });
+		}
+
 		_builder.emit(spirv::OpFunctionEnd, { });
 
 		EmittedEntryPoint result;
