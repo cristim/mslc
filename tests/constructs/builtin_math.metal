@@ -38,18 +38,27 @@ kernel void builtin_math(device Composed *out [[buffer(0)]],
 
     // saturate on a vector and on a scalar: the bounds have to take the operand's
     // own shape, since FClamp requires all three operands to have the result
-    // type.
+    // type. The scalar is a third rather than a zero or a one, and it scales the
+    // vector's own result, so a wrong bound on either shows up in the output
+    // rather than being multiplied away.
     float4 clamped = saturate(v * 4.0);
-    float scalarClamp = saturate(v.x * 4.0);
+    float scalarClamp = saturate(v.z * 0.4);
 
     // reflect(I, N) is I - 2 * dot(N, I) * N, and refract(I, N, eta) is the
-    // transmitted vector; the incident and the normal are in that order.
-    float4 reflected = reflect(v, normal);
-    float4 refracted = refract(v, normal, 0.5);
+    // transmitted vector; the incident and the normal are in that order, and the
+    // two are not interchangeable, so the normal here is not the direction of
+    // the incident. A normal parallel to the incident would make reflect(I, N)
+    // and reflect(N, I) the same value and hide a swapped pair.
+    float4 surface = normalize(values[1]);
+    float4 reflected = reflect(v, surface);
+    float4 refracted = refract(v, surface, 0.5);
 
     float4 smallest = min(v, values[1]);
     float4 largest = max(v, values[1]);
-    float4 powered = pow(v, values[1]);
+    // The base is squared first because pow is undefined for a negative base in
+    // GLSL.std.450: a host and a GPU may legitimately answer differently, so an
+    // input that makes the result undefined cannot test the instruction.
+    float4 powered = pow(v * v, values[1]);
     float dotted = dot(v, values[1]);
 
     out[index].normalized = normal;
