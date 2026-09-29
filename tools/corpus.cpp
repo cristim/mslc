@@ -34,19 +34,34 @@ namespace {
 		return true;
 	}
 
-	// A relative manifest entry names a file next to the manifest, not one
-	// relative to whatever directory the runner happens to be started from.
-	std::string resolve(const std::string& manifestPath, const std::string& entry) {
-		if (entry.empty() || entry[0] == '/') {
+	// A relative manifest entry names a file under root (the manifest's own
+	// directory unless --root says otherwise), never one relative to whatever
+	// directory the runner happens to be started from.
+	std::string resolve(const std::string& root, const std::string& entry) {
+		if (entry.empty() || entry[0] == '/' || root.empty()) {
 			return entry;
 		}
 
-		const size_t slash = manifestPath.find_last_of('/');
-		return slash == std::string::npos ? entry : manifestPath.substr(0, slash + 1) + entry;
+		return root + "/" + entry;
 	}
 
-	bool validateWithSpirvVal(const std::string& spvPath, std::string& detail) {
-		const std::string command = "spirv-val --target-env vulkan1.2 " + spvPath
+	// Single-quotes an argument for /bin/sh, so paths with spaces survive
+	// popen() and system().
+	std::string shellQuote(const std::string& arg) {
+		std::string quoted = "'";
+		for (const char c : arg) {
+			if (c == '\'') {
+				quoted += "'\\''";
+			} else {
+				quoted += c;
+			}
+		}
+
+		return quoted + "'";
+	}
+
+	bool validateWithSpirvVal(const std::string& spirvVal, const std::string& spvPath, std::string& detail) {
+		const std::string command = shellQuote(spirvVal) + " --target-env vulkan1.3 " + shellQuote(spvPath)
 			+ " 2>&1 >/dev/null";
 		FILE* pipe = popen(command.c_str(), "r");
 		if (!pipe) {
@@ -70,7 +85,7 @@ namespace {
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
-		std::fprintf(stderr, "usage: mslc-corpus <manifest> [--keep-output <dir>]\n");
+		std::fprintf(stderr, "usage: mslc-corpus <manifest> [--root <dir>] [--spirv-val <path>] [--keep-output <dir>]\n");
 		return 2;
 	}
 
@@ -81,6 +96,27 @@ int main(int argc, char** argv) {
 	const char* tmpdir = std::getenv("TMPDIR");
 	std::string outputDirectory = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/mslc-corpus";
 
+	const size_t manifestSlash = manifestPath.find_last_of('/');
+	std::string root = manifestSlash == std::string::npos ? "" : manifestPath.substr(0, manifestSlash);
+	std::string spirvVal = "spirv-val";
+
+	for (int i = 2; i + 1 < argc; ++i) {
+		if (std::strcmp(argv[i], "--keep-output") == 0) {
+			outputDirectory = argv[++i];
+		} else if (std::strcmp(argv[i], "--root") == 0) {
+			root = argv[++i];
+		} else if (std::strcmp(argv[i], "--spirv-val") == 0) {
+			spirvVal = argv[++i];
+		}
+	}
+
+	// A missing validator must fail the run rather than let "not checked"
+	// read as either a compiler regression or a pass.
+	if (std::system((shellQuote(spirvVal) + " --version >/dev/null 2>&1").c_str()) != 0) {
+		std::fprintf(stderr, "mslc-corpus: cannot run \"%s\"; install SPIRV-Tools\n", spirvVal.c_str());
+		return 2;
+	}
+
 	// Without this a missing directory turns every shader into "INVALID", which
 	// reads like a compiler regression rather than a missing scratch dir.
 	std::error_code ec;
@@ -88,12 +124,6 @@ int main(int argc, char** argv) {
 	if (ec) {
 		std::fprintf(stderr, "mslc-corpus: cannot create %s: %s\n", outputDirectory.c_str(), ec.message().c_str());
 		return 2;
-	}
-
-	for (int i = 2; i + 1 < argc; ++i) {
-		if (std::strcmp(argv[i], "--keep-output") == 0) {
-			outputDirectory = argv[i + 1];
-		}
 	}
 
 	std::ifstream manifest(manifestPath);
@@ -110,7 +140,7 @@ int main(int argc, char** argv) {
 		}
 
 		Result result;
-		result.path = resolve(manifestPath, line);
+		result.path = resolve(root, line);
 
 		std::string source;
 		if (!readFile(result.path, source)) {
@@ -151,7 +181,7 @@ int main(int argc, char** argv) {
 			std::fclose(out);
 
 			std::string detail;
-			result.valid = validateWithSpirvVal(spvPath, detail);
+			result.valid = validateWithSpirvVal(spirvVal, spvPath, detail);
 			if (!result.valid) {
 				result.diagnostic = detail;
 			}
@@ -184,6 +214,12 @@ int main(int argc, char** argv) {
 
 	std::printf("\n%zu of %zu compile, %zu of %zu reach spirv-val-valid SPIR-V\n",
 		compiled, results.size(), valid, results.size());
+
+	// An empty manifest would otherwise pass as "0 of 0 valid".
+	if (results.empty()) {
+		std::fprintf(stderr, "mslc-corpus: %s lists no shaders\n", manifestPath.c_str());
+		return 1;
+	}
 
 	return valid == results.size() ? 0 : 1;
 }
