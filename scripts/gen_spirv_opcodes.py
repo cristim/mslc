@@ -75,6 +75,10 @@ def main():
         "BuiltIn": "BuiltIn",
         "Capability": "Capability",
         "ExecutionModel": "ExecutionModel",
+        "ExecutionMode": "ExecutionMode",
+        "FunctionControl": "FunctionControl",
+        "SelectionControl": "SelectionControl",
+        "LoopControl": "LoopControl",
         "AddressingModel": "AddressingModel",
         "MemoryModel": "MemoryModel",
         "Dim": "Dim",
@@ -94,6 +98,21 @@ def main():
         if not enumerants:
             continue
 
+        # A mask category spells its values as hex literals ("0x0004"), while an
+        # enumeration category uses a plain number. Both are emitted verbatim so
+        # the header reads like the grammar, and so a mask keeps the None = 0 the
+        # emitter needs by name.
+        def render(enumerant):
+            value = enumerant["value"]
+            return value if isinstance(value, str) else str(value)
+
+        # Sorting has to be numeric, not lexical. The hex literals are not
+        # uniformly padded, so "0x20000" sorts after "0x10000000" as text and
+        # the enum comes out in the wrong order.
+        def order(enumerant):
+            value = enumerant["value"]
+            return int(value, 16) if isinstance(value, str) else value
+
         # Each category becomes its own namespace rather than a bare enum,
         # because the specification reuses names across categories: Uniform is
         # both a storage class and a decoration, Kernel is both an execution
@@ -101,7 +120,7 @@ def main():
         # spirv::StorageClass::Uniform spelling without redeclaration errors.
         lines.append("namespace %s {" % enum_name)
         lines.append("\tenum Value : uint32_t {")
-        for enumerant in sorted(enumerants, key=lambda e: e["value"]):
+        for enumerant in sorted(enumerants, key=order):
             if "aliases" in enumerant and enumerant["value"] == 0:
                 # Skip the leading "None = 0" placeholder several categories
                 # carry, since the emitter never references it.
@@ -109,7 +128,8 @@ def main():
             comment = ""
             if enumerant.get("capabilities"):
                 comment = "  // requires %s" % ", ".join(enumerant["capabilities"])
-            lines.append("\t\t%s = %d,%s" % (sanitise(enumerant["enumerant"], enum_name), enumerant["value"], comment))
+            lines.append("\t\t%s = %s,%s" % (sanitise(enumerant["enumerant"], enum_name),
+                render(enumerant), comment))
         lines.append("\t};")
         lines.append("}")
         lines.append("")

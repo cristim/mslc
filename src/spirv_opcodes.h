@@ -1557,6 +1557,165 @@ namespace ExecutionModel {
 
 using ExecutionModelValue = ExecutionModel::Value;
 
+namespace ExecutionMode {
+	enum Value : uint32_t {
+		Invocations = 0,  // requires Geometry
+		SpacingEqual = 1,  // requires Tessellation
+		SpacingFractionalEven = 2,  // requires Tessellation
+		SpacingFractionalOdd = 3,  // requires Tessellation
+		VertexOrderCw = 4,  // requires Tessellation
+		VertexOrderCcw = 5,  // requires Tessellation
+		PixelCenterInteger = 6,  // requires Shader
+		OriginUpperLeft = 7,  // requires Shader
+		OriginLowerLeft = 8,  // requires Shader
+		EarlyFragmentTests = 9,  // requires Shader
+		PointMode = 10,  // requires Tessellation
+		Xfb = 11,  // requires TransformFeedback
+		DepthReplacing = 12,  // requires Shader
+		DepthGreater = 14,  // requires Shader
+		DepthLess = 15,  // requires Shader
+		DepthUnchanged = 16,  // requires Shader
+		LocalSize = 17,
+		LocalSizeHint = 18,  // requires Kernel
+		InputPoints = 19,  // requires Geometry
+		InputLines = 20,  // requires Geometry
+		InputLinesAdjacency = 21,  // requires Geometry
+		Triangles = 22,  // requires Geometry, Tessellation
+		InputTrianglesAdjacency = 23,  // requires Geometry
+		Quads = 24,  // requires Tessellation
+		Isolines = 25,  // requires Tessellation
+		OutputVertices = 26,  // requires Geometry, Tessellation, MeshShadingNV, MeshShadingEXT
+		OutputPoints = 27,  // requires Geometry, MeshShadingNV, MeshShadingEXT
+		OutputLineStrip = 28,  // requires Geometry
+		OutputTriangleStrip = 29,  // requires Geometry
+		VecTypeHint = 30,  // requires Kernel
+		ContractionOff = 31,  // requires Kernel
+		Initializer = 33,  // requires Kernel
+		Finalizer = 34,  // requires Kernel
+		SubgroupSize = 35,  // requires SubgroupDispatch
+		SubgroupsPerWorkgroup = 36,  // requires SubgroupDispatch
+		SubgroupsPerWorkgroupId = 37,  // requires SubgroupDispatch
+		LocalSizeId = 38,
+		LocalSizeHintId = 39,  // requires Kernel
+		NonCoherentColorAttachmentReadEXT = 4169,  // requires TileImageColorReadAccessEXT
+		NonCoherentDepthAttachmentReadEXT = 4170,  // requires TileImageDepthReadAccessEXT
+		NonCoherentStencilAttachmentReadEXT = 4171,  // requires TileImageStencilReadAccessEXT
+		SubgroupUniformControlFlowKHR = 4421,  // requires Shader
+		PostDepthCoverage = 4446,  // requires SampleMaskPostDepthCoverage
+		DenormPreserve = 4459,  // requires DenormPreserve
+		DenormFlushToZero = 4460,  // requires DenormFlushToZero
+		SignedZeroInfNanPreserve = 4461,  // requires SignedZeroInfNanPreserve
+		RoundingModeRTE = 4462,  // requires RoundingModeRTE
+		RoundingModeRTZ = 4463,  // requires RoundingModeRTZ
+		NonCoherentTileAttachmentReadQCOM = 4489,  // requires TileShadingQCOM
+		TileShadingRateQCOM = 4490,  // requires TileShadingQCOM
+		SubgroupSizeHalfQCOM = 4507,  // requires SubgroupSizeQCOM
+		SubgroupSizeFullQCOM = 4508,  // requires SubgroupSizeQCOM
+		EarlyAndLateFragmentTestsAMD = 5017,  // requires Shader
+		StencilRefReplacingEXT = 5027,  // requires StencilExportEXT
+		CoalescingAMDX = 5069,  // requires ShaderEnqueueAMDX
+		IsApiEntryAMDX = 5070,  // requires ShaderEnqueueAMDX
+		MaxNodeRecursionAMDX = 5071,  // requires ShaderEnqueueAMDX
+		StaticNumWorkgroupsAMDX = 5072,  // requires ShaderEnqueueAMDX
+		ShaderIndexAMDX = 5073,  // requires ShaderEnqueueAMDX
+		MaxNumWorkgroupsAMDX = 5077,  // requires ShaderEnqueueAMDX
+		StencilRefUnchangedFrontAMD = 5079,  // requires StencilExportEXT
+		StencilRefGreaterFrontAMD = 5080,  // requires StencilExportEXT
+		StencilRefLessFrontAMD = 5081,  // requires StencilExportEXT
+		StencilRefUnchangedBackAMD = 5082,  // requires StencilExportEXT
+		StencilRefGreaterBackAMD = 5083,  // requires StencilExportEXT
+		StencilRefLessBackAMD = 5084,  // requires StencilExportEXT
+		QuadDerivativesKHR = 5088,  // requires QuadControlKHR
+		RequireFullQuadsKHR = 5089,  // requires QuadControlKHR
+		SharesInputWithAMDX = 5102,  // requires ShaderEnqueueAMDX
+		ArithmeticPoisonKHR = 5157,  // requires PoisonFreezeKHR
+		OutputLinesEXT = 5269,  // requires MeshShadingNV, MeshShadingEXT
+		OutputPrimitivesEXT = 5270,  // requires MeshShadingNV, MeshShadingEXT
+		DerivativeGroupQuadsKHR = 5289,  // requires ComputeDerivativeGroupQuadsKHR
+		DerivativeGroupLinearKHR = 5290,  // requires ComputeDerivativeGroupLinearKHR
+		OutputTrianglesEXT = 5298,  // requires MeshShadingNV, MeshShadingEXT
+		PixelInterlockOrderedEXT = 5366,  // requires FragmentShaderPixelInterlockEXT
+		PixelInterlockUnorderedEXT = 5367,  // requires FragmentShaderPixelInterlockEXT
+		SampleInterlockOrderedEXT = 5368,  // requires FragmentShaderSampleInterlockEXT
+		SampleInterlockUnorderedEXT = 5369,  // requires FragmentShaderSampleInterlockEXT
+		ShadingRateInterlockOrderedEXT = 5370,  // requires FragmentShaderShadingRateInterlockEXT
+		ShadingRateInterlockUnorderedEXT = 5371,  // requires FragmentShaderShadingRateInterlockEXT
+		Shader64BitIndexingEXT = 5427,  // requires Shader64BitIndexingEXT
+		SharedLocalMemorySizeINTEL = 5618,  // requires VectorComputeINTEL
+		RoundingModeRTPINTEL = 5620,  // requires RoundToInfinityINTEL
+		RoundingModeRTNINTEL = 5621,  // requires RoundToInfinityINTEL
+		FloatingPointModeALTINTEL = 5622,  // requires RoundToInfinityINTEL
+		FloatingPointModeIEEEINTEL = 5623,  // requires RoundToInfinityINTEL
+		MaxWorkgroupSizeINTEL = 5893,  // requires KernelAttributesINTEL
+		MaxWorkDimINTEL = 5894,  // requires KernelAttributesINTEL
+		NoGlobalOffsetINTEL = 5895,  // requires KernelAttributesINTEL
+		NumSIMDWorkitemsINTEL = 5896,  // requires FPGAKernelAttributesINTEL
+		SchedulerTargetFmaxMhzINTEL = 5903,  // requires FPGAKernelAttributesINTEL
+		MaximallyReconvergesKHR = 6023,  // requires Shader
+		FPFastMathDefault = 6028,  // requires FloatControls2
+		OpacityMicromapIdKHR = 6031,  // requires RayTracingOpacityMicromapExecutionModeKHR
+		StreamingInterfaceINTEL = 6154,  // requires FPGAKernelAttributesINTEL
+		RegisterMapInterfaceINTEL = 6160,  // requires FPGAKernelAttributesv2INTEL
+		NamedBarrierCountINTEL = 6417,  // requires VectorComputeINTEL
+		MaximumRegistersINTEL = 6461,  // requires RegisterLimitsINTEL
+		MaximumRegistersIdINTEL = 6462,  // requires RegisterLimitsINTEL
+		NamedMaximumRegistersINTEL = 6463,  // requires RegisterLimitsINTEL
+	};
+}
+
+using ExecutionModeValue = ExecutionMode::Value;
+
+namespace FunctionControl {
+	enum Value : uint32_t {
+		None = 0x0000,
+		Inline = 0x0001,
+		DontInline = 0x0002,
+		Pure = 0x0004,
+		Const = 0x0008,
+		OptNoneEXT = 0x10000,  // requires OptNoneEXT
+	};
+}
+
+using FunctionControlValue = FunctionControl::Value;
+
+namespace SelectionControl {
+	enum Value : uint32_t {
+		None = 0x0000,
+		Flatten = 0x0001,
+		DontFlatten = 0x0002,
+	};
+}
+
+using SelectionControlValue = SelectionControl::Value;
+
+namespace LoopControl {
+	enum Value : uint32_t {
+		None = 0x0000,
+		Unroll = 0x0001,
+		DontUnroll = 0x0002,
+		DependencyInfinite = 0x0004,
+		DependencyLength = 0x0008,
+		MinIterations = 0x0010,
+		MaxIterations = 0x0020,
+		IterationMultiple = 0x0040,
+		PeelCount = 0x0080,
+		PartialCount = 0x0100,
+		InitiationIntervalALTERA = 0x10000,  // requires FPGALoopControlsALTERA
+		MaxConcurrencyALTERA = 0x20000,  // requires FPGALoopControlsALTERA
+		DependencyArrayALTERA = 0x40000,  // requires FPGALoopControlsALTERA
+		PipelineEnableALTERA = 0x80000,  // requires FPGALoopControlsALTERA
+		LoopCoalesceALTERA = 0x100000,  // requires FPGALoopControlsALTERA
+		MaxInterleavingALTERA = 0x200000,  // requires FPGALoopControlsALTERA
+		SpeculatedIterationsALTERA = 0x400000,  // requires FPGALoopControlsALTERA
+		NoFusionALTERA = 0x800000,  // requires FPGALoopControlsALTERA
+		LoopCountALTERA = 0x1000000,  // requires FPGALoopControlsALTERA
+		MaxReinvocationDelayALTERA = 0x2000000,  // requires FPGALoopControlsALTERA
+		MultipleWaitQueuesQCOM = 0x10000000,
+	};
+}
+
+using LoopControlValue = LoopControl::Value;
+
 namespace AddressingModel {
 	enum Value : uint32_t {
 		Logical = 0,

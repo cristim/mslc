@@ -9,6 +9,8 @@
 #
 #   // DISASM: <substring>        spirv-dis output contains <substring>
 #   // DISASM-NOT: <substring>    spirv-dis output does not contain <substring>
+#   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
+#   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
 #
 # Invoked by ctest as:
 #   cmake -DMSLC=... -DSPIRV_VAL=... -DSPIRV_DIS=... -DPROBE=... -DOUT_DIR=... -P run_probe.cmake
@@ -58,7 +60,9 @@ if(expectation STREQUAL "valid")
 
 	file(STRINGS "${PROBE}" wanted REGEX "^// DISASM: ")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
-	if(wanted OR unwanted)
+	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
+	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -83,6 +87,24 @@ if(expectation STREQUAL "valid")
 			string(FIND "${disassembly}" "${needle}" found)
 			if(NOT found EQUAL -1)
 				message(FATAL_ERROR "${name}: disassembly contains \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
+		# A substring cannot say which instruction a trailing operand belongs to,
+		# so a probe that has to name the operand of one particular opcode uses a
+		# pattern. A bare None would otherwise be satisfied by any one of the
+		# three control masks in the module.
+		foreach(line IN LISTS wantedPatterns)
+			string(REGEX REPLACE "^// DISASM-MATCH: " "" needle "${line}")
+			string(REGEX MATCH "${needle}" found "${disassembly}")
+			if(found STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly does not match \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
+		foreach(line IN LISTS unwantedPatterns)
+			string(REGEX REPLACE "^// DISASM-NO-MATCH: " "" needle "${line}")
+			string(REGEX MATCH "${needle}" found "${disassembly}")
+			if(NOT found STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
 			endif()
 		endforeach()
 	endif()
