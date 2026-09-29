@@ -25,6 +25,7 @@ class TypeTable {
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
+	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
 	spirv::Id _voidType = spirv::InvalidId;
 
@@ -44,6 +45,11 @@ public:
 	// pointer this table created. An assignment needs this to know what type a
 	// store's value must have.
 	spirv::Id pointeeOf(spirv::Id pointerType) const;
+
+	// The storage class of a pointer type, or InvalidId when the id is not a
+	// pointer this table created. Asking is not the same as building a pointer
+	// type to compare against, which would declare one as a side effect.
+	std::optional<spirv::StorageClassValue> storageClassOf(spirv::Id pointerType) const;
 
 	bool isFloat(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
@@ -68,11 +74,36 @@ public:
 	spirv::Id namedStruct(const std::string& name);
 
 	// The Block-decorated struct that wraps a buffer's elements, as
-	// { T runtime_array[] }. Vulkan only accepts a struct for a StorageBuffer or
-	// Uniform descriptor, so a Metal "device T* parameter" becomes a descriptor
-	// over this rather than a pointer to T directly. Idempotent per element
-	// type.
+	// { T runtime_array[] }. It has to be a struct rather than a bare T because
+	// OpAccessChain rejects a non-composite base, and a PhysicalStorageBuffer
+	// pointer therefore cannot point straight at an element. Idempotent per
+	// element type.
 	spirv::Id blockStructFor(spirv::Id elementType);
+
+	// A pointer to a pointee in a buffer's own address space, which is what the
+	// binding-0 address block hands the shader. Idempotent per pointee.
+	spirv::Id bufferPointer(spirv::Id pointee);
+
+	// The binding-0 block: a Block-decorated struct whose members are the buffer
+	// pointers, one per buffer parameter in declaration order, each at offset
+	// 8 * k, and the Uniform variable that holds it. The shader loads a member to
+	// get a buffer's address, which is what indium fills in.
+	// The binding-0 block and the variable that holds it. Named here because the
+	// emitter walks the block to reach a buffer's address.
+	struct AddressBlock {
+		spirv::Id blockType = spirv::InvalidId;
+		spirv::Id variable = spirv::InvalidId;
+		spirv::Id memberPointer = spirv::InvalidId;
+	};
+	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes);
+
+	AddressBlock _addressBlock;
+
+	// The address a buffer's own storage class guarantees for one access, which
+	// is what the Aligned memory operand has to say. A buffer element sits at a
+	// multiple of its own size, so that is the whole guarantee, and claiming more
+	// is what lets a compiler read past a buffer.
+	uint32_t alignmentOf(spirv::Id type) const;
 
 	// True when the type needs a capability beyond Shader, and emits it.
 	void requireCapabilitiesFor(const Type& type);

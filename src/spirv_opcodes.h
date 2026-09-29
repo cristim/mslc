@@ -1716,6 +1716,22 @@ namespace LoopControl {
 
 using LoopControlValue = LoopControl::Value;
 
+namespace MemoryAccess {
+	enum Value : uint32_t {
+		None = 0x0000,
+		Volatile = 0x0001,
+		Aligned = 0x0002,
+		Nontemporal = 0x0004,
+		MakePointerAvailable = 0x0008,  // requires VulkanMemoryModel
+		MakePointerVisible = 0x0010,  // requires VulkanMemoryModel
+		NonPrivatePointer = 0x0020,  // requires VulkanMemoryModel
+		AliasScopeINTELMask = 0x10000,  // requires MemoryAccessAliasingINTEL
+		NoAliasINTELMask = 0x20000,  // requires MemoryAccessAliasingINTEL
+	};
+}
+
+using MemoryAccessValue = MemoryAccess::Value;
+
 namespace AddressingModel {
 	enum Value : uint32_t {
 		Logical = 0,
