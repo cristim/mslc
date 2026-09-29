@@ -415,7 +415,8 @@ spirv::Id TypeTable::bufferPointer(Id pointee) {
 	return id;
 }
 
-TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes) {
+TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes,
+	uint32_t descriptorSet) {
 	// One block per module: every buffer parameter of the entry point is a
 	// member of the same one, which is what occupies binding 0.
 	if (!_addressBlock.blockType) {
@@ -445,8 +446,11 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 
 		block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
 			{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
+		// The set is chosen by stage: indium builds set 0 from the vertex function
+		// and set 1 from the fragment function, so a fragment shader's block has
+		// to be in set 1 or indium never binds it.
 		_builder.emit(spirv::OpDecorate, { block.variable,
-			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), 0u });
+			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet });
 		_builder.emit(spirv::OpDecorate, { block.variable,
 			static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
 
@@ -694,6 +698,11 @@ namespace {
 
 	private:
 		Id constantU32(uint32_t value);
+	// indium splits descriptor sets by stage: set 0 from the vertex function,
+	// set 1 from the fragment function. A kernel has one set.
+	uint32_t descriptorSet() const {
+		return _entryPoint.stage == Stage::Fragment ? 1u : 0u;
+	}
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
 		Id loadFromBuffer(Id pointer, Id pointeeType);
@@ -1338,12 +1347,12 @@ namespace {
 			+ ", \"name\": \"" + parameter.name + "\" },\n";
 		}
 
-		// One block for every buffer parameter, at set 0 binding 0. It is emitted
-		// here rather than per parameter because its member list is only known
-		// once the loop is done, and indium binds it as a single uniform buffer
-		// whose entries are the buffer addresses in this order.
+		// One block for every buffer parameter, at binding 0. It is emitted here
+		// rather than per parameter because its member list is only known once the
+		// loop is done, and indium binds it as a single uniform buffer whose
+		// entries are the buffer addresses in this order.
 		if (!_bufferMembers.empty()) {
-			_addressBlock = _types.addressBlock(_bufferMembers);
+			_addressBlock = _types.addressBlock(_bufferMembers, descriptorSet());
 			_interface.push_back(_addressBlock.variable);
 		}
 	}
@@ -1634,11 +1643,40 @@ namespace {
 			_builder.emit(spirv::OpEntryPoint, operands);
 		}
 
+		_builder.setSection(spirv::Section::ExecutionModes);
 		if (_entryPoint.stage == Stage::Kernel) {
+			// The workgroup size is a spec constant rather than a literal, so
+			// indium can supply Metal's threadsPerThreadgroup through
+			// VkSpecializationInfo at pipeline creation. A literal would be baked
+			// in and the value the app asked for would be ignored.
+			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
+			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
+			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
+			_builder.emit(spirv::OpDecorate, { x,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
+			_builder.emit(spirv::OpDecorate, { y,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 1u });
+			_builder.emit(spirv::OpDecorate, { z,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
+
+			// OpExecutionModeId, not OpExecutionMode: a mode whose extra operands
+			// are ids has its own instruction, and OpExecutionMode rejects id
+			// operands outright.
+			//
+			// The section is set again here because the decorations above moved it
+			// to the annotations, and an execution mode emitted from there lands
+			// in the wrong section and is ignored.
+			_builder.setSection(spirv::Section::ExecutionModes);
+			_builder.emit(spirv::OpExecutionModeId, { _entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::LocalSizeId), x, y, z });
+		}
+
+		if (_entryPoint.stage == Stage::Fragment) {
+			// Vulkan requires one of the two origin modes on a fragment entry
+			// point, and Metal's framebuffer origin is upper left.
 			_builder.setSection(spirv::Section::ExecutionModes);
 			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
-				static_cast<uint32_t>(spirv::ExecutionMode::LocalSize),
-				_options.localSizeX, _options.localSizeY, _options.localSizeZ });
+				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
 		}
 
 		_builder.setSection(spirv::Section::Functions);
