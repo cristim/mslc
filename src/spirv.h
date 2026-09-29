@@ -33,6 +33,11 @@ enum class Section {
 	Functions,
 	Literals,
 
+	// Function-storage variables. SPIR-V requires them at the top of the
+	// function's first block, so finalize() splices them in after the first
+	// OpLabel of Functions rather than emitting them in order.
+	FunctionVariables,
+
 	// Not a real section: the sentinel sectionForOpcode returns for an opcode
 	// that goes wherever the caller is currently emitting.
 	Invalid,
