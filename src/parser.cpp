@@ -186,6 +186,14 @@ void Parser::parsePreprocessorDirective() {
 	const size_t directiveLine = line();
 	advance(); // '#'
 
+	// A '#' with nothing after it on its own line is the null directive, which
+	// C defines and Apple's compiler accepts. Reading a name here without the
+	// line bound would take the next line's first token for the directive name
+	// and blame it, so the name is only read from this line.
+	if (at(TokenKind::EndOfFile) || current().line != directiveLine) {
+		return;
+	}
+
 	if (atKeyword("include")) {
 		advance();
 		match(TokenKind::Less);
@@ -229,8 +237,32 @@ void Parser::parsePreprocessorDirective() {
 			"preprocessor to run before parsing, which is not implemented yet");
 	}
 
-	// pragma once, and anything else, is consumed to the end of the line.
-	skipDirectiveLine(directiveLine);
+	// A pragma is advice to the compiler and changes no meaning. #undef and
+	// #line pair with what is already discarded, and #line only moves a
+	// diagnostic. xcrun metal accepts all three, so does mslc, on the directive
+	// name alone: neither #undef with no name nor #line with a non-numeric
+	// argument is rejected here. Checking arguments is M1 item 8's preprocessor.
+	if (atKeyword("pragma") || atKeyword("undef") || atKeyword("line")) {
+		skipDirectiveLine(directiveLine);
+		return;
+	}
+
+	// #error exists to fail the build. mslc cannot evaluate the conditional that
+	// would have guarded one, so a reached #error is a real error rather than
+	// something to discard.
+	if (atKeyword("error")) {
+		throw CompileError("#error directive in this source; mslc cannot evaluate "
+			"conditionals, so it cannot be one that was meant to be skipped");
+	}
+
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected a preprocessor directive after '#'");
+	}
+
+	// A preprocessor rejects a directive it does not know, and so does Apple's.
+	// Discarding one means a shader whose intent was lost compiles anyway.
+	throw CompileError("unknown preprocessor directive \"#" + std::string(advance().text)
+		+ "\"; mslc handles #include, #define, #undef, #line and #pragma");
 }
 
 void Parser::parseDeclaration() {
