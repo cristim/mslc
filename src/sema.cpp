@@ -415,6 +415,10 @@ spirv::Id TypeTable::bufferPointer(Id pointee) {
 	return id;
 }
 
+// Returns the module's single binding-0 address block, building it from
+// pointeeTypes and decorating its variable with descriptorSet the first time
+// it is asked for. Later calls ignore both arguments and return the block
+// already built.
 TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes,
 	uint32_t descriptorSet) {
 	// One block per module: every buffer parameter of the entry point is a
@@ -1195,6 +1199,9 @@ namespace {
 		return bound;
 	}
 
+	// Binds every entry point parameter: a builtin or resource attribute gets
+	// its own interface variable, and a buffer parameter is folded into a
+	// member of the binding-0 address block once every one of them is seen.
 	void Emitter::declareParameters() {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(_entryPoint);
 
@@ -1584,6 +1591,9 @@ namespace {
 		emitStatement(statement);
 	}
 
+	// Emits the whole module for this entry point, from the capabilities down
+	// through the function body, and returns the JSON reflection string
+	// collected along the way.
 	std::string Emitter::run() {
 		_builder.setSection(spirv::Section::Capabilities);
 		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Shader) });
