@@ -46,6 +46,41 @@ namespace {
 			|| kind == ScalarKind::Int || kind == ScalarKind::Long;
 	}
 
+	// The capability a scalar type's width needs, or none when Shader already
+	// covers it. A 64-bit float needs Float64, not the Int64 that covers a
+	// 64-bit integer, and 8- and 16-bit integers need capabilities of their own.
+	// The scalar kind for an integer of the given bit width and signedness, so a
+	// conversion can name a temporary type rather than only the result type.
+	std::optional<ScalarKind> integerKind(uint32_t bits, bool isSigned) {
+		switch (bits) {
+			case 8: return isSigned ? ScalarKind::Char : ScalarKind::UChar;
+			case 16: return isSigned ? ScalarKind::Short : ScalarKind::UShort;
+			case 32: return isSigned ? ScalarKind::Int : ScalarKind::UInt;
+			case 64: return isSigned ? ScalarKind::Long : ScalarKind::ULong;
+			default: return std::nullopt;
+		}
+	}
+
+	std::optional<spirv::CapabilityValue> capabilityFor(ScalarMapping mapping) {
+		if (mapping.isFloat) {
+			if (mapping.width == 16) {
+				return spirv::Capability::Float16;
+			}
+			if (mapping.width == 64) {
+				return spirv::Capability::Float64;
+			}
+
+			return std::nullopt;
+		}
+
+		switch (mapping.width) {
+			case 8: return spirv::Capability::Int8;
+			case 16: return spirv::Capability::Int16;
+			case 64: return spirv::Capability::Int64;
+			default: return std::nullopt;
+		}
+	}
+
 	bool isFloatKind(ScalarKind kind) {
 		return mappingFor(kind).isFloat;
 	}
@@ -185,20 +220,15 @@ Id TypeTable::scalar(ScalarKind kind) {
 
 
 	Id id;
+	if (const auto capability = capabilityFor(mapping)) {
+		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(*capability) });
+	}
+
 	if (mapping.isFloat) {
-		if (mapping.width == 16) {
-			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Float16) });
-		}
-		if (mapping.width == 64) {
-			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Int64) });
-		}
 		id = _builder.emitDecl(spirv::OpTypeFloat, { mapping.width });
 	} else if (kind == ScalarKind::Bool) {
 		id = _builder.emitDecl(spirv::OpTypeBool);
 	} else {
-		if (mapping.width == 64) {
-			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Int64) });
-		}
 		id = _builder.emitDecl(spirv::OpTypeInt,
 			{ mapping.width, isSignedInteger(kind) ? 1u : 0u });
 	}
@@ -329,6 +359,23 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	}
 
 	return 1;
+}
+
+uint32_t TypeTable::bitWidth(spirv::Id type) const {
+	auto it = _widthOfScalar.find(type);
+	if (it != _widthOfScalar.end()) {
+		return it->second;
+	}
+
+	// A vector is as wide as its component, repeated. Both convert paths work on
+	// one component at a time, so the component's width is what matters.
+	for (const auto& [key, id]: _vectors) {
+		if (id == type) {
+			return scalarBitWidth(static_cast<ScalarKind>(key.first));
+		}
+	}
+
+	return 0;
 }
 
 Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
@@ -571,8 +618,9 @@ namespace {
 			return value;
 		}
 
-		// Integer and float conversions have their own opcodes; a bitcast
-		// covers a reinterpretation of the same width.
+		// Integer and float conversions each have their own opcodes. OpBitcast is
+		// a reinterpretation, which the spec permits only between operands of
+		// equal width, so anything that changes a width is a convert instead.
 		const bool fromFloat = _types.isFloat(fromType);
 		const bool toFloat = _types.isFloat(toType);
 
@@ -590,7 +638,53 @@ namespace {
 				toType, { value });
 		}
 
-		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
+		if (fromFloat) {
+			return _builder.emitTyped(spirv::OpFConvert, toType, { value });
+		}
+
+		// An integer to an integer. OpBitcast is a reinterpretation, which is what
+		// a change of signedness at the same width is, and the spec permits it only
+		// at equal width. Across widths the opcode is the extension itself:
+		// OpSConvert sign extends or truncates, OpUConvert zero extends or
+		// truncates, and spirv-val requires the opcode to match the result type's
+		// signedness.
+		const uint32_t fromWidth = _types.bitWidth(fromType);
+		const uint32_t toWidth = _types.bitWidth(toType);
+		if (fromWidth == toWidth) {
+			return _builder.emitTyped(spirv::OpBitcast, toType, { value });
+		}
+
+		const bool fromSigned = _types.isSignedInt(fromType);
+		const bool toSigned = _types.isSignedInt(toType);
+
+		// Truncation keeps the low bits whatever the signedness, so the result's
+		// own signedness picks the opcode and the value survives.
+		if (toWidth < fromWidth) {
+			return _builder.emitTyped(toSigned ? spirv::OpSConvert : spirv::OpUConvert,
+				toType, { value });
+		}
+
+		if (fromSigned == toSigned) {
+			return _builder.emitTyped(fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
+				toType, { value });
+		}
+
+		// Widening across a change of signedness. The extension has to follow the
+		// value being extended, not the type it ends up in, so the value goes to
+		// a temporary of the source's signedness at the target width and is then
+		// reinterpreted. Extending straight to the result type would zero extend
+		// a negative short into a small positive ulong, or sign extend 65535u into
+		// a negative int.
+		const auto temporary = integerKind(toWidth, fromSigned);
+		if (!temporary) {
+			throw CompileError("converting between integer widths mslc does not know "
+				"is not lowered yet");
+		}
+
+		const Id widened = _builder.emitTyped(
+			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
+			_types.scalar(*temporary), { value });
+		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {

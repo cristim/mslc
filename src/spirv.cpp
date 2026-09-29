@@ -14,6 +14,13 @@ namespace {
 	// means the caller cannot get it wrong.
 	Section sectionForOpcode(uint16_t opcode) {
 		switch (opcode) {
+			// Capabilities come first in the logical layout, whatever the
+			// caller believes it is emitting. A capability raised while a type
+			// was being declared landed in the graph-definitions section, and
+			// spirv-val rejects the whole module for it.
+			case OpCapability:
+				return Section::Capabilities;
+
 			case OpTypeVoid:
 			case OpTypeBool:
 			case OpTypeInt:

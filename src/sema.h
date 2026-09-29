@@ -49,6 +49,10 @@ public:
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
 
+	// Bit width of a scalar or of a vector's component. 0 for a type that is
+	// neither, so a caller comparing two widths can tell them apart.
+	uint32_t bitWidth(spirv::Id type) const;
+
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
 	spirv::Id namedStruct(const std::string& name);
