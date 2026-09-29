@@ -49,6 +49,18 @@ namespace {
 	// The capability a scalar type's width needs, or none when Shader already
 	// covers it. A 64-bit float needs Float64, not the Int64 that covers a
 	// 64-bit integer, and 8- and 16-bit integers need capabilities of their own.
+	// The scalar kind for an integer of the given bit width and signedness, so a
+	// conversion can name a temporary type rather than only the result type.
+	std::optional<ScalarKind> integerKind(uint32_t bits, bool isSigned) {
+		switch (bits) {
+			case 8: return isSigned ? ScalarKind::Char : ScalarKind::UChar;
+			case 16: return isSigned ? ScalarKind::Short : ScalarKind::UShort;
+			case 32: return isSigned ? ScalarKind::Int : ScalarKind::UInt;
+			case 64: return isSigned ? ScalarKind::Long : ScalarKind::ULong;
+			default: return std::nullopt;
+		}
+	}
+
 	std::optional<spirv::CapabilityValue> capabilityFor(ScalarMapping mapping) {
 		if (mapping.isFloat) {
 			if (mapping.width == 16) {
@@ -633,16 +645,47 @@ namespace {
 
 		// An integer to an integer. OpBitcast is a reinterpretation, which is what
 		// a change of signedness at the same width is, and the spec permits it only
-		// at equal width. A change of width is OpUConvert (zero extend or
-		// truncate) or OpSConvert (sign extend or truncate), where the result's
-		// signedness picks the opcode and spirv-val requires the two to agree.
-		if (_types.bitWidth(fromType) == _types.bitWidth(toType)) {
+		// at equal width. Across widths the opcode is the extension itself:
+		// OpSConvert sign extends or truncates, OpUConvert zero extends or
+		// truncates, and spirv-val requires the opcode to match the result type's
+		// signedness.
+		const uint32_t fromWidth = _types.bitWidth(fromType);
+		const uint32_t toWidth = _types.bitWidth(toType);
+		if (fromWidth == toWidth) {
 			return _builder.emitTyped(spirv::OpBitcast, toType, { value });
 		}
 
-		return _builder.emitTyped(_types.isSignedInt(toType)
-				? spirv::OpSConvert : spirv::OpUConvert,
-			toType, { value });
+		const bool fromSigned = _types.isSignedInt(fromType);
+		const bool toSigned = _types.isSignedInt(toType);
+
+		// Truncation keeps the low bits whatever the signedness, so the result's
+		// own signedness picks the opcode and the value survives.
+		if (toWidth < fromWidth) {
+			return _builder.emitTyped(toSigned ? spirv::OpSConvert : spirv::OpUConvert,
+				toType, { value });
+		}
+
+		if (fromSigned == toSigned) {
+			return _builder.emitTyped(fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
+				toType, { value });
+		}
+
+		// Widening across a change of signedness. The extension has to follow the
+		// value being extended, not the type it ends up in, so the value goes to
+		// a temporary of the source's signedness at the target width and is then
+		// reinterpreted. Extending straight to the result type would zero extend
+		// a negative short into a small positive ulong, or sign extend 65535u into
+		// a negative int.
+		const auto temporary = integerKind(toWidth, fromSigned);
+		if (!temporary) {
+			throw CompileError("converting between integer widths mslc does not know "
+				"is not lowered yet");
+		}
+
+		const Id widened = _builder.emitTyped(
+			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
+			_types.scalar(*temporary), { value });
+		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {
