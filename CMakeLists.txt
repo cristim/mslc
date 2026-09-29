@@ -66,3 +66,13 @@ foreach(probe IN LISTS probes)
 		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/probes
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
 endforeach()
+
+# Harness self-test: a compiler that prints the expected diagnostic and then
+# crashes must fail an "error" probe, not pass it.
+add_test(NAME harness/crash_after_diag COMMAND ${CMAKE_COMMAND}
+	-DMSLC=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/crash_after_diag.sh
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/crash_after_diag.metal
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+set_tests_properties(harness/crash_after_diag PROPERTIES
+	PASS_REGULAR_EXPRESSION "crash_after_diag: mslc crashed")

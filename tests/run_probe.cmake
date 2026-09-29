@@ -53,6 +53,11 @@ elseif(expectation MATCHES "^error (.+)$")
 	if(status EQUAL 0)
 		message(FATAL_ERROR "${name}: expected a compile error containing \"${needle}\", but it compiled")
 	endif()
+	# On a signal RESULT_VARIABLE is a string such as "Segmentation fault", so
+	# only a numeric nonzero exit counts as a diagnosed error.
+	if(NOT status MATCHES "^[1-9][0-9]*$")
+		message(FATAL_ERROR "${name}: mslc crashed (${status}):\n${output}")
+	endif()
 	string(FIND "${output}" "${needle}" found)
 	if(found EQUAL -1)
 		message(FATAL_ERROR "${name}: expected a diagnostic containing \"${needle}\", got:\n${output}")
