@@ -85,7 +85,6 @@ namespace {
 		Section::Annotations,
 		Section::TypesGlobals,
 		Section::Functions,
-		Section::Literals,
 	};
 
 }
@@ -197,28 +196,6 @@ void Builder::appendString(std::vector<uint32_t>& words, const std::string& text
 	std::memcpy(bytes, text.data(), text.size());
 }
 
-Id Builder::stringLiteral(const std::string& text) {
-	std::vector<uint32_t> words;
-	appendString(words, text);
-
-	auto it = _literalIds.find(words);
-	if (it != _literalIds.end()) {
-		return it->second;
-	}
-
-	const Id id = _nextId++;
-
-	Instruction instruction;
-	instruction.opcode = OpString;
-	instruction.words = std::move(words);
-	_literals.push_back(std::move(instruction));
-
-	// Keyed on the words before the move above.
-	_literalIds.emplace(std::move(words), id);
-
-	return id;
-}
-
 bool Builder::finalize(std::vector<uint8_t>& out) const {
 	if (!hasEntryPoint()) {
 		return false;
@@ -260,12 +237,6 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 				localsPlaced = true;
 			}
 		}
-	}
-
-	// The literal section is emitted as instructions too, but it is built in a
-	// separate list so it can be appended last.
-	for (const Instruction& instruction: _literals) {
-		append(instruction);
 	}
 
 	words[3] = _nextId; // bound: one past the highest id handed out

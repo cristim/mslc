@@ -31,7 +31,6 @@ enum class Section {
 	Annotations,
 	TypesGlobals,
 	Functions,
-	Literals,
 
 	// Function-storage variables. SPIR-V requires them at the top of the
 	// function's first block, so finalize() splices them in after the first
@@ -56,11 +55,6 @@ class Builder {
 	Id _nextId = 1;
 
 	std::map<Section, std::vector<Instruction>> _sections;
-	std::vector<Instruction> _literals;
-
-	// Literal pool, keyed by the word sequence, so an identical literal is
-	// stored once.
-	std::map<std::vector<uint32_t>, Id> _literalIds;
 
 	// The SPIR-V type of every value id handed out. Tracking it here rather
 	// than threading an out-parameter through every expression means the
@@ -123,10 +117,6 @@ public:
 	// Records a type for an id that was not produced by an instruction, such as
 	// a function or a label.
 	void setType(Id value, Id type);
-
-	// Emits a NUL-terminated string literal and returns its id, reusing an
-	// identical literal if one already exists.
-	Id stringLiteral(const std::string& text);
 
 	// Packs a string into SPIR-V literal words and appends them. Instructions
 	// such as OpEntryPoint and OpName take the name inline rather than by id,
