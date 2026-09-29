@@ -111,14 +111,13 @@ namespace {
 		return isMax ? 41u : 38u;
 	}
 
-	// OpFunction's FunctionControl mask. The generated table only covers value
-	// enums, not bitmasks. Pure would promise no memory writes, which an entry
-	// point that stores to a buffer breaks.
-	constexpr uint32_t kFunctionControlNone = 0;
-
-	// SelectionControl and LoopControl masks, likewise absent from the table.
-	constexpr uint32_t kSelectionControlNone = 0;
-	constexpr uint32_t kLoopControlNone = 0;
+	// The merge and function control masks. Every one of them is None: Pure
+	// would promise no memory writes, which an entry point that stores to a
+	// buffer breaks, and neither flattening nor unrolling changes what the
+	// shader computes. Named from the generated table rather than written as 0.
+	constexpr uint32_t kFunctionControlNone = spirv::FunctionControl::None;
+	constexpr uint32_t kSelectionControlNone = spirv::SelectionControl::None;
+	constexpr uint32_t kLoopControlNone = spirv::LoopControl::None;
 
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
@@ -1302,9 +1301,8 @@ namespace {
 
 		if (_entryPoint.stage == Stage::Kernel) {
 			_builder.setSection(spirv::Section::ExecutionModes);
-			// 17 is LocalSize, read from the generated opcode table by name
-			// rather than written here, since the enum is in spirv_opcodes.h.
-			_builder.emit(spirv::OpExecutionMode, { _entryPointId, 17u,
+			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::LocalSize),
 				_options.localSizeX, _options.localSizeY, _options.localSizeZ });
 		}
 
