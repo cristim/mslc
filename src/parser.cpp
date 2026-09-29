@@ -161,7 +161,13 @@ const Token& Parser::expectKeyword(const char* text, const char* context) {
 }
 
 size_t Parser::line() const {
-	return current().offset;
+	return current().line;
+}
+
+void Parser::skipDirectiveLine(size_t directiveLine) {
+	while (!at(TokenKind::EndOfFile) && current().line == directiveLine) {
+		advance();
+	}
 }
 
 TranslationUnit Parser::parse() {
@@ -177,17 +183,23 @@ TranslationUnit Parser::parse() {
 // so the include and using are consumed and discarded. A directive that could
 // change meaning, such as a conditional, is an error.
 void Parser::parsePreprocessorDirective() {
+	const size_t directiveLine = line();
 	advance(); // '#'
 
 	if (atKeyword("include")) {
 		advance();
 		match(TokenKind::Less);
 
-		// Skip to the end of the header name.
-		while (!at(TokenKind::EndOfFile) && !at(TokenKind::Greater)) {
+		// Skip the header name, which ends at '>' or at the end of the line. A
+		// quoted include has no '>' at all, so the line bound is what keeps it
+		// from consuming the declarations that follow.
+		while (!at(TokenKind::EndOfFile) && !at(TokenKind::Greater)
+			&& current().line == directiveLine) {
 			advance();
 		}
 
+		// A '>' the line does not have is a truncated include, not a reason to
+		// keep looking on the next line.
 		match(TokenKind::Greater);
 		return;
 	}
@@ -195,17 +207,19 @@ void Parser::parsePreprocessorDirective() {
 	if (atKeyword("define")) {
 		advance();
 		advance(); // macro name
-		// Parameter list, if present.
+		// Parameter list, if present. Bounded by the line like everything else,
+		// so an unclosed '(' cannot swallow the rest of the file.
 		if (at(TokenKind::LParen)) {
-			while (!at(TokenKind::EndOfFile) && !at(TokenKind::RParen)) {
+			while (!at(TokenKind::EndOfFile) && !at(TokenKind::RParen)
+				&& current().line == directiveLine) {
 				advance();
 			}
-			match(TokenKind::RParen);
+			expect(TokenKind::RParen, "to close a macro parameter list");
 		}
-		// Replacement list, to end of line.
-		while (!at(TokenKind::EndOfFile) && !at(TokenKind::Hash)) {
-			advance();
-		}
+		// Replacement list, to the end of the line. A backslash continuation is
+		// not part of the subset and the lexer has no escape for it, so a
+		// continuation is a lexer error rather than a joined line.
+		skipDirectiveLine(directiveLine);
 		return;
 	}
 
@@ -215,10 +229,8 @@ void Parser::parsePreprocessorDirective() {
 			"preprocessor to run before parsing, which is not implemented yet");
 	}
 
-	// pragma once, and anything else, is consumed to end of line.
-	while (!at(TokenKind::EndOfFile) && !at(TokenKind::Hash)) {
-		advance();
-	}
+	// pragma once, and anything else, is consumed to the end of the line.
+	skipDirectiveLine(directiveLine);
 }
 
 void Parser::parseDeclaration() {

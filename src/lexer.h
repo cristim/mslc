@@ -48,6 +48,11 @@ struct Token {
 
 	// byte offset of the token start, for diagnostics
 	size_t offset = 0;
+
+	// 1-based line the token starts on. A preprocessor directive runs to the
+	// end of its own line, which is the only place line structure matters, but
+	// the AST records this for diagnostics too.
+	size_t line = 1;
 };
 
 // Thrown by the lexer and parser for input mslc cannot represent. Carries a

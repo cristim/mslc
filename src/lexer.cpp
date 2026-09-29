@@ -104,10 +104,15 @@ std::vector<Token> tokenize(std::string_view source) {
 	size_t i = 0;
 	const size_t size = source.size();
 
+	// Incremented wherever a newline is consumed, so a token can say which line
+	// it started on.
+	size_t line = 1;
+
 	auto makeToken = [&](TokenKind kind, size_t start) {
 		Token token;
 		token.kind = kind;
 		token.offset = start;
+		token.line = line;
 		token.text = source.substr(start, i - start);
 		tokens.push_back(token);
 	};
@@ -117,6 +122,9 @@ std::vector<Token> tokenize(std::string_view source) {
 
 		// whitespace
 		if (std::isspace(static_cast<unsigned char>(c))) {
+			if (c == '\n') {
+				++line;
+			}
 			++i;
 			continue;
 		}
@@ -141,6 +149,9 @@ std::vector<Token> tokenize(std::string_view source) {
 					closed = true;
 					break;
 				}
+				if (source[i] == '\n') {
+					++line;
+				}
 				++i;
 			}
 
@@ -160,8 +171,20 @@ std::vector<Token> tokenize(std::string_view source) {
 			bool closed = false;
 			while (i < size) {
 				if (source[i] == '\\' && i + 1 < size) {
+					// A backslash-newline splices two physical lines into one
+					// logical line, so the logical line does not advance here.
+					// That is the whole point of a splice, and it is what lets a
+					// directive that owns a spliced string still end at the end
+					// of that logical line.
 					i += 2;
 					continue;
+				}
+				if (source[i] == '\n') {
+					// A raw newline is not legal in a string, and Apple's compiler
+					// rejects it. Reporting it keeps the line count meaningful
+					// rather than guessing where the token was meant to end.
+					throw CompileError("newline in a string literal at offset "
+						+ std::to_string(i));
 				}
 				if (source[i] == '"') {
 					++i;
@@ -230,6 +253,7 @@ std::vector<Token> tokenize(std::string_view source) {
 
 			Token token;
 			token.offset = start;
+			token.line = line;
 			token.text = source.substr(start, i - start);
 			token.integerIsUnsigned = isUnsigned;
 
@@ -319,6 +343,7 @@ std::vector<Token> tokenize(std::string_view source) {
 	Token end;
 	end.kind = TokenKind::EndOfFile;
 	end.offset = size;
+	end.line = line;
 	end.text = source.substr(size);
 	tokens.push_back(end);
 
