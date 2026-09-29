@@ -583,7 +583,12 @@ namespace {
 		}
 
 		if (!fromFloat && toFloat) {
-			return _builder.emitTyped(spirv::OpConvertUToF, toType, { value });
+			// The source's signedness picks the opcode: OpConvertUToF zero-extends
+			// and OpConvertSToF sign-extends, so the wrong one turns every negative
+			// int into a large positive float.
+			return _builder.emitTyped(_types.isSignedInt(fromType)
+					? spirv::OpConvertSToF : spirv::OpConvertUToF,
+				toType, { value });
 		}
 
 		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
