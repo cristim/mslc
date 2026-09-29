@@ -171,8 +171,20 @@ std::vector<Token> tokenize(std::string_view source) {
 			bool closed = false;
 			while (i < size) {
 				if (source[i] == '\\' && i + 1 < size) {
+					// A backslash-newline splices two physical lines into one
+					// logical line, so the logical line does not advance here.
+					// That is the whole point of a splice, and it is what lets a
+					// directive that owns a spliced string still end at the end
+					// of that logical line.
 					i += 2;
 					continue;
+				}
+				if (source[i] == '\n') {
+					// A raw newline is not legal in a string, and Apple's compiler
+					// rejects it. Reporting it keeps the line count meaningful
+					// rather than guessing where the token was meant to end.
+					throw CompileError("newline in a string literal at offset "
+						+ std::to_string(i));
 				}
 				if (source[i] == '"') {
 					++i;

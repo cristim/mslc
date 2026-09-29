@@ -198,6 +198,8 @@ void Parser::parsePreprocessorDirective() {
 			advance();
 		}
 
+		// A '>' the line does not have is a truncated include, not a reason to
+		// keep looking on the next line.
 		match(TokenKind::Greater);
 		return;
 	}
@@ -205,16 +207,18 @@ void Parser::parsePreprocessorDirective() {
 	if (atKeyword("define")) {
 		advance();
 		advance(); // macro name
-		// Parameter list, if present.
+		// Parameter list, if present. Bounded by the line like everything else,
+		// so an unclosed '(' cannot swallow the rest of the file.
 		if (at(TokenKind::LParen)) {
-			while (!at(TokenKind::EndOfFile) && !at(TokenKind::RParen)) {
+			while (!at(TokenKind::EndOfFile) && !at(TokenKind::RParen)
+				&& current().line == directiveLine) {
 				advance();
 			}
-			match(TokenKind::RParen);
+			expect(TokenKind::RParen, "to close a macro parameter list");
 		}
 		// Replacement list, to the end of the line. A backslash continuation is
-		// not part of the subset, so a continuation ends the macro rather than
-		// joining the next line.
+		// not part of the subset and the lexer has no escape for it, so a
+		// continuation is a lexer error rather than a joined line.
 		skipDirectiveLine(directiveLine);
 		return;
 	}
