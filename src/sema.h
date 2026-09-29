@@ -53,6 +53,16 @@ public:
 	// neither, so a caller comparing two widths can tell them apart.
 	uint32_t bitWidth(spirv::Id type) const;
 
+	// True when the type is a vector or a struct, which a single scalar value
+	// cannot stand in for.
+	bool isAggregate(spirv::Id type) const;
+
+	// The zero value of a scalar type, for a local declared without an
+	// initialiser. Each scalar kind needs its own form: a bool has separate
+	// opcodes, and OpConstant's literal count follows the width, so a 64-bit
+	// value needs two words.
+	spirv::Id zero(spirv::Id type);
+
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
 	spirv::Id namedStruct(const std::string& name);
