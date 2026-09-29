@@ -378,6 +378,43 @@ uint32_t TypeTable::bitWidth(spirv::Id type) const {
 	return 0;
 }
 
+bool TypeTable::isAggregate(spirv::Id type) const {
+	if (_widthOfVector.count(type) > 0) {
+		return true;
+	}
+
+	// _structs is keyed by name, so a struct is found by value.
+	for (const auto& [name, id]: _structs) {
+		if (id == type) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+Id TypeTable::zero(Id type) {
+	// A vector or a struct has no single zero value: OpConstant is a scalar form,
+	// so an aggregate needs OpConstantComposite over its parts. No local of that
+	// shape parses yet, and reporting it beats emitting a scalar for it.
+	if (isAggregate(type)) {
+		throw CompileError("a local of an aggregate type cannot be zero initialised yet; "
+			"give it an initialiser");
+	}
+
+	// A bool has no literal form, so it needs its own opcode rather than a zero
+	// word, which the grammar does not accept for it.
+	if (type == scalar(ScalarKind::Bool)) {
+		return _builder.emitDeclTyped(spirv::OpConstantFalse, type, { });
+	}
+
+	// OpConstant's literal count is context dependent, so it follows the width:
+	// one word up to 32 bits, two for 64. Writing one word for a 64-bit value is
+	// a short instruction, which is what this used to do.
+	return _builder.emitDeclTyped(spirv::OpConstant, type,
+		std::vector<uint32_t>((bitWidth(type) + 31) / 32, 0u));
+}
+
 Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 	const auto key = std::make_pair(storageClass, pointee);
 	const auto cached = _pointers.find(key);
@@ -616,6 +653,14 @@ namespace {
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		// A bool is neither floating point nor an integer, and no convert opcode
+		// accepts one, so reaching here means the shape is not lowered yet.
+		// Reporting it beats emitting an instruction spirv-val rejects.
+		if (fromType == _types.scalar(ScalarKind::Bool)
+			|| toType == _types.scalar(ScalarKind::Bool)) {
+			throw CompileError("converting to or from bool is not lowered yet");
 		}
 
 		// Integer and float conversions each have their own opcodes. OpBitcast is
@@ -1164,7 +1209,7 @@ namespace {
 			const Id initializer = emitExpression(*declaration.initializer);
 			initial = convert(initializer, _builder.typeOf(initializer), typeId);
 		} else {
-			initial = _builder.emitDeclTyped(spirv::OpConstant, typeId, { 0u });
+			initial = _types.zero(typeId);
 		}
 
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
@@ -1214,10 +1259,17 @@ namespace {
 			address = emitIndex(*expression.left, true);
 		} else if (expression.left->kind == ExpressionKind::Member) {
 			address = emitMemberAddress(*expression.left);
-		} else if (const auto it = _bindings.find(expression.left->name);
-			expression.left->kind == ExpressionKind::Identifier && it != _bindings.end()
-			&& it->second.isPointer && it->second.storageClass == spirv::StorageClass::Function) {
-			address = it->second.id;
+		} else if (expression.left->kind == ExpressionKind::Identifier) {
+			// A local names a Function-storage pointer, so the variable itself is
+			// the address to store to. A buffer parameter is a descriptor and a
+			// plain value is loaded, so only this case takes the binding.
+			const auto it = _bindings.find(expression.left->name);
+			if (it != _bindings.end() && it->second.isPointer
+				&& it->second.storageClass == spirv::StorageClass::Function) {
+				address = it->second.id;
+			} else {
+				address = emitExpression(*expression.left);
+			}
 		} else {
 			address = emitExpression(*expression.left);
 		}
