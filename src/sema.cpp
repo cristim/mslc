@@ -318,6 +318,16 @@ spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 	return spirv::InvalidId;
 }
 
+std::optional<spirv::StorageClassValue> TypeTable::storageClassOf(Id pointerType) const {
+	for (const auto& [key, id]: _pointers) {
+		if (id == pointerType) {
+			return key.first;
+		}
+	}
+
+	return std::nullopt;
+}
+
 bool TypeTable::isFloat(spirv::Id type) const {
 	for (const auto& [kind, id]: _scalars) {
 		if (id == type) {
@@ -391,6 +401,75 @@ bool TypeTable::isAggregate(spirv::Id type) const {
 	}
 
 	return false;
+}
+
+spirv::Id TypeTable::bufferPointer(Id pointee) {
+	const auto cached = _bufferPointers.find(pointee);
+	if (cached != _bufferPointers.end()) {
+		return cached->second;
+	}
+
+	const Id id = _builder.emitDecl(spirv::OpTypePointer,
+		{ static_cast<uint32_t>(spirv::StorageClass::PhysicalStorageBuffer), pointee });
+	_bufferPointers.emplace(pointee, id);
+	return id;
+}
+
+TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes) {
+	// One block per module: every buffer parameter of the entry point is a
+	// member of the same one, which is what occupies binding 0.
+	if (!_addressBlock.blockType) {
+		AddressBlock block;
+		std::vector<uint32_t> memberPointers;
+		memberPointers.reserve(pointeeTypes.size());
+
+		for (Id pointee: pointeeTypes) {
+			memberPointers.push_back(bufferPointer(pointee));
+		}
+
+		block.blockType = _builder.emitDecl(spirv::OpTypeStruct, memberPointers);
+		_builder.emit(spirv::OpDecorate, { block.blockType,
+			static_cast<uint32_t>(spirv::Decoration::Block) });
+
+		// Member k is the k-th buffer parameter in declaration order, at byte
+		// offset 8 * k. An 8-byte address is what the struct is laid out for, so
+		// this is the size of the value and not a stride.
+		for (size_t k = 0; k < memberPointers.size(); ++k) {
+			_builder.emit(spirv::OpMemberDecorate, { block.blockType,
+				static_cast<uint32_t>(k), static_cast<uint32_t>(spirv::Decoration::Offset),
+				static_cast<uint32_t>(8 * k) });
+		}
+
+		block.memberPointer = _builder.emitDecl(spirv::OpTypePointer,
+			{ static_cast<uint32_t>(spirv::StorageClass::Uniform), block.blockType });
+
+		block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
+			{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
+		_builder.emit(spirv::OpDecorate, { block.variable,
+			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), 0u });
+		_builder.emit(spirv::OpDecorate, { block.variable,
+			static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
+
+		_addressBlock = block;
+	}
+
+	return _addressBlock;
+}
+
+uint32_t TypeTable::alignmentOf(Id type) const {
+	// A buffer element sits at a multiple of its own size, and a struct field at
+	// a multiple of its own within the struct, so the size is the whole
+	// guarantee. Claiming more is what lets a compiler read past the end.
+	const uint32_t bits = bitWidth(type);
+	if (bits == 0) {
+		return 4;
+	}
+
+	// bitWidth is the component's width, so a vector is that many times the
+	// component's size. Rounded up, so a 24-bit component claims 4.
+	const auto it = _widthOfVector.find(type);
+	const uint32_t count = it != _widthOfVector.end() ? it->second : 1;
+	return std::max<uint32_t>(1, ((bits * count) + 7) / 8);
 }
 
 Id TypeTable::zero(Id type) {
@@ -555,6 +634,11 @@ namespace {
 		// access chain into the pointee rather than a load.
 		bool isPointer = false;
 		spirv::Id pointeeType = InvalidId;
+		// For a buffer parameter, the type a member of the binding-0 block
+		// points at, and the member's index. The pointer itself is loaded from
+		// the block the first time the parameter is used.
+		spirv::Id bufferPointeeType = InvalidId;
+		uint32_t memberIndex = 0;
 		spirv::StorageClassValue storageClass = spirv::StorageClass::Function;
 		// For a struct-typed value, the declaration, so member access can
 		// resolve a field.
@@ -576,6 +660,12 @@ namespace {
 
 		std::map<std::string, Binding> _bindings;
 		std::map<spirv::Id, const StructDecl*> _structByValue;
+		// The pointee of every buffer parameter, in declaration order, which is
+		// what the binding-0 block is built from once the loop is done.
+		std::vector<Id> _bufferMembers;
+		// The binding-0 block, and the loaded buffer pointer for each member.
+		TypeTable::AddressBlock _addressBlock;
+		std::map<uint32_t, Id> _bufferBases;
 
 		Id _uintType = InvalidId;
 		Id _intType = InvalidId;
@@ -604,6 +694,13 @@ namespace {
 
 	private:
 		Id constantU32(uint32_t value);
+		Id bufferBase(const Binding& binding);
+		void preloadBufferBases();
+		Id loadFromBuffer(Id pointer, Id pointeeType);
+		void storeIntoBuffer(Id pointer, Id value);
+		// The Aligned memory operand a buffer access has to carry, at the
+		// alignment the buffer's own layout guarantees.
+		std::vector<uint32_t> alignedOperands(Id pointeeType) const;
 		Id declaredTypeOf(const Type& type);
 		void declareParameters();
 		void emitFunctionBody(const Statement& statement);
@@ -648,6 +745,49 @@ namespace {
 
 	Id Emitter::loadFrom(Id pointer, Id pointeeType) {
 		return _builder.emitTyped(spirv::OpLoad, pointeeType, { pointer });
+	}
+
+	// A load or store through a PhysicalStorageBuffer pointer must carry the
+	// Aligned memory operand; spirv-val rejects the module without it. A buffer
+	// element sits at a multiple of its own size, so that is the whole guarantee
+	// and claiming more is what lets a compiler read past the end of a buffer.
+	std::vector<uint32_t> Emitter::alignedOperands(Id pointeeType) const {
+		if (_types.isAggregate(pointeeType)) {
+			return { };
+		}
+
+		return { static_cast<uint32_t>(spirv::MemoryAccess::Aligned),
+			_types.alignmentOf(pointeeType) };
+	}
+
+	Id Emitter::loadFromBuffer(Id pointer, Id pointeeType) {
+		std::vector<uint32_t> operands = alignedOperands(pointeeType);
+		operands.insert(operands.begin(), pointer);
+		return _builder.emitTyped(spirv::OpLoad, pointeeType, operands);
+
+	}
+
+	void Emitter::storeIntoBuffer(Id pointer, Id value) {
+		const Id pointeeType = _types.pointeeOf(_builder.typeOf(pointer));
+
+		// Inserted one at a time: insert(pos, a, b) with two integers is the
+		// count-and-value overload, which would insert a copies of b.
+		std::vector<uint32_t> operands = alignedOperands(pointeeType);
+		operands.insert(operands.begin(), pointer);
+		operands.insert(operands.begin() + 1, value);
+		_builder.emit(spirv::OpStore, operands);
+	}
+
+	// The buffer's own pointer, loaded from its member of the binding-0 block.
+	// Loaded once per parameter: the load is what turns the address indium wrote
+	// into a pointer the access chain can walk.
+	Id Emitter::bufferBase(const Binding& binding) {
+		const auto cached = _bufferBases.find(binding.memberIndex);
+		if (cached == _bufferBases.end()) {
+			throw CompileError("no address was loaded for this buffer, so it cannot be used");
+		}
+
+		return cached->second;
 	}
 
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
@@ -798,14 +938,23 @@ namespace {
 		const Id index = emitExpression(*expression.arguments[0]);
 		_builder.setType(index, _uintType);
 
-		if (binding.isBuffer) {
-			// The descriptor is a struct holding a runtime array, so reaching an
-			// element means stepping into member 0 and then indexing the array.
-			const Id address = _builder.emitTyped(spirv::OpAccessChain,
-				_types.pointer(binding.storageClass, binding.pointeeType),
-				{ binding.id, constantU32(0), index });
+		// A buffer is reached through its address rather than a descriptor, so
+		// the access chain starts from the loaded pointer. The result is a
+		// pointer in the buffer's own storage class, because the result class of
+		// an access chain has to match its base.
+		if (binding.bufferPointeeType != InvalidId) {
+			const Id base = bufferBase(binding);
+			const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
+				binding.pointeeType);
 
-			return asAddress ? address : loadFrom(address, binding.pointeeType);
+			// A buffer's pointee is { T runtime_array[] }, so an element is member
+			// 0 and then the index. A struct pointee is indexed directly.
+			const Id address = binding.isBuffer
+				? _builder.emitTyped(spirv::OpAccessChain, resultType,
+					{ base, constantU32(0), index })
+				: _builder.emitTyped(spirv::OpAccessChain, resultType, { base, index });
+
+			return asAddress ? address : loadFromBuffer(address, binding.pointeeType);
 		}
 
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
@@ -825,10 +974,14 @@ namespace {
 			throw CompileError("\"" + expression.left->name + "\" has no struct type");
 		}
 
+		const bool fromBuffer = it->second.bufferPointeeType != InvalidId;
+
 		const StructDecl* decl = it->second.structType;
 		for (const StructField& field: decl->fields) {
 			if (field.name == expression.memberName) {
-				return loadFrom(address, _types.scalar(field.type.scalar));
+				const Id fieldType = _types.scalar(field.type.scalar);
+				return fromBuffer ? loadFromBuffer(address, fieldType)
+					: loadFrom(address, fieldType);
 			}
 		}
 
@@ -870,6 +1023,12 @@ namespace {
 		// typed as a pointer to the struct does not match what the base
 		// indexes to, and spirv-val rejects it.
 		const Id fieldType = _types.scalar(decl->fields[fieldIndex].type.scalar);
+
+		if (it->second.bufferPointeeType != InvalidId) {
+			return _builder.emitTyped(spirv::OpAccessChain,
+				_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, fieldType),
+				{ bufferBase(it->second), constantU32(static_cast<uint32_t>(fieldIndex)) });
+		}
 
 		return _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(it->second.storageClass, fieldType),
@@ -1118,85 +1277,92 @@ namespace {
 				bindingIndex = static_cast<uint32_t>(it - implicitlyBound.begin());
 			}
 
-			auto storageClass = storageClassForAddressSpace(parameter.type.addressSpace);
-			if (!storageClass) {
-				throw CompileError("parameter \"" + parameter.name + "\" needs a device, constant "
-					"or threadgroup address space to be a buffer binding");
+		if (!storageClassForAddressSpace(parameter.type.addressSpace)) {
+			throw CompileError("parameter \"" + parameter.name + "\" needs a device, constant "
+				"or threadgroup address space to be a buffer binding");
+		}
+
+		Id pointeeType = InvalidId;
+		const StructDecl* structType = nullptr;
+
+		if (!parameter.type.namedType.empty()) {
+			pointeeType = _types.namedStruct(parameter.type.namedType);
+			if (pointeeType == InvalidId) {
+				throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
+					"type \"" + parameter.type.namedType + "\"");
 			}
+			structType = _unit.findStruct(parameter.type.namedType);
+		} else {
+			pointeeType = declaredTypeOf(parameter.type);
+		}
 
-			Id pointeeType = InvalidId;
-			const StructDecl* structType = nullptr;
+		// A buffer parameter's address is a member of the binding-0 block rather
+		// than a descriptor of its own, so what a member points at is the
+		// buffer's own type. A pointer parameter is a whole buffer, and
+		// OpAccessChain rejects a non-composite base, so the element type is
+		// wrapped in { T runtime_array[] } and the parameter indexes through
+		// that.
+		Id bufferPointee = pointeeType;
+		bool isBuffer = false;
+		if (parameter.type.isPointer && structType == nullptr) {
+			bufferPointee = _types.blockStructFor(pointeeType);
+			isBuffer = true;
+		}
 
-			if (!parameter.type.namedType.empty()) {
-				pointeeType = _types.namedStruct(parameter.type.namedType);
-				if (pointeeType == InvalidId) {
-					throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
-						"type \"" + parameter.type.namedType + "\"");
-				}
-				structType = _unit.findStruct(parameter.type.namedType);
-			} else {
-				pointeeType = declaredTypeOf(parameter.type);
-			}
+		// The member index is this parameter's position among the buffer
+		// parameters in declaration order, which is what indium fills in. It is
+		// not the Metal index: that says which buffer the app bound there, and
+		// goes in the reflection.
+		const auto memberIndex = static_cast<uint32_t>(_bufferMembers.size());
+		_bufferMembers.push_back(bufferPointee);
 
-			// A pointer parameter is a whole buffer, and Vulkan only accepts a
-			// Block-decorated struct for a descriptor, so the element type is
-			// wrapped in { T runtime_array[] } and the parameter indexes through
-			// that.
-			Id descriptorType = pointeeType;
-			bool isBuffer = false;
-			bool isReadOnly = false;
-			if (parameter.type.isPointer && structType == nullptr) {
-				descriptorType = _types.blockStructFor(pointeeType);
-				isBuffer = true;
+		// The block is emitted after the loop, once every member is known.
+		Binding binding;
+		binding.isPointer = true;
+		binding.pointeeType = pointeeType;
+		binding.bufferPointeeType = bufferPointee;
+		binding.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
+		binding.structType = structType;
+		binding.isBuffer = isBuffer;
+		binding.memberIndex = memberIndex;
+		_bindings[parameter.name] = binding;
 
-				// A runtime array breaks Uniform block layout, so a constant
-				// pointer is a read-only storage buffer instead.
-				if (*storageClass == spirv::StorageClass::Uniform) {
-					storageClass = spirv::StorageClass::StorageBuffer;
-					isReadOnly = true;
-				}
-			}
+		// The Metal index says which buffer the app bound at that slot. Every
+		// buffer shares the block at set 0 binding 0, so it is not a descriptor
+		// binding and the reflection says which one instead.
+		_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
+			+ std::to_string(bindingIndex)
+			+ ", \"descriptor\": { \"set\": 0, \"binding\": 0 }"
+			+ ", \"member\": " + std::to_string(memberIndex)
+			+ ", \"param_index\": " + std::to_string(index)
+			+ ", \"name\": \"" + parameter.name + "\" },\n";
+		}
 
-			_builder.setSection(spirv::Section::TypesGlobals);
-			const Id pointerType = _types.pointer(*storageClass, descriptorType);
-			const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
-				{ static_cast<uint32_t>(*storageClass) });
-
-			_builder.setSection(spirv::Section::Annotations);
-			_builder.emit(spirv::OpDecorate, { id,
-				static_cast<uint32_t>(spirv::Decoration::DescriptorSet), 0u });
-			_builder.emit(spirv::OpDecorate, { id,
-				static_cast<uint32_t>(spirv::Decoration::Binding), bindingIndex });
-			if (isReadOnly) {
-				_builder.emit(spirv::OpDecorate, { id,
-					static_cast<uint32_t>(spirv::Decoration::NonWritable) });
-			}
-
-			Binding binding;
-			binding.id = id;
-			binding.isPointer = true;
-			binding.pointeeType = pointeeType;
-			binding.storageClass = *storageClass;
-			binding.structType = structType;
-			binding.isBuffer = isBuffer;
-			_bindings[parameter.name] = binding;
-			// Every global declared for the entry point goes in its interface
-			// list. From SPIR-V 1.4 the list covers all of them, not only Input
-			// and Output, and spirv-val rejects a module that leaves a used one
-			// out of it. The DescriptorSet and Binding decorations say where
-			// indium binds a descriptor; they do not replace the listing. Listing
-			// one the entry point never reaches is accepted, so this names every
-			// declaration rather than tracking which are used.
-			_interface.push_back(id);
-
-			_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
-				+ std::to_string(bindingIndex)
-				+ ", \"descriptor\": { \"set\": 0, \"binding\": "
-				+ std::to_string(bindingIndex) + " }"
-				+ ", \"param_index\": " + std::to_string(index)
-				+ ", \"name\": \"" + parameter.name + "\" },\n";
+		// One block for every buffer parameter, at set 0 binding 0. It is emitted
+		// here rather than per parameter because its member list is only known
+		// once the loop is done, and indium binds it as a single uniform buffer
+		// whose entries are the buffer addresses in this order.
+		if (!_bufferMembers.empty()) {
+			_addressBlock = _types.addressBlock(_bufferMembers);
+			_interface.push_back(_addressBlock.variable);
 		}
 	}
+
+	// Each buffer's address is loaded once, here, so that the value dominates
+	// every use. A load emitted at the first use would not dominate a later use
+	// in another basic block, and spirv-val rejects a module where an id is used
+	// outside the block that defined it.
+	void Emitter::preloadBufferBases() {
+		for (size_t k = 0; k < _bufferMembers.size(); ++k) {
+			const Id memberType = _types.bufferPointer(_bufferMembers[k]);
+			const Id memberAddress = _builder.emitTyped(spirv::OpAccessChain,
+				_types.pointer(spirv::StorageClass::Uniform, memberType),
+				{ _addressBlock.variable, constantU32(static_cast<uint32_t>(k)) });
+			_bufferBases.emplace(static_cast<uint32_t>(k),
+				_builder.emitTyped(spirv::OpLoad, memberType, { memberAddress }));
+		}
+	}
+
 
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
@@ -1283,6 +1449,14 @@ namespace {
 		if (pointeeType == spirv::InvalidId) {
 			throw CompileError("cannot determine what \""
 				+ expression.left->name + "\" points at, so the store cannot be typed");
+		}
+
+		// A store into a buffer carries the Aligned memory operand, which the
+		// same layout rule gives the access.
+		const auto storageClass = _types.storageClassOf(addressType);
+		if (storageClass && *storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
+			storeIntoBuffer(address, convert(value, _builder.typeOf(value), pointeeType));
+			return;
 		}
 
 		_builder.emit(spirv::OpStore, { address,
@@ -1405,10 +1579,21 @@ namespace {
 		_builder.setSection(spirv::Section::Capabilities);
 		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Shader) });
 
-		_builder.setSection(spirv::Section::MemoryModel);
-		_builder.emit(spirv::OpMemoryModel,
-			{ static_cast<uint32_t>(spirv::AddressingModel::Logical),
-			  static_cast<uint32_t>(spirv::MemoryModel::GLSL450) });
+	// The capability goes with the addressing model rather than with the block:
+	// the model is declared whether or not the shader has a buffer, so a kernel
+	// with no buffer parameter would otherwise name a capability it never
+	// declared.
+	_builder.setSection(spirv::Section::Capabilities);
+	_builder.emit(spirv::OpCapability,
+		{ static_cast<uint32_t>(spirv::Capability::PhysicalStorageBufferAddresses) });
+
+	_builder.setSection(spirv::Section::MemoryModel);
+	// PhysicalStorageBuffer64, because a buffer is reached by the address the
+	// binding-0 block hands the shader rather than by a descriptor of its own.
+	_builder.emit(spirv::OpMemoryModel,
+		{ static_cast<uint32_t>(spirv::AddressingModel::PhysicalStorageBuffer64),
+		  static_cast<uint32_t>(spirv::MemoryModel::GLSL450) });
+
 
 		_uintType = _types.scalar(ScalarKind::UInt);
 		_intType = _types.scalar(ScalarKind::Int);
@@ -1462,6 +1647,7 @@ namespace {
 		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
 			{ kFunctionControlNone, functionType });
 		beginBlock(_builder.nextId());
+		preloadBufferBases();
 		emitFunctionBody(*_entryPoint.body);
 		if (!_terminated) {
 			terminate(spirv::OpReturn, { });

@@ -79,6 +79,7 @@ def main():
         "FunctionControl": "FunctionControl",
         "SelectionControl": "SelectionControl",
         "LoopControl": "LoopControl",
+        "MemoryAccess": "MemoryAccess",
         "AddressingModel": "AddressingModel",
         "MemoryModel": "MemoryModel",
         "Dim": "Dim",
