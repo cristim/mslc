@@ -1037,15 +1037,14 @@ namespace {
 			binding.structType = structType;
 			binding.isBuffer = isBuffer;
 			_bindings[parameter.name] = binding;
-			// SPIR-V 1.3 restricts the entry point's interface list to Input and
-			// Output variables; 1.4 widened it to every global the entry point
-			// statically uses. kSpirvVersion is 1.3, so a descriptor stays out of
-			// the list and is reached through its DescriptorSet and Binding
-			// decorations instead. Listing one is what spirv-val rejects.
-			if (*storageClass == spirv::StorageClass::Input
-				|| *storageClass == spirv::StorageClass::Output) {
-				_interface.push_back(id);
-			}
+			// Every global declared for the entry point goes in its interface
+			// list. From SPIR-V 1.4 the list covers all of them, not only Input
+			// and Output, and spirv-val rejects a module that leaves a used one
+			// out of it. The DescriptorSet and Binding decorations say where
+			// indium binds a descriptor; they do not replace the listing. Listing
+			// one the entry point never reaches is accepted, so this names every
+			// declaration rather than tracking which are used.
+			_interface.push_back(id);
 
 			_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 				+ std::to_string(bindingIndex)

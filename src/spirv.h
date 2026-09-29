@@ -142,11 +142,13 @@ public:
 
 // SPIR-V serial version emitted.
 //
-// 1.3 is the floor, not a preference: the StorageBuffer storage class and
-// OpTypeRuntimeArray were both introduced in 1.3, and lowering a Metal device
-// pointer to a StorageBuffer descriptor needs both. Emitting 1.0 and using them
-// produces a module spirv-val rejects.
-constexpr uint32_t kSpirvVersion = 0x00010300;
+// 1.5, which is what Iridium emits and what indium's Vulkan 1.3 target wants.
+// Two things in it matter here. 1.3 introduced the StorageBuffer storage class
+// and OpTypeRuntimeArray, which lowering a Metal device pointer needs. 1.4
+// widened the entry point's interface list from Input and Output only to every
+// global the entry point statically uses, and spirv-val enforces it, so a
+// descriptor has to be listed rather than reached only by its decorations.
+constexpr uint32_t kSpirvVersion = 0x00010500;
 
 // SPIR-V magic number, "SPV" in little-endian words.
 constexpr uint32_t kSpirvMagic = 0x07230203;
