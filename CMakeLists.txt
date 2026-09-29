@@ -36,4 +36,33 @@ add_executable(mslc-corpus tools/corpus.cpp)
 target_link_libraries(mslc-corpus PRIVATE mslc)
 
 enable_testing()
-add_test(NAME corpus COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus.txt)
+
+# Tests that validate SPIR-V fail, never skip, when this is not found.
+find_program(SPIRV_VAL spirv-val)
+if(NOT SPIRV_VAL)
+	message(WARNING "spirv-val not found: the SPIR-V validating tests will fail. Install SPIRV-Tools.")
+endif()
+
+add_test(NAME corpus COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus.txt
+	--spirv-val ${SPIRV_VAL})
+
+set(MSLC_INDIUM_DIR "" CACHE PATH "indium checkout; enables the indium-corpus test")
+if(MSLC_INDIUM_DIR)
+	add_test(NAME indium-corpus COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/indium_corpus.txt
+		--root ${MSLC_INDIUM_DIR} --spirv-val ${SPIRV_VAL})
+else()
+	add_test(NAME indium-corpus COMMAND ${CMAKE_COMMAND} -E echo "SKIPPED: set MSLC_INDIUM_DIR to an indium checkout")
+	set_tests_properties(indium-corpus PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
+endif()
+
+# One test per tests/probes/*.metal; each file carries its own expectation.
+file(GLOB probes CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/*.metal)
+foreach(probe IN LISTS probes)
+	get_filename_component(name ${probe} NAME_WE)
+	add_test(NAME probe/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_VAL=${SPIRV_VAL}
+		-DPROBE=${probe}
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/probes
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+endforeach()

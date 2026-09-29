@@ -1,0 +1,11 @@
+# The MSL corpus from indium's test suite. Each .metal file is paired with a
+# .metallib that Iridium already translates to GPU-verified SPIR-V, so mslc's
+# output has a reference to be compared against. Entries are relative to an
+# indium checkout, given to CMake as MSLC_INDIUM_DIR.
+test/basic-compute/shadersrc/add.metal
+test/cube/shadersrc/shaders.metal
+test/triangle/shadersrc/AAPLShaders.metal
+test/cubemap/shadersrc/shaders.metal
+test/lighting/shadersrc/shaders.metal
+test/sampler/shadersrc/AAPLShaders.metal
+test/texturing/shadersrc/shaders.metal
