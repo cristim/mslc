@@ -4,7 +4,14 @@
 #   // EXPECT: valid              compiles and passes spirv-val
 #   // EXPECT: error <substring>  fails, with <substring> in the diagnostic
 #
-# Invoked by ctest as: cmake -DMSLC=... -DSPIRV_VAL=... -DPROBE=... -DOUT_DIR=... -P run_probe.cmake
+# A valid probe can also pin the disassembly, for a bug whose output validates
+# but computes the wrong thing. Each line is one substring check:
+#
+#   // DISASM: <substring>        spirv-dis output contains <substring>
+#   // DISASM-NOT: <substring>    spirv-dis output does not contain <substring>
+#
+# Invoked by ctest as:
+#   cmake -DMSLC=... -DSPIRV_VAL=... -DSPIRV_DIS=... -DPROBE=... -DOUT_DIR=... -P run_probe.cmake
 
 foreach(var MSLC PROBE OUT_DIR)
 	if(NOT DEFINED ${var})
@@ -47,6 +54,37 @@ if(expectation STREQUAL "valid")
 	)
 	if(NOT status EQUAL 0)
 		message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
+	endif()
+
+	file(STRINGS "${PROBE}" wanted REGEX "^// DISASM: ")
+	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
+	if(wanted OR unwanted)
+		if(NOT SPIRV_DIS)
+			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
+		endif()
+		execute_process(
+			COMMAND "${SPIRV_DIS}" "${spv}"
+			RESULT_VARIABLE status
+			OUTPUT_VARIABLE disassembly
+			ERROR_VARIABLE disassembly
+		)
+		if(NOT status EQUAL 0)
+			message(FATAL_ERROR "${name}: spirv-dis failed:\n${disassembly}")
+		endif()
+		foreach(line IN LISTS wanted)
+			string(REGEX REPLACE "^// DISASM: " "" needle "${line}")
+			string(FIND "${disassembly}" "${needle}" found)
+			if(found EQUAL -1)
+				message(FATAL_ERROR "${name}: disassembly lacks \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
+		foreach(line IN LISTS unwanted)
+			string(REGEX REPLACE "^// DISASM-NOT: " "" needle "${line}")
+			string(FIND "${disassembly}" "${needle}" found)
+			if(NOT found EQUAL -1)
+				message(FATAL_ERROR "${name}: disassembly contains \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
 	endif()
 elseif(expectation MATCHES "^error (.+)$")
 	set(needle "${CMAKE_MATCH_1}")

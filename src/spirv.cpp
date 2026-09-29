@@ -56,6 +56,9 @@ namespace {
 			case OpMemberDecorateString:
 				return Section::Annotations;
 
+			case OpExtInstImport:
+				return Section::ExtInstImports;
+
 			// Debug names, which likewise have a fixed section.
 			case OpName:
 			case OpMemberName:

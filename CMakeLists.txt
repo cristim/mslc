@@ -42,6 +42,7 @@ find_program(SPIRV_VAL spirv-val)
 if(NOT SPIRV_VAL)
 	message(WARNING "spirv-val not found: the SPIR-V validating tests will fail. Install SPIRV-Tools.")
 endif()
+find_program(SPIRV_DIS spirv-dis)
 
 add_test(NAME corpus COMMAND mslc-corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus.txt
 	--spirv-val ${SPIRV_VAL})
@@ -55,6 +56,13 @@ else()
 	set_tests_properties(indium-corpus PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 endif()
 
+add_test(NAME validate-failure-exits-nonzero COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DFAKE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/failing-spirv-val
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/float_add.metal
+	-DOUT=${CMAKE_CURRENT_BINARY_DIR}/validate_failure.spv
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_validate_failure.cmake)
+
 # One test per tests/probes/*.metal; each file carries its own expectation.
 file(GLOB probes CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/*.metal)
 foreach(probe IN LISTS probes)
@@ -62,6 +70,7 @@ foreach(probe IN LISTS probes)
 	add_test(NAME probe/${name} COMMAND ${CMAKE_COMMAND}
 		-DMSLC=$<TARGET_FILE:mslc-cli>
 		-DSPIRV_VAL=${SPIRV_VAL}
+		-DSPIRV_DIS=${SPIRV_DIS}
 		-DPROBE=${probe}
 		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/probes
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)

@@ -13,6 +13,11 @@
 #include <string>
 #include <vector>
 
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char** environ;
+
 namespace {
 
 	bool readFile(const char* path, std::string& out) {
@@ -189,16 +194,20 @@ int main(int argc, char** argv) {
 
 	if (validate) {
 		// Run spirv-val as a separate step rather than linking SPIRV-Tools
-		// into the library, so a build without it still works.
-		std::string command = "spirv-val --target-env vulkan1.2 " + output
-			+ " >/dev/null 2>&1 && echo PASS || echo FAIL";
-		FILE* pipe = popen(command.c_str(), "r");
-		char verdict[16] = { 0 };
-		if (pipe && std::fgets(verdict, sizeof(verdict), pipe)) {
-			std::printf("spirv-val: %s", verdict);
-		}
-		if (pipe) {
-			pclose(pipe);
+		// into the library, so a build without it still works. Spawned without
+		// a shell so the output path needs no quoting.
+		const char* arguments[] = { "spirv-val", "--target-env", "vulkan1.3", output.c_str(), nullptr };
+		pid_t child = 0;
+		int status = 0;
+		const bool ran = posix_spawnp(&child, "spirv-val", nullptr, nullptr,
+			const_cast<char* const*>(arguments), environ) == 0
+			&& waitpid(child, &status, 0) == child;
+		const bool passed = ran && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+		std::printf("spirv-val: %s\n", passed ? "PASS" : ran ? "FAIL" : "could not run spirv-val");
+		if (!passed) {
+			mslc_free(spirv);
+			mslc_free(reflection);
+			return 1;
 		}
 	}
 

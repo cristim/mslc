@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stands in for spirv-val on PATH so the validate-failure test sees a rejection.
+exit 1

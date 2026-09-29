@@ -65,32 +65,56 @@ namespace {
 		}
 	}
 
-	// The SPIR-V opcode for a binary operation, given whether the operands are
-	// floating point. SPIR-V has separate opcodes for each, so the choice has
-	// to be made from the resolved operand type rather than from the AST,
-	// which does not record it.
-	uint16_t arithmeticOpcode(BinaryOperator op, bool isFloat) {
+	// The SPIR-V opcode for a binary operation, given the operand type's kind.
+	// SPIR-V has separate opcodes for float, signed and unsigned operands, so
+	// the choice has to be made from the resolved operand type rather than
+	// from the AST, which does not record it.
+	uint16_t arithmeticOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
-#define BOTH(f, i) ((isFloat) ? Op(f) : Op(i))
+#define PICK(f, s, u) ((isFloat) ? Op(f) : (isSigned) ? Op(s) : Op(u))
 
 		switch (op) {
-			case BinaryOperator::Add: return BOTH(spirv::OpFAdd, spirv::OpIAdd);
-			case BinaryOperator::Subtract: return BOTH(spirv::OpFSub, spirv::OpISub);
-			case BinaryOperator::Multiply: return BOTH(spirv::OpFMul, spirv::OpIMul);
-			case BinaryOperator::Divide: return BOTH(spirv::OpFDiv, spirv::OpSDiv);
-			case BinaryOperator::Modulo: return BOTH(spirv::OpFMod, spirv::OpSMod);
+			case BinaryOperator::Add: return PICK(spirv::OpFAdd, spirv::OpIAdd, spirv::OpIAdd);
+			case BinaryOperator::Subtract: return PICK(spirv::OpFSub, spirv::OpISub, spirv::OpISub);
+			case BinaryOperator::Multiply: return PICK(spirv::OpFMul, spirv::OpIMul, spirv::OpIMul);
+			case BinaryOperator::Divide: return PICK(spirv::OpFDiv, spirv::OpSDiv, spirv::OpUDiv);
+			case BinaryOperator::Modulo:
+				// C++ has no % on floating point (MSL spells that fmod), and a
+				// signed % truncates, which is OpSRem; OpSMod floors.
+				if (isFloat) {
+					throw CompileError("operator % needs integer operands; use fmod for floating point");
+				}
+				return isSigned ? spirv::OpSRem : spirv::OpUMod;
 			case BinaryOperator::BitAnd: return spirv::OpBitwiseAnd;
 			case BinaryOperator::BitOr: return spirv::OpBitwiseOr;
 			case BinaryOperator::BitXor: return spirv::OpBitwiseXor;
 			case BinaryOperator::ShiftLeft: return spirv::OpShiftLeftLogical;
-			case BinaryOperator::ShiftRight: return spirv::OpShiftRightLogical;
+			case BinaryOperator::ShiftRight:
+				return isSigned ? spirv::OpShiftRightArithmetic : spirv::OpShiftRightLogical;
 			default: break;
 		}
 
-#undef BOTH
+#undef PICK
 
 		throw CompileError("this binary operator is recognised but not lowered yet");
 	}
+
+	// GLSL.std.450 instruction numbers, from the extended instruction set's
+	// grammar (FMin 37, UMin 38, SMin 39, FMax 40, UMax 41, SMax 42).
+	uint32_t minMaxInstruction(bool isMax, bool isFloat, bool isSigned) {
+		if (isFloat) {
+			return isMax ? 40u : 37u;
+		}
+		if (isSigned) {
+			return isMax ? 42u : 39u;
+		}
+		return isMax ? 41u : 38u;
+	}
+
+	// OpFunction's FunctionControl mask. The generated table only covers value
+	// enums, not bitmasks. Pure would promise no memory writes, which an entry
+	// point that stores to a buffer breaks.
+	constexpr uint32_t kFunctionControlNone = 0;
 
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
@@ -747,8 +771,13 @@ namespace {
 			return _builder.emitTyped(opcode, _boolType, { left, right });
 		}
 
-		return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat),
-			leftType, { left, right });
+		// OpUDiv and OpUMod need both operands of the result type, and a literal
+		// is always uint. A shift count is free to have its own type and width.
+		const bool isShift = expression.binaryOperator == BinaryOperator::ShiftLeft
+			|| expression.binaryOperator == BinaryOperator::ShiftRight;
+		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
+		return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
+			leftType, { left, rightOperand });
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
@@ -764,17 +793,22 @@ namespace {
 			}
 
 			const Id left = emitExpression(*expression.arguments[0]);
-			const Id right = emitExpression(*expression.arguments[1]);
 			const Id type = _builder.typeOf(left);
+			// GLSL.std.450 wants every operand of the result type.
+			const Id argument = emitExpression(*expression.arguments[1]);
+			const Id right = convert(argument, _builder.typeOf(argument), type);
 
 			if (!_glslImported) {
 				_glslImported = true;
-				_glslSet = _builder.emitDecl(spirv::OpExtInstImport,
-					{ _builder.stringLiteral("GLSL.std.450") });
+				// The set name is a literal string operand, not an OpString id.
+				std::vector<uint32_t> name;
+				spirv::Builder::appendString(name, "GLSL.std.450");
+				_glslSet = _builder.emitDecl(spirv::OpExtInstImport, name);
 			}
 
 			return _builder.emitTyped(spirv::OpExtInst, type,
-				{ left, _glslSet, expression.left->name == "min" ? 40u : 37u, right });
+				{ _glslSet, minMaxInstruction(expression.left->name == "max",
+					_types.isFloat(type), _types.isSignedInt(type)), left, right });
 		}
 
 		throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
@@ -1209,7 +1243,7 @@ namespace {
 		// The function's own id has to be the one the entry point names, so it
 		// is written explicitly rather than taken from the emit's return.
 		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
-			{ _intType, functionType });
+			{ kFunctionControlNone, functionType });
 		_builder.emitDecl(spirv::OpLabel, { });
 		emitFunctionBody(*_entryPoint.body);
 		_builder.emit(spirv::OpReturn, { });
