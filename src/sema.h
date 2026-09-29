@@ -95,6 +95,9 @@ public:
 		spirv::Id variable = spirv::InvalidId;
 		spirv::Id memberPointer = spirv::InvalidId;
 	};
+	// Builds the module's one binding-0 address block from the given pointee
+	// types on first call and returns it unchanged afterwards, decorating its
+	// variable with the given descriptor set.
 	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes, uint32_t descriptorSet);
 
 	AddressBlock _addressBlock;
