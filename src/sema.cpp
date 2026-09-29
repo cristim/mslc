@@ -116,6 +116,10 @@ namespace {
 	// point that stores to a buffer breaks.
 	constexpr uint32_t kFunctionControlNone = 0;
 
+	// SelectionControl and LoopControl masks, likewise absent from the table.
+	constexpr uint32_t kSelectionControlNone = 0;
+	constexpr uint32_t kLoopControlNone = 0;
+
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
 
@@ -499,6 +503,10 @@ namespace {
 		bool _glslImported = false;
 		spirv::Id _glslSet = InvalidId;
 
+		// Set once the current block has its terminator, so nothing more may be
+		// emitted into it until the next label.
+		bool _terminated = false;
+
 		std::string _reflection;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -517,7 +525,11 @@ namespace {
 		void declareParameters();
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
+		void emitExpressionStatement(const Expression& expression);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		void beginBlock(Id label);
+		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
+		void branchUnlessTerminated(Id label);
 
 		// Every expression returns a value id whose type the builder knows.
 		// For an lvalue such as "buffer[index]" the result is a pointer, and
@@ -887,10 +899,12 @@ namespace {
 							return spirv::BuiltIn::LocalInvocationId;
 						case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
 							return spirv::BuiltIn::WorkgroupId;
+						// Vulkan forbids VertexId and InstanceId. The Index forms
+						// include the base vertex and instance, as Metal's do.
 						case ParameterAttributes::Builtin::VertexID:
-							return spirv::BuiltIn::VertexId;
+							return spirv::BuiltIn::VertexIndex;
 						case ParameterAttributes::Builtin::InstanceID:
-							return spirv::BuiltIn::InstanceId;
+							return spirv::BuiltIn::InstanceIndex;
 						case ParameterAttributes::Builtin::FragCoord:
 							return spirv::BuiltIn::FragCoord;
 						case ParameterAttributes::Builtin::FrontFacing:
@@ -900,10 +914,25 @@ namespace {
 					}
 				}();
 
-				// The SPIR-V builtin is always a vector, but MSL declares it
-				// with the width the shader actually uses, so the width is
-				// recorded and a narrower declaration extracts a component.
-				const Id typeId = _types.vector(ScalarKind::UInt, 3);
+				// Vulkan fixes each builtin's type. The compute ids are always
+				// uvec3 even where MSL declares a narrower width, so a scalar
+				// declaration extracts a component.
+				Id typeId = InvalidId;
+				switch (spvBuiltin) {
+					case spirv::BuiltIn::VertexIndex:
+					case spirv::BuiltIn::InstanceIndex:
+						typeId = _types.scalar(ScalarKind::UInt);
+						break;
+					case spirv::BuiltIn::FragCoord:
+						typeId = _types.vector(ScalarKind::Float, 4);
+						break;
+					case spirv::BuiltIn::FrontFacing:
+						typeId = _boolType;
+						break;
+					default:
+						typeId = _types.vector(ScalarKind::UInt, 3);
+						break;
+				}
 				_builder.setSection(spirv::Section::TypesGlobals);
 				const Id pointerType = _types.pointer(spirv::StorageClass::Input, typeId);
 				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
@@ -919,7 +948,8 @@ namespace {
 				binding.isPointer = true;
 				binding.pointeeType = typeId;
 				binding.storageClass = spirv::StorageClass::Input;
-				binding.scalarComponentOfVector = parameter.type.isScalar();
+				binding.scalarComponentOfVector = parameter.type.isScalar()
+					&& _types.vectorWidth(typeId) > 1;
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
 				continue;
@@ -945,7 +975,7 @@ namespace {
 				bindingIndex = static_cast<uint32_t>(it - implicitlyBound.begin());
 			}
 
-			const auto storageClass = storageClassForAddressSpace(parameter.type.addressSpace);
+			auto storageClass = storageClassForAddressSpace(parameter.type.addressSpace);
 			if (!storageClass) {
 				throw CompileError("parameter \"" + parameter.name + "\" needs a device, constant "
 					"or threadgroup address space to be a buffer binding");
@@ -971,9 +1001,17 @@ namespace {
 			// that.
 			Id descriptorType = pointeeType;
 			bool isBuffer = false;
+			bool isReadOnly = false;
 			if (parameter.type.isPointer && structType == nullptr) {
 				descriptorType = _types.blockStructFor(pointeeType);
 				isBuffer = true;
+
+				// A runtime array breaks Uniform block layout, so a constant
+				// pointer is a read-only storage buffer instead.
+				if (*storageClass == spirv::StorageClass::Uniform) {
+					storageClass = spirv::StorageClass::StorageBuffer;
+					isReadOnly = true;
+				}
 			}
 
 			_builder.setSection(spirv::Section::TypesGlobals);
@@ -986,6 +1024,10 @@ namespace {
 				static_cast<uint32_t>(spirv::Decoration::DescriptorSet), 0u });
 			_builder.emit(spirv::OpDecorate, { id,
 				static_cast<uint32_t>(spirv::Decoration::Binding), bindingIndex });
+			if (isReadOnly) {
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::NonWritable) });
+			}
 
 			Binding binding;
 			binding.id = id;
@@ -1041,50 +1083,79 @@ namespace {
 		_bindings[declaration.name] = binding;
 	}
 
+	// A label's id is allocated ahead of time so a branch can name it, which
+	// is why this emits the label with its own id instead of emitDecl's.
+	void Emitter::beginBlock(Id label) {
+		_builder.emit(spirv::OpLabel, { label });
+		_terminated = false;
+	}
+
+	void Emitter::terminate(uint16_t opcode, std::vector<uint32_t> operands) {
+		_builder.emit(opcode, std::move(operands));
+		_terminated = true;
+	}
+
+	// A block that already returned must not also branch to the merge.
+	void Emitter::branchUnlessTerminated(Id label) {
+		if (!_terminated) {
+			terminate(spirv::OpBranch, { label });
+		}
+	}
+
+	void Emitter::emitExpressionStatement(const Expression& expression) {
+		// An assignment yields an address rather than a value, so it is
+		// handled here rather than through emitExpression.
+		if (expression.kind != ExpressionKind::Assign) {
+			emitExpression(expression);
+			return;
+		}
+
+		// The left side is a place, so it is emitted as an address rather
+		// than loaded.
+		Id address = InvalidId;
+		if (expression.left->kind == ExpressionKind::Index) {
+			address = emitIndex(*expression.left, true);
+		} else if (expression.left->kind == ExpressionKind::Member) {
+			address = emitMemberAddress(*expression.left);
+		} else if (const auto it = _bindings.find(expression.left->name);
+			expression.left->kind == ExpressionKind::Identifier && it != _bindings.end()
+			&& it->second.isPointer && it->second.storageClass == spirv::StorageClass::Function) {
+			address = it->second.id;
+		} else {
+			address = emitExpression(*expression.left);
+		}
+
+		const Id value = emitExpression(*expression.right);
+
+		// A store's value has the type the address points at, not the type of
+		// the address, so the pointee is what the value is converted to.
+		const Id addressType = _builder.typeOf(address);
+		const Id pointeeType = _types.pointeeOf(addressType);
+		if (pointeeType == spirv::InvalidId) {
+			throw CompileError("cannot determine what \""
+				+ expression.left->name + "\" points at, so the store cannot be typed");
+		}
+
+		_builder.emit(spirv::OpStore, { address,
+			convert(value, _builder.typeOf(value), pointeeType) });
+	}
+
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
 			case StatementKind::Compound:
+				// Whatever follows a return in the same block is unreachable,
+				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
+					if (_terminated) {
+						break;
+					}
 					emitStatement(*child);
 				}
 				return;
 
 			case StatementKind::ExpressionStatement:
 				if (statement.expression) {
-					// An assignment yields an address rather than a value, so it
-					// is handled here rather than through emitExpression.
-					if (statement.expression->kind == ExpressionKind::Assign) {
-						const Expression& assign = *statement.expression;
-
-						// The left side is a place, so it is emitted as an
-						// address rather than loaded.
-						Id address = InvalidId;
-						if (assign.left->kind == ExpressionKind::Index) {
-							address = emitIndex(*assign.left, true);
-						} else if (assign.left->kind == ExpressionKind::Member) {
-							address = emitMemberAddress(*assign.left);
-						} else {
-							address = emitExpression(*assign.left);
-						}
-
-						const Id value = emitExpression(*assign.right);
-
-						// A store's value has the type the address points at, not
-						// the type of the address, so the pointee is what the
-						// value is converted to.
-						const Id addressType = _builder.typeOf(address);
-						const Id pointeeType = _types.pointeeOf(addressType);
-						if (pointeeType == spirv::InvalidId) {
-							throw CompileError("cannot determine what \""
-								+ assign.left->name + "\" points at, so the store cannot be typed");
-						}
-
-						_builder.emit(spirv::OpStore, { address,
-							convert(value, _builder.typeOf(value), pointeeType) });
-						return;
-					}
-
-					emitExpression(*statement.expression);
+					emitExpressionStatement(*statement.expression);
 				}
 				return;
 
@@ -1094,80 +1165,78 @@ namespace {
 
 			case StatementKind::Return:
 				if (statement.expression) {
-					_builder.emit(spirv::OpReturnValue, { emitExpression(*statement.expression) });
+					terminate(spirv::OpReturnValue, { emitExpression(*statement.expression) });
 				} else {
-					_builder.emit(spirv::OpReturn, { });
+					terminate(spirv::OpReturn, { });
 				}
 				return;
 
+			// Vulkan requires structured control flow: every conditional branch
+			// is preceded by a merge instruction naming where its paths rejoin.
 			case StatementKind::If: {
 				const Id condition = emitExpression(*statement.expression);
 				const Id thenLabel = _builder.nextId();
-				const Id elseLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
+				const Id elseLabel = statement.elseBranch ? _builder.nextId() : mergeLabel;
 
-				_builder.emit(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
-				_builder.emitDecl(spirv::OpLabel, { thenLabel });
+				_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+				terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+
+				beginBlock(thenLabel);
 				emitStatement(*statement.thenBranch);
-				_builder.emit(spirv::OpBranch, { mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { elseLabel });
+				branchUnlessTerminated(mergeLabel);
+
 				if (statement.elseBranch) {
+					beginBlock(elseLabel);
 					emitStatement(*statement.elseBranch);
+					branchUnlessTerminated(mergeLabel);
 				}
-				_builder.emit(spirv::OpBranch, { mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
+
+				beginBlock(mergeLabel);
 				return;
 			}
 
-			case StatementKind::For: {
-				if (statement.forInitializer) {
+			// Loops share one shape: the header evaluates the condition and
+			// declares the merge and continue targets, the body branches to the
+			// continue block, and that block alone branches back to the header.
+			case StatementKind::For:
+			case StatementKind::While: {
+				const bool isFor = statement.kind == StatementKind::For;
+
+				if (isFor && statement.forInitializer) {
 					emitVariableDeclaration(*statement.forInitializer);
-				} else if (statement.expression) {
-					emitExpression(*statement.expression);
+				} else if (isFor && statement.expression) {
+					emitExpressionStatement(*statement.expression);
 				}
 
-				const Id condLabel = _builder.nextId();
+				const Expression* condition = isFor
+					? statement.forCondition.get() : statement.whileCondition.get();
+				const Id headerLabel = _builder.nextId();
 				const Id bodyLabel = _builder.nextId();
 				const Id continueLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { condLabel });
-
-				if (statement.forCondition) {
-					const Id condition = emitExpression(*statement.forCondition);
-					_builder.emit(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
+				terminate(spirv::OpBranch, { headerLabel });
+				beginBlock(headerLabel);
+				const Id conditionValue = condition ? emitExpression(*condition) : InvalidId;
+				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
+				if (condition) {
+					terminate(spirv::OpBranchConditional, { conditionValue, bodyLabel, mergeLabel });
 				} else {
-					_builder.emit(spirv::OpBranch, { bodyLabel });
+					terminate(spirv::OpBranch, { bodyLabel });
 				}
 
-				_builder.emitDecl(spirv::OpLabel, { bodyLabel });
-				emitStatement(*statement.forBody);
-				_builder.emit(spirv::OpBranch, { continueLabel });
+				beginBlock(bodyLabel);
+				emitStatement(isFor ? *statement.forBody : *statement.whileBody);
+				branchUnlessTerminated(continueLabel);
 
-				_builder.emitDecl(spirv::OpLabel, { continueLabel });
-				if (statement.forIncrement) {
-					emitExpression(*statement.forIncrement);
+				beginBlock(continueLabel);
+				if (isFor && statement.forIncrement) {
+					emitExpressionStatement(*statement.forIncrement);
 				}
-				_builder.emit(spirv::OpBranch, { condLabel });
+				terminate(spirv::OpBranch, { headerLabel });
 
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
-				return;
-			}
-
-			case StatementKind::While: {
-				const Id condLabel = _builder.nextId();
-				const Id bodyLabel = _builder.nextId();
-				const Id mergeLabel = _builder.nextId();
-
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { condLabel });
-				const Id condition = emitExpression(*statement.whileCondition);
-				_builder.emit(spirv::OpBranchConditional, { condition, bodyLabel, mergeLabel });
-				_builder.emitDecl(spirv::OpLabel, { bodyLabel });
-				emitStatement(*statement.whileBody);
-				_builder.emit(spirv::OpBranch, { condLabel });
-				_builder.emitDecl(spirv::OpLabel, { mergeLabel });
+				beginBlock(mergeLabel);
 				return;
 			}
 
@@ -1244,9 +1313,11 @@ namespace {
 		// is written explicitly rather than taken from the emit's return.
 		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
 			{ kFunctionControlNone, functionType });
-		_builder.emitDecl(spirv::OpLabel, { });
+		beginBlock(_builder.nextId());
 		emitFunctionBody(*_entryPoint.body);
-		_builder.emit(spirv::OpReturn, { });
+		if (!_terminated) {
+			terminate(spirv::OpReturn, { });
+		}
 		_builder.emit(spirv::OpFunctionEnd, { });
 
 		return _reflection;

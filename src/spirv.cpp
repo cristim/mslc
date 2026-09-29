@@ -143,6 +143,10 @@ Id Builder::emitDecl(uint16_t opcode, std::vector<uint32_t> operands) {
 Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands) {
 	const Id id = _nextId++;
 
+	// A local lives in the function, unlike every other OpVariable.
+	const bool isLocal = opcode == OpVariable && !operands.empty()
+		&& operands[0] == static_cast<uint32_t>(StorageClass::Function);
+
 	operands.insert(operands.begin(), id);
 	operands.insert(operands.begin(), resultType);
 
@@ -150,7 +154,7 @@ Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> 
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
 
-	_sections[pickSection(opcode)].push_back(std::move(instruction));
+	_sections[isLocal ? Section::FunctionVariables : pickSection(opcode)].push_back(std::move(instruction));
 
 	// The object a variable names is a value the body can load from, so record
 	// its type the same way a value-producing instruction would.
@@ -228,6 +232,16 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 	words.push_back(0); // bound
 	words.push_back(0); // schema, patched below
 
+	const auto append = [&words](const Instruction& instruction) {
+		// The high 16 bits hold the total word count including this one.
+		words.push_back((static_cast<uint32_t>(instruction.words.size() + 1) << 16)
+			| instruction.opcode);
+		words.insert(words.end(), instruction.words.begin(), instruction.words.end());
+	};
+
+	const auto locals = _sections.find(Section::FunctionVariables);
+	bool localsPlaced = locals == _sections.end();
+
 	for (Section section: kSectionOrder) {
 		auto it = _sections.find(section);
 		if (it == _sections.end()) {
@@ -235,19 +249,23 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 		}
 
 		for (const Instruction& instruction: it->second) {
-			// The high 16 bits hold the total word count including this one.
-			words.push_back((static_cast<uint32_t>(instruction.words.size() + 1) << 16)
-				| instruction.opcode);
-			words.insert(words.end(), instruction.words.begin(), instruction.words.end());
+			append(instruction);
+
+			// The module has one function, so its first label opens the
+			// entry block the locals belong to.
+			if (!localsPlaced && section == Section::Functions && instruction.opcode == OpLabel) {
+				for (const Instruction& local: locals->second) {
+					append(local);
+				}
+				localsPlaced = true;
+			}
 		}
 	}
 
 	// The literal section is emitted as instructions too, but it is built in a
 	// separate list so it can be appended last.
 	for (const Instruction& instruction: _literals) {
-		words.push_back((static_cast<uint32_t>(instruction.words.size() + 1) << 16)
-			| instruction.opcode);
-		words.insert(words.end(), instruction.words.begin(), instruction.words.end());
+		append(instruction);
 	}
 
 	words[3] = _nextId; // bound: one past the highest id handed out
