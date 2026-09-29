@@ -95,7 +95,7 @@ public:
 		spirv::Id variable = spirv::InvalidId;
 		spirv::Id memberPointer = spirv::InvalidId;
 	};
-	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes);
+	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes, uint32_t descriptorSet);
 
 	AddressBlock _addressBlock;
 
