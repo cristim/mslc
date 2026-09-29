@@ -2,6 +2,7 @@
 
 #include "ast.h"
 
+#include <functional>
 #include <initializer_list>
 #include <string_view>
 #include <utility>
@@ -71,6 +72,14 @@ private:
 	// Parameters
 	Parameter parseParameter();
 	ParameterAttributes parseParameterAttributes();
+
+	// Struct fields
+	FieldAttributes parseFieldAttributes();
+
+	// One [[...]] attribute list, handing each attribute's name and its optional
+	// constant integer argument to visit. Parameters and struct fields spell the
+	// list the same way, so they share the scanner.
+	void parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>)>& visit);
 
 	// Statements
 	StatementPtr parseStatement();
