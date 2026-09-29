@@ -77,6 +77,14 @@ struct Type {
 
 	bool isPointer = false;
 	bool isConst = false;
+
+	// A packed vector, one of Metal's packed_float4 spellings. It is the same
+	// SPIR-V vector as the plain one; what it changes is the layout, where it
+	// takes the alignment of its scalar rather than a whole register. Kept
+	// because a struct that holds one is laid out differently, and the type name
+	// that said so is gone by the time the layout is computed.
+	bool isPacked = false;
+
 	AddressSpace addressSpace = AddressSpace::None;
 
 	// Set for an array type; the element type is described by the rest.

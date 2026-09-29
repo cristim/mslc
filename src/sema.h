@@ -12,6 +12,24 @@
 
 namespace mslc {
 
+// How many bytes a vector occupies in a buffer and what it aligns to, which is
+// Metal's layout and not its component count. Recorded where the type is
+// declared so that a buffer's element stride is read off the type rather than
+// re-derived from the scalar it is built from.
+struct VectorLayout {
+	uint32_t size;
+	uint32_t alignment;
+};
+
+// What a struct occupies in a buffer, which is what an array of it steps by and
+// what decides where its next member starts. Metal's own numbers, not the
+// packed widths the components have on their own: a float3 member is 16 bytes
+// of which 12 are the three floats, so a struct of one is 16 and not 12.
+struct StructLayout {
+	uint32_t size;
+	uint32_t alignment;
+};
+
 // A SPIR-V type the emitter has already declared, tracked so that a repeated
 // type is declared once. Metal and SPIR-V spell types differently often enough
 // that the emitter needs this cache rather than re-deriving per use.
@@ -23,6 +41,8 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfScalar;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _vectors;
 	std::map<spirv::Id, uint32_t> _widthOfVector;
+	// How many bytes each vector occupies in a buffer and what it aligns to.
+	std::map<spirv::Id, VectorLayout> _layoutOfVector;
 	// Keyed by the component, the column width and the column count, in that
 	// order, so a float4x4 and a float4x3 do not collide.
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, spirv::Id> _matrices;
@@ -33,9 +53,9 @@ class TypeTable {
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
 	std::map<std::string, spirv::Id> _elementStructs;
-	// The size in bytes of each struct, which is the stride an array of that
-	// struct has.
-	std::map<spirv::Id, uint32_t> _structSizes;
+	// What each struct occupies in a buffer, which is the stride an array of
+	// that struct has.
+	std::map<spirv::Id, StructLayout> _structLayouts;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _images;
 	std::map<spirv::Id, spirv::Id> _sampledImages;
 	std::map<std::vector<spirv::Id>, spirv::Id> _functionTypes;
@@ -44,14 +64,15 @@ class TypeTable {
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _samplerType = spirv::InvalidId;
 
-	// A struct's member types and where each one starts in a buffer. outSize,
-	// when given, receives the size of the struct, which is how far an array of it
-	// steps. outStride, when given, receives for each member the stride between
-	// its own columns, which SPIR-V requires as a MatrixStride for a member that
-	// is or holds a matrix. False when the name is not a struct this source
-	// declares.
+	// A struct's member types and where each one starts in a buffer. outLayout,
+	// when given, receives what the struct itself occupies, which is how far an
+	// array of it steps. outStride, when given, receives for each member the
+	// stride between its own columns, which SPIR-V requires as a MatrixStride
+	// for a member that is or holds a matrix. False when the name is not a
+	// struct this source declares.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride, uint32_t* outSize);
+		std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride,
+		StructLayout* outLayout);
 
 	// How many bytes one scalar of a kind occupies.
 	uint32_t fieldTypeSize(ScalarKind kind);

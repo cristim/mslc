@@ -73,8 +73,9 @@ namespace {
 	// ArrayStride of whatever holds it, so a packed vector is the plain vector of
 	// the same element and width. The name is a prefix rather than a vector suffix
 	// because that is how it is spelled.
+	constexpr std::string_view kPacked = "packed_";
+
 	bool unpackPackedTypeName(std::string_view text, ScalarKind& outKind, uint32_t& outWidth) {
-		constexpr std::string_view kPacked = "packed_";
 		if (text.rfind(kPacked, 0) != 0) {
 			return false;
 		}
@@ -105,6 +106,12 @@ namespace {
 		ScalarKind kind;
 		uint32_t width = 0;
 		return isTypeName(text, kind, width);
+	}
+
+	// Whether a name is one of the packed vector types, which lays out as its
+	// components do rather than as a register.
+	bool isPackedTypeName(std::string_view text) {
+		return text.rfind(kPacked, 0) == 0;
 	}
 
 	// A matrix type name, which is its scalar type with the columns and rows
@@ -653,6 +660,7 @@ Type Parser::parseType() {
 	ScalarKind scalarKind;
 	uint32_t vectorWidth = 0;
 	if (kind() == TokenKind::Identifier && isTypeName(current().text, scalarKind, vectorWidth)) {
+		type.isPacked = isPackedTypeName(current().text);
 		advance();
 		type.scalar = scalarKind;
 		type.vectorWidth = vectorWidth;

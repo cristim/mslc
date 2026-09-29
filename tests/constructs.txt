@@ -22,3 +22,4 @@ constructs/sampler_parameter.metal expect=valid
 constructs/vertex_stage_in.metal expect=valid
 constructs/cube_texture.metal expect=valid
 constructs/packed_vector.metal expect=valid
+constructs/float3_layout.metal expect=valid

@@ -227,6 +227,31 @@ namespace {
 		return found->second;
 	}
 
+	// How many bytes a vector of the given components occupies in a buffer, and
+	// what it aligns to. Metal puts a 3-component vector in a 4-component
+	// register, so a float3 is 16 bytes and 16-aligned where a float2 is 8 and a
+	// float 4; a 4-component one needs no padding, and a single component is a
+	// scalar. The alignment is the size rounded down to a register the components
+	// fill, which is what makes a 3- or 4-component vector 16 and a 2-component
+	// one 8.
+	//
+	// Iridium derives the same pair (src/iridium/air.cpp, the LLVMVectorTypeKind
+	// case), and its compiled output is the reference the corpus is measured
+	// against: a float3 array there is decorated ArrayStride 16, and the host
+	// side of indium's own lighting test declares the float3x3 uniform as
+	// "float normalMatrix[3][4]", a 176-byte struct whose matrix has 16-byte
+	// columns.
+	VectorLayout vectorLayoutFor(uint32_t scalarBytes, uint32_t components) {
+		return { (components == 3 ? 4u : components) * scalarBytes,
+			(components >= 3 ? 4u : components) * scalarBytes };
+	}
+
+	// The next multiple of the alignment at or after the offset, which is where
+	// a member of that alignment starts in a struct.
+	uint32_t alignTo(uint32_t offset, uint32_t alignment) {
+		return (offset + alignment - 1) / alignment * alignment;
+	}
+
 }
 
 //
@@ -309,6 +334,7 @@ Id TypeTable::vector(ScalarKind kind, uint32_t width) {
 
 	_vectors.emplace(key, id);
 	_widthOfVector.emplace(id, width);
+	_layoutOfVector.emplace(id, vectorLayoutFor((mappingFor(kind).width + 7) / 8, width));
 	return id;
 }
 
@@ -358,26 +384,17 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { elementType });
 
 	// The stride is how far apart two elements are, which for a scalar or a
-	// vector is its own size and for a struct is the struct's. Metal rounds a
-	// struct's size up to its alignment, and the largest alignment a member
-	// can carry here is a vector's 16 bytes, so that is what an array of a
-	// smaller struct steps by.
+	// vector is its own size in Metal's layout and for a struct is that size
+	// rounded up to the struct's own alignment. That alignment is the largest
+	// one among its members rather than a fixed 16, so a struct of packed
+	// members, whose alignments are their scalars', steps by its own size.
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
-	} else if (const auto it = _widthOfVector.find(elementType); it != _widthOfVector.end()) {
-		uint32_t width = 32;
-		// The vector's element width is not tracked separately, so this uses
-		// the common cases; a wider vector is not in the corpus.
-		for (const auto& [key, id]: _vectors) {
-			if (id == elementType) {
-				width = scalarBitWidth(static_cast<ScalarKind>(key.first));
-			}
-		}
-		stride = ((width + 7) / 8) * it->second;
-	} else if (const auto it = _structSizes.find(elementType); it != _structSizes.end()) {
-		constexpr uint32_t kMaxAlignment = 16;
-		stride = (it->second + kMaxAlignment - 1) / kMaxAlignment * kMaxAlignment;
+	} else if (const auto it = _layoutOfVector.find(elementType); it != _layoutOfVector.end()) {
+		stride = it->second.size;
+	} else if (const auto it = _structLayouts.find(elementType); it != _structLayouts.end()) {
+		stride = alignTo(it->second.size, it->second.alignment);
 	}
 
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
@@ -566,11 +583,12 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 
 // A struct's member types, where each one starts in a buffer, and the size of
 // the struct, which is how far an array of it steps. Metal lays a struct out
-// with every member at the next multiple of its own size, so a float4 member
-// both starts and steps 16 bytes, which is what a float2 field after it has to
-// account for.
+// with every member at the next multiple of its own alignment, so a float3
+// member both starts and steps 16 bytes even though it holds 12, which is what
+// a float member after it has to account for. The struct's own alignment is
+// the largest among its members, and its size is that total rounded up to it.
 bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
-	std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride, uint32_t* outSize) {
+	std::vector<uint32_t>& outOffsets, std::vector<uint32_t>* outStride, StructLayout* outLayout) {
 
 	const StructDecl* decl = _unit.findStruct(name);
 	if (!decl) {
@@ -578,6 +596,7 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	}
 
 	uint32_t offset = 0;
+	uint32_t structAlignment = 1;
 
 	for (const StructField& field: decl->fields) {
 		if (!field.type.isPointer && !field.type.namedType.empty()) {
@@ -587,19 +606,29 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 
 		Id fieldType;
 		uint32_t size;
-		// A matrix's rows are a vector's width, so the stride between its columns
-		// is that vector's size, which is what SPIR-V's MatrixStride has to say.
+		uint32_t alignment;
+		// A matrix steps by its column, so the stride between its columns is
+		// that column's size in Metal's layout, which is what SPIR-V's
+		// MatrixStride has to say.
 		uint32_t stride = 0;
 		if (field.type.isMatrix()) {
+			const VectorLayout column = vectorLayoutFor(fieldTypeSize(field.type.scalar),
+				field.type.matrixRows);
 			fieldType = matrix(field.type.scalar, field.type.matrixColumns, field.type.matrixRows);
-			stride = fieldTypeSize(field.type.scalar) * field.type.matrixRows;
+			stride = column.size;
 			size = stride * field.type.matrixColumns;
-		} else if (field.type.vectorWidth > 1) {
-			fieldType = vector(field.type.scalar, field.type.vectorWidth);
-			size = fieldTypeSize(field.type.scalar) * field.type.vectorWidth;
+			alignment = column.alignment;
 		} else {
-			fieldType = scalar(field.type.scalar);
-			size = fieldTypeSize(field.type.scalar);
+			const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
+			const VectorLayout layout = vectorLayoutFor(fieldTypeSize(field.type.scalar), components);
+			fieldType = components > 1
+				? vector(field.type.scalar, field.type.vectorWidth)
+				: scalar(field.type.scalar);
+			// A packed vector takes the alignment of its scalar, which is what
+			// makes a struct of packed_float4, packed_float4, packed_float2 40
+			// bytes and step by 40 rather than by 48.
+			size = field.type.isPacked ? fieldTypeSize(field.type.scalar) * components : layout.size;
+			alignment = field.type.isPacked ? fieldTypeSize(field.type.scalar) : layout.alignment;
 		}
 
 		if (size == 0) {
@@ -608,16 +637,18 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 				+ (field.type.isPointer ? "*" : "") + " " + field.name + "\")");
 		}
 
+		offset = alignTo(offset, alignment);
 		outTypes.push_back(fieldType);
 		outOffsets.push_back(offset);
 		if (outStride) {
 			outStride->push_back(stride);
 		}
 		offset += size;
+		structAlignment = std::max(structAlignment, alignment);
 	}
 
-	if (outSize) {
-		*outSize = offset;
+	if (outLayout) {
+		*outLayout = { alignTo(offset, structAlignment), structAlignment };
 	}
 
 	return true;
@@ -685,8 +716,8 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
 	std::vector<uint32_t> strides;
-	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, &strides, &size)) {
+	StructLayout layout;
+	if (!structMembersFor(name, fieldTypes, offsets, &strides, &layout)) {
 		return InvalidId;
 	}
 
@@ -706,7 +737,7 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	}
 
 	_elementStructs.emplace(name, id);
-	_structSizes.emplace(id, size);
+	_structLayouts.emplace(id, layout);
 	return id;
 }
 

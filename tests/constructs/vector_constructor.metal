@@ -12,8 +12,10 @@
 // block, and mslc emits each one where it is declared, so a second local
 // declared after an initialiser has been computed lands in the wrong place.
 // The outputs are float4 rather than the narrower vectors the widths here
-// suggest, because an array of a three-wide vector is a stride Vulkan's
-// relaxed storage buffer layout does not allow, which is a separate gap.
+// suggest, so that the buffer being written to is one whose element mslc has
+// already shown it can lay out; constructs/float3_layout.metal is where the
+// narrower case is covered.
+
 kernel void direct(device float4 *out [[buffer(0)]],
                    constant float4 *in [[buffer(1)]],
                    uint index [[thread_position_in_grid]])
