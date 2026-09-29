@@ -395,6 +395,9 @@ bool TypeTable::isAggregate(spirv::Id type) const {
 }
 
 Id TypeTable::zero(Id type) {
+	// A vector or a struct has no single zero value: OpConstant is a scalar form,
+	// so an aggregate needs OpConstantComposite over its parts. No local of that
+	// shape parses yet, and reporting it beats emitting a scalar for it.
 	if (isAggregate(type)) {
 		throw CompileError("a local of an aggregate type cannot be zero initialised yet; "
 			"give it an initialiser");
@@ -407,15 +410,10 @@ Id TypeTable::zero(Id type) {
 	}
 
 	// OpConstant's literal count is context dependent, so it follows the width:
-	// one word up to 32 bits, two for 64. Writing one word for a 64-bit value
-	// is a short instruction.
-	const uint32_t words = (bitWidth(type) + 31) / 32;
-	if (words == 0 || words > 2) {
-		throw CompileError("a local of this type cannot be zero initialised yet");
-	}
-
+	// one word up to 32 bits, two for 64. Writing one word for a 64-bit value is
+	// a short instruction, which is what this used to do.
 	return _builder.emitDeclTyped(spirv::OpConstant, type,
-		std::vector<uint32_t>(words, 0u));
+		std::vector<uint32_t>((bitWidth(type) + 31) / 32, 0u));
 }
 
 Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
