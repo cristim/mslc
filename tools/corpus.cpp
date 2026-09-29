@@ -45,8 +45,23 @@ namespace {
 		return root + "/" + entry;
 	}
 
+	// Single-quotes an argument for /bin/sh, so paths with spaces survive
+	// popen() and system().
+	std::string shellQuote(const std::string& arg) {
+		std::string quoted = "'";
+		for (const char c : arg) {
+			if (c == '\'') {
+				quoted += "'\\''";
+			} else {
+				quoted += c;
+			}
+		}
+
+		return quoted + "'";
+	}
+
 	bool validateWithSpirvVal(const std::string& spirvVal, const std::string& spvPath, std::string& detail) {
-		const std::string command = spirvVal + " --target-env vulkan1.3 " + spvPath
+		const std::string command = shellQuote(spirvVal) + " --target-env vulkan1.3 " + shellQuote(spvPath)
 			+ " 2>&1 >/dev/null";
 		FILE* pipe = popen(command.c_str(), "r");
 		if (!pipe) {
@@ -97,7 +112,7 @@ int main(int argc, char** argv) {
 
 	// A missing validator must fail the run rather than let "not checked"
 	// read as either a compiler regression or a pass.
-	if (std::system((spirvVal + " --version >/dev/null 2>&1").c_str()) != 0) {
+	if (std::system((shellQuote(spirvVal) + " --version >/dev/null 2>&1").c_str()) != 0) {
 		std::fprintf(stderr, "mslc-corpus: cannot run \"%s\"; install SPIRV-Tools\n", spirvVal.c_str());
 		return 2;
 	}
@@ -199,6 +214,12 @@ int main(int argc, char** argv) {
 
 	std::printf("\n%zu of %zu compile, %zu of %zu reach spirv-val-valid SPIR-V\n",
 		compiled, results.size(), valid, results.size());
+
+	// An empty manifest would otherwise pass as "0 of 0 valid".
+	if (results.empty()) {
+		std::fprintf(stderr, "mslc-corpus: %s lists no shaders\n", manifestPath.c_str());
+		return 1;
+	}
 
 	return valid == results.size() ? 0 : 1;
 }
