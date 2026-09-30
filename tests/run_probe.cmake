@@ -11,6 +11,8 @@
 #   // DISASM-NOT: <substring>    spirv-dis output does not contain <substring>
 #   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
 #   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
+#   // REFLECT: <substring>       the reflection JSON contains <substring>
+#   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
 # Invoked by ctest as:
 #   cmake -DMSLC=... -DSPIRV_VAL=... -DSPIRV_DIS=... -DPROBE=... -DOUT_DIR=... -P run_probe.cmake
@@ -33,8 +35,14 @@ file(MAKE_DIRECTORY "${OUT_DIR}")
 set(spv "${OUT_DIR}/${name}.spv")
 file(REMOVE "${spv}")
 
+# The reflection is requested on every probe, not only on the ones that check
+# it, so that a probe which starts depending on it needs no harness change. It is
+# the contract indium consumes, and nothing else in the suite looks at it.
+set(reflection "${OUT_DIR}/${name}.json")
+file(REMOVE "${reflection}")
+
 execute_process(
-	COMMAND "${MSLC}" -o "${spv}" "${PROBE}"
+	COMMAND "${MSLC}" -o "${spv}" --reflect "${reflection}" "${PROBE}"
 	RESULT_VARIABLE status
 	OUTPUT_VARIABLE output
 	ERROR_VARIABLE output
@@ -105,6 +113,45 @@ if(expectation STREQUAL "valid")
 			string(REGEX MATCH "${needle}" found "${disassembly}")
 			if(NOT found STREQUAL "")
 				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
+			endif()
+		endforeach()
+	endif()
+
+	file(STRINGS "${PROBE}" wantedReflection REGEX "^// REFLECT: ")
+	file(STRINGS "${PROBE}" unwantedReflection REGEX "^// REFLECT-NOT: ")
+
+	# A needle whose prefix is misspelled matches neither REGEX above, so it would
+	# be ignored and the probe would pass without ever checking anything. The
+	# search is deliberately wider than the form it then requires: anchoring the
+	# search the way the extractors are anchored would make it blind exactly where
+	# they are, which is the case worth catching. The case is what rejects a tab
+	# after "//", leading whitespace, and a missing colon. "Reflection:" in prose
+	# is unaffected, since the search is case-sensitive.
+	file(STRINGS "${PROBE}" reflectionNeedles REGEX "REFLECT")
+	foreach(line IN LISTS reflectionNeedles)
+		if(NOT line MATCHES "^// REFLECT(-NOT)?: .+")
+			message(FATAL_ERROR "${name}: \"${line}\" is not a reflection needle; "
+				"the prefix is \"// REFLECT: \" or \"// REFLECT-NOT: \"")
+		endif()
+	endforeach()
+
+	if(wantedReflection OR unwantedReflection)
+		if(NOT EXISTS "${reflection}")
+			message(FATAL_ERROR "${name}: mslc wrote no reflection, so it cannot be checked")
+		endif()
+		file(READ "${reflection}" reported)
+		foreach(line IN LISTS wantedReflection)
+			string(REGEX REPLACE "^// REFLECT: " "" needle "${line}")
+			string(FIND "${reported}" "${needle}" found)
+			if(found EQUAL -1)
+				message(FATAL_ERROR "${name}: reflection lacks \"${needle}\":\n${reported}")
+			endif()
+		endforeach()
+		foreach(line IN LISTS unwantedReflection)
+			string(REGEX REPLACE "^// REFLECT-NOT: " "" needle "${line}")
+			string(FIND "${reported}" "${needle}" found)
+			if(NOT found EQUAL -1)
+				message(FATAL_ERROR "${name}: reflection contains \"${needle}\":\n${reported}")
 			endif()
 		endforeach()
 	endif()

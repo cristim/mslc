@@ -3,3 +3,4 @@ build/
 # mslc writes its output alongside the input when -o is not given, so invoking
 # it on a file under tests/ drops a .spv next to the source.
 tests/*.spv
+tests/probes/*.spv
