@@ -2100,11 +2100,13 @@ namespace {
 		_bindings[parameter.name] = binding;
 
 		// The Metal index says which buffer the app bound at that slot. Every
-		// buffer shares the block at set 0 binding 0, so it is not a descriptor
-		// binding and the reflection says which one instead.
+		// buffer shares one block at binding 0, so it is not a per-buffer binding
+		// and the reflection reports the member instead. The set is the one the
+		// block is actually declared in, which is 1 for a fragment entry point.
 		_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 			+ std::to_string(bindingIndex)
-			+ ", \"descriptor\": { \"set\": 0, \"binding\": 0 }"
+			+ ", \"descriptor\": { \"set\": " + std::to_string(descriptorSet())
+			+ ", \"binding\": 0 }"
 			+ ", \"member\": " + std::to_string(memberIndex)
 			+ ", \"param_index\": " + std::to_string(index)
 			+ ", \"name\": \"" + parameter.name + "\" },\n";
@@ -2421,9 +2423,18 @@ namespace {
 			// indium can supply Metal's threadsPerThreadgroup through
 			// VkSpecializationInfo at pipeline creation. A literal would be baked
 			// in and the value the app asked for would be ignored.
-			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
-			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
-			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0u });
+			// The spec constants default to the requested size rather than to
+			// zero. indium overrides all three through VkSpecializationInfo, so
+			// the default only has to be legal, and a workgroup size of 0, 0, 0
+			// passes spirv-val and is then rejected when the pipeline is
+			// created. Using the option also makes the size the caller asked for
+			// the size the module reports.
+			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeX });
+			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeY });
+			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeZ });
 			_builder.emit(spirv::OpDecorate, { x,
 				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
 			_builder.emit(spirv::OpDecorate, { y,
