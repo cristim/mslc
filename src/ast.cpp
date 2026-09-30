@@ -22,6 +22,39 @@ const char* scalarKindName(ScalarKind kind) {
 	return "unknown";
 }
 
+std::string typeName(const Type& type) {
+	std::string name = type.namedType.empty()
+		? std::string(scalarKindName(type.scalar))
+		: type.namedType;
+
+	if (type.namedType.empty() && type.vectorWidth > 1) {
+		name += std::to_string(type.vectorWidth);
+	}
+	if (type.arrayLength) {
+		name += "[" + std::to_string(*type.arrayLength) + "]";
+	}
+	if (type.isPointer) {
+		name += "*";
+	}
+	if (type.isConst) {
+		name = "const " + name;
+	}
+
+	return name;
+}
+
+const char* addressSpaceName(AddressSpace space) {
+	switch (space) {
+		case AddressSpace::Device: return "device";
+		case AddressSpace::Constant: return "constant";
+		case AddressSpace::Threadgroup: return "threadgroup";
+		case AddressSpace::Thread: return "thread";
+		case AddressSpace::None: break;
+	}
+
+	return "none";
+}
+
 uint32_t scalarBitWidth(ScalarKind kind) {
 	switch (kind) {
 		case ScalarKind::Bool: return 1;

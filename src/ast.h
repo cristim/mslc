@@ -70,6 +70,14 @@ struct Type {
 const char* scalarKindName(ScalarKind kind);
 uint32_t scalarBitWidth(ScalarKind kind);
 
+// The type as it is written in the source: "float", "float3", or the name a
+// struct was declared with. Diagnostics quote a type the way the reader wrote
+// it, so this is deliberately the MSL spelling and not a SPIR-V one.
+std::string typeName(const Type& type);
+
+// The keyword an address space is written with, for diagnostics.
+const char* addressSpaceName(AddressSpace space);
+
 // Parameter attributes. MSL attaches these with [[...]] and they carry all the
 // binding information, so they are modelled explicitly rather than discarded.
 struct ParameterAttributes {
@@ -129,7 +137,7 @@ enum class ExpressionKind {
 	Index,
 	Member,
 	Call,
-	Cast,
+	Construct,
 	InitList,
 };
 
@@ -166,8 +174,8 @@ struct Expression {
 	ExpressionPtr left;
 	ExpressionPtr right;
 
-	// Cast target
-	std::optional<Type> castType;
+	// Construct: the type being constructed
+	std::optional<Type> constructType;
 
 	// Line the expression started on, for diagnostics.
 	size_t line = 0;

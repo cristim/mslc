@@ -97,6 +97,11 @@ private:
 
 	// Expressions, by precedence level.
 	ExpressionPtr parseExpression();
+
+	// The comma-separated list inside a pair of parentheses, up to and including
+	// the closing one. A call and a constructor differ in what they are called,
+	// not in how their arguments are separated.
+	std::vector<ExpressionPtr> parseArgumentList(const char* closing);
 	ExpressionPtr parseAssignment();
 	ExpressionPtr parseLogicalOr();
 	ExpressionPtr parseLogicalAnd();

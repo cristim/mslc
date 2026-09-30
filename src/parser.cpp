@@ -129,19 +129,6 @@ namespace {
 		return std::nullopt;
 	}
 
-	// The name a diagnostic uses for an address space.
-	const char* addressSpaceName(AddressSpace space) {
-		switch (space) {
-			case AddressSpace::Device: return "device";
-			case AddressSpace::Constant: return "constant";
-			case AddressSpace::Threadgroup: return "threadgroup";
-			case AddressSpace::Thread: return "thread";
-			case AddressSpace::None: break;
-		}
-
-		return "none";
-	}
-
 }
 
 bool isMSLBuiltinName(std::string_view name) {
@@ -824,6 +811,19 @@ StatementPtr Parser::parseStatement() {
 
 			if (match(TokenKind::Assign)) {
 				declaration.initializer = parseExpression();
+			} else if (at(TokenKind::LParen)) {
+				// Direct initialisation, float3 specularTerm(0); . The name comes
+				// first here, so the list after it constructs the variable's own
+				// type rather than calling it, and the two spellings are the same
+				// value. Metal has no other form: "float3(0) specularTerm;" is a
+				// parse error there, which xcrun metal confirms.
+				advance();
+				auto construct = std::make_unique<Expression>();
+				construct->kind = ExpressionKind::Construct;
+				construct->line = line();
+				construct->constructType = declaration.type;
+				construct->arguments = parseArgumentList("to close a constructor's argument list");
+				declaration.initializer = std::move(construct);
 			}
 
 			expect(TokenKind::Semicolon, "after a declaration");
@@ -1068,19 +1068,35 @@ ExpressionPtr Parser::parsePostfix() {
 			call->kind = ExpressionKind::Call;
 			call->line = expression->line;
 			call->left = std::move(expression);
-			while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
-				call->arguments.push_back(parseExpression());
-				if (!match(TokenKind::Comma)) {
-					break;
-				}
-			}
-			expect(TokenKind::RParen, "to close an argument list");
+			call->arguments = parseArgumentList("to close an argument list");
 			expression = std::move(call);
 			continue;
 		}
 
 		return expression;
 	}
+}
+
+std::vector<ExpressionPtr> Parser::parseArgumentList(const char* closing) {
+	std::vector<ExpressionPtr> arguments;
+
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		arguments.push_back(parseExpression());
+
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+
+		// A trailing comma is not a list with an empty last element; Apple's
+		// compiler reports "expected expression" for it. Accepting it here would
+		// mean mslc compiles a source the GPU compiler rejects.
+		if (at(TokenKind::RParen)) {
+			throw CompileError("expected an expression after ',' in an argument list");
+		}
+	}
+
+	expect(TokenKind::RParen, closing);
+	return arguments;
 }
 
 ExpressionPtr Parser::parsePrimary() {
@@ -1122,23 +1138,25 @@ ExpressionPtr Parser::parsePrimary() {
 		ScalarKind scalarKind;
 		uint32_t vectorWidth = 0;
 		if (isTypeName(text, scalarKind, vectorWidth)) {
-			// A type name in expression position is a cast: float(x), uint3(y).
+			// A type name in expression position constructs a value: float(x),
+			// float3(0), float4(a, b, c, 1). Metal has no cast syntax, so T(...) is
+			// always a constructor call, and the parenthesised part is a list of
+			// arguments rather than the single operand a cast would take.
 			advance();
 			Type type;
 			type.scalar = scalarKind;
 			type.vectorWidth = vectorWidth;
 
 			if (!at(TokenKind::LParen)) {
-				throw CompileError("expected '(' after cast type \"" + std::string(text) + "\"");
+				throw CompileError("expected '(' after type \"" + std::string(text) + "\"");
 			}
 
 			advance();
 			auto expression = std::make_unique<Expression>();
-			expression->kind = ExpressionKind::Cast;
+			expression->kind = ExpressionKind::Construct;
 			expression->line = line();
-			expression->castType = type;
-			expression->left = parseExpression();
-			expect(TokenKind::RParen, "to close a cast");
+			expression->constructType = type;
+			expression->arguments = parseArgumentList("to close a constructor's argument list");
 			return expression;
 		}
 

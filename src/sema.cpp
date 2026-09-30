@@ -910,10 +910,11 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
-		Id emitCast(const Expression& expression);
+		Id emitConstruct(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id convert(Id value, Id fromType, Id toType);
+		Id broadcast(Id value, Id vectorType);
 	};
 
 	// No setSection here: OpConstant is routed to the types block by the
@@ -1393,10 +1394,76 @@ namespace {
 			_types.pointer(storageClass, outFieldType), operands);
 	}
 
-	Id Emitter::emitCast(const Expression& expression) {
-		const Id value = emitExpression(*expression.left);
+	Id Emitter::broadcast(Id value, Id vectorType) {
+		// A scalar beside a vector is a broadcast, which is what "v * 2.0" and
+		// float3(0) both mean in MSL. The scalar is converted to the vector's own
+		// component type and put in every component; converting it to the vector
+		// type instead would be an OpFConvert into a vector, which no convert
+		// opcode accepts, so an int beside a float vector is converted rather than
+		// reinterpreted.
+		const Id component = _types.componentOf(vectorType);
+		const Id widened = convert(value, _builder.typeOf(value), component);
+		return _builder.emitTyped(spirv::OpCompositeConstruct, vectorType,
+			std::vector<uint32_t>(_types.vectorWidth(vectorType), widened));
+	}
+
+	Id Emitter::emitConstruct(const Expression& expression) {
+		if (!expression.constructType) {
+			throw CompileError("a constructor needs the type it constructs");
+		}
+
+		const Type& target = *expression.constructType;
+		const std::string spelled = typeName(target);
+
+		// Only a scalar or a vector is a value a constructor produces. A pointer,
+		// an array or a struct is not: "float* p(0)" is a null pointer in C++ and
+		// not a pointer built from a value, and a local of a pointer type whose
+		// initialiser is a scalar stores that scalar into the pointer, which
+		// validates and reads as nonsense.
+		if (target.isPointer || target.arrayLength || !target.namedType.empty()) {
+			throw CompileError("constructing a " + spelled + " is not lowered yet; "
+				"mslc builds a scalar or a vector value");
+		}
+
+		// An address space on a local is not something mslc can declare. Apple
+		// rejects one outright ("automatic variable qualified with an address
+		// space"), except for threadgroup, which is legal and needs StorageClass
+		// ThreadGroup. mslc declares every local in Function storage, so
+		// "threadgroup float3 v(0);" would be a thread-private local in a module
+		// whose source says the value is shared, and that validates.
+		if (target.addressSpace != AddressSpace::None) {
+			throw CompileError("a local in the " + std::string(addressSpaceName(target.addressSpace))
+				+ " address space is not lowered yet; every local mslc declares is "
+					"thread-private");
+		}
+
+		const Id toType = declaredTypeOf(target);
+
+		// float3() and float3(0) are different values and mslc has no value to put
+		// in the components, so it says so rather than fabricating a zero. xcrun
+		// metal accepts the empty form and zero-fills it; a caller cannot tell
+		// that apart from float3(0) in the emitted module, which is the reason for
+		// the diagnostic.
+		if (expression.arguments.empty()) {
+			throw CompileError(spelled + "() has no arguments and mslc has no default "
+				"value to put in it; write the value you want, as " + spelled + "(0)");
+		}
+
+		// The list form, float4(a, b, c, 1), is a different capability: it builds a
+		// vector from one value per component rather than by broadcast.
+		if (expression.arguments.size() > 1) {
+			throw CompileError(spelled + " built from " + std::to_string(expression.arguments.size())
+				+ " values is not lowered yet; one value broadcasts, which is what "
+				+ spelled + "(0) does");
+		}
+
+		const Id value = emitExpression(*expression.arguments.front());
 		const Id fromType = _builder.typeOf(value);
-		const Id toType = declaredTypeOf(*expression.castType);
+
+		if (_types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) > 1) {
+			return broadcast(value, toType);
+		}
+
 		return convert(value, fromType, toType);
 	}
 
@@ -1449,18 +1516,14 @@ namespace {
 			|| expression.binaryOperator == BinaryOperator::ShiftRight;
 
 		// A scalar beside a vector is a broadcast, which is what "v * 2.0" means
-		// in MSL. The scalar is converted to the vector's own component type and
-		// then put in every component; converting it to the vector type instead
-		// would be an OpFConvert into a vector, which no convert opcode accepts.
+		// in MSL, so the two cases share one rule below.
 		const uint32_t rightWidth = _types.vectorWidth(_builder.typeOf(right));
 		if (_types.vectorWidth(leftType) > 1 && rightWidth == 1
 			&& !isShift && !isLogical && !isComparison) {
 
-			const Id component = _types.componentOf(leftType);
-			const Id widened = convert(right, _builder.typeOf(right), component);
+			const Id splat = broadcast(right, leftType);
 			return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
-				leftType, { left, _builder.emitTyped(spirv::OpCompositeConstruct, leftType,
-					std::vector<uint32_t>(_types.vectorWidth(leftType), widened)) });
+				leftType, { left, splat });
 		}
 
 		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
@@ -1847,7 +1910,7 @@ namespace {
 			case ExpressionKind::Index: return emitIndex(expression, false);
 			case ExpressionKind::Member: return emitMember(expression);
 			case ExpressionKind::Call: return emitCall(expression);
-			case ExpressionKind::Cast: return emitCast(expression);
+			case ExpressionKind::Construct: return emitConstruct(expression);
 			case ExpressionKind::InitList:
 			case ExpressionKind::Assign: break;
 		}
