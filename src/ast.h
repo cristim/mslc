@@ -105,7 +105,6 @@ struct Parameter {
 	Type type;
 	std::string name;
 	ParameterAttributes attributes;
-	bool isConstReference = false;
 };
 
 struct Expression;
