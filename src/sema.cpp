@@ -474,19 +474,18 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 	// function's set, and its buffers would never bind.
 	//
 	// Two entry points in the *same* stage share a set and therefore have to
-	// share the block, which only works if they declare the same number of
-	// buffers: the block's member count is fixed when it is declared, and a
-	// second entry point indexing past it reads a member that is not there. That
-	// is a hard error rather than a silent reuse, because the wrong answer is a
-	// buffer address read from beyond the block rather than a rejected module.
+	// share the block, which only works if they declare the same buffers: the
+	// block's members are typed and its count is fixed when it is declared, and
+	// a second entry point indexing it with a different count or a different
+	// pointee type produces an access chain whose result type does not match the
+	// type the member holds. Both are hard errors rather than a silent reuse,
+	// because the module that comes out is a rejected one at best.
 	const auto cached = _addressBlocks.find(descriptorSet);
 	if (cached != _addressBlocks.end()) {
-		if (cached->second.memberCount != pointeeTypes.size()) {
-			throw CompileError("two entry points in the same stage bind "
-				+ std::to_string(cached->second.memberCount) + " and "
-				+ std::to_string(pointeeTypes.size())
-				+ " buffers, and one address block at binding 0 holds them; "
-				"they have to agree");
+		if (cached->second.pointeeTypes != pointeeTypes) {
+			throw CompileError("two entry points in the same stage bind different "
+				"buffers, and one address block at binding 0 holds them; they have "
+				"to agree in both number and type");
 		}
 
 		return cached->second;
@@ -494,7 +493,7 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 
 	{
 		AddressBlock block;
-		block.memberCount = pointeeTypes.size();
+		block.pointeeTypes = pointeeTypes;
 		std::vector<uint32_t> memberPointers;
 		memberPointers.reserve(pointeeTypes.size());
 

@@ -120,11 +120,11 @@ public:
 		spirv::Id blockType = spirv::InvalidId;
 		spirv::Id variable = spirv::InvalidId;
 		spirv::Id memberPointer = spirv::InvalidId;
-		// How many members it was declared with, which is what a second entry
-		// point in the same set has to agree with: the member list is fixed when
-		// the block is built, and indexing past it reads a member that is not
-		// there.
-		size_t memberCount = 0;
+		// What its members point at, in order. A second entry point in the same
+		// set has to agree with this in both count and type: the members are
+		// typed and fixed when the block is built, so a mismatch produces an
+		// access chain whose result type is not the type the member holds.
+		std::vector<spirv::Id> pointeeTypes;
 	};
 	// Builds the binding-0 address block for one descriptor set from the given
 	// pointee types on the first call for that set, and returns it unchanged
