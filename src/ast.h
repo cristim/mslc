@@ -111,6 +111,14 @@ struct Parameter {
 struct Expression;
 using ExpressionPtr = std::unique_ptr<Expression>;
 
+// One element of a braced initialiser list. Metal writes a struct's fields by
+// name, as in ".direction = { 0.13, 0.72, 0.68 }", so the name is part of the
+// element rather than a separate statement.
+struct InitializerElement {
+	std::string fieldName;
+	ExpressionPtr value;
+};
+
 enum class ExpressionKind {
 	IntLiteral,
 	FloatLiteral,
@@ -123,6 +131,7 @@ enum class ExpressionKind {
 	Member,
 	Call,
 	Cast,
+	InitList,
 };
 
 enum class BinaryOperator {
@@ -148,6 +157,9 @@ struct Expression {
 	std::string name;
 	std::string memberName;
 	std::vector<ExpressionPtr> arguments;
+
+	// InitList
+	std::vector<InitializerElement> elements;
 
 	// Binary, Unary, Assign
 	BinaryOperator binaryOperator = BinaryOperator::Add;
@@ -249,6 +261,10 @@ struct FunctionDecl {
 struct TranslationUnit {
 	std::vector<StructDecl> structs;
 	std::vector<FunctionDecl> functions;
+
+	// File-scope declarations, in the order the source declares them. A
+	// "constant" refers to the ones before it, so the order is the meaning.
+	std::vector<VariableDeclaration> globals;
 
 	// MSL entry points, keyed by function name.
 	const FunctionDecl* findFunction(const std::string& name) const;

@@ -393,8 +393,16 @@ bool TypeTable::isAggregate(spirv::Id type) const {
 		return true;
 	}
 
-	// _structs is keyed by name, so a struct is found by value.
+	// A struct is declared twice over, once as a value and once as a buffer's
+	// block, and the two live in different maps, so both are looked through. A
+	// scalar standing in for either is the case this answers.
 	for (const auto& [name, id]: _structs) {
+		if (id == type) {
+			return true;
+		}
+	}
+
+	for (const auto& [name, id]: _valueStructs) {
 		if (id == type) {
 			return true;
 		}
@@ -516,24 +524,22 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 	return id;
 }
 
-Id TypeTable::namedStruct(const std::string& name) {
-	const auto cached = _structs.find(name);
-	if (cached != _structs.end()) {
-		return cached->second;
-	}
+// The member types of a struct and, where the caller wants them, where each one
+// starts in a buffer. False when no struct of that name is declared, so a caller
+// can say so rather than guess.
+bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
+	std::vector<uint32_t>& outOffsets) {
 
 	const StructDecl* decl = _unit.findStruct(name);
 	if (!decl) {
-		return InvalidId;
+		return false;
 	}
 
-	std::vector<Id> fieldTypes;
-	std::vector<uint32_t> offsets;
 	uint32_t offset = 0;
 
 	for (const StructField& field: decl->fields) {
 		if (!field.type.isScalar() || !field.type.namedType.empty()) {
-			throw CompileError("struct \"" + name + "\" has a field mslc cannot represent yet ("
+			throw CompileError("struct \"" + decl->name + "\" has a field mslc cannot represent yet ("
 				+ std::string(scalarKindName(field.type.scalar))
 				+ (field.type.isPointer ? "*" : "")
 				+ (field.type.isConst ? " const" : "")
@@ -543,24 +549,61 @@ Id TypeTable::namedStruct(const std::string& name) {
 		const Id fieldType = scalar(field.type.scalar);
 		const uint32_t size = mappingFor(field.type.scalar).width / 8;
 
-		fieldTypes.push_back(fieldType);
-		offsets.push_back(offset);
+		outTypes.push_back(fieldType);
+		outOffsets.push_back(offset);
 		offset += size;
 	}
 
+	return true;
+}
+
+Id TypeTable::valueStruct(const std::string& name) {
+	const auto cached = _valueStructs.find(name);
+	if (cached != _valueStructs.end()) {
+		return cached->second;
+	}
+
+	std::vector<Id> fieldTypes;
+	std::vector<uint32_t> offsets;
+	if (!structMembersFor(name, fieldTypes, offsets)) {
+		return InvalidId;
+	}
 
 	// Members only. The count is implied by the instruction's word count, and
 	// writing it as an operand would be read as one extra member.
-	std::vector<uint32_t> operands;
-	for (Id fieldType: fieldTypes) {
-		operands.push_back(fieldType);
+	// A struct used as a value and the same struct as a buffer's block have the
+	// same members; only the decorations differ, so the members are computed once
+	// and each form decorates as much as its use needs.
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
+
+	// No Block and no member offsets: that is the layout of a buffer, and a
+	// struct used as a value is laid out by whatever holds it. A Block-decorated
+	// struct is only valid in the storage classes a descriptor is allowed in, so
+	// using this one as a constant's type would be rejected.
+	_valueStructs.emplace(name, id);
+	return id;
+}
+
+Id TypeTable::namedStruct(const std::string& name) {
+	const auto cached = _structs.find(name);
+	if (cached != _structs.end()) {
+		return cached->second;
 	}
 
-	const Id id = _builder.emitDecl(spirv::OpTypeStruct, operands);
+	std::vector<Id> fieldTypes;
+	std::vector<uint32_t> offsets;
+	if (!structMembersFor(name, fieldTypes, offsets)) {
+		return InvalidId;
+	}
+
+	// A struct used as a value and the same struct as a buffer's block have the
+	// same members; only the decorations differ, so the members are computed once
+	// and each form decorates as much as its use needs.
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
 
 	// A struct reached through a buffer binding is an interface block, so it
 	// needs Block and per-member Offset. std140 rules apply, which for the
-	// scalar members in the corpus is just their natural size and alignment.
+	// members the corpus has is Metal's own layout.
 	_builder.emit(spirv::OpDecorate, { id, static_cast<uint32_t>(spirv::Decoration::Block) });
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
@@ -659,6 +702,32 @@ namespace {
 		bool isBuffer = false;
 	};
 
+	// A value rather than a place, so there is no address to load through and a
+	// member is taken from the value itself.
+	struct ConstantBinding {
+		Id id = InvalidId;
+		const StructDecl* structType = nullptr;
+	};
+
+	// A file-scope "constant" folded to a value. SPIR-V takes only constants as a
+	// constant's operands, so an initialiser that refers to an earlier constant
+	// or does arithmetic has to be folded here rather than emitted as the
+	// expression it was written as.
+	struct FoldedConstant {
+		// A composite: the type it was declared as, and the constants making it
+		// up, which have already been emitted.
+		bool isComposite = false;
+		Id type = InvalidId;
+		std::vector<Id> parts;
+
+		// A scalar: the kind to declare it as, and its value. A double holds
+		// every 32-bit integer and every float exactly, which is the whole range
+		// of the scalar types a constant here can have.
+		ScalarKind scalar = ScalarKind::Void;
+		double number = 0.0;
+		bool boolean = false;
+	};
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -667,6 +736,13 @@ namespace {
 		TypeTable& _types;
 
 		std::map<std::string, Binding> _bindings;
+		// File-scope constants, keyed by name. Separate from _bindings because a
+		// constant belongs to the module rather than to the entry point, and an
+		// entry point's own names are looked up first.
+		std::map<std::string, ConstantBinding> _constants;
+		// What each constant folded to, so a later constant referring to this one
+		// needs the value rather than a reference to a constant.
+		std::map<std::string, FoldedConstant> _folded;
 		std::map<spirv::Id, const StructDecl*> _structByValue;
 		// The pointee of every buffer parameter, in declaration order, which is
 		// what the binding-0 block is built from once the loop is done.
@@ -715,6 +791,16 @@ namespace {
 		// alignment the buffer's own layout guarantees.
 		std::vector<uint32_t> alignedOperands(Id pointeeType) const;
 		Id declaredTypeOf(const Type& type);
+		void declareGlobals();
+		Id declareGlobalConstant(const VariableDeclaration& declaration);
+		Id emitConstant(const FoldedConstant& folded);
+		uint32_t constantBits(ScalarKind kind, double value);
+		FoldedConstant foldInitializer(const Type& type, const Expression& initializer);
+		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
+			const Expression& initializer);
+		FoldedConstant foldExpression(const Expression& expression);
+		FoldedConstant foldBinary(const Expression& expression);
+		FoldedConstant foldUnary(const Expression& expression);
 		void declareParameters();
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
@@ -733,6 +819,11 @@ namespace {
 		Id emitIndex(const Expression& expression, bool asAddress);
 		Id emitMember(const Expression& expression);
 		Id emitMemberAddress(const Expression& expression);
+
+		// The file-scope constant an expression names, or null when it names
+		// something else. A constant is a value and not a place, which is what
+		// tells a member read on one apart from a member read on a local.
+		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
 		Id emitCast(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
@@ -748,6 +839,15 @@ namespace {
 	}
 
 	Id Emitter::declaredTypeOf(const Type& type) {
+		if (!type.namedType.empty()) {
+			const Id id = _types.valueStruct(type.namedType);
+			if (id == InvalidId) {
+				throw CompileError("undeclared type \"" + type.namedType + "\"");
+			}
+
+			return id;
+		}
+
 		if (type.vectorWidth > 1) {
 			return _types.vector(type.scalar, type.vectorWidth);
 		}
@@ -886,8 +986,15 @@ namespace {
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {
+		// The entry point's own names first, then the module's: a constant declared
+		// at file scope is not a parameter of the entry point that reads it.
 		const auto it = _bindings.find(expression.name);
 		if (it == _bindings.end()) {
+			const auto constant = _constants.find(expression.name);
+			if (constant != _constants.end()) {
+				return constant->second.id;
+			}
+
 			// A parameter is free to be named after an MSL builtin: Blender's
 			// compute_buffer_clear names one "position". Reporting the collision
 			// here rather than in the parser is what lets the declaration win.
@@ -896,8 +1003,8 @@ namespace {
 					+ "\" is not supported yet");
 			}
 
-			throw CompileError("\"" + expression.name + "\" is not a parameter, local or builtin "
-				"mslc knows about");
+			throw CompileError("\"" + expression.name + "\" is not a parameter, local, constant "
+				"or builtin mslc knows about");
 		}
 
 		const Binding& binding = it->second;
@@ -977,29 +1084,77 @@ namespace {
 		return asAddress ? address : loadFrom(address, binding.pointeeType);
 	}
 
-	Id Emitter::emitMember(const Expression& expression) {
-		const Id address = emitMemberAddress(expression);
-
-		// As with indexing, a member read yields the field and a member write
-		// needs its address, so the address form does the work and this loads.
-		auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end() || !it->second.structType) {
-			throw CompileError("\"" + expression.left->name + "\" has no struct type");
-		}
-
-		const bool fromBuffer = it->second.bufferPointeeType != InvalidId;
-
-		const StructDecl* decl = it->second.structType;
-		for (const StructField& field: decl->fields) {
-			if (field.name == expression.memberName) {
-				const Id fieldType = _types.scalar(field.type.scalar);
-				return fromBuffer ? loadFromBuffer(address, fieldType)
-					: loadFrom(address, fieldType);
+	// The index of a field, or the field count when the struct has no such
+	// member. Both member paths need it, and the diagnostic needs the name of
+	// what was being asked for.
+	size_t fieldIndexOf(const StructDecl& decl, const std::string& member, std::string& outDeclName) {
+		for (size_t i = 0; i < decl.fields.size(); ++i) {
+			if (decl.fields[i].name == member) {
+				outDeclName = decl.name;
+				return i;
 			}
 		}
 
-		throw CompileError("struct \"" + decl->name + "\" has no member \""
-			+ expression.memberName + "\"");
+		outDeclName = decl.name;
+		return decl.fields.size();
+	}
+
+	const ConstantBinding* Emitter::constantFor(const Expression* expression) {
+		if (!expression || expression->kind != ExpressionKind::Identifier) {
+			return nullptr;
+		}
+
+		// An entry point's own name wins: a parameter may be called the same as
+		// a constant, and then it is the parameter the source means.
+		if (_bindings.count(expression->name) > 0) {
+			return nullptr;
+		}
+
+		const auto it = _constants.find(expression->name);
+		return it == _constants.end() ? nullptr : &it->second;
+	}
+
+	Id Emitter::emitMember(const Expression& expression) {
+		std::string declName;
+		const ConstantBinding* constant = constantFor(expression.left.get());
+		const auto binding = _bindings.find(expression.left->name);
+
+		// A file-scope constant is a value rather than a place, so there is no
+		// address to load through and the field is taken from the value. Every
+		// other struct-valued name is a place, so it goes through an address.
+		if (constant) {
+			if (!constant->structType) {
+				throw CompileError("\"" + expression.left->name + "\" is a constant, so \"."
+					+ expression.memberName + "\" is not a member of it");
+			}
+
+			const size_t fieldIndex = fieldIndexOf(*constant->structType, expression.memberName, declName);
+			if (fieldIndex == constant->structType->fields.size()) {
+				throw CompileError("struct \"" + declName + "\" has no member \""
+					+ expression.memberName + "\"");
+			}
+
+			const Id fieldType = declaredTypeOf(constant->structType->fields[fieldIndex].type);
+			return _builder.emitTyped(spirv::OpCompositeExtract, fieldType,
+				{ constant->id, static_cast<uint32_t>(fieldIndex) });
+		}
+
+		if (binding == _bindings.end() || !binding->second.structType) {
+			throw CompileError("\"" + expression.left->name + "\" has no struct type");
+		}
+
+		const Id address = emitMemberAddress(expression);
+		const StructDecl* decl = binding->second.structType;
+		const size_t fieldIndex = fieldIndexOf(*decl, expression.memberName, declName);
+		if (fieldIndex == decl->fields.size()) {
+			throw CompileError("struct \"" + declName + "\" has no member \""
+				+ expression.memberName + "\"");
+		}
+
+		const Id fieldType = declaredTypeOf(decl->fields[fieldIndex].type);
+		const bool fromBuffer = binding->second.bufferPointeeType != InvalidId;
+		return fromBuffer ? loadFromBuffer(address, fieldType)
+			: loadFrom(address, fieldType);
 	}
 
 	Id Emitter::emitMemberAddress(const Expression& expression) {
@@ -1018,16 +1173,10 @@ namespace {
 				+ expression.memberName + "\" is not a member of it");
 		}
 
-		size_t fieldIndex = decl->fields.size();
-		for (size_t i = 0; i < decl->fields.size(); ++i) {
-			if (decl->fields[i].name == expression.memberName) {
-				fieldIndex = i;
-				break;
-			}
-		}
-
+		std::string declName;
+		const size_t fieldIndex = fieldIndexOf(*decl, expression.memberName, declName);
 		if (fieldIndex == decl->fields.size()) {
-			throw CompileError("struct \"" + decl->name + "\" has no member \""
+			throw CompileError("struct \"" + declName + "\" has no member \""
 				+ expression.memberName + "\"");
 		}
 
@@ -1035,7 +1184,7 @@ namespace {
 		// parameter names. Indexing a struct yields the field, so a chain
 		// typed as a pointer to the struct does not match what the base
 		// indexes to, and spirv-val rejects it.
-		const Id fieldType = _types.scalar(decl->fields[fieldIndex].type.scalar);
+		const Id fieldType = declaredTypeOf(decl->fields[fieldIndex].type);
 
 		if (it->second.bufferPointeeType != InvalidId) {
 			return _builder.emitTyped(spirv::OpAccessChain,
@@ -1142,6 +1291,322 @@ namespace {
 			"recognises, and user functions are not lowered yet");
 	}
 
+	// The constant a folded value becomes: a scalar as an OpConstant of its kind,
+	// a bool as OpConstantTrue or OpConstantFalse, and a composite as the
+	// constants making it up.
+	Id Emitter::emitConstant(const FoldedConstant& folded) {
+		if (folded.isComposite) {
+			return _builder.emitDeclTyped(spirv::OpConstantComposite, folded.type, folded.parts);
+		}
+
+		if (folded.scalar == ScalarKind::Bool) {
+			return folded.boolean
+				? _builder.emitDeclTyped(spirv::OpConstantTrue, _boolType, { })
+				: _builder.emitDeclTyped(spirv::OpConstantFalse, _boolType, { });
+		}
+
+		return _builder.emitDeclTyped(spirv::OpConstant,
+			_types.scalar(folded.scalar), { constantBits(folded.scalar, folded.number) });
+	}
+
+	// The bits of a scalar constant of the given kind. A float is narrowed to its
+	// own width here, since the value was folded as a double and OpConstant takes
+	// the bits of the type it declares.
+	uint32_t Emitter::constantBits(ScalarKind kind, double value) {
+		// A 64-bit constant's literal is two words. Reporting is better than
+		// emitting one word of the two, which is a short instruction rather than a
+		// narrow constant.
+		if (scalarBitWidth(kind) > 32) {
+			throw CompileError("a constant of " + std::string(scalarKindName(kind))
+				+ " is not lowered yet");
+		}
+
+		if (isFloatKind(kind)) {
+			const auto narrowed = static_cast<float>(value);
+			uint32_t bits = 0;
+			static_assert(sizeof(bits) == sizeof(narrowed), "float is not 32 bits");
+			std::memcpy(&bits, &narrowed, sizeof(bits));
+			return bits;
+		}
+
+		return static_cast<uint32_t>(static_cast<int64_t>(value));
+	}
+
+	// A struct's fields are initialised by name in Metal, and every one of them
+	// has to be given, so the list is checked against the declaration field by
+	// field rather than taken positionally.
+	void Emitter::foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
+		const Expression& initializer) {
+
+		if (initializer.elements.size() != decl.fields.size()) {
+			throw CompileError("struct \"" + decl.name + "\" is initialised with "
+				+ std::to_string(initializer.elements.size()) + " values, and it has "
+				+ std::to_string(decl.fields.size()) + " fields");
+		}
+
+		for (size_t i = 0; i < decl.fields.size(); ++i) {
+			const InitializerElement& element = initializer.elements[i];
+
+			if (element.fieldName.empty()) {
+				throw CompileError("struct \"" + decl.name + "\" is initialised by field name, so \""
+					+ decl.fields[i].name + "\" has to be named rather than given in place");
+			}
+
+			if (element.fieldName != decl.fields[i].name) {
+				throw CompileError("struct \"" + decl.name + "\" has no field \""
+					+ element.fieldName + "\" where \"" + decl.fields[i].name + "\" goes");
+			}
+
+			folded.parts.push_back(emitConstant(
+				foldInitializer(decl.fields[i].type, *element.value)));
+		}
+	}
+
+	// An initialiser that is not a list, so a single value. Only what can be
+	// worked out from the declarations before it is folded; anything else is
+	// reported, since a constant has to be constant.
+	FoldedConstant Emitter::foldExpression(const Expression& expression) {
+		FoldedConstant folded;
+
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+				// An integer literal is an int, as it is in C++, rather than the
+				// uint an emitted literal happens to be declared as.
+				folded.scalar = ScalarKind::Int;
+				folded.number = static_cast<double>(expression.intValue);
+				return folded;
+
+			case ExpressionKind::FloatLiteral:
+				folded.scalar = ScalarKind::Float;
+				folded.number = expression.floatValue;
+				return folded;
+
+			case ExpressionKind::BoolLiteral:
+				folded.scalar = ScalarKind::Bool;
+				folded.boolean = expression.boolValue;
+				return folded;
+
+			case ExpressionKind::Identifier: {
+				// Declaration order is what makes this resolvable, and the module's
+				// constants are declared in the order the source declares them.
+				const auto found = _folded.find(expression.name);
+				if (found == _folded.end()) {
+					throw CompileError("\"" + expression.name + "\" is not a constant this source "
+						"declares before this one");
+				}
+
+				if (found->second.isComposite) {
+					throw CompileError("\"" + expression.name + "\" is a composite constant, and "
+						"composites are not folded into a value");
+				}
+
+				return found->second;
+			}
+
+			case ExpressionKind::Binary: return foldBinary(expression);
+			case ExpressionKind::Unary: return foldUnary(expression);
+			default: break;
+		}
+
+		throw CompileError("a constant's initialiser has to be a value that can be worked out "
+			"from the declarations before it, and this is not one");
+	}
+
+	FoldedConstant Emitter::foldUnary(const Expression& expression) {
+		FoldedConstant folded = foldExpression(*expression.left);
+
+		if (folded.isComposite) {
+			throw CompileError("a composite constant cannot have a unary operator applied to it");
+		}
+
+		switch (expression.unaryOperator) {
+			case UnaryOperator::Plus: return folded;
+			case UnaryOperator::Negate:
+				folded.number = -folded.number;
+				return folded;
+			default: break;
+		}
+
+		throw CompileError("this unary operator is recognised but not folded yet");
+	}
+
+	FoldedConstant Emitter::foldBinary(const Expression& expression) {
+		const FoldedConstant left = foldExpression(*expression.left);
+		const FoldedConstant right = foldExpression(*expression.right);
+
+		if (left.isComposite || right.isComposite) {
+			throw CompileError("a composite constant cannot be an operand of a binary operator");
+		}
+
+		if (left.scalar != right.scalar) {
+			throw CompileError("a constant's operands have to be of the same type, found "
+				+ std::string(scalarKindName(left.scalar)) + " and "
+				+ std::string(scalarKindName(right.scalar)));
+		}
+
+		const BinaryOperator op = expression.binaryOperator;
+
+		if (isFloatKind(left.scalar)) {
+			FoldedConstant folded = left;
+
+			switch (op) {
+				case BinaryOperator::Add: folded.number = left.number + right.number; break;
+				case BinaryOperator::Subtract: folded.number = left.number - right.number; break;
+				case BinaryOperator::Multiply: folded.number = left.number * right.number; break;
+				// A float division by zero is infinity, which is what the language
+				// says, so it is not treated as a mistake here.
+				case BinaryOperator::Divide: folded.number = left.number / right.number; break;
+				default:
+					throw CompileError("this operator is recognised but not folded yet");
+			}
+
+			return folded;
+		}
+
+		// Integer arithmetic at the width the operands have, so a constant that
+		// overflows wraps the way it would at run time rather than in the double it
+		// was folded through.
+		const auto l = static_cast<uint32_t>(static_cast<int64_t>(left.number));
+		const auto r = static_cast<uint32_t>(static_cast<int64_t>(right.number));
+
+		uint32_t value = 0;
+		switch (op) {
+			case BinaryOperator::Add: value = l + r; break;
+			case BinaryOperator::Subtract: value = l - r; break;
+			case BinaryOperator::Multiply: value = l * r; break;
+			case BinaryOperator::Modulo:
+				if (r == 0) {
+					throw CompileError("an integer constant divides by zero");
+				}
+				value = l % r;
+				break;
+			case BinaryOperator::Divide:
+				if (r == 0) {
+					throw CompileError("an integer constant divides by zero");
+				}
+				value = l / r;
+				break;
+			case BinaryOperator::ShiftLeft: value = l << (r & 31u); break;
+			case BinaryOperator::ShiftRight: value = l >> (r & 31u); break;
+			case BinaryOperator::BitAnd: value = l & r; break;
+			case BinaryOperator::BitOr: value = l | r; break;
+			case BinaryOperator::BitXor: value = l ^ r; break;
+			default:
+				throw CompileError("this operator is recognised but not folded yet");
+		}
+
+		FoldedConstant folded = left;
+		folded.number = value;
+		return folded;
+	}
+
+	// Folds an initialiser of the given declared type. A list of values for a
+	// vector or a struct is a composite, and anything else is a scalar, so the
+	// declared type is what says which the source wrote.
+	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer) {
+		if (initializer.kind != ExpressionKind::InitList) {
+			if (!type.namedType.empty()) {
+				throw CompileError("the struct \"" + type.namedType + "\" is initialised with a "
+					"braced list naming its fields, not with a single value");
+			}
+
+			if (type.vectorWidth > 1) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
+					"list of its components, not with a single value");
+			}
+
+			FoldedConstant folded = foldExpression(initializer);
+			if (folded.isComposite) {
+				throw CompileError("a composite cannot initialise a scalar");
+			}
+
+			// A bool is initialised with true or false and nothing else. OpConstant
+			// has no literal form for it, so folding a number into one would emit
+			// a word where the grammar allows none.
+			if ((type.scalar == ScalarKind::Bool) != (folded.scalar == ScalarKind::Bool)) {
+				throw CompileError(type.scalar == ScalarKind::Bool
+					? "a bool constant is initialised with true or false"
+					: std::string("a bool cannot initialise a ")
+						+ std::string(scalarKindName(type.scalar)));
+			}
+
+			// The declared type is what the constant is. An integer literal may
+			// initialise a float, since that is a widening; the other direction would
+			// have to round, which is not something to do silently.
+			if (isFloatKind(folded.scalar) && !isFloatKind(type.scalar)) {
+				throw CompileError("a float cannot initialise a "
+					+ std::string(scalarKindName(type.scalar)));
+			}
+
+			folded.scalar = type.scalar;
+			return folded;
+		}
+
+		FoldedConstant folded;
+		folded.isComposite = true;
+		folded.type = declaredTypeOf(type);
+
+		if (type.vectorWidth > 1) {
+			// A vector's components are positional, so the list is the vector in
+			// order and each element is the vector's own component type.
+			if (initializer.elements.size() != type.vectorWidth) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ std::to_string(type.vectorWidth) + " constant takes "
+					+ std::to_string(type.vectorWidth) + " values, found "
+					+ std::to_string(initializer.elements.size()));
+			}
+
+			for (const InitializerElement& element: initializer.elements) {
+				if (!element.fieldName.empty()) {
+					throw CompileError("a vector's components are given in order, but \""
+						+ element.fieldName + "\" names one");
+				}
+
+				Type component = type;
+				component.vectorWidth = 0;
+				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value)));
+			}
+
+			return folded;
+		}
+
+		const StructDecl* decl = _unit.findStruct(type.namedType);
+		if (!decl) {
+			throw CompileError("a constant of \"" + type.namedType
+				+ "\" is not a struct this source declares");
+		}
+
+		foldStructInitializer(folded, *decl, initializer);
+		return folded;
+	}
+
+	// A file-scope "constant" is a compile-time constant, so its initialiser is
+	// folded and the result declared as one of the module's constants, with no
+	// binding of its own.
+	Id Emitter::declareGlobalConstant(const VariableDeclaration& declaration) {
+		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
+		const Id id = emitConstant(folded);
+
+		ConstantBinding binding;
+		binding.id = id;
+		binding.structType = _unit.findStruct(declaration.type.namedType);
+		_constants[declaration.name] = binding;
+		_folded[declaration.name] = folded;
+
+		return id;
+	}
+
+	// The module's own declarations, in source order. A constant is declared
+	// before the entry point that reads it, which is what lets the folder resolve
+	// one constant's initialiser against the ones above it.
+	void Emitter::declareGlobals() {
+		for (const VariableDeclaration& global: _unit.globals) {
+			_builder.setSection(spirv::Section::TypesGlobals);
+			declareGlobalConstant(global);
+		}
+	}
+
 	Id Emitter::emitExpression(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
@@ -1171,12 +1636,14 @@ namespace {
 			case ExpressionKind::Member: return emitMember(expression);
 			case ExpressionKind::Call: return emitCall(expression);
 			case ExpressionKind::Cast: return emitCast(expression);
+			case ExpressionKind::InitList:
 			case ExpressionKind::Assign: break;
 		}
 
-		// An assignment is a statement, so reaching it here means it was used
-		// as a value, which MSL does not allow.
-		throw CompileError("an assignment cannot be used as a value");
+		// A braced list is only spelled in an initialiser, and an assignment is a
+		// statement, so reaching either here means the source used it as a value,
+		// which MSL does not allow.
+		throw CompileError("this expression cannot be used as a value");
 	}
 
 
@@ -1618,6 +2085,11 @@ namespace {
 		_intType = _types.scalar(ScalarKind::Int);
 		_boolType = _types.scalar(ScalarKind::Bool);
 		_voidType = _types.voidType();
+
+		// Before the parameters, since a constant's initialiser may name a struct
+		// and a struct's members have to be declared before the constant that holds
+		// one of them.
+		declareGlobals();
 
 		declareParameters();
 

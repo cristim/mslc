@@ -24,6 +24,7 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfVector;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
+	std::map<std::string, spirv::Id> _valueStructs;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
@@ -72,6 +73,17 @@ public:
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
 	spirv::Id namedStruct(const std::string& name);
+
+	// The same struct as a value rather than as a buffer's block: the same
+	// members, with no Block decoration and no member offsets, since a struct
+	// used as a constant or an interface member is laid out by whatever holds
+	// it. InvalidId when the name is not declared.
+	spirv::Id valueStruct(const std::string& name);
+
+	// The member types of a struct and where each one starts in a buffer, laid
+	// out the way Metal lays it out. False when the name is not declared.
+	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
+		std::vector<uint32_t>& outOffsets);
 
 	// The Block-decorated struct that wraps a buffer's elements, as
 	// { T runtime_array[] }. It has to be a struct rather than a bare T because
