@@ -227,9 +227,12 @@ TranslationUnit Parser::parse() {
 }
 
 // The corpus starts with a licence block, a #include <metal_stdlib> and a
-// using-directive. None of those change the meaning of the code that follows,
-// so the include and using are consumed and discarded. A directive that could
-// change meaning, such as a conditional, is an error.
+// using-directive. The include is honoured rather than discarded, because its
+// contents are the MSL builtins mslc already has, and the using-directive changes
+// nothing that follows. A directive that could change meaning, such as a
+// conditional, is an error, and so is an include mslc has no contents for: the
+// two failure modes that matter are dropping meaning and inventing it, and
+// neither is a silent success.
 void Parser::parsePreprocessorDirective() {
 	const size_t directiveLine = line();
 	advance(); // '#'
@@ -244,19 +247,95 @@ void Parser::parsePreprocessorDirective() {
 
 	if (atKeyword("include")) {
 		advance();
-		match(TokenKind::Less);
 
-		// Skip the header name, which ends at '>' or at the end of the line. A
-		// quoted include has no '>' at all, so the line bound is what keeps it
-		// from consuming the declarations that follow.
-		while (!at(TokenKind::EndOfFile) && !at(TokenKind::Greater)
-			&& current().line == directiveLine) {
+		// The header name, as the text of the rest of the directive line:
+		// "<simd/simd.h>" or "\"AAPLShaderTypes.h\"". A quoted include is one
+		// identifier token that keeps its quotes, and an angled one is a run of
+		// tokens up to the '>', so this is the line's text rather than any single
+		// token's. The end of the line is the only bound, which is what keeps an
+		// include with no '>' from consuming the declarations that follow.
+		std::vector<Token> name;
+		while (!at(TokenKind::EndOfFile) && current().line == directiveLine) {
+			name.push_back(current());
 			advance();
 		}
 
-		// A '>' the line does not have is a truncated include, not a reason to
-		// keep looking on the next line.
-		match(TokenKind::Greater);
+		if (name.empty()) {
+			throw CompileError("#include with no file name");
+		}
+
+		// Where the name ends. The angled form is Less ... the first Greater, and
+		// the quoted form is one identifier that keeps its quotes, so the name is
+		// that token alone.
+		const bool angled = name.front().kind == TokenKind::Less;
+		size_t last = 0;
+		if (angled) {
+			for (size_t i = 1; i < name.size(); i++) {
+				if (name[i].kind == TokenKind::Greater) {
+					last = i;
+					break;
+				}
+			}
+
+			// A '>' the line does not have is a truncated include, not a reason to
+			// keep reading into the code after it. No name is reported here, because
+			// what the tokens spell is not the name that was written.
+			if (name[last].kind != TokenKind::Greater) {
+				throw CompileError("the #include on line " + std::to_string(directiveLine)
+					+ " has no '>' on its line, so the header name does not end here");
+			}
+		}
+
+		// xcrun metal calls this "extra tokens at end of #include directive" and
+		// warns rather than failing. It is reported rather than ignored, because the
+		// tokens are not part of the include and dropping them would change what the
+		// directive says.
+		if (last + 1 < name.size()) {
+			throw CompileError("extra tokens at the end of the #include on line "
+				+ std::to_string(directiveLine));
+		}
+
+		// A gap between two tokens of the name makes it a different name. The lexer
+		// splits a run on whitespace and concatenating the tokens discards it, so
+		// "<metal_std lib>" comes back as "<metal_stdlib>" and would be accepted as
+		// the one header mslc honours, and "< metal_stdlib >" likewise. Apple's
+		// compiler treats the whitespace as part of the name it looks for, reporting
+		// "' metal_stdlib ' file not found, did you mean 'metal_stdlib'?", so
+		// rejecting is the reading that agrees with the reference compiler rather
+		// than a stricter one.
+		//
+		// The gap between "include" and the name is deliberately not checked, since
+		// it is outside the name: xcrun metal accepts "#include/**/<metal_stdlib>".
+		for (size_t i = 1; i <= last; i++) {
+			const size_t previousEnd = name[i - 1].offset + name[i - 1].text.size();
+			if (name[i].offset != previousEnd) {
+				throw CompileError("the #include on line " + std::to_string(directiveLine)
+					+ " has whitespace in the header name, which is part of the name it "
+						"looks for");
+			}
+		}
+
+		std::string raw;
+		for (const Token& token: name) {
+			raw += token.text;
+		}
+
+		// An include mslc cannot honour is an error, not a discarded line. The
+		// header's contents are declarations mslc does not have, so dropping the
+		// directive leaves the program compiling up to the first name it needed,
+		// and mslc hands back a library for source it did not read.
+		//
+		// Only <metal_stdlib> is honoured: it carries the MSL builtins, which mslc
+		// resolves from its own table rather than from a header. Compared as
+		// written, so the angled form only: a quoted include searches the
+		// includer's own directory in MSL, and an app shipping a file of that name
+		// would have it ignored here, which is the failure this rule removes.
+		if (raw != "<metal_stdlib>") {
+			throw CompileError("cannot honour #include " + raw + ": mslc has no "
+				"preprocessor, and a header it does not read would leave the program "
+				"compiling up to the first name it needed");
+		}
+
 		return;
 	}
 
