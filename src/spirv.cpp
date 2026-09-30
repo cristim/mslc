@@ -160,7 +160,11 @@ Id Builder::emitDeclTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> 
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
 
-	_sections[isLocal ? Section::FunctionVariables : pickSection(opcode)].push_back(std::move(instruction));
+	if (isLocal) {
+		_functionLocals[_currentFunction].push_back(std::move(instruction));
+	} else {
+		_sections[pickSection(opcode)].push_back(std::move(instruction));
+	}
 
 	// The object a variable names is a value the body can load from, so record
 	// its type the same way a value-producing instruction would.
@@ -179,6 +183,12 @@ void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	instruction.opcode = opcode;
 	instruction.words = std::move(operands);
 	_sections[pickSection(opcode)].push_back(std::move(instruction));
+
+	// A function's id is what its locals are keyed by, and it is known only here,
+	// where the OpFunction carrying it is emitted.
+	if (opcode == OpFunction) {
+		_currentFunction = resultId;
+	}
 
 	_valueTypes[resultId] = resultType;
 }
@@ -223,8 +233,13 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 		words.insert(words.end(), instruction.words.begin(), instruction.words.end());
 	};
 
-	const auto locals = _sections.find(Section::FunctionVariables);
-	bool localsPlaced = locals == _sections.end();
+	// Each function's locals go at the top of that function's first block, so
+	// the splice follows the function ids in the Functions section rather than
+	// assuming a single module-wide bucket. A local in the wrong function's entry
+	// block is a dominance error, and one module can hold a vertex and a fragment
+	// entry point.
+	Id function = InvalidId;
+	bool localsPlaced = false;
 
 	for (Section section: kSectionOrder) {
 		auto it = _sections.find(section);
@@ -233,13 +248,21 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 		}
 
 		for (const Instruction& instruction: it->second) {
+			if (section == Section::Functions && instruction.opcode == OpFunction) {
+				function = instruction.words[1];
+				localsPlaced = false;
+			}
+
 			append(instruction);
 
-			// The module has one function, so its first label opens the
-			// entry block the locals belong to.
+			// OpFunction's first operand is the result type and the second is the
+			// function's own id, which is the one OpEntryPoint names.
 			if (!localsPlaced && section == Section::Functions && instruction.opcode == OpLabel) {
-				for (const Instruction& local: locals->second) {
-					append(local);
+				const auto locals = _functionLocals.find(function);
+				if (locals != _functionLocals.end()) {
+					for (const Instruction& local: locals->second) {
+						append(local);
+					}
 				}
 				localsPlaced = true;
 			}

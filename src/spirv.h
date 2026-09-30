@@ -32,11 +32,6 @@ enum class Section {
 	TypesGlobals,
 	Functions,
 
-	// Function-storage variables. SPIR-V requires them at the top of the
-	// function's first block, so finalize() splices them in after the first
-	// OpLabel of Functions rather than emitting them in order.
-	FunctionVariables,
-
 	// Not a real section: the sentinel sectionForOpcode returns for an opcode
 	// that goes wherever the caller is currently emitting.
 	Invalid,
@@ -61,6 +56,18 @@ class Builder {
 	// emitter never has to re-derive a type it already knew, and it removes
 	// the confusion between a pointer's own type and its pointee.
 	std::map<Id, Id> _valueTypes;
+
+	// Function-storage variables, keyed by the function they belong to. SPIR-V
+	// requires them at the top of their own function's first block, so finalize()
+	// splices each function's locals in after that function's first OpLabel. One
+	// bucket for the module put every local in the first function's block, which
+	// is a dominance error the moment a second function declares one.
+	std::map<Id, std::vector<Instruction>> _functionLocals;
+
+	// The function being emitted, which is what keys _functionLocals. Set when an
+	// OpFunction is emitted and not restored afterwards, because the sections are
+	// written in a different order from the functions' bodies.
+	Id _currentFunction = InvalidId;
 
 	Section _currentSection = Section::TypesGlobals;
 
