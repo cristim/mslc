@@ -60,6 +60,12 @@ public:
 	// neither, so a caller comparing two widths can tell them apart.
 	uint32_t bitWidth(spirv::Id type) const;
 
+	// The component of a vector, or InvalidId when the id is not a vector this
+	// table created. A broadcast needs it: the value has to be converted to the
+	// component's own type before it goes in every component, or a float would be
+	// reinterpreted as an int.
+	spirv::Id componentOf(spirv::Id vectorType);
+
 	// True when the type is a vector or a struct, which a single scalar value
 	// cannot stand in for.
 	bool isAggregate(spirv::Id type) const;
