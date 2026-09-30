@@ -314,6 +314,10 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 		}
 
 		stride = vectorLayoutFor(scalarBytes, it->second).size;
+	} else if (const auto it = _structSizes.find(elementType); it != _structSizes.end()) {
+		// Metal rounds a struct's size up to its own alignment, and structMembersFor
+		// has already done that, so this is the size and not a guess at it.
+		stride = it->second;
 	}
 
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
@@ -572,7 +576,7 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 // False when no struct of that name is declared, so a caller can say so rather
 // than guess.
 bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
-	std::vector<uint32_t>& outOffsets) {
+	std::vector<uint32_t>& outOffsets, uint32_t& outSize) {
 
 	const StructDecl* decl = _unit.findStruct(name);
 	if (!decl) {
@@ -580,6 +584,7 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	}
 
 	uint32_t offset = 0;
+	uint32_t alignment = 1;
 
 	for (const StructField& field: decl->fields) {
 		if (!field.type.isPointer && !field.type.namedType.empty()) {
@@ -598,9 +603,43 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		offset = alignTo(offset, layout.alignment);
 		outOffsets.push_back(offset);
 		offset += layout.size;
+
+		// The struct's alignment is the largest among its members, and its size is
+		// the total rounded up to that, so an array of it steps by a whole number
+		// of alignments.
+		alignment = std::max(alignment, layout.alignment);
 	}
 
+	outSize = alignTo(offset, alignment);
 	return true;
+}
+
+// A struct as the element of an array of it: the same members with their
+// offsets, and no Block decoration. Vulkan requires a struct nested inside a
+// Block to be laid out, and rejects a Block-decorated struct inside an array, so
+// this is a third form between the value struct and the buffer's block.
+Id TypeTable::arrayElementStruct(const std::string& name) {
+	const auto cached = _elementStructs.find(name);
+	if (cached != _elementStructs.end()) {
+		return cached->second;
+	}
+
+	std::vector<Id> fieldTypes;
+	std::vector<uint32_t> offsets;
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+		return InvalidId;
+	}
+
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
+	for (size_t i = 0; i < fieldTypes.size(); ++i) {
+		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
+			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+	}
+
+	_elementStructs.emplace(name, id);
+	_structSizes.emplace(id, size);
+	return id;
 }
 
 Id TypeTable::valueStruct(const std::string& name) {
@@ -611,15 +650,13 @@ Id TypeTable::valueStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	if (!structMembersFor(name, fieldTypes, offsets)) {
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
 		return InvalidId;
 	}
 
 	// Members only. The count is implied by the instruction's word count, and
 	// writing it as an operand would be read as one extra member.
-	// A struct used as a value and the same struct as a buffer's block have the
-	// same members; only the decorations differ, so the members are computed once
-	// and each form decorates as much as its use needs.
 	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
 
 	// No Block and no member offsets: that is the layout of a buffer, and a
@@ -638,13 +675,11 @@ Id TypeTable::namedStruct(const std::string& name) {
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
-	if (!structMembersFor(name, fieldTypes, offsets)) {
+	uint32_t size = 0;
+	if (!structMembersFor(name, fieldTypes, offsets, size)) {
 		return InvalidId;
 	}
 
-	// A struct used as a value and the same struct as a buffer's block have the
-	// same members; only the decorations differ, so the members are computed once
-	// and each form decorates as much as its use needs.
 	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
 
 	// A struct reached through a buffer binding is an interface block, so it
@@ -740,6 +775,10 @@ namespace {
 		// For a struct-typed value, the declaration, so member access can
 		// resolve a field.
 		const StructDecl* structType = nullptr;
+		// What this names points at, as the source spelled it. An access chain
+		// walks that rather than the SPIR-V ids, so it can tell a struct from an
+		// array from a scalar and find the declaration for the next field.
+		Type pointeeMsl;
 		// True when the MSL type is a scalar but the SPIR-V form is a vector,
 		// so a use wants one component rather than the whole vector.
 		bool scalarComponentOfVector = false;
@@ -864,7 +903,7 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		Id emitMember(const Expression& expression);
-		Id emitMemberAddress(const Expression& expression);
+		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
 
 		// The file-scope constant an expression names, or null when it names
 		// something else. A constant is a value and not a place, which is what
@@ -1173,87 +1212,185 @@ namespace {
 		return it == _constants.end() ? nullptr : &it->second;
 	}
 
-	Id Emitter::emitMember(const Expression& expression) {
-		std::string declName;
-		const ConstantBinding* constant = constantFor(expression.left.get());
-		const auto binding = _bindings.find(expression.left->name);
+	// One step of an access chain: either a field of a struct or an element of
+	// one, in the order the source wrote them. A field's index is not known until
+	// the declaration is, so the name is carried and resolved as the chain is
+	// walked.
+	struct AccessStep {
+		bool isIndex = false;
+		const Expression* index = nullptr;
+		std::string memberName;
+	};
 
-		// A file-scope constant is a value rather than a place, so there is no
-		// address to load through and the field is taken from the value. Every
-		// other struct-valued name is a place, so it goes through an address.
+	// Splits "vertices[vid].position" into the name at its root and the steps
+	// after it, innermost last, which is the order OpAccessChain wants. An index
+	// is part of the chain rather than the end of it: a buffer element's member is
+	// reached as "buffer[index].field", and loading the element first would hand
+	// OpAccessChain a value where it needs an address.
+	static void accessChain(const Expression& expression, std::string& outName,
+		std::vector<AccessStep>& outSteps) {
+
+		std::vector<AccessStep> reversed;
+
+		const Expression* current = &expression;
+		while (current->kind == ExpressionKind::Member || current->kind == ExpressionKind::Index) {
+			AccessStep step;
+			step.isIndex = current->kind == ExpressionKind::Index;
+
+			if (step.isIndex) {
+				if (current->arguments.size() != 1) {
+					throw CompileError("expected exactly one index, found "
+						+ std::to_string(current->arguments.size()));
+				}
+
+				step.index = current->arguments[0].get();
+			} else {
+				step.memberName = current->memberName;
+			}
+
+			reversed.push_back(step);
+			current = current->left.get();
+		}
+
+		if (current->kind != ExpressionKind::Identifier) {
+			throw CompileError("a member or an index has to start at a name mslc knows");
+		}
+
+		outName = current->name;
+		outSteps.assign(reversed.rbegin(), reversed.rend());
+	}
+
+	Id Emitter::emitMember(const Expression& expression) {
+		const ConstantBinding* constant = constantFor(expression.left.get());
 		if (constant) {
 			if (!constant->structType) {
 				throw CompileError("\"" + expression.left->name + "\" is a constant, so \"."
 					+ expression.memberName + "\" is not a member of it");
 			}
 
-			const size_t fieldIndex = fieldIndexOf(*constant->structType, expression.memberName, declName);
-			if (fieldIndex == constant->structType->fields.size()) {
+			std::string declName;
+			const size_t field = fieldIndexOf(*constant->structType, expression.memberName, declName);
+			if (field == constant->structType->fields.size()) {
 				throw CompileError("struct \"" + declName + "\" has no member \""
 					+ expression.memberName + "\"");
 			}
 
-			const Id fieldType = declaredTypeOf(constant->structType->fields[fieldIndex].type);
-			return _builder.emitTyped(spirv::OpCompositeExtract, fieldType,
-				{ constant->id, static_cast<uint32_t>(fieldIndex) });
+			// A file-scope constant is a value rather than a place, so there is no
+			// address to load through and the field is taken from the value. Every
+			// other struct-valued name is a place, so it goes through an address.
+			return _builder.emitTyped(spirv::OpCompositeExtract,
+				declaredTypeOf(constant->structType->fields[field].type),
+				{ constant->id, static_cast<uint32_t>(field) });
 		}
 
-		if (binding == _bindings.end() || !binding->second.structType) {
-			throw CompileError("\"" + expression.left->name + "\" has no struct type");
-		}
+		// The chain says which binding the access starts from, which is not the
+		// name on the left of the '.' when that is an index.
+		std::string rootName;
+		std::vector<AccessStep> steps;
+		accessChain(expression, rootName, steps);
 
-		const Id address = emitMemberAddress(expression);
-		const StructDecl* decl = binding->second.structType;
-		const size_t fieldIndex = fieldIndexOf(*decl, expression.memberName, declName);
-		if (fieldIndex == decl->fields.size()) {
-			throw CompileError("struct \"" + declName + "\" has no member \""
-				+ expression.memberName + "\"");
-		}
+		Id fieldType = InvalidId;
+		const Id address = emitMemberAddress(expression, fieldType);
 
-		const Id fieldType = declaredTypeOf(decl->fields[fieldIndex].type);
-		const bool fromBuffer = binding->second.bufferPointeeType != InvalidId;
-		return fromBuffer ? loadFromBuffer(address, fieldType)
+		// A member read yields the field and a member write needs its address, so
+		// the address form does the work and this loads. A buffer's load carries the
+		// Aligned operand the same rule as any other access through its pointer.
+		const auto it = _bindings.find(rootName);
+		return it != _bindings.end() && it->second.bufferPointeeType != InvalidId
+			? loadFromBuffer(address, fieldType)
 			: loadFrom(address, fieldType);
 	}
 
-	Id Emitter::emitMemberAddress(const Expression& expression) {
-		if (expression.left->kind != ExpressionKind::Identifier) {
-			throw CompileError("member access on an expression is not supported yet");
-		}
+	// The address a member access names, and the type of the value it points at.
+	//
+	// A buffer is a wrapper struct holding a runtime array, so an element of one
+	// is two steps in: into the member, then into the array. A struct reached
+	// directly is the buffer itself, so its first step is a field index with no
+	// member in front of it.
+	Id Emitter::emitMemberAddress(const Expression& expression, Id& outFieldType) {
+		std::string rootName;
+		std::vector<AccessStep> steps;
+		accessChain(expression, rootName, steps);
 
-		const auto it = _bindings.find(expression.left->name);
+		const auto it = _bindings.find(rootName);
 		if (it == _bindings.end()) {
-			throw CompileError("\"" + expression.left->name + "\" is not a parameter or local");
+			throw CompileError("\"" + rootName + "\" is not a parameter or local");
 		}
 
-		const StructDecl* decl = it->second.structType;
-		if (!decl) {
-			throw CompileError("\"" + expression.left->name + "\" is not a struct, so \"."
-				+ expression.memberName + "\" is not a member of it");
+		const Binding& binding = it->second;
+		const bool fromBuffer = binding.bufferPointeeType != InvalidId;
+
+		// What the chain points at now, as the source spelled it, so the next step
+		// can tell a struct from something else and resolve a field against the
+		// right declaration. An index does not change it: a buffer's element is
+		// the buffer's own type.
+		Type current = binding.pointeeMsl;
+
+		std::vector<uint32_t> operands;
+		if (fromBuffer && binding.isBuffer) {
+			// Into the runtime array the wrapper holds, before the element index.
+			operands.push_back(constantU32(0));
+
+			// The element itself. A source index names it; "->" and a member reached
+			// straight off the pointer mean element zero, which is what a pointer to
+			// a buffer's first element is. Reading the field without it would index
+			// the element struct by a field index and read the wrong bytes.
+			if (!steps.empty() && !steps[0].isIndex) {
+				operands.push_back(constantU32(0));
+			}
 		}
 
-		std::string declName;
-		const size_t fieldIndex = fieldIndexOf(*decl, expression.memberName, declName);
-		if (fieldIndex == decl->fields.size()) {
-			throw CompileError("struct \"" + declName + "\" has no member \""
-				+ expression.memberName + "\"");
+		outFieldType = InvalidId;
+
+		for (const AccessStep& step: steps) {
+			if (step.isIndex) {
+				// Only a pointer names a buffer, and only a buffer is an array. A
+				// struct reached directly is one value, whether through a reference
+				// or through the address a buffer of scalars put in a register.
+				if (!fromBuffer || !binding.isBuffer) {
+					throw CompileError("\"" + rootName + "\" is not a buffer, so it cannot "
+						"be indexed as an array");
+				}
+
+				const Id index = emitExpression(*step.index);
+				_builder.setType(index, _uintType);
+				operands.push_back(index);
+				continue;
+			}
+
+			const StructDecl* decl = current.namedType.empty()
+				? nullptr : _unit.findStruct(current.namedType);
+			if (!decl) {
+				throw CompileError("\"" + step.memberName + "\" is not a member of \""
+					+ rootName + "\", which is not a struct there");
+			}
+
+			std::string declName;
+			const size_t field = fieldIndexOf(*decl, step.memberName, declName);
+			if (field == decl->fields.size()) {
+				throw CompileError("struct \"" + declName + "\" has no member \""
+					+ step.memberName + "\"");
+			}
+
+			operands.push_back(constantU32(static_cast<uint32_t>(field)));
+			current = decl->fields[field].type;
 		}
 
-		// The result type is a pointer to the field, not to the struct the
-		// parameter names. Indexing a struct yields the field, so a chain
-		// typed as a pointer to the struct does not match what the base
-		// indexes to, and spirv-val rejects it.
-		const Id fieldType = declaredTypeOf(decl->fields[fieldIndex].type);
-
-		if (it->second.bufferPointeeType != InvalidId) {
-			return _builder.emitTyped(spirv::OpAccessChain,
-				_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, fieldType),
-				{ bufferBase(it->second), constantU32(static_cast<uint32_t>(fieldIndex)) });
+		if (current.namedType.empty() && steps.back().isIndex) {
+			throw CompileError("a member access has to end at a struct field");
 		}
+
+		outFieldType = declaredTypeOf(current);
+
+		const spirv::StorageClassValue storageClass = fromBuffer
+			? spirv::StorageClass::PhysicalStorageBuffer : binding.storageClass;
+
+		// The base is the address the chain starts from: the buffer's own pointer,
+		// loaded from the binding-0 block, or the variable itself.
+		operands.insert(operands.begin(), fromBuffer ? bufferBase(binding) : binding.id);
 
 		return _builder.emitTyped(spirv::OpAccessChain,
-			_types.pointer(it->second.storageClass, fieldType),
-			{ it->second.id, constantU32(static_cast<uint32_t>(fieldIndex)) });
+			_types.pointer(storageClass, outFieldType), operands);
 	}
 
 	Id Emitter::emitCast(const Expression& expression) {
@@ -1844,11 +1981,22 @@ namespace {
 		const StructDecl* structType = nullptr;
 
 		if (!parameter.type.namedType.empty()) {
-			pointeeType = _types.namedStruct(parameter.type.namedType);
+			// A Metal "device T*" is a buffer of T, so the element is the struct
+			// laid out for an array rather than the Block-decorated form: Vulkan
+			// requires a struct nested inside a Block to be laid out, and rejects a
+			// Block-decorated struct inside an array. A struct reached directly is
+			// the buffer itself, so it is the Block form.
+			if (parameter.type.isPointer) {
+				pointeeType = _types.arrayElementStruct(parameter.type.namedType);
+			} else {
+				pointeeType = _types.namedStruct(parameter.type.namedType);
+			}
+
 			if (pointeeType == InvalidId) {
 				throw CompileError("parameter \"" + parameter.name + "\" refers to undeclared "
 					"type \"" + parameter.type.namedType + "\"");
 			}
+
 			structType = _unit.findStruct(parameter.type.namedType);
 		} else {
 			pointeeType = declaredTypeOf(parameter.type);
@@ -1859,10 +2007,10 @@ namespace {
 		// buffer's own type. A pointer parameter is a whole buffer, and
 		// OpAccessChain rejects a non-composite base, so the element type is
 		// wrapped in { T runtime_array[] } and the parameter indexes through
-		// that.
+		// that -- for a struct element as much as for a scalar one.
 		Id bufferPointee = pointeeType;
 		bool isBuffer = false;
-		if (parameter.type.isPointer && structType == nullptr) {
+		if (parameter.type.isPointer) {
 			bufferPointee = _types.blockStructFor(pointeeType);
 			isBuffer = true;
 		}
@@ -1882,6 +2030,9 @@ namespace {
 		binding.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
 		binding.structType = structType;
 		binding.isBuffer = isBuffer;
+		binding.pointeeMsl = parameter.type;
+		binding.pointeeMsl.isPointer = false;
+		binding.pointeeMsl.isConst = false;
 		binding.memberIndex = memberIndex;
 		_bindings[parameter.name] = binding;
 
@@ -1982,7 +2133,8 @@ namespace {
 		if (expression.left->kind == ExpressionKind::Index) {
 			address = emitIndex(*expression.left, true);
 		} else if (expression.left->kind == ExpressionKind::Member) {
-			address = emitMemberAddress(*expression.left);
+			Id fieldType = InvalidId;
+			address = emitMemberAddress(*expression.left, fieldType);
 		} else if (expression.left->kind == ExpressionKind::Identifier) {
 			// A local names a Function-storage pointer, so the variable itself is
 			// the address to store to. A buffer parameter is a descriptor and a

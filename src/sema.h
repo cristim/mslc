@@ -25,6 +25,10 @@ class TypeTable {
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
+	std::map<std::string, spirv::Id> _elementStructs;
+	// The size in bytes of each array-element struct, which is the stride an
+	// array of that struct steps by.
+	std::map<spirv::Id, uint32_t> _structSizes;
 	std::map<spirv::Id, spirv::Id> _blockStructs;
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
@@ -86,10 +90,16 @@ public:
 	// it. InvalidId when the name is not declared.
 	spirv::Id valueStruct(const std::string& name);
 
-	// The member types of a struct and where each one starts in a buffer, laid
-	// out the way Metal lays it out. False when the name is not declared.
+	// The member types of a struct, where each one starts in a buffer, and the
+	// struct's own size, laid out the way Metal lays it out. False when the name
+	// is not declared.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
-		std::vector<uint32_t>& outOffsets);
+		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
+
+	// The same struct as the element of an array of it: the members with their
+	// offsets, and no Block decoration, since Vulkan requires a struct nested in
+	// a Block to be laid out and rejects a Block-decorated one inside an array.
+	spirv::Id arrayElementStruct(const std::string& name);
 
 	// The Block-decorated struct that wraps a buffer's elements, as
 	// { T runtime_array[] }. It has to be a struct rather than a bare T because
