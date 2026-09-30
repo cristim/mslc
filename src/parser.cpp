@@ -341,6 +341,13 @@ StructDecl Parser::parseStructDeclaration() {
 		StructField field;
 		field.type = parseType();
 		expectFieldName(field.name);
+
+		// An attribute list and an array suffix both open with a bracket, but an
+		// attribute list opens with two, which is what tells them apart.
+		if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+			field.attributes = parseFieldAttributes();
+		}
+
 		match(TokenKind::Semicolon);
 		decl.fields.push_back(std::move(field));
 	}
@@ -476,31 +483,7 @@ Parameter Parser::parseParameter() {
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 
-	expect(TokenKind::LBracket, "to open an attribute list");
-	expect(TokenKind::LBracket, "to open an attribute");
-
-	while (!at(TokenKind::EndOfFile)) {
-		if (match(TokenKind::RBracket)) {
-			break;
-		}
-		match(TokenKind::RBracket);
-
-		if (kind() != TokenKind::Identifier) {
-			throw CompileError("expected an attribute name, found " + std::string(tokenKindName(kind())));
-		}
-
-		const std::string name(advance().text);
-
-		std::optional<uint32_t> argument;
-		if (at(TokenKind::LParen)) {
-			advance();
-			if (!at(TokenKind::IntegerLiteral)) {
-				throw CompileError("attribute \"" + name + "\" needs a constant integer argument");
-			}
-			argument = static_cast<uint32_t>(advance().integerValue);
-			expect(TokenKind::RParen, "to close an attribute argument");
-		}
-
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument) {
 		if (name == "buffer") {
 			if (!argument) {
 				throw CompileError("[[buffer]] needs an index");
@@ -526,13 +509,65 @@ ParameterAttributes Parser::parseParameterAttributes() {
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\"");
 		}
+	});
+
+	return attributes;
+}
+
+FieldAttributes Parser::parseFieldAttributes() {
+	FieldAttributes attributes;
+
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument) {
+		if (name == "position") {
+			attributes.position = true;
+		} else if (name == "attribute") {
+			if (!argument) {
+				throw CompileError("[[attribute]] needs an index");
+			}
+			attributes.attributeIndex = argument;
+		} else if (builtinFromName(name)) {
+			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
+				"field; only [[position]] and [[attribute(n)]] are");
+		} else {
+			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
+		}
+	});
+
+	return attributes;
+}
+
+void Parser::parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>)>& visit) {
+	expect(TokenKind::LBracket, "to open an attribute list");
+	expect(TokenKind::LBracket, "to open an attribute");
+
+	while (!at(TokenKind::EndOfFile)) {
+		if (match(TokenKind::RBracket)) {
+			break;
+		}
+		match(TokenKind::RBracket);
+
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected an attribute name, found " + std::string(tokenKindName(kind())));
+		}
+
+		const std::string name(advance().text);
+
+		std::optional<uint32_t> argument;
+		if (at(TokenKind::LParen)) {
+			advance();
+			if (!at(TokenKind::IntegerLiteral)) {
+				throw CompileError("attribute \"" + name + "\" needs a constant integer argument");
+			}
+			argument = static_cast<uint32_t>(advance().integerValue);
+			expect(TokenKind::RParen, "to close an attribute argument");
+		}
+
+		visit(name, argument);
 
 		match(TokenKind::Comma);
 	}
 
 	expect(TokenKind::RBracket, "to close an attribute list");
-
-	return attributes;
 }
 
 FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
