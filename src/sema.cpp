@@ -41,6 +41,28 @@ namespace {
 		return { false, false, 0 };
 	}
 
+	// Where a member sits in a Metal struct, and how far an array of the struct
+	// steps. Metal puts a float3 at the next multiple of 16 even though it holds
+	// 12, and steps 16 too, so a float after it starts at 16 rather than 12.
+	// indium's own lighting test relies on that: the host side declares
+	// normalMatrix as "float normalMatrix[3][4]", a 176-byte struct whose matrix
+	// has 16-byte columns.
+	struct VectorLayout {
+		uint32_t size;
+		uint32_t alignment;
+	};
+
+	VectorLayout vectorLayoutFor(uint32_t scalarBytes, uint32_t components) {
+		return { (components == 3 ? 4u : components) * scalarBytes,
+			(components >= 3 ? 4u : components) * scalarBytes };
+	}
+
+	// The next multiple of the alignment at or after the offset, which is where
+	// a member of that alignment starts in a struct.
+	uint32_t alignTo(uint32_t offset, uint32_t alignment) {
+		return (offset + alignment - 1) / alignment * alignment;
+	}
+
 	bool isSignedInteger(ScalarKind kind) {
 		return kind == ScalarKind::Char || kind == ScalarKind::Short
 			|| kind == ScalarKind::Int || kind == ScalarKind::Long;
@@ -273,21 +295,25 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	// Metal buffer whose size is not known when the shader is compiled.
 	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { elementType });
 
-	// The stride is the element's own size, taken from the scalar width, since
-	// an array of a vector has the vector's size.
+	// The stride is the element's own size in Metal's layout, which is the
+	// scalar's size times the component count with a float3 rounded up to a
+	// register. Taken from the same rule the struct offsets come from, so an
+	// array of a struct's member and the member itself cannot disagree.
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
 	} else if (const auto it = _widthOfVector.find(elementType); it != _widthOfVector.end()) {
-		uint32_t width = 32;
-		// The vector's element width is not tracked separately, so this uses
-		// the common cases; a wider vector is not in the corpus.
+		// The component's own size, from the scalar the vector was built from, so
+		// a vector of half strides 8 and one of ulong strides 32 rather than both
+		// striding as though they were floats.
+		uint32_t scalarBytes = 4;
 		for (const auto& [key, id]: _vectors) {
 			if (id == elementType) {
-				width = scalarBitWidth(static_cast<ScalarKind>(key.first));
+				scalarBytes = (scalarBitWidth(static_cast<ScalarKind>(key.first)) + 7) / 8;
 			}
 		}
-		stride = ((width + 7) / 8) * it->second;
+
+		stride = vectorLayoutFor(scalarBytes, it->second).size;
 	}
 
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
@@ -362,6 +388,16 @@ bool TypeTable::isSignedInt(spirv::Id type) const {
 	return false;
 }
 
+Id TypeTable::componentOf(Id vectorType) {
+	for (const auto& [key, id]: _vectors) {
+		if (id == vectorType) {
+			return scalar(static_cast<ScalarKind>(key.first));
+		}
+	}
+
+	return InvalidId;
+}
+
 uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	auto it = _widthOfVector.find(type);
 	if (it != _widthOfVector.end()) {
@@ -371,8 +407,7 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	return 1;
 }
 
-uint32_t TypeTable::bitWidth(spirv::Id type) const {
-	auto it = _widthOfScalar.find(type);
+	uint32_t TypeTable::bitWidth(spirv::Id type) const {	auto it = _widthOfScalar.find(type);
 	if (it != _widthOfScalar.end()) {
 		return it->second;
 	}
@@ -473,19 +508,23 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 }
 
 uint32_t TypeTable::alignmentOf(Id type) const {
-	// A buffer element sits at a multiple of its own size, and a struct field at
-	// a multiple of its own within the struct, so the size is the whole
-	// guarantee. Claiming more is what lets a compiler read past the end.
+	// A struct's own alignment is not tracked, and 4 is the weaker claim, which
+	// is the safe direction: a claim below what the layout gives is always sound.
 	const uint32_t bits = bitWidth(type);
 	if (bits == 0) {
 		return 4;
 	}
 
-	// bitWidth is the component's width, so a vector is that many times the
-	// component's size. Rounded up, so a 24-bit component claims 4.
+	// bitWidth is the component's width, so the element's own size comes from the
+	// component's size and the component count. Rounded up, so a 24-bit
+	// component claims 4, and taken from Metal's own rule rather than from
+	// (bits * count) / 8, because a float3 is 16 bytes and 16-aligned where its
+	// three floats are 12. Aligned has to name a power of two, which the Metal
+	// rule gives and a size does not.
 	const auto it = _widthOfVector.find(type);
 	const uint32_t count = it != _widthOfVector.end() ? it->second : 1;
-	return std::max<uint32_t>(1, ((bits * count) + 7) / 8);
+	const uint32_t scalarBytes = (bits + 7) / 8;
+	return std::max<uint32_t>(1, vectorLayoutFor(scalarBytes, count).alignment);
 }
 
 Id TypeTable::zero(Id type) {
@@ -525,8 +564,13 @@ Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 }
 
 // The member types of a struct and, where the caller wants them, where each one
-// starts in a buffer. False when no struct of that name is declared, so a caller
-// can say so rather than guess.
+// starts in a buffer. Metal lays a struct out with every member at the next
+// multiple of its own alignment, so a float3 member both starts and steps 16
+// bytes even though it holds 12, which is what a float member after it has to
+// account for.
+//
+// False when no struct of that name is declared, so a caller can say so rather
+// than guess.
 bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTypes,
 	std::vector<uint32_t>& outOffsets) {
 
@@ -538,20 +582,22 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	uint32_t offset = 0;
 
 	for (const StructField& field: decl->fields) {
-		if (!field.type.isScalar() || !field.type.namedType.empty()) {
-			throw CompileError("struct \"" + decl->name + "\" has a field mslc cannot represent yet ("
-				+ std::string(scalarKindName(field.type.scalar))
-				+ (field.type.isPointer ? "*" : "")
-				+ (field.type.isConst ? " const" : "")
-				+ " " + field.name + ")");
+		if (!field.type.isPointer && !field.type.namedType.empty()) {
+			throw CompileError("struct \"" + decl->name + "\" has a field whose type is itself "
+				"a struct, which mslc cannot represent yet (\"" + field.name + "\")");
 		}
 
-		const Id fieldType = scalar(field.type.scalar);
-		const uint32_t size = mappingFor(field.type.scalar).width / 8;
+		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
+		const VectorLayout layout = vectorLayoutFor(
+			mappingFor(field.type.scalar).width / 8, components);
 
-		outTypes.push_back(fieldType);
+		outTypes.push_back(components > 1
+			? vector(field.type.scalar, field.type.vectorWidth)
+			: scalar(field.type.scalar));
+
+		offset = alignTo(offset, layout.alignment);
 		outOffsets.push_back(offset);
-		offset += size;
+		offset += layout.size;
 	}
 
 	return true;
@@ -861,14 +907,10 @@ namespace {
 	}
 
 	// A load or store through a PhysicalStorageBuffer pointer must carry the
-	// Aligned memory operand; spirv-val rejects the module without it. A buffer
-	// element sits at a multiple of its own size, so that is the whole guarantee
-	// and claiming more is what lets a compiler read past the end of a buffer.
+	// Aligned memory operand; spirv-val rejects the module without it. There is
+	// no exemption for an aggregate: the VUID is about the access, not the type
+	// it accesses, and a float3 element is the first aggregate load mslc emits.
 	std::vector<uint32_t> Emitter::alignedOperands(Id pointeeType) const {
-		if (_types.isAggregate(pointeeType)) {
-			return { };
-		}
-
 		return { static_cast<uint32_t>(spirv::MemoryAccess::Aligned),
 			_types.alignmentOf(pointeeType) };
 	}
@@ -906,6 +948,23 @@ namespace {
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		// A scalar is not a value of a vector type, and neither vector is a value
+		// of the other's width, so there is no conversion between them:
+		// OpFConvert and OpBitcast both reject a change of component count, and
+		// OpCompositeConstruct would be a broadcast, which is what the arithmetic
+		// path asks for explicitly and what an initialiser or a store does not
+		// mean.
+		const uint32_t fromWidth = _types.vectorWidth(fromType);
+		const uint32_t toWidth = _types.vectorWidth(toType);
+		if (fromWidth != toWidth && (fromWidth > 1 || toWidth > 1)) {
+			throw CompileError(fromWidth == 1 || toWidth == 1
+				? "a scalar cannot be converted to a vector; mslc builds a vector from a "
+					"list of values, which it does not do yet"
+				: "a vector of " + std::to_string(fromWidth) + " components cannot be "
+					"converted to one of " + std::to_string(toWidth) + "; mslc builds a "
+					"vector from a list of values, which it does not do yet");
 		}
 
 		// A bool is neither floating point nor an integer, and no convert opcode
@@ -946,9 +1005,9 @@ namespace {
 		// OpSConvert sign extends or truncates, OpUConvert zero extends or
 		// truncates, and spirv-val requires the opcode to match the result type's
 		// signedness.
-		const uint32_t fromWidth = _types.bitWidth(fromType);
-		const uint32_t toWidth = _types.bitWidth(toType);
-		if (fromWidth == toWidth) {
+		const uint32_t fromBits = _types.bitWidth(fromType);
+		const uint32_t toBits = _types.bitWidth(toType);
+		if (fromBits == toBits) {
 			return _builder.emitTyped(spirv::OpBitcast, toType, { value });
 		}
 
@@ -957,7 +1016,7 @@ namespace {
 
 		// Truncation keeps the low bits whatever the signedness, so the result's
 		// own signedness picks the opcode and the value survives.
-		if (toWidth < fromWidth) {
+		if (toBits < fromBits) {
 			return _builder.emitTyped(toSigned ? spirv::OpSConvert : spirv::OpUConvert,
 				toType, { value });
 		}
@@ -973,7 +1032,7 @@ namespace {
 		// reinterpreted. Extending straight to the result type would zero extend
 		// a negative short into a small positive ulong, or sign extend 65535u into
 		// a negative int.
-		const auto temporary = integerKind(toWidth, fromSigned);
+		const auto temporary = integerKind(toBits, fromSigned);
 		if (!temporary) {
 			throw CompileError("converting between integer widths mslc does not know "
 				"is not lowered yet");
@@ -1251,6 +1310,22 @@ namespace {
 		// is always uint. A shift count is free to have its own type and width.
 		const bool isShift = expression.binaryOperator == BinaryOperator::ShiftLeft
 			|| expression.binaryOperator == BinaryOperator::ShiftRight;
+
+		// A scalar beside a vector is a broadcast, which is what "v * 2.0" means
+		// in MSL. The scalar is converted to the vector's own component type and
+		// then put in every component; converting it to the vector type instead
+		// would be an OpFConvert into a vector, which no convert opcode accepts.
+		const uint32_t rightWidth = _types.vectorWidth(_builder.typeOf(right));
+		if (_types.vectorWidth(leftType) > 1 && rightWidth == 1
+			&& !isShift && !isLogical && !isComparison) {
+
+			const Id component = _types.componentOf(leftType);
+			const Id widened = convert(right, _builder.typeOf(right), component);
+			return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
+				leftType, { left, _builder.emitTyped(spirv::OpCompositeConstruct, leftType,
+					std::vector<uint32_t>(_types.vectorWidth(leftType), widened)) });
+		}
+
 		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
 		return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
 			leftType, { left, rightOperand });

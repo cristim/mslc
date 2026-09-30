@@ -51,6 +51,42 @@ namespace {
 		return true;
 	}
 
+	// A scalar or a vector type name. Metal spells a vector as its scalar type
+	// with the component count on the end, so "float4" is "float" and a 4, and
+	// the only thing to do with the name is split it. The count has to be 2 to 9
+	// and the rest has to name a scalar: a type with a width of 1 is not spelled
+	// that way, and "float0" is not a type.
+	bool isTypeName(std::string_view text, ScalarKind& outKind, uint32_t& outWidth) {
+		if (isScalarTypeName(text, outKind)) {
+			outWidth = 0;
+			return true;
+		}
+
+		if (text.size() < 2) {
+			return false;
+		}
+
+		const char last = text.back();
+		if (last < '2' || last > '9') {
+			return false;
+		}
+
+		if (!isScalarTypeName(text.substr(0, text.size() - 1), outKind)) {
+			return false;
+		}
+
+		outWidth = static_cast<uint32_t>(last - '0');
+		return true;
+	}
+
+	// Whether a name is a scalar or a vector type, for a caller that only needs
+	// to know which it is.
+	bool isTypeName(std::string_view text) {
+		ScalarKind kind;
+		uint32_t width = 0;
+		return isTypeName(text, kind, width);
+	}
+
 	// Keywords that may appear before a type and are not address spaces.
 	bool isTypeQualifier(std::string_view text) {
 		return text == "const" || text == "static" || text == "constexpr"
@@ -511,25 +547,11 @@ Type Parser::parseType() {
 	}
 
 	ScalarKind scalarKind;
-	if (kind() == TokenKind::Identifier && isScalarTypeName(current().text, scalarKind)) {
-		std::string_view base = advance().text;
+	uint32_t vectorWidth = 0;
+	if (kind() == TokenKind::Identifier && isTypeName(current().text, scalarKind, vectorWidth)) {
+		advance();
 		type.scalar = scalarKind;
-
-		// Vector suffix: float4, uint2, half3. The count is part of the name
-		// in MSL, so it is split off here rather than being a separate token.
-		if (base.size() > 1) {
-			const char last = base.back();
-			if (last >= '2' && last <= '9') {
-				type.vectorWidth = static_cast<uint32_t>(last - '0');
-				type.scalar = scalarKind;
-				// Re-derive the base name without the digits.
-				std::string_view trimmed = base.substr(0, base.size() - 1);
-				if (!isScalarTypeName(trimmed, scalarKind)) {
-					throw CompileError("unknown type \"" + std::string(base) + "\"");
-				}
-				type.scalar = scalarKind;
-			}
-		}
+		type.vectorWidth = vectorWidth;
 	} else if (kind() == TokenKind::Identifier) {
 		type.namedType = std::string(advance().text);
 	} else {
@@ -759,13 +781,15 @@ StatementPtr Parser::parseStatement() {
 	}
 
 	// A declaration statement starts with a type. Distinguish it from an
-	// expression by looking for a bare type keyword or a known address space
-	// before anything that could begin an expression.
+	// expression by looking for a bare type name, a type qualifier or a known
+	// address space before anything that could begin an expression. A struct
+	// declared earlier in the unit counts, since "Vertex vtx;" is a declaration
+	// and nothing else could start with those two words.
 	{
-		ScalarKind scalarKind;
 		const bool looksLikeType =
-			(kind() == TokenKind::Identifier && (isScalarTypeName(current().text, scalarKind)
-				|| isTypeQualifier(current().text)))
+			(kind() == TokenKind::Identifier && (isTypeName(current().text)
+				|| isTypeQualifier(current().text)
+				|| _unit.findStruct(std::string(current().text)) != nullptr))
 			|| atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 
@@ -824,10 +848,8 @@ StatementPtr Parser::parseForStatement() {
 	expect(TokenKind::LParen, "after 'for'");
 
 	{
-		ScalarKind scalarKind;
 		const bool looksLikeType =
-			(kind() == TokenKind::Identifier && (isScalarTypeName(current().text, scalarKind)
-				|| isTypeQualifier(current().text)));
+			kind() == TokenKind::Identifier && isTypeName(current().text);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -1077,25 +1099,16 @@ ExpressionPtr Parser::parsePrimary() {
 		std::string_view text = current().text;
 
 		ScalarKind scalarKind;
-		if (isScalarTypeName(text, scalarKind)) {
+		uint32_t vectorWidth = 0;
+		if (isTypeName(text, scalarKind, vectorWidth)) {
 			// A type name in expression position is a cast: float(x), uint3(y).
-			std::string_view name = advance().text;
+			advance();
 			Type type;
 			type.scalar = scalarKind;
-
-			if (name.size() > 1) {
-				const char last = name.back();
-				if (last >= '2' && last <= '9') {
-					type.vectorWidth = static_cast<uint32_t>(last - '0');
-					if (!isScalarTypeName(name.substr(0, name.size() - 1), scalarKind)) {
-						throw CompileError("unknown cast type \"" + std::string(name) + "\"");
-					}
-					type.scalar = scalarKind;
-				}
-			}
+			type.vectorWidth = vectorWidth;
 
 			if (!at(TokenKind::LParen)) {
-				throw CompileError("expected '(' after cast type \"" + std::string(name) + "\"");
+				throw CompileError("expected '(' after cast type \"" + std::string(text) + "\"");
 			}
 
 			advance();
