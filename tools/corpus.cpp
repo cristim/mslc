@@ -60,8 +60,22 @@ namespace {
 		return quoted + "'";
 	}
 
+	// --scalar-block-layout because indium passes the VkPhysicalDeviceFeatures2 it
+	// queried straight to vkCreateDevice, so every feature the device reports is
+	// enabled and VK_EXT_scalar_block_layout is one of them whenever the device has
+	// it. A module that needs it is therefore one the device will accept, and
+	// spirv-val without the flag checks the stricter layout rules that apply to a
+	// device without the feature. Its own diagnostic says as much: "This is may be
+	// allowed if you enable the scalarBlockLayout feature (or use the
+	// --scalar-block-layout command line flag)".
+	//
+	// The probes are left alone. They are mslc's own regression guard, the strict
+	// layout is what every module it emits today satisfies, and relaxing the check
+	// on all seventy of them to accommodate a construct none of them has is not a
+	// trade this runner should make on its own.
 	bool validateWithSpirvVal(const std::string& spirvVal, const std::string& spvPath, std::string& detail) {
-		const std::string command = shellQuote(spirvVal) + " --target-env vulkan1.3 " + shellQuote(spvPath)
+		const std::string command = shellQuote(spirvVal)
+			+ " --target-env vulkan1.3 --scalar-block-layout " + shellQuote(spvPath)
 			+ " 2>&1 >/dev/null";
 		FILE* pipe = popen(command.c_str(), "r");
 		if (!pipe) {
