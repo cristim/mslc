@@ -85,3 +85,11 @@ add_test(NAME harness/crash_after_diag COMMAND ${CMAKE_COMMAND}
 	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
 set_tests_properties(harness/crash_after_diag PROPERTIES
 	PASS_REGULAR_EXPRESSION "crash_after_diag: mslc crashed")
+
+# The CLI's own paths: argument handling, --dump-tokens, and the exit codes. A
+# probe drives the library, so none of this runs otherwise, and --dump-tokens is
+# what a review reaches for when it has a lexing question.
+add_test(NAME cli/arguments COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cli.cmake)
