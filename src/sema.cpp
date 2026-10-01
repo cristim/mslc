@@ -972,6 +972,18 @@ namespace {
 	}
 
 	Id Emitter::declaredTypeOf(const Type& type) {
+		// A pointer and an array are not one value each, and answering with the
+		// base type says something narrower than the type that was asked about. A
+		// *local* of one of them is then declared as a base, and its initialiser is
+		// converted to that base and stored, so "float[2] v;" became one float and
+		// "float *p = 0;" wrote a float 0.0 into a pointer. Both validate, and both
+		// read as nonsense afterwards.
+		//
+		// The check is in the local path and not here, because a buffer parameter
+		// is a pointer by definition: that is how every parameter reaches the
+		// binding-0 block, and the base type is exactly what a member of it has to
+		// point at. This function answers the value a type denotes, which for a
+		// pointer is its pointee, and refusing it here would refuse every buffer.
 		if (!type.namedType.empty()) {
 			const Id id = _types.valueStruct(type.namedType);
 			if (id == InvalidId) {
@@ -1548,13 +1560,76 @@ namespace {
 		const bool isComparison = !isLogical && leftType != _boolType
 			&& isComparisonOperator(expression.binaryOperator);
 
-		if (isLogical || isComparison) {
-			const uint16_t opcode = isLogical
-				? (expression.binaryOperator == BinaryOperator::LogicalAnd
-					? spirv::OpLogicalAnd : spirv::OpLogicalOr)
-				: comparisonOpcode(expression.binaryOperator, isFloat, isSigned);
-
+		if (isLogical) {
+			const uint16_t opcode = expression.binaryOperator == BinaryOperator::LogicalAnd
+				? spirv::OpLogicalAnd : spirv::OpLogicalOr;
 			return _builder.emitTyped(opcode, _boolType, { left, right });
+		}
+
+		if (isComparison) {
+			// The two operands have to share a type, and the rule is C's usual
+			// arithmetic conversions: a float beats an integer, then the wider
+			// integer beats the narrower, and only then does signedness break a tie
+			// with both becoming unsigned. Neither direction narrows, which is what
+			// this used to do: it converted the right operand to the left one's type,
+			// so "3 < f" for a float f turned the 3 into an int and answered the
+			// wrong thing, and "b < v" for a uchar and an int turned the int into a
+			// uchar. Both validate.
+			Id leftOperand = left;
+			Id rightOperand = right;
+			Id leftType = _builder.typeOf(left);
+			Id rightType = _builder.typeOf(right);
+
+			const bool leftIsFloat = _types.isFloat(leftType);
+			const bool rightIsFloat = _types.isFloat(rightType);
+			// Not named `signed`, which is a keyword.
+			bool operandsSigned = _types.isSignedInt(leftType);
+
+			// The type both operands end up in, which is also what the opcode is
+			// chosen from. Float wins over integer; then the wider integer; then the
+			// left one's own type.
+			Id commonType = leftType;
+			if (leftIsFloat != rightIsFloat) {
+				commonType = leftIsFloat ? leftType : rightType;
+				operandsSigned = false;
+			} else if (_types.bitWidth(rightType) > _types.bitWidth(leftType)) {
+				commonType = rightType;
+				operandsSigned = _types.isSignedInt(rightType);
+			} else if (leftType != rightType) {
+				// Equal widths, or the left is already the wider: the tie-break is
+				// signedness, and C says both sides become unsigned.
+				operandsSigned = _types.isSignedInt(leftType) && _types.isSignedInt(rightType);
+			}
+
+			if (_types.isFloat(commonType)) {
+				operandsSigned = false;
+			} else if (_types.isSignedInt(commonType) != operandsSigned) {
+				// Same width, opposite signedness: the signed side becomes the
+				// unsigned kind of the same width, which is what makes "-1 < u" an
+				// unsigned comparison of 4294967295 against the value.
+				// The unsigned kind of the same width, taken from the width rather
+				// than named, so a 64-bit operand stays 64 bits.
+				uint32_t width = _types.bitWidth(commonType);
+				if (width == 64) {
+					commonType = _types.scalar(ScalarKind::ULong);
+				} else if (width == 16) {
+					commonType = _types.scalar(ScalarKind::UShort);
+				} else if (width == 8) {
+					commonType = _types.scalar(ScalarKind::UChar);
+				} else {
+					commonType = _types.scalar(ScalarKind::UInt);
+				}
+			}
+
+			if (_builder.typeOf(left) != commonType) {
+				leftOperand = convert(left, _builder.typeOf(left), commonType);
+			}
+			if (_builder.typeOf(right) != commonType) {
+				rightOperand = convert(right, _builder.typeOf(right), commonType);
+			}
+
+			return _builder.emitTyped(comparisonOpcode(expression.binaryOperator,
+				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
 		}
 
 		// OpUDiv and OpUMod need both operands of the result type, and a literal
@@ -1932,7 +2007,27 @@ namespace {
 	Id Emitter::emitExpression(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
-				return _builder.emitDeclTyped(spirv::OpConstant, _uintType,
+				// The suffix decides, not the value. An unsuffixed integer literal
+				// is an int and a `u` one is a uint, which is what picks the
+				// opcode for "4294967295u / 3u" and what a literal's conversion
+				// reads it through.
+				//
+				// These were both wrong once and in opposite directions. Emitting
+				// every literal as %uint made a negative one wrap: "-1" was
+				// OpSNegate %uint %uint_1, and negating 1 as an unsigned is
+				// 4294967295. A declaration hid it, because the stored value is
+				// bitcast back to %int, so "int b = -1" read correctly while
+				// "float3 v(-1)" broadcast 4294967295.0f. Emitting every literal as
+				// %int hid nothing and broke unsigned arithmetic instead, because
+				// emitBinary takes the opcode from the left type, so
+				// "4294967295u / 3u" became OpSDiv.
+				//
+				// A literal that does not fit in an int is a long in Apple's
+				// compiler, with no suffix to ask for it, and mslc has no 64-bit
+				// literal. Both reads therefore give the wrong answer for one, and
+				// that gap is left for the 64-bit work rather than papered over here.
+				const Id type = expression.intIsUnsigned ? _uintType : _intType;
+				return _builder.emitDeclTyped(spirv::OpConstant, type,
 					{ static_cast<uint32_t>(expression.intValue) });
 			}
 
@@ -2270,6 +2365,24 @@ namespace {
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
+		// A local has to be a value: the declaration stores an initialiser into a
+		// Function-storage variable, and declaredTypeOf answers a pointer type with
+		// its pointee, so a local of pointer or array type would be declared as that
+		// base and have the initialiser converted to it. "float *p = 0;" stored a
+		// float 0.0 into a pointer and "float[2] v;" declared one float, both of
+		// which validate. The type is quoted as the source spelled it, so the
+		// message names "float *" rather than "float".
+		if (declaration.type.isPointer) {
+			throw CompileError("a local of type " + typeName(declaration.type)
+				+ " is not lowered yet, since a pointer is not a value mslc can declare "
+					"in a function's own storage");
+		}
+
+		if (declaration.type.arrayLength) {
+			throw CompileError("a local of array type " + typeName(declaration.type)
+				+ " is not lowered yet; an array has no single SPIR-V type to store into");
+		}
+
 		const Id typeId = declaredTypeOf(declaration.type);
 
 		Id initial = InvalidId;

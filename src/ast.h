@@ -157,6 +157,11 @@ struct Expression {
 
 	// literals
 	uint64_t intValue = 0;
+	// Whether the literal was written with a `u` suffix, which is what makes it
+	// a uint rather than an int. MSL has no `l` suffix for a 64-bit literal, so
+	// an unsuffixed value that does not fit in an int is a long in Apple's
+	// compiler and nothing mslc can represent, which is its own gap.
+	bool intIsUnsigned = false;
 	double floatValue = 0.0;
 	bool boolValue = false;
 

@@ -1,7 +1,7 @@
 // EXPECT: valid
 // DISASM: OpVariable %_ptr_Function_uint Function
 // DISASM-ORDER: %50 = OpFunction %void None
-// DISASM-ORDER: %62 = OpVariable %_ptr_Function_uint Function
+// DISASM-ORDER: OpVariable %_ptr_Function_uint Function
 //
 // Locals belong to their own function's first block, and the module has as many
 // functions as it has entry points. Every Function-storage OpVariable used to go
@@ -29,10 +29,13 @@
 // the function id would put both in the first function's block, which is before
 // the second OpFunction, and the pair would then read the other way round.
 //
-// The ids are pinned rather than matched, because CMake's REGEX MATCH does not
-// span a newline, so no pattern can reach across the two functions to say which
-// block a line is in. DISASM-ORDER compares positions instead, and the two ids
-// are stable because the first function's body is fixed by the probe.
+// Only the function's id is pinned. The locals' own ids are not, because they
+// are allocated after the function id and move whenever anything before them
+// changes: a signed int literal was one instruction's worth of ids different
+// between two runs of this same probe. Pinning them made the probe fail on an
+// unrelated change, which is a probe that reports the wrong thing. What the pair
+// needs to say is "the first OpFunction is before an OpVariable", and that
+// holds for the second function's locals whichever ids they were given.
 vertex void vertex_without_locals(device uint *in [[buffer(0)]],
                                   device uint *out [[buffer(1)]],
                                   uint index [[vertex_id]])
