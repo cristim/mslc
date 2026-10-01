@@ -462,53 +462,73 @@ spirv::Id TypeTable::bufferPointer(Id pointee) {
 	return id;
 }
 
-// Returns the module's single binding-0 address block, building it from
+// Returns the binding-0 address block for one descriptor set, building it from
 // pointeeTypes and decorating its variable with descriptorSet the first time
-// it is asked for. Later calls ignore both arguments and return the block
-// already built.
+// that set is asked for.
 TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes,
 	uint32_t descriptorSet) {
-	// One block per module: every buffer parameter of the entry point is a
-	// member of the same one, which is what occupies binding 0.
-	if (!_addressBlock.blockType) {
-		AddressBlock block;
-		std::vector<uint32_t> memberPointers;
-		memberPointers.reserve(pointeeTypes.size());
-
-		for (Id pointee: pointeeTypes) {
-			memberPointers.push_back(bufferPointer(pointee));
+	// One block per set: every buffer parameter of an entry point is a member of
+	// the same one, which is what occupies binding 0, and a module with both a
+	// vertex and a fragment entry point needs one each because indium splits the
+	// sets by stage. A single cache would hand the fragment function the vertex
+	// function's set, and its buffers would never bind.
+	//
+	// Two entry points in the *same* stage share a set and therefore have to
+	// share the block, which only works if they declare the same buffers: the
+	// block's members are typed and its count is fixed when it is declared, and
+	// a second entry point indexing it with a different count or a different
+	// pointee type produces an access chain whose result type does not match the
+	// type the member holds. Both are hard errors rather than a silent reuse,
+	// because the module that comes out is a rejected one at best.
+	const auto cached = _addressBlocks.find(descriptorSet);
+	if (cached != _addressBlocks.end()) {
+		if (cached->second.pointeeTypes != pointeeTypes) {
+			throw CompileError("two entry points sharing descriptor set "
+				+ std::to_string(descriptorSet) + " bind different buffers, and one "
+					"address block at binding 0 holds them; they have to agree in both "
+					"number and type");
 		}
 
-		block.blockType = _builder.emitDecl(spirv::OpTypeStruct, memberPointers);
-		_builder.emit(spirv::OpDecorate, { block.blockType,
-			static_cast<uint32_t>(spirv::Decoration::Block) });
-
-		// Member k is the k-th buffer parameter in declaration order, at byte
-		// offset 8 * k. An 8-byte address is what the struct is laid out for, so
-		// this is the size of the value and not a stride.
-		for (size_t k = 0; k < memberPointers.size(); ++k) {
-			_builder.emit(spirv::OpMemberDecorate, { block.blockType,
-				static_cast<uint32_t>(k), static_cast<uint32_t>(spirv::Decoration::Offset),
-				static_cast<uint32_t>(8 * k) });
-		}
-
-		block.memberPointer = _builder.emitDecl(spirv::OpTypePointer,
-			{ static_cast<uint32_t>(spirv::StorageClass::Uniform), block.blockType });
-
-		block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
-			{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
-		// The set is chosen by stage: indium builds set 0 from the vertex function
-		// and set 1 from the fragment function, so a fragment shader's block has
-		// to be in set 1 or indium never binds it.
-		_builder.emit(spirv::OpDecorate, { block.variable,
-			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet });
-		_builder.emit(spirv::OpDecorate, { block.variable,
-			static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
-
-		_addressBlock = block;
+		return cached->second;
 	}
 
-	return _addressBlock;
+	AddressBlock block;
+	block.pointeeTypes = pointeeTypes;
+	std::vector<uint32_t> memberPointers;
+	memberPointers.reserve(pointeeTypes.size());
+
+	for (Id pointee: pointeeTypes) {
+		memberPointers.push_back(bufferPointer(pointee));
+	}
+
+	block.blockType = _builder.emitDecl(spirv::OpTypeStruct, memberPointers);
+	_builder.emit(spirv::OpDecorate, { block.blockType,
+		static_cast<uint32_t>(spirv::Decoration::Block) });
+
+	// Member k is the k-th buffer parameter in declaration order, at byte
+	// offset 8 * k. An 8-byte address is what the struct is laid out for, so
+	// this is the size of the value and not a stride.
+	for (size_t k = 0; k < memberPointers.size(); ++k) {
+		_builder.emit(spirv::OpMemberDecorate, { block.blockType,
+			static_cast<uint32_t>(k), static_cast<uint32_t>(spirv::Decoration::Offset),
+			static_cast<uint32_t>(8 * k) });
+	}
+
+	block.memberPointer = _builder.emitDecl(spirv::OpTypePointer,
+		{ static_cast<uint32_t>(spirv::StorageClass::Uniform), block.blockType });
+
+	block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
+		{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
+	// The set is chosen by stage: indium builds set 0 from the vertex function
+	// and set 1 from the fragment function, so a fragment shader's block has
+	// to be in set 1 or indium never binds it.
+	_builder.emit(spirv::OpDecorate, { block.variable,
+		static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet });
+	_builder.emit(spirv::OpDecorate, { block.variable,
+		static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
+
+	_addressBlocks.emplace(descriptorSet, block);
+	return block;
 }
 
 uint32_t TypeTable::alignmentOf(Id type) const {
@@ -718,38 +738,56 @@ std::optional<spirv::StorageClassValue> storageClassForAddressSpace(AddressSpace
 	return std::nullopt;
 }
 
-const FunctionDecl* selectEntryPoint(const TranslationUnit& unit, Stage requested) {
-	if (requested != Stage::None) {
-		for (const FunctionDecl& function: unit.functions) {
-			if (function.stage == requested) {
-				return &function;
-			}
-		}
+std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, Stage requested) {
+	std::vector<const FunctionDecl*> found;
 
-		throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"
-			: requested == Stage::Vertex ? "vertex" : "fragment")
-			+ " entry point in this source");
-	}
-
-	const FunctionDecl* found = nullptr;
 	for (const FunctionDecl& function: unit.functions) {
+		// A requested stage narrows the module to that stage, and every function
+		// of it is an entry point: Metal's newLibraryWithSource: compiles a whole
+		// file, so one .metal source carrying a vertex and a fragment function is
+		// one module with two entry points rather than a choice between them.
 		if (function.stage == Stage::None) {
 			continue;
 		}
 
-		if (found) {
-			throw CompileError("source declares more than one entry point (\"" + found->name
-				+ "\" and \"" + function.name + "\"); pass an explicit stage");
+		if (requested != Stage::None && function.stage != requested) {
+			continue;
 		}
 
-		found = &function;
+		found.push_back(&function);
 	}
 
-	if (!found) {
+	if (!found.empty()) {
+		// Two compute entry points cannot share a module. The workgroup size is
+		// three spec constants at SpecId 0, 1, 2, and indium writes constantID
+		// 0, 1, 2 once per pipeline against the module it was handed, so there is
+		// one set of ids per module and no way to specialise the second entry
+		// point. Declaring a second set would leave two decorated constants per
+		// id, which spirv-val accepts and no driver can resolve. One vertex and
+		// one fragment is the shape indium builds, and it is fine.
+		size_t kernels = 0;
+		for (const FunctionDecl* function: found) {
+			if (function->stage == Stage::Kernel) {
+				kernels++;
+			}
+		}
+
+		if (kernels > 1) {
+			throw CompileError("a source may declare one kernel; mslc has no way to give a "
+				"second one its own workgroup size, because indium specialises one set of "
+				"three constants per module");
+		}
+
+		return found;
+	}
+
+	if (requested == Stage::None) {
 		throw CompileError("source declares no kernel, vertex or fragment entry point");
 	}
 
-	return found;
+	throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"
+		: requested == Stage::Vertex ? "vertex" : "fragment")
+		+ " entry point in this source");
 }
 
 //
@@ -816,7 +854,14 @@ namespace {
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
-		const FunctionDecl& _entryPoint;
+		// The module's entry points, in declaration order. Several of them is
+		// ordinary: Metal compiles a whole file, so one source carrying a vertex
+		// and a fragment function is one module with two entry points.
+		const std::vector<const FunctionDecl*>& _entryPoints;
+		// The one being emitted. Everything stage-dependent reads it, so a second
+		// entry point in another stage gets its own set and its own execution
+		// modes without any of them being passed down.
+		const FunctionDecl* _entryPoint = nullptr;
 		const ModuleOptions& _options;
 		TypeTable& _types;
 
@@ -855,18 +900,20 @@ namespace {
 
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
-			const FunctionDecl& entryPoint, const ModuleOptions& options, TypeTable& types):
-			_builder(builder), _unit(unit), _entryPoint(entryPoint),
+			const std::vector<const FunctionDecl*>& entryPoints,
+			const ModuleOptions& options, TypeTable& types):
+			_builder(builder), _unit(unit), _entryPoints(entryPoints),
 			_options(options), _types(types) {}
 
 		std::string run();
 
 	private:
+		void emitEntryPoint(spirv::Id functionType);
 		Id constantU32(uint32_t value);
 	// indium splits descriptor sets by stage: set 0 from the vertex function,
 	// set 1 from the fragment function. A kernel has one set.
 	uint32_t descriptorSet() const {
-		return _entryPoint.stage == Stage::Fragment ? 1u : 0u;
+		return _entryPoint->stage == Stage::Fragment ? 1u : 0u;
 	}
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
@@ -1922,6 +1969,51 @@ namespace {
 	}
 
 
+	// The MSL spelling of a builtin, for a diagnostic that names it.
+	const char* builtinName(ParameterAttributes::Builtin builtin) {
+		switch (builtin) {
+			case ParameterAttributes::Builtin::ThreadPositionInGrid: return "thread_position_in_grid";
+			case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
+				return "threadgroup_position_in_grid";
+			case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
+				return "thread_position_in_threadgroup";
+			case ParameterAttributes::Builtin::ThreadIndexInThreadgroup:
+				return "thread_index_in_threadgroup";
+			case ParameterAttributes::Builtin::VertexID: return "vertex_id";
+			case ParameterAttributes::Builtin::InstanceID: return "instance_id";
+			case ParameterAttributes::Builtin::Position: return "position";
+			case ParameterAttributes::Builtin::FragCoord: return "frag_coord";
+			case ParameterAttributes::Builtin::FrontFacing: return "front_facing";
+			case ParameterAttributes::Builtin::None: break;
+		}
+
+		return "unknown";
+	}
+
+	// Whether Vulkan allows this builtin in this execution model. The dispatch
+	// ids are compute only and frag_coord is fragment only, and a module that
+	// used one in the wrong stage is rejected by validation rather than being a
+	// shader that quietly computes the wrong thing.
+	bool builtinAllowedInStage(ParameterAttributes::Builtin builtin, Stage stage) {
+		switch (builtin) {
+			case ParameterAttributes::Builtin::ThreadPositionInGrid:
+			case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
+			case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
+			case ParameterAttributes::Builtin::ThreadIndexInThreadgroup:
+				return stage == Stage::Kernel;
+			case ParameterAttributes::Builtin::VertexID:
+			case ParameterAttributes::Builtin::InstanceID:
+				return stage == Stage::Vertex;
+			case ParameterAttributes::Builtin::FragCoord:
+			case ParameterAttributes::Builtin::FrontFacing:
+			case ParameterAttributes::Builtin::Position:
+				return stage == Stage::Fragment;
+			case ParameterAttributes::Builtin::None: break;
+		}
+
+		return false;
+	}
+
 	// MSL does not require [[buffer(n)]] on an entry point's device or
 	// constant parameters: an unbinding parameter's index is its position
 	// among the binding parameters, with builtins skipped. add.metal relies on
@@ -1945,10 +2037,10 @@ namespace {
 	// its own interface variable, and a buffer parameter is folded into a
 	// member of the binding-0 address block once every one of them is seen.
 	void Emitter::declareParameters() {
-		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(_entryPoint);
+		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(*_entryPoint);
 
-		for (size_t index = 0; index < _entryPoint.parameters.size(); ++index) {
-			const Parameter& parameter = _entryPoint.parameters[index];
+		for (size_t index = 0; index < _entryPoint->parameters.size(); ++index) {
+			const Parameter& parameter = _entryPoint->parameters[index];
 
 			if (parameter.attributes.builtin) {
 				const spirv::BuiltInValue spvBuiltin = [&]() {
@@ -1998,10 +2090,35 @@ namespace {
 				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 					{ static_cast<uint32_t>(spirv::StorageClass::Input) });
 
+				// Vulkan fixes which execution models each builtin is legal in, and
+				// an integer Input on a fragment entry point additionally has to be
+				// Flat. A builtin used in the wrong stage is rejected rather than
+				// decorated: the alternative is a module that validates on one
+				// stage's terms and is wrong on another's. Checked before the
+				// decoration, so a rejected builtin is never emitted.
+				if (!builtinAllowedInStage(*parameter.attributes.builtin, _entryPoint->stage)) {
+					throw CompileError(std::string("builtin \"") + builtinName(*parameter.attributes.builtin)
+						+ "\" is not available in a "
+						+ (_entryPoint->stage == Stage::Kernel ? "kernel"
+							: _entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
+						+ " function (parameter \"" + parameter.name + "\")");
+				}
+
 				_builder.setSection(spirv::Section::Annotations);
 				_builder.emit(spirv::OpDecorate, { id,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
 					static_cast<uint32_t>(spvBuiltin) });
+
+				// An integer Input on a fragment entry point has to be Flat:
+				// there is no sensible way to interpolate an integer, and
+				// VUID-StandaloneSpirv-Flat-04744 rejects the module without it.
+				// A compute or vertex entry point has no interpolation at all, so
+				// the decoration would be meaningless there.
+				if (_entryPoint->stage == Stage::Fragment && spvBuiltin != spirv::BuiltIn::FragCoord
+					&& spvBuiltin != spirv::BuiltIn::FrontFacing) {
+					_builder.emit(spirv::OpDecorate, { id,
+						static_cast<uint32_t>(spirv::Decoration::Flat) });
+				}
 
 				Binding binding;
 				binding.id = id;
@@ -2100,17 +2217,29 @@ namespace {
 		_bindings[parameter.name] = binding;
 
 		// The Metal index says which buffer the app bound at that slot. Every
-		// buffer shares one block at binding 0, so it is not a per-buffer binding
-		// and the reflection reports the member instead. The set is the one the
-		// block is actually declared in, which is 1 for a fragment entry point.
-		_reflection += "\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
+		// buffer of an entry point shares one block at binding 0, so it is not a
+		// per-buffer descriptor binding and the reflection says which one instead.
+		// The set is the one the block is actually declared in, which is 1 for a
+		// fragment entry point.
+		//
+		// The separator goes before the entry rather than after it, because a
+		// trailing comma makes the array a syntax error: json.load refuses
+		// "Illegal trailing comma before end of array", so a reflection a reader
+		// cannot parse is not a reflection. That is why the first binding is the
+		// one that carries no comma.
+		if (!_reflection.empty()) {
+			_reflection.pop_back();  // the newline the previous entry ended with
+			_reflection += ",\n";
+		}
+
+		_reflection += "\t\t\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 			+ std::to_string(bindingIndex)
 			+ ", \"descriptor\": { \"set\": " + std::to_string(descriptorSet())
 			+ ", \"binding\": 0 }"
 			+ ", \"member\": " + std::to_string(memberIndex)
 			+ ", \"param_index\": " + std::to_string(index)
-			+ ", \"name\": \"" + parameter.name + "\" },\n";
-		}
+			+ ", \"name\": \"" + parameter.name + "\" }\n";
+	}
 
 		// One block for every buffer parameter, at binding 0. It is emitted here
 		// rather than per parameter because its member list is only known once the
@@ -2121,7 +2250,6 @@ namespace {
 			_interface.push_back(_addressBlock.variable);
 		}
 	}
-
 	// Each buffer's address is loaded once, here, so that the value dominates
 	// every use. A load emitted at the first use would not dominate a later use
 	// in another basic block, and spirv-val rejects a module where an id is used
@@ -2350,9 +2478,100 @@ namespace {
 		emitStatement(statement);
 	}
 
-	// Emits the whole module for this entry point, from the capabilities down
-	// through the function body, and returns the JSON reflection string
-	// collected along the way.
+	// Emits one entry point: its parameters, its OpEntryPoint, its execution
+	// modes and its function. Everything stage-dependent is decided from
+	// _entryPoint, which the caller points at the one being emitted. functionType
+	// is the module's one void function type.
+	void Emitter::emitEntryPoint(Id functionType) {
+		declareParameters();
+
+		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
+		if (_entryPoint->stage == Stage::Vertex) {
+			model = spirv::ExecutionModel::Vertex;
+		} else if (_entryPoint->stage == Stage::Fragment) {
+			model = spirv::ExecutionModel::Fragment;
+		}
+
+		// The entry point's own id has to exist before it is named in
+		// OpEntryPoint, so it is allocated here rather than after.
+		_entryPointId = _builder.nextId();
+
+		_builder.setSection(spirv::Section::EntryPoints);
+		{
+			std::vector<uint32_t> operands = {
+				static_cast<uint32_t>(model), _entryPointId
+			};
+			spirv::Builder::appendString(operands, _entryPoint->name);
+			for (Id id: _interface) {
+				operands.push_back(id);
+			}
+			_builder.emit(spirv::OpEntryPoint, operands);
+		}
+
+		_builder.setSection(spirv::Section::ExecutionModes);
+		if (_entryPoint->stage == Stage::Kernel) {
+			// The workgroup size is a spec constant rather than a literal, so
+			// indium can supply Metal's threadsPerThreadgroup through
+			// VkSpecializationInfo at pipeline creation. A literal would be baked
+			// in and the value the app asked for would be ignored.
+			//
+			// One set of SpecIds for the module, not one per entry point. indium
+			// writes constantID 0, 1, 2 once per pipeline against the module it was
+			// given, so a second compute entry point declaring its own 0, 1, 2 would
+			// leave two decorated constants per id, which spirv-val accepts and no
+			// driver can resolve: both entry points would read whichever the driver
+			// picked. A module with more than one compute entry point is refused
+			// below rather than given a second set.
+			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeX });
+			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeY });
+			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+				{ _options.localSizeZ });
+			_builder.emit(spirv::OpDecorate, { x,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
+			_builder.emit(spirv::OpDecorate, { y,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 1u });
+			_builder.emit(spirv::OpDecorate, { z,
+				static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
+
+			// OpExecutionModeId, not OpExecutionMode: a mode whose extra operands
+			// are ids has its own instruction, and OpExecutionMode rejects id
+			// operands outright.
+			//
+			// The section is set again here because the decorations above moved it
+			// to the annotations, and an execution mode emitted from there lands
+			// in the wrong section and is ignored.
+			_builder.setSection(spirv::Section::ExecutionModes);
+			_builder.emit(spirv::OpExecutionModeId, { _entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::LocalSizeId), x, y, z });
+		}
+
+		if (_entryPoint->stage == Stage::Fragment) {
+			// Vulkan requires one of the two origin modes on a fragment entry
+			// point, and Metal's framebuffer origin is upper left.
+			_builder.setSection(spirv::Section::ExecutionModes);
+			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
+		}
+
+		_builder.setSection(spirv::Section::Functions);
+		// The function's own id has to be the one the entry point names, so it
+		// is written explicitly rather than taken from the emit's return.
+		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
+			{ kFunctionControlNone, functionType });
+		beginBlock(_builder.nextId());
+		preloadBufferBases();
+		emitFunctionBody(*_entryPoint->body);
+		if (!_terminated) {
+			terminate(spirv::OpReturn, { });
+		}
+		_builder.emit(spirv::OpFunctionEnd, { });
+	}
+
+	// Emits the whole module: the capabilities, the memory model and the
+	// file-scope globals once, then every entry point. Returns the reflection
+	// document.
 	std::string Emitter::run() {
 		_builder.setSection(spirv::Section::Capabilities);
 		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::Shader) });
@@ -2383,107 +2602,66 @@ namespace {
 		// one of them.
 		declareGlobals();
 
-		declareParameters();
-
-		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
-		if (_entryPoint.stage == Stage::Vertex) {
-			model = spirv::ExecutionModel::Vertex;
-		} else if (_entryPoint.stage == Stage::Fragment) {
-			model = spirv::ExecutionModel::Fragment;
-		}
-
-		// The entry point's own id has to exist before it is named in
-		// OpEntryPoint, so it is allocated here rather than after.
-		_entryPointId = _builder.nextId();
-
-		// A type declaration, so TypesGlobals rather than whatever section the
-		// last decoration left behind. It also has to come after the types it
-		// names, which it does because the parameters declared theirs already.
+		// The function type, declared once for the module. Every entry point is a
+		// void function, and a duplicate OpTypeFunction is a hard validation
+		// failure, so this cannot be emitted per entry point.
 		_builder.setSection(spirv::Section::TypesGlobals);
 		// No parameter count: like OpTypeStruct, the trailing variadic count is
 		// derived from the instruction's word count and is not in the binary.
 		// Writing one is read as a parameter type, which shows up as "Id is 0".
 		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType });
 
-		_builder.setSection(spirv::Section::EntryPoints);
-		{
-			std::vector<uint32_t> operands = {
-				static_cast<uint32_t>(model), _entryPointId
-			};
-			spirv::Builder::appendString(operands, _entryPoint.name);
-			for (Id id: _interface) {
-				operands.push_back(id);
-			}
-			_builder.emit(spirv::OpEntryPoint, operands);
+		// One reflection entry per entry point, in the order they were selected.
+		std::string document = "{\n";
+		document += "\t\"reflection_version\": 2,\n";
+		document += "\t\"entry_points\": [\n";
+
+		for (size_t k = 0; k < _entryPoints.size(); ++k) {
+			_entryPoint = _entryPoints[k];
+
+			// Per entry point rather than per module: a name bound in one
+			// function is not visible in another, the buffers are that entry
+			// point's own, and the interface is the list this OpEntryPoint names.
+			_bindings.clear();
+			_bufferMembers.clear();
+			_bufferBases.clear();
+			_interface.clear();
+			_reflection.clear();
+			// The address block is per entry point too, and clearing it with the
+			// rest is what keeps a later change to when it is read from inheriting
+			// the previous function's. Nothing reads it while _bufferMembers is
+			// empty today, so this is not a fix for an observable case.
+			_addressBlock = {};
+			_terminated = false;
+
+			emitEntryPoint(functionType);
+
+			document += "\t\t{\n";
+			document += "\t\t\t\"name\": \"" + _entryPoint->name + "\",\n";
+			document += std::string("\t\t\t\"stage\": \"")
+				+ (_entryPoint->stage == Stage::Kernel ? "compute"
+					: _entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
+				+ "\",\n";
+			document += "\t\t\t\"local_size\": [" + std::to_string(_options.localSizeX) + ", "
+				+ std::to_string(_options.localSizeY) + ", "
+				+ std::to_string(_options.localSizeZ) + "],\n";
+			document += "\t\t\t\"bindings\": [\n";
+			document += _reflection;
+			document += "\t\t\t]\n";
+			document += k + 1 < _entryPoints.size() ? "\t\t},\n" : "\t\t}\n";
 		}
 
-		_builder.setSection(spirv::Section::ExecutionModes);
-		if (_entryPoint.stage == Stage::Kernel) {
-			// The workgroup size is a spec constant rather than a literal, so
-			// indium can supply Metal's threadsPerThreadgroup through
-			// VkSpecializationInfo at pipeline creation. A literal would be baked
-			// in and the value the app asked for would be ignored.
-			// The spec constants default to the requested size rather than to
-			// zero. indium overrides all three through VkSpecializationInfo, so
-			// the default only has to be legal, and a workgroup size of 0, 0, 0
-			// passes spirv-val and is then rejected when the pipeline is
-			// created. Using the option also makes the size the caller asked for
-			// the size the module reports.
-			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeX });
-			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeY });
-			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeZ });
-			_builder.emit(spirv::OpDecorate, { x,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
-			_builder.emit(spirv::OpDecorate, { y,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 1u });
-			_builder.emit(spirv::OpDecorate, { z,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
+		document += "\t]\n}\n";
 
-			// OpExecutionModeId, not OpExecutionMode: a mode whose extra operands
-			// are ids has its own instruction, and OpExecutionMode rejects id
-			// operands outright.
-			//
-			// The section is set again here because the decorations above moved it
-			// to the annotations, and an execution mode emitted from there lands
-			// in the wrong section and is ignored.
-			_builder.setSection(spirv::Section::ExecutionModes);
-			_builder.emit(spirv::OpExecutionModeId, { _entryPointId,
-				static_cast<uint32_t>(spirv::ExecutionMode::LocalSizeId), x, y, z });
-		}
-
-		if (_entryPoint.stage == Stage::Fragment) {
-			// Vulkan requires one of the two origin modes on a fragment entry
-			// point, and Metal's framebuffer origin is upper left.
-			_builder.setSection(spirv::Section::ExecutionModes);
-			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
-				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
-		}
-
-		_builder.setSection(spirv::Section::Functions);
-		// The function's own id has to be the one the entry point names, so it
-		// is written explicitly rather than taken from the emit's return.
-		_builder.emitDeclTypedAt(spirv::OpFunction, _voidType, _entryPointId,
-			{ kFunctionControlNone, functionType });
-		beginBlock(_builder.nextId());
-		preloadBufferBases();
-		emitFunctionBody(*_entryPoint.body);
-		if (!_terminated) {
-			terminate(spirv::OpReturn, { });
-		}
-		_builder.emit(spirv::OpFunctionEnd, { });
-
-		return _reflection;
+		return document;
 	}
 
 }
 
 std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
-	const FunctionDecl& entryPoint, const ModuleOptions& options) {
+	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options) {
 	TypeTable types(builder, unit);
-	Emitter emitter(builder, unit, entryPoint, options, types);
+	Emitter emitter(builder, unit, entryPoints, options, types);
 	return emitter.run();
 }
 

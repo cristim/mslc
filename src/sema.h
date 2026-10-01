@@ -116,19 +116,34 @@ public:
 	// pointers, one per buffer parameter in declaration order, each at offset
 	// 8 * k, and the Uniform variable that holds it. The shader loads a member to
 	// get a buffer's address, which is what indium fills in.
-	// The binding-0 block and the variable that holds it. Named here because the
-	// emitter walks the block to reach a buffer's address.
 	struct AddressBlock {
 		spirv::Id blockType = spirv::InvalidId;
 		spirv::Id variable = spirv::InvalidId;
 		spirv::Id memberPointer = spirv::InvalidId;
+		// What its members point at, in order. A second entry point in the same
+		// set has to agree with this in both count and type: the members are
+		// typed and fixed when the block is built, so a mismatch produces an
+		// access chain whose result type is not the type the member holds.
+		std::vector<spirv::Id> pointeeTypes;
 	};
-	// Builds the module's one binding-0 address block from the given pointee
-	// types on first call and returns it unchanged afterwards, decorating its
-	// variable with the given descriptor set.
-	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes, uint32_t descriptorSet);
+	// Builds the binding-0 address block for one descriptor set from the given
+	// pointee types on the first call for that set, and returns it unchanged
+	// afterwards. Keyed by set rather than cached singly, because indium splits
+	// the sets by stage, so a module with both a vertex and a fragment entry point
+	// has one block each, and a single cache would hand the fragment function the
+	// vertex function's set.
+	//
+	// Keyed by descriptor set alone, and the set is the whole of the constraint.
+	// indium writes one descriptor per set and one fill per function, so two entry
+	// points resolving to one set have to agree on the block, whether they are two
+	// vertex functions or a kernel and a vertex function, which both use set 0.
+	// Keying by stage as well would give a kernel and a vertex function a block
+	// each, and both would be decorated DescriptorSet 0 Binding 0: a module
+	// spirv-val accepts, holding two Uniform variables where indium binds one.
+	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes,
+		uint32_t descriptorSet);
 
-	AddressBlock _addressBlock;
+	std::map<uint32_t, AddressBlock> _addressBlocks;
 
 	// The address a buffer's own storage class guarantees for one access, which
 	// is what the Aligned memory operand has to say. A buffer element sits at a
@@ -164,11 +179,12 @@ struct ResolvedEntryPoint {
 	spirv::Id returnType = spirv::InvalidId;
 };
 
-// Finds the entry point to compile: the one matching the requested stage, or the
-// single entry point in the unit when the stage is unspecified. Returns nullptr
-// when the choice is ambiguous, which is an error the caller must report rather
-// than guess at.
-const FunctionDecl* selectEntryPoint(const TranslationUnit& unit, Stage requested);
+// The entry points to compile, in declaration order. A requested stage selects
+// every function of that stage, and an unspecified stage selects every entry
+// point in the unit. Throws CompileError when the source declares none of the
+// requested stage, or none at all, rather than emitting a module with no entry
+// point, which no pipeline can be created from.
+std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, Stage requested);
 
 // Options that affect code generation rather than parsing.
 struct ModuleOptions {
@@ -178,9 +194,12 @@ struct ModuleOptions {
 	bool separateImageSet = false;
 };
 
-// Emits the module for one entry point. Throws CompileError for anything the
-// subset cannot represent, naming the construct.
+// Emits the module for every given entry point: one OpEntryPoint and one
+// function each, with the descriptor set, the execution modes and the interface
+// chosen per entry point's stage. Returns the reflection document, one entry per
+// entry point, in the same order. Throws CompileError for anything the subset
+// cannot represent, naming the construct.
 std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
-	const FunctionDecl& entryPoint, const ModuleOptions& options);
+	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options);
 
 }

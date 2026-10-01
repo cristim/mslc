@@ -39,17 +39,6 @@ namespace {
 		return buffer;
 	}
 
-	const char* stageName(mslc::Stage stage) {
-		switch (stage) {
-			case mslc::Stage::Vertex: return "vertex";
-			case mslc::Stage::Fragment: return "fragment";
-			case mslc::Stage::Kernel: return "kernel";
-			case mslc::Stage::None: return "none";
-		}
-
-		return "none";
-	}
-
 }
 
 extern "C" {
@@ -103,7 +92,7 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		mslc::Parser parser(tokens);
 		const mslc::TranslationUnit unit = parser.parse();
 
-		const mslc::FunctionDecl* entryPoint = mslc::selectEntryPoint(unit,
+		const std::vector<const mslc::FunctionDecl*> entryPoints = mslc::selectEntryPoints(unit,
 			stageFromApi(effective.stage));
 
 		mslc::ModuleOptions moduleOptions;
@@ -113,25 +102,17 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
 
 		mslc::spirv::Builder builder;
-		std::string reflection = mslc::emitModule(builder, unit, *entryPoint, moduleOptions);
+		std::string reflection = mslc::emitModule(builder, unit, entryPoints, moduleOptions);
 
 		std::vector<uint8_t> module;
 		if (!builder.finalize(module)) {
 			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
 		}
 
-		// Wrap the reflection fragments in a document now that the entry point
-		// is known.
-		std::string document = "{\n";
-		document += "\t\"reflection_version\": 1,\n";
-		document += std::string("\t\"stage\": \"") + stageName(entryPoint->stage) + "\",\n";
-		document += "\t\"entry_point\": \"" + entryPoint->name + "\",\n";
-		document += "\t\"local_size\": [" + std::to_string(moduleOptions.localSizeX) + ", "
-			+ std::to_string(moduleOptions.localSizeY) + ", "
-			+ std::to_string(moduleOptions.localSizeZ) + "],\n";
-		document += "\t\"bindings\": [\n";
-		document += reflection;
-		document += "\t]\n}\n";
+		// The reflection is a complete document already: the emitter built it
+		// around the entry points it emitted, and there is more than one of them
+		// whenever the source declared more than one.
+		const std::string& document = reflection;
 
 		auto* buffer = static_cast<uint8_t*>(std::malloc(module.size()));
 		if (!buffer) {
