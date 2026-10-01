@@ -9,6 +9,7 @@
 #
 #   // DISASM: <substring>        spirv-dis output contains <substring>
 #   // DISASM-NOT: <substring>    spirv-dis output does not contain <substring>
+#   // DISASM-ORDER: <text>      a later DISASM-ORDER line appears after this one
 #   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
 #   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
@@ -70,7 +71,13 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
 	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
 	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns)
+	# Collected on whitespace after the prefix rather than one literal space, so a
+	# tab-separated needle is collected instead of silently skipped. A line whose
+	# prefix is not followed by whitespace is not a needle at all and is reported
+	# below, since the REGEX above cannot see it.
+	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
+	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -115,6 +122,62 @@ if(expectation STREQUAL "valid")
 				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
 			endif()
 		endforeach()
+		# Every other needle answers whether a string is present, which cannot say
+		# where it is relative to another string. CMake's REGEX MATCH does not span
+		# a newline either, so a pattern cannot reach across two lines to say it.
+		# Where the claim is about position, the two needles go in consecutive
+		# DISASM-ORDER lines and the first has to come first in the disassembly.
+		# A needle that is only whitespace is as vacuous as an empty one, and
+		# string(FIND) finds a space in the disassembly's own indentation, so the
+		# comparison would hold whatever the second needle said.
+		foreach(line IN LISTS orderNeedles)
+			string(REGEX REPLACE "^// DISASM-ORDER:[ \t]+" "" value "${line}")
+			string(STRIP "${value}" value)
+			if(value STREQUAL "")
+				message(FATAL_ERROR "${name}: DISASM-ORDER needle is empty or only whitespace: \"${line}\"")
+			endif()
+		endforeach()
+		# A DISASM-ORDER line the REGEX above did not collect is one whose prefix is
+		# not followed by whitespace, so it is not a needle and would be ignored
+		# along with the ordering claim it was meant to state.
+		foreach(line IN LISTS malformedOrder)
+			if(NOT line MATCHES "^// DISASM-ORDER:[ \t]")
+				message(FATAL_ERROR "${name}: \"${line}\" is not a DISASM-ORDER needle; the prefix is \"// DISASM-ORDER: <text>\"")
+			endif()
+		endforeach()
+		list(LENGTH orderNeedles orderCount)
+		math(EXPR orderOdd "${orderCount} % 2")
+		if(orderOdd)
+			message(FATAL_ERROR "${name}: DISASM-ORDER takes two lines at a time, found ${orderCount}, which is not a whole number of pairs")
+		endif()
+		math(EXPR orderLast "${orderCount} - 1")
+		if(orderCount GREATER 0)
+			foreach(i RANGE 0 ${orderLast} 2)
+				math(EXPR j "${i} + 1")
+				list(GET orderNeedles ${i} firstLine)
+				list(GET orderNeedles ${j} secondLine)
+				string(REGEX REPLACE "^// DISASM-ORDER:[ \t]+" "" first "${firstLine}")
+				string(REGEX REPLACE "^// DISASM-ORDER:[ \t]+" "" second "${secondLine}")
+				# Defended again here rather than only above, because the pair is what
+				# is compared and this is the point where the comparison is made.
+				string(STRIP "${first}" first)
+				string(STRIP "${second}" second)
+				if(first STREQUAL "" OR second STREQUAL "")
+					message(FATAL_ERROR "${name}: a DISASM-ORDER needle is empty: \"${firstLine}\" / \"${secondLine}\"")
+				endif()
+				string(FIND "${disassembly}" "${first}" firstAt)
+				string(FIND "${disassembly}" "${second}" secondAt)
+				if(firstAt EQUAL -1)
+					message(FATAL_ERROR "${name}: disassembly lacks \"${first}\":\n${disassembly}")
+				endif()
+				if(secondAt EQUAL -1)
+					message(FATAL_ERROR "${name}: disassembly lacks \"${second}\":\n${disassembly}")
+				endif()
+				if(NOT firstAt LESS secondAt)
+					message(FATAL_ERROR "${name}: \"${first}\" is at ${firstAt} and \"${second}\" is at ${secondAt}, so the first does not come first:\n${disassembly}")
+				endif()
+			endforeach()
+		endif()
 	endif()
 
 	file(STRINGS "${PROBE}" wantedReflection REGEX "^// REFLECT: ")
@@ -140,6 +203,22 @@ if(expectation STREQUAL "valid")
 			message(FATAL_ERROR "${name}: mslc wrote no reflection, so it cannot be checked")
 		endif()
 		file(READ "${reflection}" reported)
+		# A document a reader cannot parse is not a reflection, and every needle
+		# below would still be satisfied by one with a syntax error in it. This
+		# checks the one way mslc produced an unparseable document, which is a comma
+		# before the closing bracket: string(JSON) accepts a trailing comma, so
+		# asking it to parse the document cannot be the check. json.load does not:
+		# "Illegal trailing comma before end of array".
+		# All whitespace removed before looking, because a comma and the bracket it
+		# precedes are on different lines and CMake's regex does not match across
+		# one. Removing every space is safe for a check: whitespace cannot appear
+		# inside a token, so "x, ]" and "x,]" mean the same thing here.
+		string(REGEX REPLACE "[ \t\n\r]" "" tight "${reported}")
+		string(FIND "${tight}" ",]" commaBeforeBracket)
+		string(FIND "${tight}" ",}" commaBeforeBrace)
+		if(NOT commaBeforeBracket EQUAL -1 OR NOT commaBeforeBrace EQUAL -1)
+			message(FATAL_ERROR "${name}: reflection has a comma before a closing bracket, which a reader rejects:\n${reported}")
+		endif()
 		foreach(line IN LISTS wantedReflection)
 			string(REGEX REPLACE "^// REFLECT: " "" needle "${line}")
 			string(FIND "${reported}" "${needle}" found)

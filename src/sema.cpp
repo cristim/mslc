@@ -483,54 +483,52 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 	const auto cached = _addressBlocks.find(descriptorSet);
 	if (cached != _addressBlocks.end()) {
 		if (cached->second.pointeeTypes != pointeeTypes) {
-			throw CompileError("two entry points in the same stage bind different "
-				"buffers, and one address block at binding 0 holds them; they have "
-				"to agree in both number and type");
+			throw CompileError("two entry points sharing descriptor set "
+				+ std::to_string(descriptorSet) + " bind different buffers, and one "
+					"address block at binding 0 holds them; they have to agree in both "
+					"number and type");
 		}
 
 		return cached->second;
 	}
 
-	{
-		AddressBlock block;
-		block.pointeeTypes = pointeeTypes;
-		std::vector<uint32_t> memberPointers;
-		memberPointers.reserve(pointeeTypes.size());
+	AddressBlock block;
+	block.pointeeTypes = pointeeTypes;
+	std::vector<uint32_t> memberPointers;
+	memberPointers.reserve(pointeeTypes.size());
 
-		for (Id pointee: pointeeTypes) {
-			memberPointers.push_back(bufferPointer(pointee));
-		}
+	for (Id pointee: pointeeTypes) {
+		memberPointers.push_back(bufferPointer(pointee));
+	}
 
-		block.blockType = _builder.emitDecl(spirv::OpTypeStruct, memberPointers);
-		_builder.emit(spirv::OpDecorate, { block.blockType,
-			static_cast<uint32_t>(spirv::Decoration::Block) });
+	block.blockType = _builder.emitDecl(spirv::OpTypeStruct, memberPointers);
+	_builder.emit(spirv::OpDecorate, { block.blockType,
+		static_cast<uint32_t>(spirv::Decoration::Block) });
 
-		// Member k is the k-th buffer parameter in declaration order, at byte
-		// offset 8 * k. An 8-byte address is what the struct is laid out for, so
-		// this is the size of the value and not a stride.
-		for (size_t k = 0; k < memberPointers.size(); ++k) {
-			_builder.emit(spirv::OpMemberDecorate, { block.blockType,
-				static_cast<uint32_t>(k), static_cast<uint32_t>(spirv::Decoration::Offset),
-				static_cast<uint32_t>(8 * k) });
-		}
+	// Member k is the k-th buffer parameter in declaration order, at byte
+	// offset 8 * k. An 8-byte address is what the struct is laid out for, so
+	// this is the size of the value and not a stride.
+	for (size_t k = 0; k < memberPointers.size(); ++k) {
+		_builder.emit(spirv::OpMemberDecorate, { block.blockType,
+			static_cast<uint32_t>(k), static_cast<uint32_t>(spirv::Decoration::Offset),
+			static_cast<uint32_t>(8 * k) });
+	}
 
-		block.memberPointer = _builder.emitDecl(spirv::OpTypePointer,
-			{ static_cast<uint32_t>(spirv::StorageClass::Uniform), block.blockType });
+	block.memberPointer = _builder.emitDecl(spirv::OpTypePointer,
+		{ static_cast<uint32_t>(spirv::StorageClass::Uniform), block.blockType });
 
-		block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
-			{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
-		// The set is chosen by stage: indium builds set 0 from the vertex function
-		// and set 1 from the fragment function, so a fragment shader's block has
-		// to be in set 1 or indium never binds it.
-		_builder.emit(spirv::OpDecorate, { block.variable,
-			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet });
-		_builder.emit(spirv::OpDecorate, { block.variable,
-			static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
+	block.variable = _builder.emitDeclTyped(spirv::OpVariable, block.memberPointer,
+		{ static_cast<uint32_t>(spirv::StorageClass::Uniform) });
+	// The set is chosen by stage: indium builds set 0 from the vertex function
+	// and set 1 from the fragment function, so a fragment shader's block has
+	// to be in set 1 or indium never binds it.
+	_builder.emit(spirv::OpDecorate, { block.variable,
+		static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet });
+	_builder.emit(spirv::OpDecorate, { block.variable,
+		static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
 
-		_addressBlocks.emplace(descriptorSet, block);
-		return block;	}
-
-	return cached->second;
+	_addressBlocks.emplace(descriptorSet, block);
+	return block;
 }
 
 uint32_t TypeTable::alignmentOf(Id type) const {
@@ -2020,7 +2018,8 @@ namespace {
 	// constant parameters: an unbinding parameter's index is its position
 	// among the binding parameters, with builtins skipped. add.metal relies on
 	// this, since none of its pointers carry an attribute.
-	std::vector<const Parameter*> assignImplicitBindings(const FunctionDecl& entryPoint) {		std::vector<const Parameter*> bound;
+	std::vector<const Parameter*> assignImplicitBindings(const FunctionDecl& entryPoint) {
+		std::vector<const Parameter*> bound;
 
 		for (const Parameter& parameter: entryPoint.parameters) {
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
@@ -2091,16 +2090,12 @@ namespace {
 				const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 					{ static_cast<uint32_t>(spirv::StorageClass::Input) });
 
-				_builder.setSection(spirv::Section::Annotations);
-				_builder.emit(spirv::OpDecorate, { id,
-					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
-					static_cast<uint32_t>(spvBuiltin) });
-
 				// Vulkan fixes which execution models each builtin is legal in, and
 				// an integer Input on a fragment entry point additionally has to be
 				// Flat. A builtin used in the wrong stage is rejected rather than
 				// decorated: the alternative is a module that validates on one
-				// stage's terms and is wrong on another's.
+				// stage's terms and is wrong on another's. Checked before the
+				// decoration, so a rejected builtin is never emitted.
 				if (!builtinAllowedInStage(*parameter.attributes.builtin, _entryPoint->stage)) {
 					throw CompileError(std::string("builtin \"") + builtinName(*parameter.attributes.builtin)
 						+ "\" is not available in a "
@@ -2108,6 +2103,11 @@ namespace {
 							: _entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
 						+ " function (parameter \"" + parameter.name + "\")");
 				}
+
+				_builder.setSection(spirv::Section::Annotations);
+				_builder.emit(spirv::OpDecorate, { id,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spvBuiltin) });
 
 				// An integer Input on a fragment entry point has to be Flat:
 				// there is no sensible way to interpolate an integer, and
@@ -2221,14 +2221,25 @@ namespace {
 		// per-buffer descriptor binding and the reflection says which one instead.
 		// The set is the one the block is actually declared in, which is 1 for a
 		// fragment entry point.
+		//
+		// The separator goes before the entry rather than after it, because a
+		// trailing comma makes the array a syntax error: json.load refuses
+		// "Illegal trailing comma before end of array", so a reflection a reader
+		// cannot parse is not a reflection. That is why the first binding is the
+		// one that carries no comma.
+		if (!_reflection.empty()) {
+			_reflection.pop_back();  // the newline the previous entry ended with
+			_reflection += ",\n";
+		}
+
 		_reflection += "\t\t\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
 			+ std::to_string(bindingIndex)
 			+ ", \"descriptor\": { \"set\": " + std::to_string(descriptorSet())
 			+ ", \"binding\": 0 }"
 			+ ", \"member\": " + std::to_string(memberIndex)
 			+ ", \"param_index\": " + std::to_string(index)
-			+ ", \"name\": \"" + parameter.name + "\" },\n";
-		}
+			+ ", \"name\": \"" + parameter.name + "\" }\n";
+	}
 
 		// One block for every buffer parameter, at binding 0. It is emitted here
 		// rather than per parameter because its member list is only known once the
@@ -2616,6 +2627,11 @@ namespace {
 			_bufferBases.clear();
 			_interface.clear();
 			_reflection.clear();
+			// The address block is per entry point too, and clearing it with the
+			// rest is what keeps a later change to when it is read from inheriting
+			// the previous function's. Nothing reads it while _bufferMembers is
+			// empty today, so this is not a fix for an observable case.
+			_addressBlock = {};
 			_terminated = false;
 
 			emitEntryPoint(functionType);

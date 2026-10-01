@@ -132,7 +132,16 @@ public:
 	// the sets by stage, so a module with both a vertex and a fragment entry point
 	// has one block each, and a single cache would hand the fragment function the
 	// vertex function's set.
-	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes, uint32_t descriptorSet);
+	//
+	// Keyed by descriptor set alone, and the set is the whole of the constraint.
+	// indium writes one descriptor per set and one fill per function, so two entry
+	// points resolving to one set have to agree on the block, whether they are two
+	// vertex functions or a kernel and a vertex function, which both use set 0.
+	// Keying by stage as well would give a kernel and a vertex function a block
+	// each, and both would be decorated DescriptorSet 0 Binding 0: a module
+	// spirv-val accepts, holding two Uniform variables where indium binds one.
+	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes,
+		uint32_t descriptorSet);
 
 	std::map<uint32_t, AddressBlock> _addressBlocks;
 
