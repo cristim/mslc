@@ -1580,6 +1580,32 @@ namespace {
 			Id leftType = _builder.typeOf(left);
 			Id rightType = _builder.typeOf(right);
 
+			// The integer promotions come before the usual arithmetic conversions,
+			// not after them, and skipping them loses a sign. Anything narrower than
+			// int becomes int whatever its signedness, so "char a = -1; ushort b = 0;
+			// a < b" compares -1 with 0 as two ints and is true. Going straight to the
+			// wider type instead widens -1 to 65535, which reads as false.
+			//
+			// It is only the narrower-than-int types that are wrong, because they are
+			// the only ones that fit in an int and so the only ones where the
+			// promotion changes the answer. A uint beside an int is already the
+			// wider type and the tie-break handles it.
+			const bool bothIntegers = !_types.isFloat(leftType) && !_types.isFloat(rightType);
+			if (bothIntegers
+				&& (_types.bitWidth(leftType) < 32 || _types.bitWidth(rightType) < 32)) {
+
+				const uint32_t components = std::max(_types.vectorWidth(leftType),
+					_types.vectorWidth(rightType));
+				const Id promoted = components > 1
+					? _types.vector(ScalarKind::Int, components)
+					: _types.scalar(ScalarKind::Int);
+
+				leftType = promoted;
+				rightType = promoted;
+				leftOperand = convert(left, _builder.typeOf(left), promoted);
+				rightOperand = convert(right, _builder.typeOf(right), promoted);
+			}
+
 			const bool leftIsFloat = _types.isFloat(leftType);
 			const bool rightIsFloat = _types.isFloat(rightType);
 			// Not named `signed`, which is a keyword.
