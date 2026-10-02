@@ -1183,7 +1183,9 @@ ExpressionPtr Parser::parsePrimary() {
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::IntLiteral;
 		expression->line = line();
-		expression->intValue = advance().integerValue;
+		const Token literal = advance();
+		expression->intValue = literal.integerValue;
+		expression->intIsUnsigned = literal.integerIsUnsigned;
 		return expression;
 	}
 

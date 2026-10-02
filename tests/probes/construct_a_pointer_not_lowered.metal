@@ -1,4 +1,4 @@
-// EXPECT: error constructing a float* is not lowered yet
+// EXPECT: error a local of type float* is not lowered yet
 //
 // Direct initialisation reaches a type that is not a value. "float* p(0)" is a
 // null pointer in C++, not a pointer built out of 0, and mslc has no null
@@ -12,9 +12,12 @@
 // spirv-val accepts that. Nothing downstream would report it either, which is
 // why this is a pin and not a comment.
 //
-// The "=" spelling, "float* p = 0;", reaches the same wrong module on master and
-// is tracked separately; what this probe holds is that the new syntax does not
-// add a second route to it.
+// The guard is in the local path, not in declaredTypeOf, because a buffer
+// parameter is a pointer by definition and its pointee is exactly what a member
+// of the binding-0 block has to point at. Refusing it in declaredTypeOf refuses
+// every buffer. The "=" spelling reaches the same wrong module on master and is
+// #34; this probe holds the direct-initialisation spelling, and the comment above
+// names why the two are one capability.
 kernel void construct_a_pointer_not_lowered(device float *out [[buffer(0)]],
                                              uint index [[thread_position_in_grid]])
 {
