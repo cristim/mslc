@@ -960,6 +960,7 @@ namespace {
 		Id emitConstruct(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
+		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
 		Id broadcast(Id value, Id vectorType);
 	};
@@ -1000,6 +1001,15 @@ namespace {
 		return _types.scalar(type.scalar);
 	}
 
+
+	// The type an integer operand is promoted to: int, keeping the operand's shape.
+	// The caller has already established that the operand is narrower than int, so
+	// the only thing left to know is whether it is a vector.
+	Id Emitter::promotedTo(uint32_t components) const {
+		return components > 1
+			? _types.vector(ScalarKind::Int, components)
+			: _types.scalar(ScalarKind::Int);
+	}
 
 	Id Emitter::loadFrom(Id pointer, Id pointeeType) {
 		return _builder.emitTyped(spirv::OpLoad, pointeeType, { pointer });
@@ -1580,6 +1590,33 @@ namespace {
 			Id leftType = _builder.typeOf(left);
 			Id rightType = _builder.typeOf(right);
 
+			// The integer promotions come before the usual arithmetic conversions,
+			// not after them, and skipping them loses a sign. Anything narrower than
+			// int becomes int whatever its signedness, so "char a = -1; ushort b = 0;
+			// a < b" compares -1 with 0 as two ints and is true. Going straight to the
+			// wider type instead widens -1 to 65535, which reads as false.
+			//
+			// It is only the narrower-than-int types that are wrong, because they are
+			// the only ones that fit in an int and so the only ones where the
+			// promotion changes the answer. A uint beside an int needs no promotion:
+			// the rank rule below leaves the wider type alone.
+			//
+			// Each operand is promoted on its own, and only the *types* are changed
+			// here: the conversions are emitted below, once, when both operands go to
+			// the common type. Promoting both sides to one int here instead of each
+			// on its own would replace the conversions rather than precede them, and
+			// then "char c = -1; uint u = 0; c < u" would compare two ints and answer
+			// true where MSL makes both sides unsigned and answers false. It would
+			// also truncate a 64-bit operand, which the conversions never do.
+			if (!_types.isFloat(leftType) && !_types.isFloat(rightType)) {
+				if (_types.bitWidth(leftType) < 32) {
+					leftType = promotedTo(_types.vectorWidth(leftType));
+				}
+				if (_types.bitWidth(rightType) < 32) {
+					rightType = promotedTo(_types.vectorWidth(rightType));
+				}
+			}
+
 			const bool leftIsFloat = _types.isFloat(leftType);
 			const bool rightIsFloat = _types.isFloat(rightType);
 			// Not named `signed`, which is a keyword.
@@ -1593,11 +1630,17 @@ namespace {
 				commonType = leftIsFloat ? leftType : rightType;
 				operandsSigned = false;
 			} else if (_types.bitWidth(rightType) > _types.bitWidth(leftType)) {
+				// The wider type wins outright, signedness and all. A long beside a
+				// uint is a signed comparison, because long has the higher rank and can
+				// represent every uint; making both sides unsigned here is what turned
+				// that pair wrong.
 				commonType = rightType;
 				operandsSigned = _types.isSignedInt(rightType);
+			} else if (_types.bitWidth(leftType) > _types.bitWidth(rightType)) {
+				// The left is already the wider, which the default above already says.
 			} else if (leftType != rightType) {
-				// Equal widths, or the left is already the wider: the tie-break is
-				// signedness, and C says both sides become unsigned.
+				// Equal widths and opposite signedness, which is the only case signedness
+				// decides: C makes both sides unsigned.
 				operandsSigned = _types.isSignedInt(leftType) && _types.isSignedInt(rightType);
 			}
 
