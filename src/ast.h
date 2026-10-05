@@ -175,6 +175,11 @@ struct Expression {
 	std::string memberName;
 	std::vector<ExpressionPtr> arguments;
 
+	// Index: the expression was written "*p", which is "p[0]" and is built as
+	// that, so the two lower identically. Kept so a diagnostic can say which
+	// spelling it is about.
+	bool isDereference = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 

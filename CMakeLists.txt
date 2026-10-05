@@ -99,6 +99,22 @@ foreach(macro IN LISTS equivalences)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# "*p" is "p[0]": one test per tests/equivalence/<name>.deref.metal, against its
+# <name>.index.metal, which is the same program with every dereference written as
+# an index. The two have to disassemble identically, not just both compile.
+file(GLOB dereferences CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.deref.metal)
+foreach(deref IN LISTS dereferences)
+	get_filename_component(name ${deref} NAME)
+	string(REGEX REPLACE "\\.deref\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${deref}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.index.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # Negative control: a pair that does differ must fail, or the comparison above
 # could not tell a macro that expands wrongly from one that expands right.
 add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}
