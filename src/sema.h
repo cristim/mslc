@@ -43,8 +43,10 @@ private:
 	// The size in bytes of each array-element struct, which is the stride an
 	// array of that struct steps by.
 	std::map<spirv::Id, uint32_t> _structSizes;
-	std::map<spirv::Id, spirv::Id> _blockStructs;
+	std::map<std::pair<spirv::Id, bool>, spirv::Id> _blockStructs;
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
+
+	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _packedStorage;
 
 	spirv::Id _voidType = spirv::InvalidId;
 	spirv::Id _image2D = spirv::InvalidId;
@@ -55,6 +57,9 @@ private:
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
 	// matrix member goes through this. Does nothing for any other member type.
 	void decorateMatrixMember(spirv::Id structure, uint32_t member, spirv::Id type);
+
+	std::vector<spirv::Id> storageTypesFor(const std::string& name,
+		const std::vector<spirv::Id>& valueTypes);
 
 public:
 	TypeTable(spirv::Builder& builder, const TranslationUnit& unit):
@@ -74,6 +79,10 @@ public:
 	spirv::Id image2D();
 	spirv::Id samplerType();
 	spirv::Id sampledImage2D();
+
+	// How a packed vector of the given type is stored in a laid-out struct or
+	// buffer: an array of its components, strided by the component's size.
+	spirv::Id packedStorage(ScalarKind kind, uint32_t width);
 
 	// The shape of a matrix, or null when the id is not a matrix this table
 	// created.
@@ -145,8 +154,9 @@ public:
 	// { T runtime_array[] }. It has to be a struct rather than a bare T because
 	// OpAccessChain rejects a non-composite base, and a PhysicalStorageBuffer
 	// pointer therefore cannot point straight at an element. Idempotent per
-	// element type.
-	spirv::Id blockStructFor(spirv::Id elementType);
+	// element type and layout. A packed vector element steps by its components'
+	// total size, and an unpacked one by Metal's rule, which rounds a 3-vector up.
+	spirv::Id blockStructFor(spirv::Id elementType, bool packed);
 
 	// A pointer to a pointee in a buffer's own address space, which is what the
 	// binding-0 address block hands the shader. Idempotent per pointee.
@@ -188,8 +198,9 @@ public:
 	// The address a buffer's own storage class guarantees for one access, which
 	// is what the Aligned memory operand has to say. A buffer element sits at a
 	// multiple of its own size, so that is the whole guarantee, and claiming more
-	// is what lets a compiler read past a buffer.
-	uint32_t alignmentOf(spirv::Id type) const;
+	// is what lets a compiler read past a buffer. A packed vector is only as
+	// aligned as its component.
+	uint32_t alignmentOf(spirv::Id type, bool packed) const;
 
 	// True when the type needs a capability beyond Shader, and emits it.
 	void requireCapabilitiesFor(const Type& type);

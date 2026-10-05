@@ -59,7 +59,7 @@ namespace {
 	// and the rest has to name a scalar: a type with a width of 1 is not spelled
 	// that way, and "float0" is not a type. A matrix is "floatCxR" or "halfCxR"
 	// with C and R from 2 to 4; MSL has no matrix of any other scalar.
-	bool isTypeName(std::string_view text, Type& outType) {
+	bool isUnpackedTypeName(std::string_view text, Type& outType) {
 		ScalarKind kind;
 		if (isScalarTypeName(text, kind)) {
 			outType.scalar = kind;
@@ -98,6 +98,31 @@ namespace {
 		return true;
 	}
 
+	// packed_float3 and its family: packed_<scalar><N> for the integer, half and
+	// float scalars and N from 2 to 4. Apple also spells packed_bool, which mslc
+	// reports by name where the type is resolved, and has no packed double.
+	bool isPackedVectorName(std::string_view text, Type& outType) {
+		constexpr std::string_view prefix = "packed_";
+		if (text.size() <= prefix.size() || text.substr(0, prefix.size()) != prefix) {
+			return false;
+		}
+
+		Type vector;
+		if (!isUnpackedTypeName(text.substr(prefix.size()), vector) || !vector.isVector()
+			|| vector.isMatrix() || vector.vectorWidth > 4 || vector.scalar == ScalarKind::Double) {
+			return false;
+		}
+
+		outType.scalar = vector.scalar;
+		outType.vectorWidth = vector.vectorWidth;
+		outType.isPacked = true;
+		return true;
+	}
+
+	bool isTypeName(std::string_view text, Type& outType) {
+		return isUnpackedTypeName(text, outType) || isPackedVectorName(text, outType);
+	}
+
 	// The vector typedefs Apple's compiler has without any include: vector_float4,
 	// simd_uint2 and the rest. They name a vector of 2 to 4 components only, so
 	// vector_float and vector_float4x4 are not types, and neither are the double
@@ -106,7 +131,7 @@ namespace {
 		for (const std::string_view prefix: { std::string_view("vector_"), std::string_view("simd_") }) {
 			if (text.size() > prefix.size() && text.substr(0, prefix.size()) == prefix) {
 				Type vector;
-				if (isTypeName(text.substr(prefix.size()), vector) && vector.isVector() && !vector.isMatrix()
+				if (isUnpackedTypeName(text.substr(prefix.size()), vector) && vector.isVector() && !vector.isMatrix()
 					&& vector.vectorWidth <= 4 && vector.scalar != ScalarKind::Double
 					&& vector.scalar != ScalarKind::Void) {
 					outType.scalar = vector.scalar;
@@ -460,7 +485,8 @@ namespace {
 
 	bool sameType(const Type& a, const Type& b) {
 		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth
-			&& a.matrixColumns == b.matrixColumns && a.namedType == b.namedType && a.isConst == b.isConst;
+			&& a.matrixColumns == b.matrixColumns && a.isPacked == b.isPacked
+			&& a.namedType == b.namedType && a.isConst == b.isConst;
 	}
 
 	// Names the typedef and enum support has to keep distinct from everything else.
@@ -475,7 +501,20 @@ namespace {
 
 bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	if (isTypeName(text, out) || isSimdVectorName(text, out)) {
+		if (out.isPacked && out.scalar == ScalarKind::Bool) {
+			throw CompileError("\"" + std::string(text) + "\" is not supported: a bool vector has "
+				"no storage layout in mslc");
+		}
+
 		return true;
+	}
+
+	if (text.substr(0, 7) == "packed_") {
+		Type rest;
+		if (isUnpackedTypeName(text.substr(7), rest) && rest.isVector() && !rest.isMatrix()) {
+			throw CompileError("\"" + std::string(text) + "\" is not supported: mslc has packed "
+				"vectors of 2 to 4 components of the integer, half and float types");
+		}
 	}
 
 	const auto alias = _typedefs.find(std::string(text));
@@ -486,6 +525,7 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.scalar = alias->second.scalar;
 	out.vectorWidth = alias->second.vectorWidth;
 	out.matrixColumns = alias->second.matrixColumns;
+	out.isPacked = alias->second.isPacked;
 	out.namedType = alias->second.namedType;
 	out.isConst = out.isConst || alias->second.isConst;
 	return true;

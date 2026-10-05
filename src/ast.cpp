@@ -38,6 +38,9 @@ std::string typeName(const Type& type) {
 		name += std::to_string(type.matrixColumns) + "x" + std::to_string(type.vectorWidth);
 	} else if (type.namedType.empty() && type.vectorWidth > 1) {
 		name += std::to_string(type.vectorWidth);
+		if (type.isPacked) {
+			name = "packed_" + name;
+		}
 	}
 	if (type.arrayLength) {
 		name += "[" + std::to_string(*type.arrayLength) + "]";

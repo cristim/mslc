@@ -58,6 +58,13 @@ namespace {
 			(components >= 3 ? 4u : components) * scalarBytes };
 	}
 
+	// A packed vector is its components back to back, aligned as a component is: a
+	// packed_float3 is 12 bytes at any multiple of 4, where a float3 is 16 at a
+	// multiple of 16.
+	VectorLayout packedVectorLayoutFor(uint32_t scalarBytes, uint32_t components) {
+		return { components * scalarBytes, scalarBytes };
+	}
+
 	// A matrix is its columns laid out as an array of column vectors, so a
 	// float3x3 is three 16-byte columns, 48 bytes, and not nine packed floats.
 	// The column's own size is the MatrixStride.
@@ -415,6 +422,44 @@ Id TypeTable::matrix(ScalarKind kind, uint32_t columns, uint32_t rows) {
 	return id;
 }
 
+// A packed vector in a laid-out struct or array is its components as a plain
+// array of scalars. A vector there would have to obey the Block layout rules,
+// which put a 3- or 4-component vector at an offset that does not straddle a
+// 16-byte boundary: a packed_float3 at offset 12 is the common case, and a
+// module with one is rejected by spirv-val unless scalarBlockLayout is assumed.
+// An array of scalars has no such rule, and the access casts the element's
+// address back to a pointer to the vector.
+Id TypeTable::packedStorage(ScalarKind kind, uint32_t width) {
+	const auto key = std::make_pair(static_cast<uint32_t>(kind), width);
+	const auto cached = _packedStorage.find(key);
+	if (cached != _packedStorage.end()) {
+		return cached->second;
+	}
+
+	const Id length = _builder.emitDeclTyped(spirv::OpConstant, scalar(ScalarKind::UInt), { width });
+	const Id id = _builder.emitDecl(spirv::OpTypeArray, { scalar(kind), length });
+	_builder.emit(spirv::OpDecorate, { id, static_cast<uint32_t>(spirv::Decoration::ArrayStride),
+		scalarBitWidth(kind) / 8 });
+
+	_packedStorage.emplace(key, id);
+	return id;
+}
+
+// The types a struct's members have where the struct is laid out, which are the
+// value types except for the packed ones.
+std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::vector<Id>& valueTypes) {
+	std::vector<Id> types = valueTypes;
+	const StructDecl* decl = _unit.findStruct(name);
+	for (size_t i = 0; i < types.size(); ++i) {
+		const Type& field = decl->fields[i].type;
+		if (field.isPacked) {
+			types[i] = packedStorage(field.scalar, field.vectorWidth);
+		}
+	}
+
+	return types;
+}
+
 const TypeTable::MatrixInfo* TypeTable::matrixInfo(Id type) const {
 	const auto it = _matrixInfo.find(type);
 	return it == _matrixInfo.end() ? nullptr : &it->second;
@@ -434,20 +479,19 @@ void TypeTable::decorateMatrixMember(Id structure, uint32_t member, Id type) {
 		vectorLayoutFor(scalarBytes, it->second.rows).size });
 }
 
-spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
-	const auto cached = _blockStructs.find(elementType);
+spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
+	// Keyed by the layout as well as the type: a packed_float3 and a float3 are
+	// one SPIR-V vector, and the two buffers step 12 and 16.
+	const auto cached = _blockStructs.find({ elementType, packed });
 	if (cached != _blockStructs.end()) {
 		return cached->second;
 	}
-
-	// A runtime array has no length, which is what lets the descriptor cover a
-	// Metal buffer whose size is not known when the shader is compiled.
-	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { elementType });
 
 	// The stride is the element's own size in Metal's layout, which is the
 	// scalar's size times the component count with a float3 rounded up to a
 	// register. Taken from the same rule the struct offsets come from, so an
 	// array of a struct's member and the member itself cannot disagree.
+	Id storedType = elementType;
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
@@ -459,10 +503,14 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 		for (const auto& [key, id]: _vectors) {
 			if (id == elementType) {
 				scalarBytes = (scalarBitWidth(static_cast<ScalarKind>(key.first)) + 7) / 8;
+				if (packed) {
+					storedType = packedStorage(static_cast<ScalarKind>(key.first), it->second);
+				}
 			}
 		}
 
-		stride = vectorLayoutFor(scalarBytes, it->second).size;
+		stride = (packed ? packedVectorLayoutFor(scalarBytes, it->second)
+			: vectorLayoutFor(scalarBytes, it->second)).size;
 	} else if (const auto it = _matrixInfo.find(elementType); it != _matrixInfo.end()) {
 		stride = matrixLayoutFor(scalarBitWidth(it->second.scalar) / 8,
 			it->second.columns, it->second.rows).size;
@@ -472,6 +520,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 		stride = it->second;
 	}
 
+	// A runtime array has no length, which is what lets the descriptor cover a
+	// Metal buffer whose size is not known when the shader is compiled.
+	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { storedType });
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
 		static_cast<uint32_t>(spirv::Decoration::ArrayStride), stride });
 
@@ -487,7 +538,7 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 		static_cast<uint32_t>(spirv::Decoration::Offset), 0u });
 	decorateMatrixMember(structure, 0, elementType);
 
-	_blockStructs.emplace(elementType, structure);
+	_blockStructs.emplace(std::make_pair(elementType, packed), structure);
 	return structure;
 }
 
@@ -689,7 +740,7 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 	return block;
 }
 
-uint32_t TypeTable::alignmentOf(Id type) const {
+uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 	// A struct's own alignment is not tracked, and 4 is the weaker claim, which
 	// is the safe direction: a claim below what the layout gives is always sound.
 	const uint32_t bits = bitWidth(type);
@@ -706,6 +757,10 @@ uint32_t TypeTable::alignmentOf(Id type) const {
 	const auto it = _widthOfVector.find(type);
 	const uint32_t count = it != _widthOfVector.end() ? it->second : 1;
 	const uint32_t scalarBytes = (bits + 7) / 8;
+	if (packed) {
+		return std::max<uint32_t>(1, packedVectorLayoutFor(scalarBytes, count).alignment);
+	}
+
 	return std::max<uint32_t>(1, vectorLayoutFor(scalarBytes, count).alignment);
 }
 
@@ -798,6 +853,7 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
 		const VectorLayout layout = field.type.isMatrix()
 			? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
+			: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
 			: vectorLayoutFor(scalarBytes, components);
 
 		outTypes.push_back(field.type.isMatrix()
@@ -837,7 +893,7 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 		return InvalidId;
 	}
 
-	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, storageTypesFor(name, fieldTypes));
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
 			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
@@ -887,7 +943,7 @@ Id TypeTable::namedStruct(const std::string& name) {
 		return InvalidId;
 	}
 
-	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
+	const Id id = _builder.emitDecl(spirv::OpTypeStruct, storageTypesFor(name, fieldTypes));
 
 	// A struct reached through a buffer binding is an interface block, so it
 	// needs Block and per-member Offset. std140 rules apply, which for the
@@ -1106,6 +1162,10 @@ namespace {
 		// The binding-0 block, and the loaded buffer pointer for each member.
 		TypeTable::AddressBlock _addressBlock;
 		std::map<uint32_t, Id> _bufferBases;
+		// Addresses of a packed vector in a buffer. The pointee is the same SPIR-V
+		// vector as a float3's, so the address is what remembers that it is only as
+		// aligned as a component.
+		std::set<Id> _packedAddresses;
 
 		Id _uintType = InvalidId;
 		Id _intType = InvalidId;
@@ -1155,11 +1215,14 @@ namespace {
 	}
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
+		// The address of a packed vector's storage, viewed as a pointer to the
+		// vector itself, which is what a load or store wants.
+		Id packedVectorAddress(Id storageAddress, Id vectorType);
 		Id loadFromBuffer(Id pointer, Id pointeeType);
 		void storeIntoBuffer(Id pointer, Id value);
 		// The Aligned memory operand a buffer access has to carry, at the
 		// alignment the buffer's own layout guarantees.
-		std::vector<uint32_t> alignedOperands(Id pointeeType) const;
+		std::vector<uint32_t> alignedOperands(Id pointer, Id pointeeType) const;
 		Id declaredTypeOf(const Type& type);
 		void declareGlobals();
 		Id declareGlobalConstant(const VariableDeclaration& declaration);
@@ -1290,13 +1353,20 @@ namespace {
 	// Aligned memory operand; spirv-val rejects the module without it. There is
 	// no exemption for an aggregate: the VUID is about the access, not the type
 	// it accesses, and a float3 element is the first aggregate load mslc emits.
-	std::vector<uint32_t> Emitter::alignedOperands(Id pointeeType) const {
+	std::vector<uint32_t> Emitter::alignedOperands(Id pointer, Id pointeeType) const {
 		return { static_cast<uint32_t>(spirv::MemoryAccess::Aligned),
-			_types.alignmentOf(pointeeType) };
+			_types.alignmentOf(pointeeType, _packedAddresses.count(pointer) > 0) };
+	}
+
+	Id Emitter::packedVectorAddress(Id storageAddress, Id vectorType) {
+		const Id address = _builder.emitTyped(spirv::OpBitcast,
+			_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, vectorType), { storageAddress });
+		_packedAddresses.insert(address);
+		return address;
 	}
 
 	Id Emitter::loadFromBuffer(Id pointer, Id pointeeType) {
-		std::vector<uint32_t> operands = alignedOperands(pointeeType);
+		std::vector<uint32_t> operands = alignedOperands(pointer, pointeeType);
 		operands.insert(operands.begin(), pointer);
 		return _builder.emitTyped(spirv::OpLoad, pointeeType, operands);
 
@@ -1307,7 +1377,7 @@ namespace {
 
 		// Inserted one at a time: insert(pos, a, b) with two integers is the
 		// count-and-value overload, which would insert a copies of b.
-		std::vector<uint32_t> operands = alignedOperands(pointeeType);
+		std::vector<uint32_t> operands = alignedOperands(pointer, pointeeType);
 		operands.insert(operands.begin(), pointer);
 		operands.insert(operands.begin() + 1, value);
 		_builder.emit(spirv::OpStore, operands);
@@ -1533,15 +1603,21 @@ namespace {
 		// an access chain has to match its base.
 		if (binding.bufferPointeeType != InvalidId) {
 			const Id base = bufferBase(binding);
+			const bool packed = binding.pointeeMsl.isPacked;
 			const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
-				binding.pointeeType);
+				packed ? _types.packedStorage(binding.pointeeMsl.scalar, binding.pointeeMsl.vectorWidth)
+					: binding.pointeeType);
 
 			// A buffer's pointee is { T runtime_array[] }, so an element is member
 			// 0 and then the index. A struct pointee is indexed directly.
-			const Id address = binding.isBuffer
+			Id address = binding.isBuffer
 				? _builder.emitTyped(spirv::OpAccessChain, resultType,
 					{ base, constantU32(0), index })
 				: _builder.emitTyped(spirv::OpAccessChain, resultType, { base, index });
+
+			if (packed) {
+				address = packedVectorAddress(address, binding.pointeeType);
+			}
 
 			return asAddress ? address : loadFromBuffer(address, binding.pointeeType);
 		}
@@ -1851,8 +1927,14 @@ namespace {
 		// loaded from the binding-0 block, or the variable itself.
 		operands.insert(operands.begin(), fromBuffer ? bufferBase(binding) : binding.id);
 
-		return _builder.emitTyped(spirv::OpAccessChain,
-			_types.pointer(storageClass, outFieldType), operands);
+		// A packed member of a laid-out struct is stored as an array of its
+		// components, and is viewed as the vector once it has an address.
+		const bool packed = fromBuffer && current.isPacked;
+		const Id address = _builder.emitTyped(spirv::OpAccessChain,
+			_types.pointer(storageClass, packed
+				? _types.packedStorage(current.scalar, current.vectorWidth) : outFieldType), operands);
+
+		return packed ? packedVectorAddress(address, outFieldType) : address;
 	}
 
 	Id Emitter::broadcast(Id value, Id vectorType) {
@@ -3034,7 +3116,7 @@ namespace {
 		Id bufferPointee = pointeeType;
 		bool isBuffer = false;
 		if (parameter.type.isPointer) {
-			bufferPointee = _types.blockStructFor(pointeeType);
+			bufferPointee = _types.blockStructFor(pointeeType, parameter.type.isPacked);
 			isBuffer = true;
 		}
 
@@ -3477,6 +3559,11 @@ namespace {
 	// than given a layout guessed at.
 	StageVariable Emitter::declareStageVariable(const Type& type,
 		spirv::StorageClassValue storageClass, const std::string& what) {
+
+		if (type.isPacked) {
+			throw CompileError(what + " is a " + typeName(type) + ", which Apple's compiler does not "
+				"allow across a stage boundary; use " + typeName(Type { type.scalar, type.vectorWidth }));
+		}
 
 		const uint32_t bits = scalarBitWidth(type.scalar);
 		if (type.isPointer || type.arrayLength || !type.namedType.empty() || type.isMatrix()
