@@ -1,4 +1,13 @@
-// EXPECT: error cannot honour #include "local_defs.h"
+// EXPECT: error #include "local_defs.h" not found
+//
+// A quoted include used to be refused outright, because mslc had no preprocessor
+// and dropping it left the program compiling up to the first name the header
+// would have declared. It is searched for now, so what this pins is a header
+// that is not there: the include is an error, never a skipped line.
+//
+// Not checked with xcrun metal: it fails the same way because
+// tests/probes/local_defs.h does not exist.
+#include "local_defs.h"
 //
 // mslc used to discard every #include, so a quoted one was discarded the same
 // way: no diagnostic, and the source compiled on up to the first name the header

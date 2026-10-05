@@ -36,6 +36,10 @@ typedef enum {
 	MSLC_SET_IMAGES = 1,
 } MslcImageSetPolicy;
 
+/* Options are passed by pointer and new fields are appended, as sourcePath,
+ * includeDirs and includeDirCount were. A caller must be compiled against the
+ * header it links with and start from mslc_default_options(); a caller built
+ * against an older header passes a shorter struct, which mslc would read past. */
 typedef struct {
 	/* Overrides the stage when the caller knows it. MSLC_STAGE_UNKNOWN asks
 	 * mslc to infer it from the source, which works when the file declares a
@@ -50,10 +54,25 @@ typedef struct {
 	uint32_t localSizeZ;
 
 	MslcImageSetPolicy imageSetPolicy;
+
+	/* Path of the source passed to mslc_translate, or NULL when it did not come
+	 * from a file. A quoted #include is looked for first in this file's
+	 * directory, so a source with no path can include only from includeDirs. The
+	 * file is not read; the path is used for resolving includes and for naming
+	 * the source in diagnostics. */
+	const char* sourcePath;
+
+	/* Directories searched, in order, for a quoted #include after the source's
+	 * own directory. An include may resolve only inside the source's directory
+	 * and these; an absolute path, or one that escapes them, is an error. An
+	 * entry must name an existing directory; an empty string is refused rather
+	 * than read as the current directory. */
+	const char* const* includeDirs;
+	size_t includeDirCount;
 } MslcOptions;
 
 /* Fills options with the defaults: stage inferred, local size 1/1/1, combined
- * descriptor set. */
+ * descriptor set, no source path and no include directories. */
 void mslc_default_options(MslcOptions* options);
 
 /* Translates MSL source to a SPIR-V module.

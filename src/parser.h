@@ -31,6 +31,9 @@ public:
 
 	TranslationUnit parse();
 
+	// Index of the token the parser is at, which is the one a failure is about.
+	size_t position() const { return _position; }
+
 private:
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
@@ -50,14 +53,8 @@ private:
 
 	size_t line() const;
 
-	// Advances past the rest of the current preprocessor directive. A directive
-	// ends at the end of its own line, so this stops at the first token on a
-	// later line instead of consuming the declarations that follow.
-	void skipDirectiveLine(size_t directiveLine);
-
 	// Top-level declarations
 	void parseDeclaration();
-	void parsePreprocessorDirective();
 	StructDecl parseStructDeclaration();
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	VariableDeclaration parseGlobalDeclaration();
