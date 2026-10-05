@@ -487,23 +487,11 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 		return cached->second;
 	}
 
-	// A runtime array has no length, which is what lets the descriptor cover a
-	// Metal buffer whose size is not known when the shader is compiled.
-	Id storedType = elementType;
-	if (packed) {
-		for (const auto& [key, id]: _vectors) {
-			if (id == elementType) {
-				storedType = packedStorage(static_cast<ScalarKind>(key.first), _widthOfVector.at(id));
-			}
-		}
-	}
-
-	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { storedType });
-
 	// The stride is the element's own size in Metal's layout, which is the
 	// scalar's size times the component count with a float3 rounded up to a
 	// register. Taken from the same rule the struct offsets come from, so an
 	// array of a struct's member and the member itself cannot disagree.
+	Id storedType = elementType;
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
@@ -515,6 +503,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 		for (const auto& [key, id]: _vectors) {
 			if (id == elementType) {
 				scalarBytes = (scalarBitWidth(static_cast<ScalarKind>(key.first)) + 7) / 8;
+				if (packed) {
+					storedType = packedStorage(static_cast<ScalarKind>(key.first), it->second);
+				}
 			}
 		}
 
@@ -529,6 +520,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 		stride = it->second;
 	}
 
+	// A runtime array has no length, which is what lets the descriptor cover a
+	// Metal buffer whose size is not known when the shader is compiled.
+	const Id runtimeArray = _builder.emitDecl(spirv::OpTypeRuntimeArray, { storedType });
 	_builder.emit(spirv::OpDecorate, { runtimeArray,
 		static_cast<uint32_t>(spirv::Decoration::ArrayStride), stride });
 
