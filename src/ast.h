@@ -44,6 +44,14 @@ enum class ScalarKind {
 	Double,
 };
 
+// The texture and sampler types an entry point can take. A texture's component
+// type, the T of texture2d<T>, is in Type::scalar.
+enum class ResourceKind {
+	None,
+	Texture2D,
+	Sampler,
+};
+
 struct Type {
 	// Scalar base. For a named type, a pointer, or an array, the base is the
 	// element type and the wrappers below describe the rest.
@@ -66,6 +74,8 @@ struct Type {
 
 	// Set for an array type; the element type is described by the rest.
 	std::optional<uint32_t> arrayLength;
+
+	ResourceKind resource = ResourceKind::None;
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
@@ -212,10 +222,40 @@ enum class StatementKind {
 struct Statement;
 using StatementPtr = std::unique_ptr<Statement>;
 
+enum class SamplerAddress { ClampToZero, ClampToEdge, Repeat, MirroredRepeat };
+enum class SamplerFilter { Nearest, Linear };
+enum class SamplerMipFilter { None, Nearest, Linear };
+
+// The state of a sampler declared in the shader, with the defaults of a
+// sampler declared with no options. Compare/anisotropy/LOD/border options are
+// rejected by the parser, so none of them is modelled.
+struct SamplerState {
+	SamplerAddress sAddress = SamplerAddress::ClampToEdge;
+	SamplerAddress tAddress = SamplerAddress::ClampToEdge;
+	SamplerAddress rAddress = SamplerAddress::ClampToEdge;
+	SamplerFilter magFilter = SamplerFilter::Nearest;
+	SamplerFilter minFilter = SamplerFilter::Nearest;
+	SamplerMipFilter mipFilter = SamplerMipFilter::None;
+	bool normalizedCoordinates = true;
+
+	bool operator==(const SamplerState& other) const {
+		return sAddress == other.sAddress && tAddress == other.tAddress && rAddress == other.rAddress
+			&& magFilter == other.magFilter && minFilter == other.minFilter
+			&& mipFilter == other.mipFilter && normalizedCoordinates == other.normalizedCoordinates;
+	}
+};
+
+const char* samplerAddressName(SamplerAddress mode);
+const char* samplerFilterName(SamplerFilter filter);
+const char* samplerMipFilterName(SamplerMipFilter filter);
+
 struct VariableDeclaration {
 	Type type;
 	std::string name;
 	ExpressionPtr initializer;
+
+	// A sampler local: the state its options spell.
+	std::optional<SamplerState> sampler;
 };
 
 struct Statement {

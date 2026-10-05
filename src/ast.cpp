@@ -23,6 +23,13 @@ const char* scalarKindName(ScalarKind kind) {
 }
 
 std::string typeName(const Type& type) {
+	if (type.resource == ResourceKind::Sampler) {
+		return "sampler";
+	}
+	if (type.resource == ResourceKind::Texture2D) {
+		return std::string("texture2d<") + scalarKindName(type.scalar) + ">";
+	}
+
 	std::string name = type.namedType.empty()
 		? std::string(scalarKindName(type.scalar))
 		: type.namedType;
@@ -43,6 +50,31 @@ std::string typeName(const Type& type) {
 	}
 
 	return name;
+}
+
+const char* samplerAddressName(SamplerAddress mode) {
+	switch (mode) {
+		case SamplerAddress::ClampToZero: return "ClampToZero";
+		case SamplerAddress::ClampToEdge: return "ClampToEdge";
+		case SamplerAddress::Repeat: return "Repeat";
+		case SamplerAddress::MirroredRepeat: return "MirrorRepeat";
+	}
+
+	return "unknown";
+}
+
+const char* samplerFilterName(SamplerFilter filter) {
+	return filter == SamplerFilter::Linear ? "Linear" : "Nearest";
+}
+
+const char* samplerMipFilterName(SamplerMipFilter filter) {
+	switch (filter) {
+		case SamplerMipFilter::None: return "None";
+		case SamplerMipFilter::Nearest: return "Nearest";
+		case SamplerMipFilter::Linear: return "Linear";
+	}
+
+	return "unknown";
 }
 
 const char* addressSpaceName(AddressSpace space) {

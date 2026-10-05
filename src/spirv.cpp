@@ -32,6 +32,9 @@ namespace {
 			case OpTypeStruct:
 			case OpTypePointer:
 			case OpTypeFunction:
+			case OpTypeImage:
+			case OpTypeSampler:
+			case OpTypeSampledImage:
 			case OpConstant:
 			case OpConstantTrue:
 			case OpConstantFalse:

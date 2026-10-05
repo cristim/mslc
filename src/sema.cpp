@@ -251,6 +251,9 @@ namespace {
 	constexpr uint32_t kFunctionControlNone = spirv::FunctionControl::None;
 	constexpr uint32_t kSelectionControlNone = spirv::SelectionControl::None;
 	constexpr uint32_t kLoopControlNone = spirv::LoopControl::None;
+	// The Lod bit of the image operands mask, which an explicit-lod sample and
+	// an image fetch both carry.
+	constexpr uint32_t kImageOperandsLod = 0x2;
 
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
@@ -689,6 +692,32 @@ Id TypeTable::zero(Id type) {
 		std::vector<uint32_t>((bitWidth(type) + 31) / 32, 0u));
 }
 
+Id TypeTable::image2D() {
+	if (_image2D == InvalidId) {
+		_image2D = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
+			static_cast<uint32_t>(spirv::Dim::Dim2D), 2u, 0u, 0u, 1u,
+			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+	}
+
+	return _image2D;
+}
+
+Id TypeTable::samplerType() {
+	if (_samplerType == InvalidId) {
+		_samplerType = _builder.emitDecl(spirv::OpTypeSampler);
+	}
+
+	return _samplerType;
+}
+
+Id TypeTable::sampledImage2D() {
+	if (_sampledImage2D == InvalidId) {
+		_sampledImage2D = _builder.emitDecl(spirv::OpTypeSampledImage, { image2D() });
+	}
+
+	return _sampledImage2D;
+}
+
 Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
 	const auto key = std::make_pair(storageClass, pointee);
 	const auto cached = _pointers.find(key);
@@ -948,6 +977,16 @@ namespace {
 		// True for a const local and for a buffer in constant memory or declared
 		// const: Metal rejects a store through it.
 		bool readOnly = false;
+		// True for a sampler declared with coord::pixel. Vulkan forbids an
+		// implicit-lod lookup through an unnormalized sampler.
+		bool unnormalizedSampler = false;
+	};
+
+	// A constexpr sampler of the entry point being emitted. Samplers with equal
+	// state share one variable, as Apple gives equal states one global.
+	struct EmbeddedSampler {
+		SamplerState state;
+		Id variable = InvalidId;
 	};
 
 	// A name declared in a block or a for-loop header stops naming it when the
@@ -1044,6 +1083,12 @@ namespace {
 		bool _terminated = false;
 
 		std::string _reflection;
+		// The next descriptor binding a texture or sampler takes, and the
+		// constexpr samplers declared so far in the entry point.
+		uint32_t _nextBinding = 0;
+		std::vector<EmbeddedSampler> _embeddedSamplers;
+		// Set once the module needs ImageQuery, which is declared once.
+		bool _imageQueryDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
 
@@ -1090,6 +1135,18 @@ namespace {
 		FoldedConstant foldBinary(const Expression& expression);
 		FoldedConstant foldUnary(const Expression& expression);
 		void declareParameters();
+		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
+		Id declareDescriptorVariable(Id pointee, uint32_t binding);
+		void reserveLocalSamplers(const Statement& statement);
+		void declareLocalSampler(const VariableDeclaration& declaration);
+		void addReflectionEntry(const std::string& entry);
+		std::string descriptorJson(uint32_t binding) const;
+		Id emitTextureCall(const Expression& call);
+		Id emitTextureSample(const Expression& call, const Binding& texture);
+		Id emitTextureRead(const Expression& call, const Binding& texture);
+		Id emitTextureSize(const Expression& call, const Binding& texture, bool width);
+		Id texturePixels(const Binding& texture, Id sampled);
+		Id emitLod(const Expression& expression, const std::string& callName);
 		const StructDecl* structValue(const Type& type) const;
 		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
 			const std::string& what);
@@ -1359,6 +1416,12 @@ namespace {
 		}
 
 		const Binding& binding = it->second;
+
+		if (binding.pointeeMsl.resource != ResourceKind::None) {
+			throw CompileError("\"" + expression.name + "\" is a " + typeName(binding.pointeeMsl)
+				+ ", which mslc uses as the receiver of a texture call or as sample's sampler "
+					"argument only");
+		}
 
 		// A buffer is reached through the address block, so the binding has no id
 		// of its own to load, and loading it wrote an OpLoad of id 0.
@@ -2129,6 +2192,10 @@ namespace {
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
+		if (expression.left->kind == ExpressionKind::Member) {
+			return emitTextureCall(expression);
+		}
+
 		if (expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError("only a direct function call is supported");
 		}
@@ -2713,7 +2780,7 @@ namespace {
 		for (const Parameter& parameter: entryPoint.parameters) {
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
 				|| parameter.attributes.samplerIndex || parameter.attributes.builtin
-				|| parameter.attributes.stageIn) {
+				|| parameter.attributes.stageIn || parameter.type.resource != ResourceKind::None) {
 				continue;
 			}
 
@@ -2728,9 +2795,30 @@ namespace {
 	// member of the binding-0 address block once every one of them is seen.
 	void Emitter::declareParameters() {
 		const std::vector<const Parameter*> implicitlyBound = assignImplicitBindings(*_entryPoint);
+		std::vector<std::pair<size_t, const Parameter*>> resources;
 
 		for (size_t index = 0; index < _entryPoint->parameters.size(); ++index) {
 			const Parameter& parameter = _entryPoint->parameters[index];
+			const ParameterAttributes& attributes = parameter.attributes;
+
+			// A texture or sampler parameter, or an attribute that says it is one.
+			// Apple takes [[texture]] on a texture and [[sampler]] on a sampler and
+			// nothing else: "type 'device float *' is not valid for attribute
+			// 'texture'".
+			const bool isTexture = parameter.type.resource == ResourceKind::Texture2D;
+			const bool isSampler = parameter.type.resource == ResourceKind::Sampler;
+			if (isTexture || isSampler || attributes.textureIndex || attributes.samplerIndex) {
+				const char* expected = isTexture ? "texture" : "sampler";
+				if ((attributes.textureIndex && !isTexture) || (attributes.samplerIndex && !isSampler)
+					|| attributes.bufferIndex || attributes.builtin || attributes.stageIn) {
+					throw CompileError("parameter \"" + parameter.name + "\" is a " + typeName(parameter.type)
+						+ ", and its attribute is not valid for it"
+						+ (isTexture || isSampler ? std::string("; it takes [[") + expected + "(n)]] only" : ""));
+				}
+
+				resources.emplace_back(index, &parameter);
+				continue;
+			}
 
 			if (parameter.attributes.stageIn) {
 				if (_entryPoint->stage != Stage::Fragment) {
@@ -2847,11 +2935,6 @@ namespace {
 				continue;
 			}
 
-			if (parameter.attributes.textureIndex || parameter.attributes.samplerIndex) {
-				throw CompileError("texture and sampler parameters are not lowered yet (parameter \""
-					+ parameter.name + "\")");
-			}
-
 			// An unbinding parameter takes the next index among the binding
 			// parameters, which is what Metal does.
 			uint32_t bindingIndex = 0;
@@ -2952,18 +3035,13 @@ namespace {
 		// "Illegal trailing comma before end of array", so a reflection a reader
 		// cannot parse is not a reflection. That is why the first binding is the
 		// one that carries no comma.
-		if (!_reflection.empty()) {
-			_reflection.pop_back();  // the newline the previous entry ended with
-			_reflection += ",\n";
-		}
-
-		_reflection += "\t\t\t\t{ \"kind\": \"Buffer\", \"metal_index\": "
+		addReflectionEntry("{ \"kind\": \"Buffer\", \"metal_index\": "
 			+ std::to_string(bindingIndex)
 			+ ", \"descriptor\": { \"set\": " + std::to_string(descriptorSet())
 			+ ", \"binding\": 0 }"
 			+ ", \"member\": " + std::to_string(memberIndex)
 			+ ", \"param_index\": " + std::to_string(index)
-			+ ", \"name\": \"" + parameter.name + "\" }\n";
+			+ ", \"name\": \"" + parameter.name + "\" }");
 	}
 
 		// One block for every buffer parameter, at binding 0. It is emitted here
@@ -2974,6 +3052,333 @@ namespace {
 			_addressBlock = _types.addressBlock(_bufferMembers, descriptorSet());
 			_interface.push_back(_addressBlock.variable);
 		}
+
+		declareResources(resources);
+		reserveLocalSamplers(*_entryPoint->body);
+	}
+
+	// One entry per binding goes in the reflection. The separator goes before the
+	// entry rather than after it, because a trailing comma makes the array a
+	// syntax error: json.load refuses "Illegal trailing comma before end of
+	// array", so a reflection a reader cannot parse is not a reflection.
+	void Emitter::addReflectionEntry(const std::string& entry) {
+		if (!_reflection.empty()) {
+			_reflection.pop_back();  // the newline the previous entry ended with
+			_reflection += ",\n";
+		}
+
+		_reflection += "\t\t\t\t" + entry + "\n";
+	}
+
+	std::string Emitter::descriptorJson(uint32_t binding) const {
+		return "{ \"set\": " + std::to_string(descriptorSet()) + ", \"binding\": "
+			+ std::to_string(binding) + " }";
+	}
+
+	// A UniformConstant variable of the pointee's type at the next descriptor
+	// binding of this entry point's set.
+	Id Emitter::declareDescriptorVariable(Id pointee, uint32_t binding) {
+		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::UniformConstant, pointee),
+			{ static_cast<uint32_t>(spirv::StorageClass::UniformConstant) });
+		_builder.emit(spirv::OpDecorate, { variable,
+			static_cast<uint32_t>(spirv::Decoration::DescriptorSet), descriptorSet() });
+		_builder.emit(spirv::OpDecorate, { variable,
+			static_cast<uint32_t>(spirv::Decoration::Binding), binding });
+		_interface.push_back(variable);
+		return variable;
+	}
+
+	// Textures take the bindings after the address block, in declaration order,
+	// then the samplers, then the constexpr samplers as the body declares them.
+	// That is Iridium's order (indium src/iridium/air.cpp: the texture loop, the
+	// sampler loop, then air.sampler_states), and it is what indium binds by.
+	// The index among its own kind is the Metal index, and an unattributed
+	// parameter takes the next one not claimed by an attribute, as Apple's does.
+	void Emitter::declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources) {
+		_nextBinding = _bufferMembers.empty() ? 0u : 1u;
+
+		struct Entry {
+			size_t index;
+			const Parameter* parameter;
+			uint32_t metalIndex;
+		};
+		std::vector<Entry> textures;
+		std::vector<Entry> samplers;
+		uint32_t implicitTextures = 0;
+		uint32_t implicitSamplers = 0;
+
+		for (const auto& [index, parameter]: resources) {
+			const bool isTexture = parameter->type.resource == ResourceKind::Texture2D;
+			const auto& declared = isTexture ? parameter->attributes.textureIndex
+				: parameter->attributes.samplerIndex;
+			const uint32_t metalIndex = declared ? *declared
+				: (isTexture ? implicitTextures++ : implicitSamplers++);
+			(isTexture ? textures : samplers).push_back({ index, parameter, metalIndex });
+		}
+
+		for (const Entry& entry: textures) {
+			const uint32_t binding = _nextBinding++;
+			const Id variable = declareDescriptorVariable(_types.image2D(), binding);
+
+			Binding bound;
+			bound.id = variable;
+			bound.isPointer = true;
+			bound.pointeeType = _types.image2D();
+			bound.storageClass = spirv::StorageClass::UniformConstant;
+			bound.pointeeMsl = entry.parameter->type;
+			_bindings[entry.parameter->name] = bound;
+
+			addReflectionEntry("{ \"kind\": \"Texture\", \"metal_index\": "
+				+ std::to_string(entry.metalIndex)
+				+ ", \"descriptor\": " + descriptorJson(binding)
+				+ ", \"texture_access\": \"Sample\""
+				+ ", \"param_index\": " + std::to_string(entry.index)
+				+ ", \"name\": \"" + entry.parameter->name + "\" }");
+		}
+
+		for (const Entry& entry: samplers) {
+			const uint32_t binding = _nextBinding++;
+			const Id variable = declareDescriptorVariable(_types.samplerType(), binding);
+
+			Binding bound;
+			bound.id = variable;
+			bound.isPointer = true;
+			bound.pointeeType = _types.samplerType();
+			bound.storageClass = spirv::StorageClass::UniformConstant;
+			bound.pointeeMsl = entry.parameter->type;
+			_bindings[entry.parameter->name] = bound;
+
+			addReflectionEntry("{ \"kind\": \"Sampler\", \"metal_index\": "
+				+ std::to_string(entry.metalIndex)
+				+ ", \"descriptor\": " + descriptorJson(binding)
+				+ ", \"param_index\": " + std::to_string(entry.index)
+				+ ", \"name\": \"" + entry.parameter->name + "\" }");
+		}
+	}
+
+	// A sampler declared in the shader is a sampler variable at the next binding,
+	// and the reflection carries its state, because there is nothing for the app
+	// to bind: indium creates the immutable sampler from it, as it does from
+	// Iridium's EmbeddedSampler. Equal states share one variable and one binding.
+	//
+	// Every one in the body is reserved before the entry point is emitted, since
+	// the variable has to be in the OpEntryPoint interface, which comes first.
+	void Emitter::reserveLocalSamplers(const Statement& statement) {
+		if (statement.declaration && statement.declaration->sampler) {
+			const VariableDeclaration& declaration = *statement.declaration;
+			const bool known = std::any_of(_embeddedSamplers.begin(), _embeddedSamplers.end(),
+				[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
+			if (!known) {
+				const uint32_t binding = _nextBinding++;
+				_embeddedSamplers.push_back({ *declaration.sampler,
+					declareDescriptorVariable(_types.samplerType(), binding) });
+
+				addReflectionEntry("{ \"kind\": \"Sampler\", \"descriptor\": " + descriptorJson(binding)
+					+ ", \"embedded_sampler\": " + std::to_string(_embeddedSamplers.size() - 1)
+					+ ", \"name\": \"" + declaration.name + "\" }");
+			}
+		}
+
+		for (const StatementPtr& child: statement.children) {
+			reserveLocalSamplers(*child);
+		}
+		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
+			statement.forBody.get(), statement.whileBody.get() }) {
+			if (nested) {
+				reserveLocalSamplers(*nested);
+			}
+		}
+	}
+
+	void Emitter::declareLocalSampler(const VariableDeclaration& declaration) {
+		const auto found = std::find_if(_embeddedSamplers.begin(), _embeddedSamplers.end(),
+			[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
+		if (found == _embeddedSamplers.end()) {
+			throw CompileError("the sampler \"" + declaration.name + "\" was not reserved a binding");
+		}
+
+		Binding bound;
+		bound.id = found->variable;
+		bound.isPointer = true;
+		bound.pointeeType = _types.samplerType();
+		bound.storageClass = spirv::StorageClass::UniformConstant;
+		bound.pointeeMsl = declaration.type;
+		bound.unnormalizedSampler = !declaration.sampler->normalizedCoordinates;
+		_bindings[declaration.name] = bound;
+	}
+
+	// A half texture is sampled as a float image and narrowed here, because the
+	// image type has a float sampled type whatever the texture's component is.
+	Id Emitter::texturePixels(const Binding& texture, Id sampled) {
+		if (texture.pointeeMsl.scalar != ScalarKind::Half) {
+			return sampled;
+		}
+
+		return convert(sampled, _builder.typeOf(sampled), _types.vector(ScalarKind::Half, 4));
+	}
+
+	Id Emitter::emitTextureCall(const Expression& call) {
+		const Expression& member = *call.left;
+		if (member.left->kind != ExpressionKind::Identifier) {
+			throw CompileError("the receiver of \"." + member.memberName + "\" has to be a texture parameter");
+		}
+
+		const auto it = _bindings.find(member.left->name);
+		if (it == _bindings.end() || it->second.pointeeMsl.resource != ResourceKind::Texture2D) {
+			throw CompileError("\"" + member.left->name + "\" is not a texture parameter, so "
+				"\"." + member.memberName + "\" is not a call mslc lowers");
+		}
+
+		const std::string& method = member.memberName;
+		if (method == "sample") {
+			return emitTextureSample(call, it->second);
+		}
+		if (method == "read") {
+			return emitTextureRead(call, it->second);
+		}
+		if (method == "get_width" || method == "get_height") {
+			return emitTextureSize(call, it->second, method == "get_width");
+		}
+
+		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
+			"sample, read, get_width and get_height");
+	}
+
+	// sample(sampler, float2 coordinate [, level(lod)]). A fragment function takes
+	// the level from the derivatives, which is OpImageSampleImplicitLod; a vertex
+	// or kernel function has none, so it samples level 0 with an explicit lod,
+	// and so does a sampler with pixel coordinates, which Vulkan does not allow
+	// an implicit lod on.
+	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture) {
+		const auto& arguments = call.arguments;
+		if (arguments.size() < 2 || arguments.size() > 3) {
+			throw CompileError("sample takes a sampler, a coordinate and optionally level(lod); "
+				"this call passes " + std::to_string(arguments.size()));
+		}
+
+		if (arguments[0]->kind != ExpressionKind::Identifier) {
+			throw CompileError("the first argument of sample has to name a sampler");
+		}
+		const auto samplerIt = _bindings.find(arguments[0]->name);
+		if (samplerIt == _bindings.end() || samplerIt->second.pointeeMsl.resource != ResourceKind::Sampler) {
+			throw CompileError("\"" + arguments[0]->name + "\" is not a sampler, and sample takes one "
+				"as its first argument");
+		}
+		const Binding& sampler = samplerIt->second;
+
+		const Id float2 = _types.vector(ScalarKind::Float, 2);
+		Id coordinate = emitExpression(*arguments[1]);
+		const Id coordinateType = _builder.typeOf(coordinate);
+		if (coordinateType != float2) {
+			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
+				throw CompileError("the coordinate of sample has to be a float2 or a number");
+			}
+			coordinate = broadcast(coordinate, float2);
+		}
+
+		Id lod = InvalidId;
+		if (arguments.size() == 3) {
+			const Expression& option = *arguments[2];
+			const bool isCall = option.kind == ExpressionKind::Call
+				&& option.left->kind == ExpressionKind::Identifier;
+			if (isCall && option.left->name == "level") {
+				if (option.arguments.size() != 1) {
+					throw CompileError("level takes one argument");
+				}
+				const Id value = emitExpression(*option.arguments[0]);
+				const Id valueType = _builder.typeOf(value);
+				if (_types.vectorWidth(valueType) != 1 || _types.bitWidth(valueType) < 8) {
+					throw CompileError("level takes a scalar number");
+				}
+				lod = convert(value, valueType, _types.scalar(ScalarKind::Float));
+			} else if (isCall && (option.left->name == "bias" || option.left->name == "gradient2d"
+				|| option.left->name == "min_lod_clamp")) {
+				throw CompileError("the sample option " + option.left->name + "(...) is not lowered "
+					"yet; mslc lowers level(lod)");
+			} else {
+				throw CompileError("the third argument of sample has to be level(lod); an offset "
+					"and the other options are not lowered yet");
+			}
+		}
+
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage2D(),
+			{ image, loadedSampler });
+
+		const Id float4 = _types.vector(ScalarKind::Float, 4);
+		Id sampled = InvalidId;
+		if (lod == InvalidId && _entryPoint->stage == Stage::Fragment && !sampler.unnormalizedSampler) {
+			sampled = _builder.emitTyped(spirv::OpImageSampleImplicitLod, float4, { combined, coordinate });
+		} else {
+			if (lod == InvalidId) {
+				lod = _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Float), { 0u });
+			}
+			sampled = _builder.emitTyped(spirv::OpImageSampleExplicitLod, float4,
+				{ combined, coordinate, kImageOperandsLod, lod });
+		}
+
+		return texturePixels(texture, sampled);
+	}
+
+	// read(uint2 coordinate [, lod]): a texel by integer coordinate, with no
+	// sampler. Metal takes uint2 and ushort2 and rejects int2 and float2.
+	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
+		const auto& arguments = call.arguments;
+		if (arguments.empty() || arguments.size() > 2) {
+			throw CompileError("read takes a coordinate and optionally a lod; this call passes "
+				+ std::to_string(arguments.size()));
+		}
+
+		Id coordinate = emitExpression(*arguments[0]);
+		const Id coordinateType = _builder.typeOf(coordinate);
+		const bool unsignedPair = _types.vectorWidth(coordinateType) == 2
+			&& !_types.isFloat(coordinateType) && !_types.isSignedInt(coordinateType)
+			&& (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
+		if (!unsignedPair) {
+			throw CompileError("the coordinate of read has to be a uint2 or a ushort2");
+		}
+		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
+
+		Id lod = arguments.size() == 2 ? emitLod(*arguments[1], "read") : constantU32(0);
+
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		const Id fetched = _builder.emitTyped(spirv::OpImageFetch,
+			_types.vector(ScalarKind::Float, 4), { image, coordinate, kImageOperandsLod, lod });
+		return texturePixels(texture, fetched);
+	}
+
+	// get_width() and get_height(), of level 0 or of the lod given.
+	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, bool width) {
+		const std::string name = width ? "get_width" : "get_height";
+		if (call.arguments.size() > 1) {
+			throw CompileError(name + " takes an optional lod; this call passes "
+				+ std::to_string(call.arguments.size()));
+		}
+
+		const Id lod = call.arguments.empty() ? constantU32(0) : emitLod(*call.arguments[0], name);
+
+		if (!_imageQueryDeclared) {
+			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageQuery) });
+			_imageQueryDeclared = true;
+		}
+
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		const Id size = _builder.emitTyped(spirv::OpImageQuerySizeLod,
+			_types.vector(ScalarKind::UInt, 2), { image, lod });
+		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, width ? 0u : 1u });
+	}
+
+	// A mip level argument: any number, converted to the uint the instruction takes.
+	Id Emitter::emitLod(const Expression& expression, const std::string& callName) {
+		const Id value = emitExpression(expression);
+		const Id type = _builder.typeOf(value);
+		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) < 8) {
+			throw CompileError("the lod of " + callName + " has to be a number");
+		}
+
+		return convert(value, type, _uintType);
 	}
 	// Each buffer's address is loaded once, here, so that the value dominates
 	// every use. A load emitted at the first use would not dominate a later use
@@ -3254,6 +3659,11 @@ namespace {
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
+		if (declaration.type.resource != ResourceKind::None) {
+			declareLocalSampler(declaration);
+			return;
+		}
+
 		// A local has to be a value: the declaration stores an initialiser into a
 		// Function-storage variable, and declaredTypeOf answers a pointer type with
 		// its pointee, so a local of pointer or array type would be declared as that
@@ -3757,6 +4167,8 @@ namespace {
 			_bufferBases.clear();
 			_interface.clear();
 			_reflection.clear();
+			_embeddedSamplers.clear();
+			_nextBinding = 0;
 			// The address block is per entry point too, and clearing it with the
 			// rest is what keeps a later change to when it is read from inheriting
 			// the previous function's. Nothing reads it while _bufferMembers is
@@ -3780,7 +4192,21 @@ namespace {
 				+ std::to_string(_options.localSizeZ) + "],\n";
 			document += "\t\t\t\"bindings\": [\n";
 			document += _reflection;
-			document += "\t\t\t]\n";
+			document += "\t\t\t],\n";
+			document += "\t\t\t\"embedded_samplers\": [";
+			for (size_t e = 0; e < _embeddedSamplers.size(); ++e) {
+				const SamplerState& state = _embeddedSamplers[e].state;
+				document += std::string(e ? "," : "") + "\n\t\t\t\t{ \"s_address\": \""
+					+ samplerAddressName(state.sAddress)
+					+ "\", \"t_address\": \"" + samplerAddressName(state.tAddress)
+					+ "\", \"r_address\": \"" + samplerAddressName(state.rAddress)
+					+ "\", \"mag_filter\": \"" + samplerFilterName(state.magFilter)
+					+ "\", \"min_filter\": \"" + samplerFilterName(state.minFilter)
+					+ "\", \"mip_filter\": \"" + samplerMipFilterName(state.mipFilter)
+					+ "\", \"normalized_coordinates\": " + (state.normalizedCoordinates ? "true" : "false")
+					+ " }";
+			}
+			document += _embeddedSamplers.empty() ? "]\n" : "\n\t\t\t]\n";
 			document += k + 1 < _entryPoints.size() ? "\t\t},\n" : "\t\t}\n";
 		}
 
