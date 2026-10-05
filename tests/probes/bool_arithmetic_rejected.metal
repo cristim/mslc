@@ -1,4 +1,4 @@
-// EXPECT: error an arithmetic or bitwise operator on a bool is not lowered yet
+// EXPECT: error an arithmetic, bitwise or comparison operator on a bool is not lowered yet
 //
 // Apple promotes the bool to int. mslc emitted OpIAdd with a bool result type,
 // which spirv-val rejects, so it reports the operand instead.

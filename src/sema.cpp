@@ -807,10 +807,11 @@ Id TypeTable::one(Id type) {
 
 	std::vector<uint32_t> words;
 	if (isFloat(component)) {
-		// 1.0 as a half is 0x3C00 and as a double 0x3FF0 in the high word.
-		words = bits == 16 ? std::vector<uint32_t>{ 0x3C00u }
-			: bits == 32 ? std::vector<uint32_t>{ 0x3F800000u }
-			: std::vector<uint32_t>{ 0u, 0x3FF00000u };
+		if (bits == 64) {
+			throw CompileError("double is not supported");
+		}
+
+		words = { bits == 16 ? 0x3C00u : 0x3F800000u };
 	} else {
 		words = std::vector<uint32_t>((bits + 31) / 32, 0u);
 		words.front() = 1u;
@@ -1495,8 +1496,8 @@ namespace {
 			}
 
 			return toBool
-				? _builder.emitTyped(_types.isFloat(fromType)
-						? spirv::OpFUnordNotEqual : spirv::OpINotEqual,
+				? _builder.emitTyped(comparisonOpcode(BinaryOperator::NotEqual,
+						_types.isFloat(fromType), false),
 					toType, { value, _types.zero(fromType) })
 				: _builder.emitTyped(spirv::OpSelect, toType,
 					{ value, _types.one(toType), _types.zero(toType) });
@@ -1599,7 +1600,7 @@ namespace {
 			return value;
 		}
 
-		if (_types.bitWidth(type) == 0 || _types.vectorWidth(type) > 1) {
+		if (_types.vectorWidth(type) > 1) {
 			throw CompileError("a condition has to be a bool or a numeric scalar");
 		}
 
@@ -2347,7 +2348,7 @@ namespace {
 		// Apple promotes a bool operand to int. mslc has no such promotion, and
 		// OpIAdd on a bool is a module spirv-val rejects.
 		if (_types.isBool(leftType) || _types.isBool(_builder.typeOf(right))) {
-			throw CompileError("an arithmetic or bitwise operator on a bool is not lowered yet; "
+			throw CompileError("an arithmetic, bitwise or comparison operator on a bool is not lowered yet; "
 				"convert the bool to an int first");
 		}
 
