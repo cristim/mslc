@@ -1333,6 +1333,7 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
 	};
@@ -1549,6 +1550,26 @@ namespace {
 			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
 			_types.scalar(*temporary), { value });
 		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
+	}
+
+	// The conversion an initialiser or an assignment makes without a cast. Apple
+	// takes a scalar there and fills every component with it, and rejects a
+	// vector of another component type, so int2 does not become float2 or bool2
+	// until it is written as one.
+	Id Emitter::convertImplicit(Id value, Id toType) {
+		const Id fromType = _builder.typeOf(value);
+		if (_types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) > 1
+			&& _types.bitWidth(fromType) != 0) {
+			return broadcast(value, toType);
+		}
+
+		if (fromType != toType && _types.vectorWidth(fromType) > 1 && _types.vectorWidth(toType) > 1
+			&& _types.vectorWidth(fromType) == _types.vectorWidth(toType)) {
+			throw CompileError("a vector is not implicitly converted to a vector of another "
+				"component type; write the conversion as a constructor");
+		}
+
+		return convert(value, fromType, toType);
 	}
 
 	// A condition, !, && and || take a numeric scalar and compare it with zero, as
@@ -3935,7 +3956,7 @@ namespace {
 					"read straight from a buffer, whose layout differs; mslc does not copy between "
 					"them yet");
 			}
-			initial = convert(initializer, _builder.typeOf(initializer), typeId);
+			initial = convertImplicit(initializer, typeId);
 		} else {
 			initial = _types.zero(typeId);
 		}
@@ -4138,12 +4159,11 @@ namespace {
 		// same layout rule gives the access.
 		const auto storageClass = _types.storageClassOf(addressType);
 		if (storageClass && *storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
-			storeIntoBuffer(address, convert(value, _builder.typeOf(value), pointeeType));
+			storeIntoBuffer(address, convertImplicit(value, pointeeType));
 			return;
 		}
 
-		_builder.emit(spirv::OpStore, { address,
-			convert(value, _builder.typeOf(value), pointeeType) });
+		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
 	void Emitter::emitStatement(const Statement& statement) {
