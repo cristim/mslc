@@ -51,14 +51,17 @@ namespace {
 		return true;
 	}
 
-	// A scalar or a vector type name. Metal spells a vector as its scalar type
+	// A scalar, vector or matrix type name, filling in the scalar, the vector
+	// width and the matrix column count. Metal spells a vector as its scalar type
 	// with the component count on the end, so "float4" is "float" and a 4, and
 	// the only thing to do with the name is split it. The count has to be 2 to 9
 	// and the rest has to name a scalar: a type with a width of 1 is not spelled
-	// that way, and "float0" is not a type.
-	bool isTypeName(std::string_view text, ScalarKind& outKind, uint32_t& outWidth) {
-		if (isScalarTypeName(text, outKind)) {
-			outWidth = 0;
+	// that way, and "float0" is not a type. A matrix is "floatCxR" or "halfCxR"
+	// with C and R from 2 to 4; MSL has no matrix of any other scalar.
+	bool isTypeName(std::string_view text, Type& outType) {
+		ScalarKind kind;
+		if (isScalarTypeName(text, kind)) {
+			outType.scalar = kind;
 			return true;
 		}
 
@@ -71,20 +74,34 @@ namespace {
 			return false;
 		}
 
-		if (!isScalarTypeName(text.substr(0, text.size() - 1), outKind)) {
+		if (text.size() > 3 && text[text.size() - 2] == 'x') {
+			const char columns = text[text.size() - 3];
+			if (columns < '2' || columns > '4' || last > '4'
+				|| !isScalarTypeName(text.substr(0, text.size() - 3), kind)
+				|| (kind != ScalarKind::Float && kind != ScalarKind::Half)) {
+				return false;
+			}
+
+			outType.scalar = kind;
+			outType.vectorWidth = static_cast<uint32_t>(last - '0');
+			outType.matrixColumns = static_cast<uint32_t>(columns - '0');
+			return true;
+		}
+
+		if (!isScalarTypeName(text.substr(0, text.size() - 1), kind)) {
 			return false;
 		}
 
-		outWidth = static_cast<uint32_t>(last - '0');
+		outType.scalar = kind;
+		outType.vectorWidth = static_cast<uint32_t>(last - '0');
 		return true;
 	}
 
-	// Whether a name is a scalar or a vector type, for a caller that only needs
-	// to know which it is.
+	// Whether a name is a scalar, vector or matrix type, for a caller that only
+	// needs to know which it is.
 	bool isTypeName(std::string_view text) {
-		ScalarKind kind;
-		uint32_t width = 0;
-		return isTypeName(text, kind, width);
+		Type type;
+		return isTypeName(text, type);
 	}
 
 	// Keywords that may appear before a type and are not address spaces.
@@ -633,12 +650,8 @@ Type Parser::parseType() {
 		advance();
 	}
 
-	ScalarKind scalarKind;
-	uint32_t vectorWidth = 0;
-	if (kind() == TokenKind::Identifier && isTypeName(current().text, scalarKind, vectorWidth)) {
+	if (kind() == TokenKind::Identifier && isTypeName(current().text, type)) {
 		advance();
-		type.scalar = scalarKind;
-		type.vectorWidth = vectorWidth;
 	} else if (kind() == TokenKind::Identifier) {
 		type.namedType = std::string(advance().text);
 	} else {
@@ -1216,17 +1229,13 @@ ExpressionPtr Parser::parsePrimary() {
 	if (kind() == TokenKind::Identifier) {
 		std::string_view text = current().text;
 
-		ScalarKind scalarKind;
-		uint32_t vectorWidth = 0;
-		if (isTypeName(text, scalarKind, vectorWidth)) {
+		Type type;
+		if (isTypeName(text, type)) {
 			// A type name in expression position constructs a value: float(x),
 			// float3(0), float4(a, b, c, 1). Metal has no cast syntax, so T(...) is
 			// always a constructor call, and the parenthesised part is a list of
 			// arguments rather than the single operand a cast would take.
 			advance();
-			Type type;
-			type.scalar = scalarKind;
-			type.vectorWidth = vectorWidth;
 
 			if (!at(TokenKind::LParen)) {
 				throw CompileError("expected '(' after type \"" + std::string(text) + "\"");

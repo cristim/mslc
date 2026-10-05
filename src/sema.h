@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace mslc {
@@ -22,6 +23,19 @@ class TypeTable {
 	std::map<spirv::Id, uint32_t> _widthOfScalar;
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _vectors;
 	std::map<spirv::Id, uint32_t> _widthOfVector;
+
+public:
+	struct MatrixInfo {
+		ScalarKind scalar;
+		uint32_t columns;
+		uint32_t rows;
+		// The column vector type, which is what indexing a matrix yields.
+		spirv::Id column;
+	};
+
+private:
+	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, spirv::Id> _matrices;
+	std::map<spirv::Id, MatrixInfo> _matrixInfo;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -34,6 +48,11 @@ class TypeTable {
 
 	spirv::Id _voidType = spirv::InvalidId;
 
+	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
+	// SPIR-V only allows on a struct member, so every struct with an Offset on a
+	// matrix member goes through this. Does nothing for any other member type.
+	void decorateMatrixMember(spirv::Id structure, uint32_t member, spirv::Id type);
+
 public:
 	TypeTable(spirv::Builder& builder, const TranslationUnit& unit):
 		_builder(builder), _unit(unit) {}
@@ -42,6 +61,11 @@ public:
 	spirv::Id scalar(ScalarKind kind);
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
+	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
+
+	// The shape of a matrix, or null when the id is not a matrix this table
+	// created.
+	const MatrixInfo* matrixInfo(spirv::Id type) const;
 
 	// What kind of type an id is. The table knows these because it created
 	// them, which is why they are asked here rather than inferred at each use
