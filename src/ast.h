@@ -64,6 +64,12 @@ struct Type {
 	// 0 unless this is a matrix, which MSL spells floatCxR: C columns of R rows.
 	uint32_t matrixColumns = 0;
 
+	// Set for packed_float3 and the other packed_<scalar><2-4> vectors. Its value
+	// is the same vector as the unpacked spelling's; only the storage layout
+	// differs: the components sit back to back and the alignment is the
+	// component's, where float3 takes 16 bytes aligned to 16.
+	bool isPacked = false;
+
 	// Set for a type referred to by name, such as a struct. Resolved during
 	// semantic analysis.
 	std::string namedType;
