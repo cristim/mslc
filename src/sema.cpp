@@ -2254,11 +2254,9 @@ namespace {
 		// The two operands have to share a type, and the rule is C's usual
 		// arithmetic conversions: a float beats an integer, then the wider
 		// integer beats the narrower, and only then does signedness break a tie
-		// with both becoming unsigned. Neither direction narrows, which is what
-		// this used to do: it converted the right operand to the left one's type,
-		// so "3 < f" for a float f turned the 3 into an int and answered the
-		// wrong thing, and "b < v" for a uchar and an int turned the int into a
-		// uchar. Both validate.
+		// with both becoming unsigned. Converting one side to the other's type
+		// instead narrows: "3 < f" would compare as ints and "b < v" for a uchar
+		// and an int would compare as uchars.
 		Id leftType = leftOperandType;
 		Id rightType = rightOperandType;
 
@@ -2321,9 +2319,8 @@ namespace {
 		} else if (_types.isSignedInt(commonType) != operandsSigned) {
 			// Same width, opposite signedness: the signed side becomes the
 			// unsigned kind of the same width, which is what makes "-1 < u" an
-			// unsigned comparison of 4294967295 against the value.
-			// The unsigned kind of the same width, taken from the width rather
-			// than named, so a 64-bit operand stays 64 bits.
+			// unsigned comparison of 4294967295 against the value. It is taken from
+			// the width, so a 64-bit operand stays 64 bits.
 			uint32_t width = _types.bitWidth(commonType);
 			if (width == 64) {
 				commonType = _types.scalar(ScalarKind::ULong);
@@ -2519,8 +2516,7 @@ namespace {
 			}
 		}
 		if (targetMatrix || _types.matrixInfo(valueType)) {
-			const Id product = emitBinaryOperation(op, current, value);
-			return convert(product, _builder.typeOf(product), targetType);
+			return emitBinaryOperation(op, current, value);
 		}
 
 		const bool isShift = op == BinaryOperator::ShiftLeft || op == BinaryOperator::ShiftRight;
