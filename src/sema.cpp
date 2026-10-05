@@ -1998,13 +1998,20 @@ namespace {
 		// arguments say what type the call is in.
 		const size_t sharing = builtin.shape == MathShape::Refract ? 2 : values.size();
 
+		const bool takesIntegers = builtin.signedInstruction != kNoInstruction;
+
 		// The type the call is in: the first vector argument's, since a scalar
-		// beside it is broadcast, or the first argument's when all are scalars.
+		// beside it is broadcast. Among scalars alone it is the first float
+		// argument's, as Apple types pow(x, 2) as float, or else the first's.
 		Id type = _builder.typeOf(values[0]);
 		for (size_t i = 0; i < sharing; ++i) {
-			if (_types.vectorWidth(_builder.typeOf(values[i])) > 1) {
-				type = _builder.typeOf(values[i]);
+			const Id argumentType = _builder.typeOf(values[i]);
+			if (_types.vectorWidth(argumentType) > 1) {
+				type = argumentType;
 				break;
+			}
+			if (!_types.isFloat(type) && _types.isFloat(argumentType)) {
+				type = argumentType;
 			}
 		}
 
@@ -2014,7 +2021,6 @@ namespace {
 		const bool isSigned = _types.isSignedInt(type);
 		const uint32_t bits = _types.bitWidth(type);
 
-		const bool takesIntegers = builtin.signedInstruction != kNoInstruction;
 		const bool takesScalars = builtin.shape == MathShape::Componentwise
 			|| builtin.shape == MathShape::Saturate;
 		// Metal has no double, and GLSL.std.450's transcendentals take only 16 and
@@ -2034,20 +2040,22 @@ namespace {
 		}
 
 		// A scalar beside a vector is broadcast, as Metal converts a scalar to any
-		// vector. Scalars of different types are rejected: Apple reports
-		// min(int, float) or mix(half, half, float) as ambiguous.
+		// vector. Beside a float scalar only an integer is converted, and only
+		// for a builtin with no integer form: Apple reports min(int, float) and
+		// mix(half, half, float) as ambiguous.
 		for (size_t i = 0; i < sharing; ++i) {
 			const Id argumentType = _builder.typeOf(values[i]);
 			if (argumentType == type) {
 				continue;
 			}
 
-			if (width == 1 || _types.vectorWidth(argumentType) != 1) {
+			const bool converts = width == 1 && !takesIntegers && !_types.isFloat(argumentType);
+			if (_types.vectorWidth(argumentType) != 1 || (width == 1 && !converts)) {
 				throw CompileError("the arguments of " + name + " have to be one type, or a "
 					"scalar beside a vector");
 			}
 
-			values[i] = broadcast(values[i], type);
+			values[i] = width > 1 ? broadcast(values[i], type) : convert(values[i], argumentType, type);
 		}
 
 		if (builtin.shape == MathShape::Refract) {
