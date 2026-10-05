@@ -1389,6 +1389,13 @@ namespace {
 		return loaded;
 	}
 
+	static const char* const kDereferenceOperand = "the operand of unary '*' has to be a pointer "
+		"parameter; a dereference of an element, a call or other expression is not supported";
+
+	static std::string notAPointer(const std::string& name) {
+		return "\"" + name + "\" is not a pointer, so unary '*' cannot dereference it";
+	}
+
 	// Indexing is an lvalue: it produces the address of the element. Most uses
 	// want the element, so the value is loaded by default and only an
 	// assignment target asks for the address. Without this the operands of
@@ -1396,14 +1403,18 @@ namespace {
 	// integer.
 	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
 		if (expression.left->kind != ExpressionKind::Identifier) {
-			throw CompileError("indexing an expression is not supported yet; index a parameter "
-				"or local directly");
+			throw CompileError(expression.isDereference ? kDereferenceOperand
+				: "indexing an expression is not supported yet; index a parameter or local directly");
 		}
 
 		const auto it = _bindings.find(expression.left->name);
 		if (it == _bindings.end() || !it->second.isPointer) {
 			throw CompileError("\"" + expression.left->name + "\" is not a pointer, so it cannot "
 				"be indexed");
+		}
+
+		if (expression.isDereference && !it->second.isBuffer) {
+			throw CompileError(notAPointer(expression.left->name));
 		}
 
 		const Binding& binding = it->second;
@@ -1481,6 +1492,7 @@ namespace {
 	// walked.
 	struct AccessStep {
 		bool isIndex = false;
+		bool isDereference = false;
 		const Expression* index = nullptr;
 		std::string memberName;
 	};
@@ -1501,6 +1513,11 @@ namespace {
 			step.isIndex = current->kind == ExpressionKind::Index;
 
 			if (step.isIndex) {
+				step.isDereference = current->isDereference;
+				if (step.isDereference && current->left->kind != ExpressionKind::Identifier) {
+					throw CompileError(kDereferenceOperand);
+				}
+
 				if (current->arguments.size() != 1) {
 					throw CompileError("expected exactly one index, found "
 						+ std::to_string(current->arguments.size()));
@@ -1690,6 +1707,9 @@ namespace {
 				// struct reached directly is one value, whether through a reference
 				// or through the address a buffer of scalars put in a register.
 				if (!fromBuffer || !binding.isBuffer) {
+					if (step.isDereference) {
+						throw CompileError(notAPointer(rootName));
+					}
 					throw CompileError("\"" + rootName + "\" is not a buffer, so it cannot "
 						"be indexed as an array");
 				}
@@ -3436,6 +3456,18 @@ namespace {
 			&& !structOf(*expression.left->left)) {
 			emitSwizzleStore(*expression.left, *expression.right);
 			return;
+		}
+
+		const Expression* root = expression.left.get();
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		if (root->kind == ExpressionKind::Identifier) {
+			const auto target = _bindings.find(root->name);
+			if (target != _bindings.end() && target->second.readOnly) {
+				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
+					"constant address space or declared const");
+			}
 		}
 
 		const Id address = emitPlaceAddress(*expression.left);

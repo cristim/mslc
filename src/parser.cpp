@@ -892,6 +892,9 @@ Type Parser::parseType() {
 	}
 
 	while (at(TokenKind::Star)) {
+		if (type.isPointer) {
+			throw CompileError("a pointer to a pointer is not supported");
+		}
 		advance();
 		type.isPointer = true;
 	}
@@ -1367,6 +1370,37 @@ ExpressionPtr Parser::parseMultiplicative() {
 }
 
 ExpressionPtr Parser::parseUnary() {
+	// Only in prefix position: a '*' between two operands never gets here, because
+	// parseMultiplicative consumes it after the left operand is complete.
+	if (at(TokenKind::Star)) {
+		auto dereference = std::make_unique<Expression>();
+		dereference->kind = ExpressionKind::Index;
+		dereference->isDereference = true;
+		dereference->line = line();
+		advance();
+
+		auto operand = parseUnary();
+		if (operand->kind == ExpressionKind::Binary) {
+			throw CompileError("pointer arithmetic such as \"*(p + i)\" is not supported; "
+				"index the pointer instead, \"p[i]\"");
+		}
+		if (operand->isDereference) {
+			throw CompileError("dereferencing a pointer to a pointer is not supported");
+		}
+
+		auto zero = std::make_unique<Expression>();
+		zero->kind = ExpressionKind::IntLiteral;
+		zero->line = dereference->line;
+
+		dereference->left = std::move(operand);
+		dereference->arguments.push_back(std::move(zero));
+		return dereference;
+	}
+
+	if (at(TokenKind::Ampersand)) {
+		throw CompileError("taking an address with '&' is not supported");
+	}
+
 	if (at(TokenKind::Minus) || at(TokenKind::Plus) || at(TokenKind::Bang) || at(TokenKind::Tilde)
 		|| at(TokenKind::Increment) || at(TokenKind::Decrement)) {
 		auto expression = std::make_unique<Expression>();
