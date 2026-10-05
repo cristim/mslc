@@ -305,7 +305,8 @@ namespace {
 		if (isFloat) {
 			switch (op) {
 				case BinaryOperator::Equal: return spirv::OpFOrdEqual;
-				case BinaryOperator::NotEqual: return spirv::OpFOrdNotEqual;
+				// Unordered, so NaN != x is true; the other five are false for a NaN.
+				case BinaryOperator::NotEqual: return spirv::OpFUnordNotEqual;
 				case BinaryOperator::Less: return spirv::OpFOrdLessThan;
 				case BinaryOperator::LessEqual: return spirv::OpFOrdLessThanEqual;
 				case BinaryOperator::Greater: return spirv::OpFOrdGreaterThan;
