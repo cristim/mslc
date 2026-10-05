@@ -1334,6 +1334,13 @@ namespace {
 
 		const Binding& binding = it->second;
 
+		// A buffer is reached through the address block, so the binding has no id
+		// of its own to load, and loading it wrote an OpLoad of id 0.
+		if (binding.bufferPointeeType != InvalidId) {
+			throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
+				"which is not lowered yet");
+		}
+
 		if (!binding.isPointer) {
 			return binding.id;
 		}
