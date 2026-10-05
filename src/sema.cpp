@@ -581,6 +581,21 @@ bool TypeTable::isFloat(spirv::Id type) const {
 	return false;
 }
 
+bool TypeTable::isBool(spirv::Id type) const {
+	const auto boolScalar = _scalars.find(static_cast<uint32_t>(ScalarKind::Bool));
+	if (boolScalar != _scalars.end() && boolScalar->second == type) {
+		return true;
+	}
+
+	for (const auto& [key, id]: _vectors) {
+		if (id == type) {
+			return static_cast<ScalarKind>(key.first) == ScalarKind::Bool;
+		}
+	}
+
+	return false;
+}
+
 bool TypeTable::isSignedInt(spirv::Id type) const {
 	for (const auto& [kind, id]: _scalars) {
 		if (id == type) {
@@ -783,6 +798,31 @@ Id TypeTable::zero(Id type) {
 	// a short instruction, which is what this used to do.
 	return _builder.emitDeclTyped(spirv::OpConstant, type,
 		std::vector<uint32_t>((bitWidth(type) + 31) / 32, 0u));
+}
+
+Id TypeTable::one(Id type) {
+	const Id vectorComponent = componentOf(type);
+	const Id component = vectorComponent == InvalidId ? type : vectorComponent;
+	const uint32_t bits = bitWidth(component);
+
+	std::vector<uint32_t> words;
+	if (isFloat(component)) {
+		// 1.0 as a half is 0x3C00 and as a double 0x3FF0 in the high word.
+		words = bits == 16 ? std::vector<uint32_t>{ 0x3C00u }
+			: bits == 32 ? std::vector<uint32_t>{ 0x3F800000u }
+			: std::vector<uint32_t>{ 0u, 0x3FF00000u };
+	} else {
+		words = std::vector<uint32_t>((bits + 31) / 32, 0u);
+		words.front() = 1u;
+	}
+
+	const Id scalarOne = _builder.emitDeclTyped(spirv::OpConstant, component, words);
+	if (component == type) {
+		return scalarOne;
+	}
+
+	return _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+		std::vector<uint32_t>(vectorWidth(type), scalarOne));
 }
 
 Id TypeTable::image2D() {
@@ -1424,12 +1464,21 @@ namespace {
 					"converted to one of " + std::to_string(toWidth));
 		}
 
-		// A bool is neither floating point nor an integer, and no convert opcode
-		// accepts one, so reaching here means the shape is not lowered yet.
-		// Reporting it beats emitting an instruction spirv-val rejects.
-		if (fromType == _types.scalar(ScalarKind::Bool)
-			|| toType == _types.scalar(ScalarKind::Bool)) {
-			throw CompileError("converting to or from bool is not lowered yet");
+		// No convert opcode takes a bool, scalar or vector. To a bool, C++ says
+		// "not equal to zero", and a NaN is not equal to anything, so it is true:
+		// the float compare is the unordered one. From a bool, true is one.
+		const bool toBool = _types.isBool(toType);
+		if (toBool || _types.isBool(fromType)) {
+			if (_types.bitWidth(toBool ? fromType : toType) == 0) {
+				throw CompileError("a bool converts to and from a numeric scalar or vector only");
+			}
+
+			return toBool
+				? _builder.emitTyped(_types.isFloat(fromType)
+						? spirv::OpFUnordNotEqual : spirv::OpINotEqual,
+					toType, { value, _types.zero(fromType) })
+				: _builder.emitTyped(spirv::OpSelect, toType,
+					{ value, _types.one(toType), _types.zero(toType) });
 		}
 
 		// Integer and float conversions each have their own opcodes. OpBitcast is
@@ -2088,6 +2137,11 @@ namespace {
 			throw CompileError("a unary operator on a matrix is not lowered yet");
 		}
 
+		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
+			throw CompileError("a unary operator on a bool is not lowered yet; "
+				"convert the bool to an int first");
+		}
+
 		switch (expression.unaryOperator) {
 			case UnaryOperator::Plus: return operand;
 			case UnaryOperator::Negate:
@@ -2225,6 +2279,13 @@ namespace {
 
 			return _builder.emitTyped(comparisonOpcode(expression.binaryOperator,
 				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
+		}
+
+		// Apple promotes a bool operand to int. mslc has no such promotion, and
+		// OpIAdd on a bool is a module spirv-val rejects.
+		if (_types.isBool(leftType) || _types.isBool(_builder.typeOf(right))) {
+			throw CompileError("an arithmetic or bitwise operator on a bool is not lowered yet; "
+				"convert the bool to an int first");
 		}
 
 		// OpUDiv and OpUMod need both operands of the result type, and a literal

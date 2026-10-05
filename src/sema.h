@@ -102,6 +102,7 @@ public:
 	std::optional<spirv::StorageClassValue> storageClassOf(spirv::Id pointerType) const;
 
 	bool isFloat(spirv::Id type) const;
+	bool isBool(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
 
@@ -128,6 +129,10 @@ public:
 	// OpConstant's literal count follows the width, so a 64-bit value needs two
 	// words. A vector, a matrix or a struct is OpConstantNull.
 	spirv::Id zero(spirv::Id type);
+
+	// One in a numeric scalar or vector type, in every component. A bool
+	// converts to this where it is true.
+	spirv::Id one(spirv::Id type);
 
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
