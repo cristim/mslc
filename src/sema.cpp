@@ -506,9 +506,14 @@ bool TypeTable::isSignedInt(spirv::Id type) const {
 }
 
 Id TypeTable::componentOf(Id vectorType) {
+	return withWidth(vectorType, 1);
+}
+
+Id TypeTable::withWidth(Id vectorType, uint32_t width) {
 	for (const auto& [key, id]: _vectors) {
 		if (id == vectorType) {
-			return scalar(static_cast<ScalarKind>(key.first));
+			const auto kind = static_cast<ScalarKind>(key.first);
+			return vector(kind, width);
 		}
 	}
 
@@ -1104,6 +1109,8 @@ namespace {
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
+		const StructDecl* structOf(const Expression& expression);
+		Id emitSwizzle(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
@@ -1496,14 +1503,95 @@ namespace {
 		outSteps.assign(reversed.rbegin(), reversed.rend());
 	}
 
-	Id Emitter::emitMember(const Expression& expression) {
-		const ConstantBinding* constant = constantFor(expression.left.get());
-		if (constant) {
-			if (!constant->structType) {
-				throw CompileError("\"" + expression.left->name + "\" is a constant, so \"."
-					+ expression.memberName + "\" is not a member of it");
+	// The struct an expression's value is, or null when it is not one. A '.' on
+	// anything else is a swizzle, which is why this is asked before any code for
+	// the left side is emitted.
+	const StructDecl* Emitter::structOf(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Identifier: {
+				const auto it = _bindings.find(expression.name);
+				if (it != _bindings.end()) {
+					const std::string& name = it->second.pointeeMsl.namedType;
+					return name.empty() ? nullptr : _unit.findStruct(name);
+				}
+				const auto constant = _constants.find(expression.name);
+				return constant == _constants.end() ? nullptr : constant->second.structType;
 			}
 
+			// An element of a buffer has the buffer's own type.
+			case ExpressionKind::Index: return structOf(*expression.left);
+
+			case ExpressionKind::Member: {
+				const StructDecl* outer = structOf(*expression.left);
+				if (!outer) {
+					return nullptr;
+				}
+				std::string declName;
+				const size_t field = fieldIndexOf(*outer, expression.memberName, declName);
+				if (field == outer->fields.size()) {
+					return nullptr;
+				}
+				const std::string& name = outer->fields[field].type.namedType;
+				return name.empty() ? nullptr : _unit.findStruct(name);
+			}
+
+			default: return nullptr;
+		}
+	}
+
+	// v.zyx, (a * b).xyz, normalize(n).w: the components of a vector value, in
+	// the order named, from one of the two letter sets Metal allows.
+	Id Emitter::emitSwizzle(const Expression& expression) {
+		const std::string& name = expression.memberName;
+		const std::string quoted = "\"." + name + "\"";
+		if (name.size() > 4) {
+			throw CompileError(quoted + " names more than four components");
+		}
+
+		std::vector<uint32_t> indices;
+		const std::string_view set = std::string_view("xyzw").find(name[0]) != std::string_view::npos
+			? "xyzw" : "rgba";
+		for (const char letter: name) {
+			const size_t index = set.find(letter);
+			if (index == std::string_view::npos) {
+				throw CompileError(quoted + " is not a swizzle: each letter has to be one of "
+					"xyzw, or each one of rgba");
+			}
+			indices.push_back(static_cast<uint32_t>(index));
+		}
+
+		const Id vector = emitExpression(*expression.left);
+		const Id type = _builder.typeOf(vector);
+		if (_types.componentOf(type) == InvalidId) {
+			throw CompileError(quoted + " swizzles a value that is not a vector");
+		}
+
+		const uint32_t width = _types.vectorWidth(type);
+		for (const uint32_t index: indices) {
+			if (index >= width) {
+				throw CompileError(quoted + " names a component past the end of a vector of "
+					+ std::to_string(width));
+			}
+		}
+
+		if (indices.size() == 1) {
+			return _builder.emitTyped(spirv::OpCompositeExtract, _types.componentOf(type),
+				{ vector, indices[0] });
+		}
+
+		std::vector<uint32_t> operands = { vector, vector };
+		operands.insert(operands.end(), indices.begin(), indices.end());
+		return _builder.emitTyped(spirv::OpVectorShuffle,
+			_types.withWidth(type, static_cast<uint32_t>(indices.size())), operands);
+	}
+
+	Id Emitter::emitMember(const Expression& expression) {
+		if (!structOf(*expression.left)) {
+			return emitSwizzle(expression);
+		}
+
+		const ConstantBinding* constant = constantFor(expression.left.get());
+		if (constant) {
 			std::string declName;
 			const size_t field = fieldIndexOf(*constant->structType, expression.memberName, declName);
 			if (field == constant->structType->fields.size()) {
@@ -3213,6 +3301,10 @@ namespace {
 		if (expression.left->kind == ExpressionKind::Index) {
 			address = emitIndex(*expression.left, true);
 		} else if (expression.left->kind == ExpressionKind::Member) {
+			if (!structOf(*expression.left->left)) {
+				throw CompileError("assigning to \"." + expression.left->memberName
+					+ "\" of a value that is not a struct, a swizzle, is not lowered yet");
+			}
 			Id fieldType = InvalidId;
 			address = emitMemberAddress(*expression.left, fieldType);
 		} else if (expression.left->kind == ExpressionKind::Identifier) {
