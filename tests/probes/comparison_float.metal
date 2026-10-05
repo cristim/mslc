@@ -1,6 +1,7 @@
 // EXPECT: valid
 // DISASM-MATCH: = OpFOrdEqual %bool
-// DISASM-MATCH: = OpF(Ord|Unord)NotEqual %bool
+// DISASM-MATCH: = OpFUnordNotEqual %bool
+// DISASM-NO-MATCH: = OpFOrdNotEqual %bool
 // DISASM-MATCH: = OpFOrdLessThan %bool
 // DISASM-MATCH: = OpFOrdLessThanEqual %bool
 // DISASM-MATCH: = OpFOrdGreaterThan %bool
@@ -10,13 +11,11 @@
 // DISASM-NO-MATCH: = OpS(Less|Greater)\w* %bool
 // DISASM-NO-MATCH: = OpU(Less|Greater)\w* %bool
 //
-// All six comparison operators on two %float operands. The ordered FOrd forms
-// are what a comparison against a NaN needs to be false. != is the exception:
-// Apple's compiler emits an unordered compare for it (`fcmp une`), so NaN != x
-// is true, while mslc emits OpFOrdNotEqual today. The != pin accepts either form
-// so this probe does not lock in that difference; it is tracked in its own
-// issue. Nothing here produces a NaN, so the other pins show the ordered family
-// was picked, not that a NaN was handled.
+// All six comparison operators on two %float operands. == < <= > >= are the
+// ordered FOrd forms, false when either operand is NaN. != is the unordered
+// OpFUnordNotEqual, so NaN != x is true; Apple's compiler emits `fcmp une` for
+// it. Nothing here produces a NaN, so these pins show which opcode was picked,
+// not that a NaN was handled.
 kernel void comparison_float(device int *out [[buffer(0)]],
                              constant int *in [[buffer(1)]],
                              uint index [[thread_position_in_grid]])
