@@ -7,7 +7,8 @@
 // DISASM-MATCH: = OpLogicalNot %bool
 //
 // The bitwise operators, the left shift, and the two kinds of not. The right
-// shifts are pinned by shift_right_by_sign, which is why they are not here.
+// shifts are not pinned here; shift_right_by_sign and
+// unsigned_literal_picks_the_opcode cover them.
 //
 // A left shift has no signed form in SPIR-V, so OpShiftLeftLogical is what any
 // left shift has to be. ~ is OpNot on an integer and ! is OpLogicalNot on a
