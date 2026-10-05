@@ -34,6 +34,12 @@ const char* tokenKindName(TokenKind kind) {
 		case TokenKind::MinusAssign: return "-=";
 		case TokenKind::StarAssign: return "*=";
 		case TokenKind::SlashAssign: return "/=";
+		case TokenKind::PercentAssign: return "%=";
+		case TokenKind::AmpersandAssign: return "&=";
+		case TokenKind::PipeAssign: return "|=";
+		case TokenKind::CaretAssign: return "^=";
+		case TokenKind::ShiftLeftAssign: return "<<=";
+		case TokenKind::ShiftRightAssign: return ">>=";
 		case TokenKind::Less: return "<";
 		case TokenKind::LessEqual: return "<=";
 		case TokenKind::Greater: return ">";
@@ -77,8 +83,8 @@ namespace {
 	// never has to backtrack.
 	const std::unordered_map<std::string_view, TokenKind>& multiCharOperators() {
 		static const std::unordered_map<std::string_view, TokenKind> table = {
-			{ "<<=", TokenKind::ShiftLeft },
-			{ ">>=", TokenKind::ShiftRight },
+			{ "<<=", TokenKind::ShiftLeftAssign },
+			{ ">>=", TokenKind::ShiftRightAssign },
 			{ "->", TokenKind::Arrow },
 			{ "::", TokenKind::ColonColon },
 			{ "++", TokenKind::Increment },
@@ -95,6 +101,10 @@ namespace {
 			{ "-=", TokenKind::MinusAssign },
 			{ "*=", TokenKind::StarAssign },
 			{ "/=", TokenKind::SlashAssign },
+			{ "%=", TokenKind::PercentAssign },
+			{ "&=", TokenKind::AmpersandAssign },
+			{ "|=", TokenKind::PipeAssign },
+			{ "^=", TokenKind::CaretAssign },
 		};
 
 		return table;

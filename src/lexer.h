@@ -24,7 +24,8 @@ enum class TokenKind {
 
 	Plus, Minus, Star, Slash, Percent,
 	Assign,
-	PlusAssign, MinusAssign, StarAssign, SlashAssign,
+	PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign,
+	AmpersandAssign, PipeAssign, CaretAssign, ShiftLeftAssign, ShiftRightAssign,
 	Less, LessEqual,
 	Greater, GreaterEqual,
 	Equal, NotEqual,
