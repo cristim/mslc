@@ -47,6 +47,9 @@ private:
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
 	spirv::Id _voidType = spirv::InvalidId;
+	spirv::Id _image2D = spirv::InvalidId;
+	spirv::Id _samplerType = spirv::InvalidId;
+	spirv::Id _sampledImage2D = spirv::InvalidId;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -62,6 +65,15 @@ public:
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
+
+	// The 2D image a texture2d<float> and a texture2d<half> are both declared as:
+	// a float sampled type, sampled by a sampler (Sampled 1), format Unknown and
+	// depth unspecified, which is what Iridium declares (indium src/iridium/
+	// air.cpp:771). The component type is not in the image type; a half texture's
+	// samples are narrowed after the lookup.
+	spirv::Id image2D();
+	spirv::Id samplerType();
+	spirv::Id sampledImage2D();
 
 	// The shape of a matrix, or null when the id is not a matrix this table
 	// created.
@@ -222,6 +234,14 @@ struct ModuleOptions {
 	bool separateImageSet = false;
 };
 
+// The reflection's embedded_samplers entries carry the whole of indium's
+// EmbeddedSampler. The options that set compare_function, anisotropy,
+// border_color and the lod clamp are refused, so those fields hold Apple's
+// defaults for a sampler that does not set them: compare_function Never (8 in
+// Apple's sampler state word), anisotropy 1, border_color TransparentBlack,
+// lod_min 0 and lod_max 65504 (the largest half). A consumer must not zero-fill
+// them: lod_max 0 would restrict the sampler to mip level 0.
+//
 // Emits the module for every given entry point: one OpEntryPoint and one
 // function each, with the descriptor set, the execution modes and the interface
 // chosen per entry point's stage. Returns the reflection document, one entry per

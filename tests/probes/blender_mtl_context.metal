@@ -1,4 +1,4 @@
-// EXPECT: error only a constant can be declared at file scope
+// EXPECT: error "sampler" is a texture or sampler type
 using namespace metal;
 struct Vertex {
   float4 position [[position]];

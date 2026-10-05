@@ -132,6 +132,19 @@ namespace {
 			|| text == "volatile" || text == "restrict" || text == "__restrict";
 	}
 
+	// The texture and sampler type names. Only texture2d and sampler are lowered;
+	// the rest are recognised so they are reported by name rather than read as a
+	// struct type and failing later.
+	bool isResourceTypeName(std::string_view text) {
+		static const std::set<std::string_view> names = {
+			"sampler", "texture1d", "texture1d_array", "texture2d", "texture2d_array",
+			"texture2d_ms", "texture2d_ms_array", "texture3d", "texturecube",
+			"texturecube_array", "texture_buffer", "depth2d", "depth2d_array",
+			"depth2d_ms", "depth2d_ms_array", "depthcube", "depthcube_array",
+		};
+		return names.count(text) > 0;
+	}
+
 	// MSL builtin attributes the subset can map onto a SPIR-V BuiltIn. An
 	// attribute outside this table is rejected rather than ignored, so an
 	// unsupported builtin can never be dropped without a diagnostic.
@@ -841,7 +854,7 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 	return length;
 }
 
-Type Parser::parseType() {
+Type Parser::parseType(bool allowResource) {
 	Type type;
 
 	// MSL writes the address space and the const qualifier in either order, and
@@ -877,7 +890,24 @@ Type Parser::parseType() {
 		advance();
 	}
 
-	if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
+	// metal::sampler and metal::texture2d, which Apple takes as the unqualified names.
+	if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon
+		&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)) {
+		advance();
+		advance();
+	}
+
+	if (kind() == TokenKind::Identifier && isResourceTypeName(current().text)) {
+		if (!allowResource) {
+			throw CompileError("\"" + std::string(current().text) + "\" is a texture or sampler type, "
+				"which mslc takes as an entry point parameter only, and a sampler also as a local");
+		}
+		parseResourceType(type);
+		if (atKeyword("const")) {
+			type.isConst = true;
+			advance();
+		}
+	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
 	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
 		throw CompileError("the enum type \"" + std::string(current().text) + "\" is not supported as a "
@@ -906,14 +936,68 @@ Type Parser::parseType() {
 	return type;
 }
 
+void Parser::parseResourceType(Type& type) {
+	const std::string name(advance().text);
+
+	if (name == "sampler") {
+		type.resource = ResourceKind::Sampler;
+		return;
+	}
+
+	if (name != "texture2d") {
+		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d<float>, "
+			"texture2d<half> and sampler");
+	}
+
+	expect(TokenKind::Less, "to open the sampled type of texture2d");
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected the sampled type of texture2d, found "
+			+ std::string(tokenKindName(kind())));
+	}
+
+	const std::string component(advance().text);
+	if (component != "float" && component != "half") {
+		throw CompileError("texture2d<" + component + "> is not lowered yet; mslc lowers the "
+			"sampled types float and half");
+	}
+
+	if (match(TokenKind::Comma)) {
+		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
+			advance();
+			advance();
+		}
+		if (kind() != TokenKind::Identifier || current().text != "access") {
+			throw CompileError("expected an access qualifier after the sampled type of texture2d");
+		}
+		advance();
+		expect(TokenKind::ColonColon, "after \"access\"");
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected an access qualifier name after \"access::\"");
+		}
+		const std::string access(advance().text);
+		if (access != "sample") {
+			throw CompileError("texture2d access::" + access + " is not lowered yet; mslc lowers "
+				"access::sample, which is the default");
+		}
+	}
+
+	expect(TokenKind::Greater, "to close the sampled type of texture2d");
+	type.resource = ResourceKind::Texture2D;
+	type.scalar = component == "half" ? ScalarKind::Half : ScalarKind::Float;
+}
+
 Parameter Parser::parseParameter() {
 	Parameter param;
 
-	param.type = parseType();
+	param.type = parseType(true);
 
 	// "constant BufferClearParams &params" and "constant BufferClearParams
 	// *params" name the same buffer and lower to the same descriptor, so a
 	// reference is consumed and nothing is recorded for it.
+	if (at(TokenKind::Ampersand) && param.type.resource != ResourceKind::None) {
+		throw CompileError("a reference to " + typeName(param.type) + " is not valid; a texture or "
+			"sampler parameter is taken by value");
+	}
 	match(TokenKind::Ampersand);
 
 	if (kind() != TokenKind::Identifier) {
@@ -922,6 +1006,13 @@ Parameter Parser::parseParameter() {
 
 	param.name = std::string(advance().text);
 	rejectShadowing(param.name);
+
+	if (param.type.resource != ResourceKind::None
+		&& (param.type.isPointer || param.type.arrayLength || param.type.addressSpace != AddressSpace::None)) {
+		throw CompileError("parameter \"" + param.name + "\" is a pointer to or an array of "
+			+ typeName(param.type) + " or has an address space, which is not lowered yet; mslc "
+			"takes a texture or sampler by value");
+	}
 
 	// "float values[4]" is an array suffix, "[[buffer(0)]]" is an attribute
 	// list, and both start with a bracket, so the second one has to be
@@ -1147,7 +1238,7 @@ StatementPtr Parser::parseStatement() {
 		Type probe;
 		const bool looksLikeType =
 			(kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
-				|| isTypeQualifier(current().text)
+				|| isTypeQualifier(current().text) || isResourceTypeName(current().text)
 				|| _enumTypes.count(std::string(current().text)) > 0
 				|| _unit.findStruct(std::string(current().text)) != nullptr))
 			|| atKeyword("device") || atKeyword("constant")
@@ -1156,13 +1247,27 @@ StatementPtr Parser::parseStatement() {
 		if (looksLikeType) {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
-			declaration.type = parseType();
+			const size_t typeStart = _position;
+			declaration.type = parseType(true);
+			if (declaration.type.resource != ResourceKind::None) {
+				for (size_t at = typeStart; at < _position; ++at) {
+					if (_tokens[at].text == "static") {
+						throw CompileError("variables in function scope cannot be declared static");
+					}
+				}
+			}
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 			}
 			declaration.name = std::string(advance().text);
 			rejectShadowing(declaration.name);
+
+			if (declaration.type.resource != ResourceKind::None) {
+				parseSamplerLocal(declaration);
+				statement->declaration = std::move(declaration);
+				return statement;
+			}
 
 			if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
 				&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
@@ -1197,6 +1302,173 @@ StatementPtr Parser::parseStatement() {
 	expect(TokenKind::Semicolon, "after an expression statement");
 
 	return statement;
+}
+
+// A sampler declared in the shader: "constexpr sampler s(options);", with a
+// brace list or "= sampler(options)" for the options, or with none. Apple's
+// compiler takes the same declaration without constexpr, so this does too.
+void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
+	const Type& type = declaration.type;
+	if (type.resource != ResourceKind::Sampler) {
+		throw CompileError("a local \"" + declaration.name + "\" of type " + typeName(type)
+			+ " is not lowered yet; a texture is an entry point parameter");
+	}
+	if (type.isPointer || type.arrayLength
+		|| (type.addressSpace != AddressSpace::None && type.addressSpace != AddressSpace::Thread)) {
+		throw CompileError("a local sampler \"" + declaration.name + "\" with a pointer, an array "
+			"or an address space other than thread is not lowered yet");
+	}
+
+	if (match(TokenKind::LParen)) {
+		if (at(TokenKind::RParen)) {
+			throw CompileError("\"" + declaration.name + "\" with empty parentheses declares a function, "
+				"not a sampler; write the sampler with no parentheses or with braces");
+		}
+		declaration.sampler = parseSamplerOptions(TokenKind::RParen);
+	} else if (match(TokenKind::LBrace)) {
+		declaration.sampler = parseSamplerOptions(TokenKind::RBrace);
+	} else if (match(TokenKind::Assign)) {
+		if (match(TokenKind::LBrace)) {
+			declaration.sampler = parseSamplerOptions(TokenKind::RBrace);
+			expect(TokenKind::Semicolon, "after a declaration");
+			return;
+		}
+		if (kind() != TokenKind::Identifier || current().text != "sampler"
+			|| lookahead().kind != TokenKind::LParen) {
+			throw CompileError("a sampler local \"" + declaration.name + "\" is initialised from "
+				"\"sampler(options)\" only; a copy of another sampler is not lowered yet");
+		}
+		advance();
+		advance();
+		declaration.sampler = parseSamplerOptions(TokenKind::RParen);
+	} else {
+		declaration.sampler = SamplerState();
+	}
+
+	expect(TokenKind::Semicolon, "after a declaration");
+}
+
+// The options of a constexpr sampler, "mag_filter::linear, address::repeat", up
+// to and including the closing token. The restrictions are Apple's: pixel
+// coordinates allow only equal filters, no mip filter and the clamp address modes.
+SamplerState Parser::parseSamplerOptions(TokenKind closing) {
+	SamplerState state;
+	std::set<std::string> assigned;
+
+	while (!at(closing) && !at(TokenKind::EndOfFile)) {
+		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
+			advance();
+			advance();
+		}
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected a sampler option, found " + std::string(tokenKindName(kind())));
+		}
+
+		const std::string family(advance().text);
+		static const std::set<std::string> unlowered = {
+			"compare_func", "max_anisotropy", "lod_clamp", "border_color", "reduction",
+		};
+		static const std::set<std::string> known = {
+			"coord", "address", "s_address", "t_address", "r_address", "filter",
+			"mag_filter", "min_filter", "mip_filter",
+		};
+		if (unlowered.count(family)) {
+			throw CompileError("the sampler option \"" + family + "\" is not lowered yet; mslc lowers "
+				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter and "
+				"mip_filter");
+		}
+		if (!known.count(family)) {
+			throw CompileError("\"" + family + "\" is not a sampler option");
+		}
+
+		expect(TokenKind::ColonColon, "after a sampler option name");
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected a value after \"" + family + "::\"");
+		}
+		const std::string value(advance().text);
+		const std::string spelled = family + "::" + value;
+
+		const auto address = [&]() -> SamplerAddress {
+			if (value == "clamp_to_zero" || value == "clamp_to_border") return SamplerAddress::ClampToZero;
+			if (value == "clamp_to_edge") return SamplerAddress::ClampToEdge;
+			if (value == "repeat") return SamplerAddress::Repeat;
+			if (value == "mirrored_repeat") return SamplerAddress::MirroredRepeat;
+			throw CompileError("\"" + spelled + "\" is not a sampler address mode");
+		};
+		const auto filter = [&]() -> SamplerFilter {
+			if (value == "nearest") return SamplerFilter::Nearest;
+			if (value == "linear") return SamplerFilter::Linear;
+			throw CompileError("\"" + spelled + "\" is not a sampler filter");
+		};
+
+		// Apple keeps the first option that names an attribute and ignores a later
+		// one for it: "address::repeat, address::clamp_to_edge" is repeat, and
+		// "s_address::repeat, address::clamp_to_edge" repeats s and clamps t and r.
+		// So an option only fills the attributes nothing before it set.
+		const auto fill = [&](std::initializer_list<const char*> attributes, auto&& assign) {
+			for (const char* attribute: attributes) {
+				if (assigned.insert(attribute).second) {
+					assign(attribute);
+				}
+			}
+		};
+
+		if (family == "coord") {
+			if (value != "normalized" && value != "pixel") {
+				throw CompileError("\"" + spelled + "\" is not a coordinate mode");
+			}
+			fill({ "coord" }, [&](const char*) { state.normalizedCoordinates = value != "pixel"; });
+		} else if (family == "address" || family == "s_address" || family == "t_address"
+			|| family == "r_address") {
+			const SamplerAddress mode = address();
+			fill(family == "address" ? std::initializer_list<const char*>{ "s", "t", "r" }
+					: family == "s_address" ? std::initializer_list<const char*>{ "s" }
+					: family == "t_address" ? std::initializer_list<const char*>{ "t" }
+					: std::initializer_list<const char*>{ "r" },
+				[&](const char* attribute) {
+					(attribute[0] == 's' ? state.sAddress : attribute[0] == 't' ? state.tAddress
+						: state.rAddress) = mode;
+				});
+		} else if (family == "filter" || family == "mag_filter" || family == "min_filter") {
+			const SamplerFilter chosen = filter();
+			fill(family == "filter" ? std::initializer_list<const char*>{ "mag", "min" }
+					: family == "mag_filter" ? std::initializer_list<const char*>{ "mag" }
+					: std::initializer_list<const char*>{ "min" },
+				[&](const char* attribute) {
+					(attribute[1] == 'a' ? state.magFilter : state.minFilter) = chosen;
+				});
+		} else {
+			SamplerMipFilter chosen = SamplerMipFilter::None;
+			if (value == "none") chosen = SamplerMipFilter::None;
+			else if (value == "nearest") chosen = SamplerMipFilter::Nearest;
+			else if (value == "linear") chosen = SamplerMipFilter::Linear;
+			else throw CompileError("\"" + spelled + "\" is not a mip filter");
+			fill({ "mip" }, [&](const char*) { state.mipFilter = chosen; });
+		}
+
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+		if (at(closing)) {
+			throw CompileError("expected a sampler option after ',' in a sampler's option list");
+		}
+	}
+
+	expect(closing, "to close a sampler's option list");
+
+	if (!state.normalizedCoordinates) {
+		const auto clamps = [](SamplerAddress mode) {
+			return mode == SamplerAddress::ClampToZero || mode == SamplerAddress::ClampToEdge;
+		};
+		if (state.magFilter != state.minFilter || state.mipFilter != SamplerMipFilter::None
+			|| !clamps(state.sAddress) || !clamps(state.tAddress) || !clamps(state.rAddress)) {
+			throw CompileError("invalid values combination in sampler initialization: with "
+				"coord::pixel the min_filter and mag_filter have to be the same, the mip_filter "
+				"none, and the address modes clamp_to_zero, clamp_to_edge or clamp_to_border");
+		}
+	}
+
+	return state;
 }
 
 StatementPtr Parser::parseIfStatement() {

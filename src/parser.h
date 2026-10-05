@@ -107,7 +107,12 @@ private:
 	ExpressionPtr parseInitializerList();
 
 	// Types
-	Type parseType();
+	// allowResource is true where a texture or sampler type may be spelled: an
+	// entry point parameter, and a local declaration, which only a sampler may be.
+	Type parseType(bool allowResource = false);
+	void parseResourceType(Type& type);
+	void parseSamplerLocal(VariableDeclaration& declaration);
+	SamplerState parseSamplerOptions(TokenKind closing);
 	bool parseAddressSpace(AddressSpace& space);
 	std::optional<uint32_t> tryParseArrayLength();
 
