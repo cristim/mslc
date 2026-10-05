@@ -27,6 +27,7 @@ namespace {
 	constexpr size_t kMaxOutputTokens = size_t(1) << 20;
 	constexpr size_t kMaxExpandedTokens = size_t(1) << 24;
 	constexpr size_t kMaxPendingTokens = size_t(1) << 18;
+	constexpr size_t kMaxHeldArgumentTokens = size_t(1) << 19;
 	constexpr size_t kMaxFileBytes = size_t(32) << 20;
 	constexpr size_t kMaxExpansionDepth = 200;
 	constexpr size_t kMaxConditionalDepth = 1000;
@@ -109,6 +110,7 @@ namespace {
 		std::string name;
 		bool functionLike = false;
 		bool variadic = false;
+		std::string variadicName = "__VA_ARGS__";
 		std::vector<std::string> params;
 		std::vector<BodyItem> body;
 		Loc definedAt;
@@ -151,6 +153,20 @@ namespace {
 	bool isBuiltinName(std::string_view name) {
 		return name == "defined" || name == "__VA_ARGS__" || name == "__has_include"
 			|| builtinByName(name) || isUnsupportedBuiltin(name);
+	}
+
+	// C++'s spellings of operators, which Apple's compiler refuses as macro names.
+	bool isAlternativeOperator(std::string_view name) {
+		static const char* const names[] = {
+			"and", "or", "not", "xor", "bitand", "bitor", "compl", "and_eq", "or_eq", "xor_eq", "not_eq",
+		};
+
+		for (const char* candidate: names) {
+			if (name == candidate) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool isKeyword(std::string_view name) {
@@ -228,15 +244,18 @@ namespace {
 				if (next + 1 < raw.size() && raw[next] == '\r' && raw[next + 1] == '\n') {
 					++next;
 				}
-				if (next < raw.size() && raw[next] == '\n') {
+				if (next < raw.size() && (raw[next] == '\n' || raw[next] == '\r')) {
 					i = next;
 					lineStarts.push_back(text.size());
 					continue;
 				}
 			}
 
-			text.push_back(c);
-			if (c == '\n') {
+			// A carriage return alone ends a line, as it does for Apple's compiler;
+			// before \n it is part of a CRLF and stays.
+			const bool loneReturn = c == '\r' && !(i + 1 < raw.size() && raw[i + 1] == '\n');
+			text.push_back(loneReturn ? '\n' : c);
+			if (c == '\n' || loneReturn) {
 				lineStarts.push_back(text.size());
 			}
 		}
@@ -380,10 +399,17 @@ public:
 	void run(std::string_view source);
 
 	std::vector<Token> takeOutput() { return std::move(_output); }
+	std::vector<TokenOrigin> takeOrigins() { return std::move(_origins); }
+	std::vector<std::string> takeFileNames() { return std::move(_fileNames); }
 
 private:
 	PreprocessOptions _options;
 	std::vector<Token> _output;
+	std::vector<TokenOrigin> _origins;
+	std::vector<std::string> _fileNames;
+	std::map<const SourceFile*, uint32_t> _fileIndex;
+	SourceFile* _stdlibMacros = nullptr;
+	SourceFile* _matrixMacros = nullptr;
 	std::deque<std::string> _storage;
 	std::vector<std::unique_ptr<SourceFile>> _owned;
 	std::map<std::string, SourceFile*> _files;
@@ -395,6 +421,7 @@ private:
 	size_t _counter = 0;
 	size_t _includeCount = 0;
 	size_t _expanded = 0;
+	size_t _heldArguments = 0;
 
 	[[noreturn]] void fail(const Loc& loc, const std::string& message) const;
 	std::string describe(const Loc& loc) const;
@@ -407,6 +434,7 @@ private:
 	void processFile(SourceFile& file, size_t nameId);
 	void scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPTok>& out, size_t depth);
 	void flush(std::vector<PPTok>& out);
+	TokenOrigin originOf(const Loc& loc);
 
 	// Directives
 	void directive(Cursor& cursor);
@@ -533,6 +561,20 @@ PPTok Preprocessor::fromFile(const Cursor& cursor, const Token& token) const {
 	return result;
 }
 
+TokenOrigin Preprocessor::originOf(const Loc& loc) {
+	auto found = _fileIndex.find(loc.file);
+	if (found == _fileIndex.end()) {
+		found = _fileIndex.emplace(loc.file, static_cast<uint32_t>(_fileNames.size())).first;
+		_fileNames.push_back(loc.file->displayPath);
+	}
+
+	TokenOrigin origin;
+	origin.file = found->second;
+	origin.line = static_cast<uint32_t>(loc.line);
+	origin.column = static_cast<uint32_t>(loc.column);
+	return origin;
+}
+
 void Preprocessor::flush(std::vector<PPTok>& out) {
 	if (_output.size() + out.size() > kMaxOutputTokens) {
 		throw CompileError("the preprocessed source is larger than " + std::to_string(kMaxOutputTokens)
@@ -546,6 +588,7 @@ void Preprocessor::flush(std::vector<PPTok>& out) {
 
 		pp.tok.line = pp.loc.line;
 		_output.push_back(pp.tok);
+		_origins.push_back(originOf(pp.loc));
 	}
 	out.clear();
 }
@@ -634,7 +677,12 @@ SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::s
 
 	bool escaped = false;
 	for (const Base& base: bases) {
-		const fs::path candidate = (base.directory / name).lexically_normal();
+		// The bounds are checked on the normalised path first, so a name that leaves
+		// the roots is refused without asking the filesystem about it. The
+		// filesystem is then asked about the path as written, because "x/../a.h" is
+		// not "a.h" unless x exists.
+		const fs::path joined = base.directory / name;
+		const fs::path candidate = joined.lexically_normal();
 		const bool lexicallyInside = std::any_of(_roots.begin(), _roots.end(),
 			[&](const fs::path& root) { return isWithin(candidate, root); });
 		if (!lexicallyInside) {
@@ -643,11 +691,11 @@ SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::s
 		}
 
 		std::error_code ec;
-		if (!fs::exists(candidate, ec)) {
+		if (!fs::exists(joined, ec)) {
 			continue;
 		}
 
-		const fs::path real = fs::canonical(candidate, ec);
+		const fs::path real = fs::canonical(joined, ec);
 		const bool realInside = !ec && std::any_of(_roots.begin(), _roots.end(),
 			[&](const fs::path& root) { return isWithin(real, root); });
 		if (!realInside) {
@@ -655,7 +703,7 @@ SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::s
 			continue;
 		}
 
-		const std::string display = (fs::path(base.display) / name).lexically_normal().string();
+		const std::string display = (fs::path(base.display.empty() ? "." : base.display) / name).string();
 		return loadFile(real, display, at);
 	}
 
@@ -730,6 +778,15 @@ void Preprocessor::includeDirective(Cursor& cursor, const std::vector<Token>& li
 				"<metal_matrix> only, and a header it does not read would leave the program compiling "
 				"up to the first name it needed");
 		}
+
+		// The header's declarations are built in, but its macros are real, and a
+		// shader may test them.
+		const bool stdlib = header.name == "<metal_stdlib>";
+		SourceFile*& macros = stdlib ? _stdlibMacros : _matrixMacros;
+		if (!macros) {
+			macros = &loadText("<built-in>", "", stdlib ? kMetalStdlibMacros : kMetalMatrixMacros);
+		}
+		processFile(*macros, internName(macros->displayPath));
 		return;
 	}
 
@@ -975,6 +1032,9 @@ void Preprocessor::undefMacro(Cursor& cursor, const std::vector<Token>& line, co
 	requireNoExtra(line, 2, "undef", cursor);
 
 	const std::string_view name = line[1].text;
+	if (isAlternativeOperator(name)) {
+		fail(locate(cursor, line[1]), "C++ operator '" + std::string(name) + "' used as a macro name");
+	}
 	if (isBuiltinName(name)) {
 		fail(locate(cursor, line[1]), "cannot #undef \"" + std::string(name) + "\": it is a builtin");
 	}
@@ -997,6 +1057,9 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 	if (isBuiltinName(name)) {
 		fail(nameLoc, "cannot #define \"" + name + "\": it is a builtin");
 	}
+	if (isAlternativeOperator(name)) {
+		fail(nameLoc, "C++ operator '" + name + "' used as a macro name");
+	}
 	if (isKeyword(name)) {
 		fail(nameLoc, "cannot #define \"" + name + "\": it is a keyword, and redefining it would change "
 			"what the rest of the source means");
@@ -1005,6 +1068,8 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 	auto macro = std::make_unique<Macro>();
 	macro->name = name;
 	macro->definedAt = nameLoc;
+
+	std::map<std::string_view, size_t> parameterIndex;
 
 	size_t bodyStart = 2;
 	if (line.size() > 2 && line[2].kind == TokenKind::LParen && !line[2].spaceBefore) {
@@ -1019,36 +1084,42 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 				break;
 			}
 
-			if (line[i].kind == TokenKind::Ellipsis) {
+			// "..." names the variable arguments __VA_ARGS__; "args..." names them args.
+			const bool anonymousVariadic = line[i].kind == TokenKind::Ellipsis;
+			if (!anonymousVariadic && !isName(line[i])) {
+				fail(locate(cursor, line[i]), "expected a macro parameter name, found \""
+					+ std::string(line[i].text) + "\"");
+			}
+			if (!anonymousVariadic && line[i].text == "__VA_ARGS__") {
+				fail(locate(cursor, line[i]), "__VA_ARGS__ cannot be a macro parameter name");
+			}
+			if (!anonymousVariadic && !parameterIndex.emplace(line[i].text, macro->params.size()).second) {
+				fail(locate(cursor, line[i]), "duplicate macro parameter \"" + std::string(line[i].text) + "\"");
+			}
+
+			if (anonymousVariadic) {
 				macro->variadic = true;
 				++i;
+			} else if (i + 1 < line.size() && line[i + 1].kind == TokenKind::Ellipsis) {
+				macro->variadic = true;
+				macro->variadicName = std::string(line[i].text);
+				parameterIndex.erase(line[i].text);
+				i += 2;
+			} else {
+				macro->params.emplace_back(line[i].text);
+				++i;
+			}
+
+			if (macro->variadic) {
 				if (i >= line.size() || line[i].kind != TokenKind::RParen) {
 					fail(locate(cursor, line[std::min(i, line.size() - 1)]),
-						"expected ) to close a macro parameter list after \"...\"");
+						"expected ) to close a macro parameter list after the variable arguments");
 				}
 				closed = true;
 				++i;
 				break;
 			}
 
-			if (!isName(line[i])) {
-				fail(locate(cursor, line[i]), "expected a macro parameter name, found \""
-					+ std::string(line[i].text) + "\"");
-			}
-			if (line[i].text == "__VA_ARGS__") {
-				fail(locate(cursor, line[i]), "__VA_ARGS__ cannot be a macro parameter name");
-			}
-			if (std::find(macro->params.begin(), macro->params.end(), std::string(line[i].text))
-				!= macro->params.end()) {
-				fail(locate(cursor, line[i]), "duplicate macro parameter \"" + std::string(line[i].text) + "\"");
-			}
-			macro->params.emplace_back(line[i].text);
-			++i;
-
-			if (i < line.size() && line[i].kind == TokenKind::Ellipsis) {
-				fail(locate(cursor, line[i]), "named variadic macro parameters (\"args...\") are not "
-					"supported; use \"...\" and __VA_ARGS__");
-			}
 			if (i < line.size() && line[i].kind == TokenKind::RParen) {
 				closed = true;
 				++i;
@@ -1082,12 +1153,11 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 		if (!macro->functionLike || !isName(token)) {
 			return std::nullopt;
 		}
-		for (size_t p = 0; p < named; ++p) {
-			if (macro->params[p] == token.text) {
-				return p;
-			}
+		const auto found = parameterIndex.find(token.text);
+		if (found != parameterIndex.end()) {
+			return found->second;
 		}
-		if (macro->variadic && token.text == "__VA_ARGS__") {
+		if (macro->variadic && token.text == macro->variadicName) {
 			return named;
 		}
 		return std::nullopt;
@@ -1099,12 +1169,15 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 		item.tok = token;
 		item.spaceBefore = i > 0 && token.spaceBefore;
 
-		if (token.text == "__VA_ARGS__" && !macro->variadic) {
+		if (token.text == "__VA_ARGS__" && !(macro->variadic && macro->variadicName == "__VA_ARGS__")) {
 			fail(locate(cursor, token), "__VA_ARGS__ can only appear in the expansion of a variadic macro");
 		}
 		if (token.kind == TokenKind::HashHash) {
 			if (i == 0 || i + 1 == body.size()) {
 				fail(locate(cursor, token), "'##' cannot appear at either end of a macro expansion");
+			}
+			if (body[i + 1].kind == TokenKind::HashHash) {
+				fail(locate(cursor, token), "pasting formed '##', which is not a valid preprocessing token");
 			}
 			item.kind = BodyKind::Paste;
 		} else if (macro->functionLike && token.kind == TokenKind::Hash) {
@@ -1126,7 +1199,8 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 	if (existing != _macros.end()) {
 		const Macro& old = *existing->second;
 		bool same = old.functionLike == macro->functionLike && old.variadic == macro->variadic
-			&& old.params == macro->params && old.body.size() == macro->body.size();
+			&& old.params == macro->params && old.variadicName == macro->variadicName
+			&& old.body.size() == macro->body.size();
 		for (size_t i = 0; same && i < old.body.size(); ++i) {
 			const BodyItem& a = old.body[i];
 			const BodyItem& b = macro->body[i];
@@ -1147,6 +1221,9 @@ bool Preprocessor::isDefinedName(std::string_view name, const Loc& at) const {
 	if (isUnsupportedBuiltin(name)) {
 		fail(at, "\"" + std::string(name) + "\" is a builtin of Apple's compiler that mslc does not "
 			"provide, so whether it is defined cannot be answered");
+	}
+	if (isAlternativeOperator(name)) {
+		fail(at, "C++ operator '" + std::string(name) + "' used as a macro name");
 	}
 	return _macros.find(name) != _macros.end() || builtinByName(name) || name == "__has_include";
 }
@@ -1294,6 +1371,7 @@ Value Preprocessor::applyBinary(BinaryOp op, Value a, Value b, bool live, const 
 			result.isUnsigned = a.isUnsigned;
 			const Wide count = b.bits;
 
+			// Apple's compiler truncates a right-shift count to 32 bits first; mslc does not.
 			if (op == BinaryOp::Shl) {
 				result.bits = count >= kWideBits ? 0 : a.bits << static_cast<unsigned>(count);
 			} else {
@@ -1830,6 +1908,7 @@ void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPT
 
 		const Macro& macro = *found->second;
 		std::vector<std::vector<PPTok>> arguments;
+		size_t heldHere = 0;
 		bool variadicOmitted = false;
 		HideSet hide;
 		Loc bodyLoc = token.loc;
@@ -1859,6 +1938,15 @@ void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPT
 			while (true) {
 				PPTok next;
 				pull(next, token.loc, macro.name);
+
+				// Every invocation being expanded keeps its arguments, and each nested one
+				// copies what is inside it, so what is held at once is bounded as a whole:
+				// by the time a nesting limit fires, the copies would already be too many.
+				if (++_heldArguments > kMaxHeldArgumentTokens) {
+					fail(token.loc, "the arguments of macro calls being expanded hold more than "
+						+ std::to_string(kMaxHeldArgumentTokens) + " tokens");
+				}
+				++heldHere;
 
 				if (next.tok.kind == TokenKind::LParen) {
 					++nesting;
@@ -1899,6 +1987,7 @@ void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPT
 		}
 
 		std::vector<PPTok> result = substitute(macro, token, arguments, variadicOmitted, bodyLoc, depth);
+		_heldArguments -= heldHere;
 
 		_expanded += result.size();
 		if (_expanded > kMaxExpandedTokens) {
@@ -1953,6 +2042,9 @@ void Preprocessor::run(std::string_view source) {
 		_roots.push_back(real.parent_path());
 	}
 	for (const std::string& directory: _options.includeDirs) {
+		if (directory.empty()) {
+			throw CompileError("an include directory is the empty string");
+		}
 		const fs::path real = fs::canonical(directory, ec);
 		if (ec || !fs::is_directory(real, ec)) {
 			throw CompileError("include directory \"" + directory + "\" does not exist or is not a directory");
@@ -1963,7 +2055,8 @@ void Preprocessor::run(std::string_view source) {
 	// Built-in macros, defined by running their #define lines through the same
 	// code a source's own would go through.
 	{
-		SourceFile& predefined = loadText("<built-in>", "", kPredefinedMacros);
+		SourceFile& predefined = loadText("<built-in>", "",
+			std::string(kPredefinedMacros) + kImplicitImportMacros);
 		processFile(predefined, internName("<built-in>"));
 		_output.clear();
 	}
@@ -1978,6 +2071,7 @@ void Preprocessor::run(std::string_view source) {
 	end.line = _output.empty() ? 1 : _output.back().line;
 	end.text = std::string_view();
 	_output.push_back(end);
+	_origins.push_back(_origins.empty() ? TokenOrigin() : _origins.back());
 }
 
 PreprocessedSource preprocess(std::string_view source, const PreprocessOptions& options) {
@@ -1986,8 +2080,22 @@ PreprocessedSource preprocess(std::string_view source, const PreprocessOptions& 
 
 	PreprocessedSource result;
 	result.tokens = state->takeOutput();
+	result.origins = state->takeOrigins();
+	result.fileNames = state->takeFileNames();
 	result.storage = state;
 	return result;
+}
+
+std::string describeOrigin(const PreprocessedSource& source, size_t tokenIndex) {
+	if (tokenIndex >= source.origins.size()) {
+		return "<unknown>";
+	}
+
+	const TokenOrigin& origin = source.origins[tokenIndex];
+	if (origin.file >= source.fileNames.size()) {
+		return "<unknown>";
+	}
+	return source.fileNames[origin.file] + ":" + std::to_string(origin.line) + ":" + std::to_string(origin.column);
 }
 
 std::string renderTokens(const std::vector<Token>& tokens) {

@@ -36,6 +36,10 @@ typedef enum {
 	MSLC_SET_IMAGES = 1,
 } MslcImageSetPolicy;
 
+/* Options are passed by pointer and new fields are appended, as sourcePath,
+ * includeDirs and includeDirCount were. A caller must be compiled against the
+ * header it links with and start from mslc_default_options(); a caller built
+ * against an older header passes a shorter struct, which mslc would read past. */
 typedef struct {
 	/* Overrides the stage when the caller knows it. MSLC_STAGE_UNKNOWN asks
 	 * mslc to infer it from the source, which works when the file declares a
@@ -60,7 +64,9 @@ typedef struct {
 
 	/* Directories searched, in order, for a quoted #include after the source's
 	 * own directory. An include may resolve only inside the source's directory
-	 * and these; an absolute path, or one that escapes them, is an error. */
+	 * and these; an absolute path, or one that escapes them, is an error. An
+	 * entry must name an existing directory; an empty string is refused rather
+	 * than read as the current directory. */
 	const char* const* includeDirs;
 	size_t includeDirCount;
 } MslcOptions;

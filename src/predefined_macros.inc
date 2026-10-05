@@ -689,3 +689,434 @@ static const char kPredefinedMacros[] = R"PREDEF(#define __AIR_ABI__ __AIR_PB_AB
 #define __WINT_WIDTH__ 32
 #define _LP64 1
 )PREDEF";
+
+// The macros the Metal front end gets from the header it imports implicitly,
+// metal_types, which -dM does not list. Found with `metal -E -dM -fno-modules` on an
+// empty file, less the table above.
+static const char kImplicitImportMacros[] = R"PREDEF(#define BFLT_DECIMAL_DIG __BFLT16_DECIMAL_DIG__
+#define BFLT_DIG __BFLT16_DIG__
+#define BFLT_EPSILON __BFLT16_EPSILON__
+#define BFLT_MANT_DIG __BFLT16_MANT_DIG__
+#define BFLT_MAX __BFLT16_MAX__
+#define BFLT_MAX_10_EXP __BFLT16_MAX_10_EXP__
+#define BFLT_MAX_EXP __BFLT16_MAX_EXP__
+#define BFLT_MIN __BFLT16_MIN__
+#define BFLT_MIN_10_EXP __BFLT16_MIN_10_EXP__
+#define BFLT_MIN_EXP __BFLT16_MIN_EXP__
+#define BFLT_RADIX __BFLT16_RADIX__
+#define CHAR_BIT __CHAR_BIT__
+#define CHAR_MAX SCHAR_MAX
+#define CHAR_MIN SCHAR_MIN
+#define FLT_DECIMAL_DIG __FLT_DECIMAL_DIG__
+#define FLT_DIG __FLT_DIG__
+#define FLT_EPSILON __FLT_EPSILON__
+#define FLT_MANT_DIG __FLT_MANT_DIG__
+#define FLT_MAX __FLT_MAX__
+#define FLT_MAX_10_EXP __FLT_MAX_10_EXP__
+#define FLT_MAX_EXP __FLT_MAX_EXP__
+#define FLT_MIN __FLT_MIN__
+#define FLT_MIN_10_EXP __FLT_MIN_10_EXP__
+#define FLT_MIN_EXP __FLT_MIN_EXP__
+#define FLT_RADIX __FLT_RADIX__
+#define FP_ILOGB0 __FP_ILOGB0__
+#define FP_ILOGBNAN __FP_ILOGBNAN__
+#define HALF_DECIMAL_DIG __HALF_DECIMAL_DIG__
+#define HALF_DIG __HALF_DIG__
+#define HALF_EPSILON __HALF_EPSILON__
+#define HALF_MANT_DIG __HALF_MANT_DIG__
+#define HALF_MAX __HALF_MAX__
+#define HALF_MAX_10_EXP __HALF_MAX_10_EXP__
+#define HALF_MAX_EXP __HALF_MAX_EXP__
+#define HALF_MIN __HALF_MIN__
+#define HALF_MIN_10_EXP __HALF_MIN_10_EXP__
+#define HALF_MIN_EXP __HALF_MIN_EXP__
+#define HALF_RADIX __HALF_RADIX__
+#define HUGE_VALBF __builtin_huge_valf16b()
+#define HUGE_VALF __builtin_huge_valf()
+#define HUGE_VALH __builtin_huge_valh()
+#define INFINITY __builtin_inff()
+#define INT_MAX __INT_MAX__
+#define INT_MIN (-__INT_MAX__ - 1)
+#define LONG_MAX __LONG_MAX__
+#define LONG_MIN (-__LONG_MAX__ - 1L)
+#define MAXBFLOAT __BFLT16_MAX__
+#define MAXFLOAT __FLT_MAX__
+#define MAXHALF __HALF_MAX__
+#define METAL_ALIGN(L) __attribute__((aligned(L)))
+#define METAL_ASM 
+#define METAL_CONST __attribute__((const))
+#define METAL_CONST_ARG(A) METAL_ENABLE_IF(_constarg_traits<decltype(A)>::check(A), "'" #A "' argument must be known at compile-time")
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+#define METAL_ENABLE_IF(P,M) __attribute__((enable_if(P, M)))
+#define METAL_EXPLICIT explicit METAL_ENABLE_IF(true, "")
+#define METAL_FUNC inline __attribute__((__always_inline__))
+#define METAL_IMPLICIT 
+#define METAL_INTERNAL 
+#define METAL_MAYBE_UNDEF __attribute__((__maybe_undef__))
+#define METAL_NON_NULL_RETURN __attribute__((returns_nonnull))
+#define METAL_NOTHROW __attribute__((nothrow))
+#define METAL_OS_LOG_FORMAT(F) __attribute__((format(metal_os_log, F, F + 1)))
+#define METAL_PURE __attribute__((pure))
+#define METAL_UNAVAILABLE(M) __attribute__((unavailable(M)))
+#define M_1_PI_BF __BFLT16_M_1_PI__
+#define M_1_PI_F __FLT_M_1_PI__
+#define M_1_PI_H __HALF_M_1_PI__
+#define M_2_PI_BF __BFLT16_M_2_PI__
+#define M_2_PI_F __FLT_M_2_PI__
+#define M_2_PI_H __HALF_M_2_PI__
+#define M_2_SQRTPI_BF __BFLT16_M_2_SQRTPI__
+#define M_2_SQRTPI_F __FLT_M_2_SQRTPI__
+#define M_2_SQRTPI_H __HALF_M_2_SQRTPI__
+#define M_E_BF __BFLT16_M_E__
+#define M_E_F __FLT_M_E__
+#define M_E_H __HALF_M_E__
+#define M_LN10_BF __BFLT16_M_LN10__
+#define M_LN10_F __FLT_M_LN10__
+#define M_LN10_H __HALF_M_LN10__
+#define M_LN2_BF __BFLT16_M_LN2__
+#define M_LN2_F __FLT_M_LN2__
+#define M_LN2_H __HALF_M_LN2__
+#define M_LOG10E_BF __BFLT16_M_LOG10E__
+#define M_LOG10E_F __FLT_M_LOG10E__
+#define M_LOG10E_H __HALF_M_LOG10E__
+#define M_LOG2E_BF __BFLT16_M_LOG2E__
+#define M_LOG2E_F __FLT_M_LOG2E__
+#define M_LOG2E_H __HALF_M_LOG2E__
+#define M_PI_2_BF __BFLT16_M_PI_2__
+#define M_PI_2_F __FLT_M_PI_2__
+#define M_PI_2_H __HALF_M_PI_2__
+#define M_PI_4_BF __BFLT16_M_PI_4__
+#define M_PI_4_F __FLT_M_PI_4__
+#define M_PI_4_H __HALF_M_PI_4__
+#define M_PI_BF __BFLT16_M_PI__
+#define M_PI_F __FLT_M_PI__
+#define M_PI_H __HALF_M_PI__
+#define M_SQRT1_2_BF __BFLT16_M_SQRT1_2__
+#define M_SQRT1_2_F __FLT_M_SQRT1_2__
+#define M_SQRT1_2_H __HALF_M_SQRT1_2__
+#define M_SQRT2_BF __BFLT16_M_SQRT2__
+#define M_SQRT2_F __FLT_M_SQRT2__
+#define M_SQRT2_H __HALF_M_SQRT2__
+#define NAN __builtin_nanf("")
+#define SCHAR_MAX __SCHAR_MAX__
+#define SCHAR_MIN (-__SCHAR_MAX__ - 1)
+#define SHRT_MAX __SHRT_MAX__
+#define SHRT_MIN (-__SHRT_MAX__ - 1)
+#define UCHAR_MAX (__SCHAR_MAX__ * 2 + 1)
+#define UINT_MAX (__INT_MAX__ * 2U + 1U)
+#define ULONG_MAX (__LONG_MAX__ * 2UL + 1UL)
+#define USHRT_MAX (__SHRT_MAX__ * 2 + 1)
+#define __HAVE_16B_COORDS__ 1
+#define __HAVE_ALWAYS_NEVER_COMPARE_FUNCTION__ 1
+#define __HAVE_ANISOTROPY_LOD_MIN_MAX__ 1
+#define __HAVE_ARBITRARY_GRID_SIZE__ 1
+#define __HAVE_ARRAYS_OF_SAMPLERS__ 1
+#define __HAVE_ARRAYS_OF_TEXTURES__ 1
+#define __HAVE_ARRAY_CONSTEXPR__ 1
+#define __HAVE_ARRAY__ 1
+#define __HAVE_ATOMIC_BOOL__ 1
+#define __HAVE_ATOMIC_FENCE__ 1
+#define __HAVE_ATOMIC_FLOAT__ 1
+#define __HAVE_ATOMIC_TEMPLATE__ 1
+#define __HAVE_ATOMIC_ULONG_MIN_MAX__ 1
+#define __HAVE_ATOMIC_ULONG__ 1
+#define __HAVE_BARRIER_MEMORY_SCOPE__ 1
+#define __HAVE_BARYCENTRIC_COORD__ 1
+#define __HAVE_BFLOAT__ 1
+#define __HAVE_BICUBIC_FILTERING__ 1
+#define __HAVE_BORDER_COLOR__ 1
+#define __HAVE_CALCULATE_LOD__ 1
+#define __HAVE_COHERENT__ 1
+#define __HAVE_COLOR_ARGUMENTS__ 1
+#define __HAVE_COMPUTE_COMMANDS_SET_IMAGEBLOCK_SIZE__ 1
+#define __HAVE_COMPUTE_COMMANDS__ 1
+#define __HAVE_COMPUTE_COMMAND_KERNEL_BUFFER_STRIDE__ 1
+#define __HAVE_COMPUTE_IMPROVED_INDIRECT__ 1
+#define __HAVE_COPY_ASSIGNABLE_TEXTURE__ 1
+#define __HAVE_DEDUCTION_GUIDES__ 1
+#define __HAVE_DEFAULT_CONSTRUCTABLE_TEXTURE__ 1
+#define __HAVE_DEPENDENT_ATTRIBUTE_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_BUFFER_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_COLOR_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_INDEX_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_MAX_TOTAL_THREADS_PER_THREADGROUP_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_PATCH_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_SAMPLER_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_TEXTURE_ATTRIBUTE__ 1
+#define __HAVE_DEPENDENT_THREADGROUP_ATTRIBUTE__ 1
+#define __HAVE_DEPRECATED_FUNC_TYPEDEFS__ 1
+#define __HAVE_DEPTH_2D_MS_ARRAY__ 1
+#define __HAVE_DEPTH_CUBE_ARRAY__ 1
+#define __HAVE_DEPTH_CUBE_READ__ 1
+#define __HAVE_DEVICE_COHERENT_READ_WRITE_TEXTURES__ 1
+#define __HAVE_DIVIDE__ 1
+#define __HAVE_DRAW_INDIRECT__ 1
+#define __HAVE_DUAL_SOURCE_BLENDING__ 1
+#define __HAVE_EARLY_FRAGMENT_TEST__ 1
+#define __HAVE_EXECUTION_UNIT__ 1
+#define __HAVE_FMAX3__ 1
+#define __HAVE_FMA__ 1
+#define __HAVE_FMEDIAN3__ 1
+#define __HAVE_FMIN3__ 1
+#define __HAVE_FUNCTION_CONSTANTS__ 1
+#define __HAVE_FUNCTION_HANDLES__ 1
+#define __HAVE_FUNCTION_POINTERS__ 1
+#define __HAVE_FUNCTION_QUALIFICATION_CXX11_ATTRIBUTES__ 1
+#define __HAVE_GET_SIZE_COMMAND_BUFFER__ 1
+#define __HAVE_GLOBAL_COMPUTE_BUILTIN_BINDINGS__ 1
+#define __HAVE_GLOBAL_RESOURCE_BINDINGS__ 1
+#define __HAVE_HOST_NAME__ 1
+#define __HAVE_IMAGEBLOCKS__ 1
+#define __HAVE_IMAGEBLOCK_CHAR_SLICES__ 1
+#define __HAVE_INCOMPLETE_POINTEE_TYPE_BUFFER_BINDING__ 1
+#define __HAVE_INDIRECT_ARGUMENT_BUFFER__ 1
+#define __HAVE_INDIRECT_WRITABLE_TEXTURES__ 1
+#define __HAVE_INTEGER_BIT_EDIT_FUNCTIONS__ 1
+#define __HAVE_INTEGER_LONG_FUNCTIONS__ 1
+#define __HAVE_INTERPOLATION_FUNCTIONS__ 1
+#define __HAVE_LOGGING__ 1
+#define __HAVE_MAD24__ 1
+#define __HAVE_MAKE_FILLED_MATRIX__ 1
+#define __HAVE_MATRIX_MULTIPLE_SCALAR_CONSTRUCTORS__ 1
+#define __HAVE_MATRIX_SCALAR_DIVISION__ 1
+#define __HAVE_MATRIX_THREADGROUP_DEFAULT_CONSTRUCTOR__ 1
+#define __HAVE_MAX3__ 1
+#define __HAVE_MAX_TOTAL_THREADS_PER_THREADGROUP__ 1
+#define __HAVE_MEDIAN3__ 1
+#define __HAVE_MEMFLAG_OPERATORS__ 1
+#define __HAVE_MEMORY_COHERENCE__ 1
+#define __HAVE_MESH__ 1
+#define __HAVE_MIN3__ 1
+#define __HAVE_MIN_LOD_CLAMP__ 1
+#define __HAVE_MTL_ACCELERATION_STRUCTURE_INSTANCE_OPTIONS__ 1
+#define __HAVE_MTL_RESOURCE_ID__ 1
+#define __HAVE_MUL24__ 1
+#define __HAVE_NESTED_STRUCT__ 1
+#define __HAVE_NEXTAFTER__ 1
+#define __HAVE_NON_CONSTEXPR_ATTRIBUTE_INDICES__ 1
+#define __HAVE_NULLPTR_T__ 1
+#define __HAVE_NULL_TEXTURE__ 1
+#define __HAVE_PACKED_VECTOR_COMPONENTS__ 1
+#define __HAVE_PACK_UNPACK_RGB10A2_SNORM_FUNCTIONS__ 1
+#define __HAVE_PIXEL_DATA_TYPES__ 1
+#define __HAVE_POSITION_INVARIANCE__ 1
+#define __HAVE_POST_DEPTH_COVERAGE__ 1
+#define __HAVE_PRIMITIVE_ID__ 1
+#define __HAVE_PROHIBIT_CXX11_DECL_SPEC_ATTRS__ 1
+#define __HAVE_QUADGROUP_BALLOT__ 1
+#define __HAVE_QUADGROUP_BROADCAST_FIRST__ 1
+#define __HAVE_QUADGROUP_IS_FIRST__ 1
+#define __HAVE_QUADGROUP_REDUCTION__ 1
+#define __HAVE_QUADGROUP_SHUFFLE_AND_FILL__ 1
+#define __HAVE_QUADGROUP_SHUFFLE_ROTATE_DOWN__ 1
+#define __HAVE_QUADGROUP_SHUFFLE_ROTATE_UP__ 1
+#define __HAVE_QUADGROUP__ 1
+#define __HAVE_RASTERIZATION_RATE__ 1
+#define __HAVE_RASTER_ORDER_GROUP__ 1
+#define __HAVE_RAYTRACING_CURVES_HINTS__ 1
+#define __HAVE_RAYTRACING_CURVES__ 1
+#define __HAVE_RAYTRACING_DIRECT_ACCESS__ 1
+#define __HAVE_RAYTRACING_EXTENDED_LIMITS__ 1
+#define __HAVE_RAYTRACING_GET_CANDIDATE_CURVE_DISTANCE__ 1
+#define __HAVE_RAYTRACING_INDIRECT_INSTANCE_BUILD__ 1
+#define __HAVE_RAYTRACING_INSTANCE_RANDOM_ACCESS__ 1
+#define __HAVE_RAYTRACING_INSTANCE_TRANSFORMS__ 1
+#define __HAVE_RAYTRACING_INTERSECTION_FUNCTION_BUFFER__ 1
+#define __HAVE_RAYTRACING_INTERSECTION_FUNCTION_HANDLES__ 1
+#define __HAVE_RAYTRACING_INTERSECTION_QUERY__ 1
+#define __HAVE_RAYTRACING_MOTION__ 1
+#define __HAVE_RAYTRACING_MULTI_LEVEL_INSTANCING__ 1
+#define __HAVE_RAYTRACING_PRIMITIVE_DATA__ 1
+#define __HAVE_RAYTRACING_RENDER__ 1
+#define __HAVE_RAYTRACING_TABLE_GET_BUFFERS__ 1
+#define __HAVE_RAYTRACING_TABLE_SET_BUFFERS__ 1
+#define __HAVE_RAYTRACING_USER_INSTANCE_ID__ 1
+#define __HAVE_RAYTRACING__ 1
+#define __HAVE_RECURSION_COMPUTE__ 1
+#define __HAVE_RECURSION_RENDER__ 1
+#define __HAVE_RELAXED_ORDER_ATOMIC__ 1
+#define __HAVE_RENDER_COMMANDS__ 1
+#define __HAVE_RENDER_COMMAND_DEPTH_BIAS__ 1
+#define __HAVE_RENDER_COMMAND_DEPTH_CLIP_MODE__ 1
+#define __HAVE_RENDER_COMMAND_DEPTH_STENCIL_STATE__ 1
+#define __HAVE_RENDER_COMMAND_MESH__ 1
+#define __HAVE_RENDER_COMMAND_RENDERING__ 1
+#define __HAVE_RENDER_COMMAND_VERTEX_BUFFER_STRIDE__ 1
+#define __HAVE_RENDER_DRAW_PATCHES_TESSELLATION_FACTOR_SCALE__ 1
+#define __HAVE_RENDER_PIPELINE_STATE__ 1
+#define __HAVE_RENDER_TARGET_ARRAY_INDEX_IN_COMPUTE_KERNELS__ 1
+#define __HAVE_RENDER_TARGET_ARRAY_INDEX__ 1
+#define __HAVE_SAMPLER_LOD_BIAS__ 1
+#define __HAVE_SAMPLER_REDUCTION__ 1
+#define __HAVE_SAMPLE_COMPARE_BIAS_OVERLOAD__ 1
+#define __HAVE_SAMPLE_COMPARE_GRADIENT2D_OVERLOAD__ 1
+#define __HAVE_SAMPLE_COMPARE_GRADIENTCUBE_OVERLOAD__ 1
+#define __HAVE_SAMPLING_INTERPOLATION_QUALIFIER_STRUCTS__ 1
+#define __HAVE_SELECT_FAST_PRECISE_FUNCTIONS__ 1
+#define __HAVE_SIMDGROUP_BALLOT_VOTE_ULONG__ 1
+#define __HAVE_SIMDGROUP_BALLOT__ 1
+#define __HAVE_SIMDGROUP_BARRIER__ 1
+#define __HAVE_SIMDGROUP_BROADCAST_FIRST__ 1
+#define __HAVE_SIMDGROUP_INFO_IN_FRAGMENT_FUNCTIONS__ 1
+#define __HAVE_SIMDGROUP_IS_FIRST__ 1
+#define __HAVE_SIMDGROUP_MATRIX__ 1
+#define __HAVE_SIMDGROUP_REDUCTION__ 1
+#define __HAVE_SIMDGROUP_SHUFFLE_AND_FILL__ 1
+#define __HAVE_SIMDGROUP_SHUFFLE_ROTATE_DOWN__ 1
+#define __HAVE_SIMDGROUP_SHUFFLE_ROTATE_UP__ 1
+#define __HAVE_SIMDGROUP__ 1
+#define __HAVE_SIMD_TYPES_PREFIX__ 1
+#define __HAVE_SPARSE_SAMPLE_COMPARE_BIAS_OVERLOAD__ 1
+#define __HAVE_SPARSE_SAMPLE_COMPARE_GRADIENT2D_OVERLOAD__ 1
+#define __HAVE_SPARSE_SAMPLE_COMPARE_GRADIENTCUBE_OVERLOAD__ 1
+#define __HAVE_SPARSE_TEXTURES__ 1
+#define __HAVE_STENCIL_FEEDBACK__ 1
+#define __HAVE_STITCHABLE_ATTRIBUTE__ 1
+#define __HAVE_TENSOR__ 1
+#define __HAVE_TESSELLATION__ 1
+#define __HAVE_TEXTURE_2D_MS_ARRAY__ 1
+#define __HAVE_TEXTURE_BUFFER__ 1
+#define __HAVE_TEXTURE_CUBE_ARRAY_RELAXED_ORDER_ATOMIC__ 1
+#define __HAVE_TEXTURE_CUBE_ARRAY_ULONG_COLOR_CHANNEL__ 1
+#define __HAVE_TEXTURE_CUBE_ARRAY__ 1
+#define __HAVE_TEXTURE_CUBE_READ__ 1
+#define __HAVE_TEXTURE_CUBE_RELAXED_ORDER_ATOMIC__ 1
+#define __HAVE_TEXTURE_CUBE_ULONG_COLOR_CHANNEL__ 1
+#define __HAVE_TEXTURE_CUBE_WRITE__ 1
+#define __HAVE_TEXTURE_READWRITE__ 1
+#define __HAVE_TEXTURE_RELAXED_ORDER_ATOMIC__ 1
+#define __HAVE_TEXTURE_ULONG_COLOR_CHANNEL__ 1
+#define __HAVE_TEXTURE_WRITABLE_FROM_FRAGMENT__ 1
+#define __HAVE_TEXTURE_WRITABLE_FROM_VERTEX__ 1
+#define __HAVE_THREADGROUP_MEMORY_IN_FRAGMENT_FUNCTIONS__ 1
+#define __HAVE_THREAD_SCOPE__ 1
+#define __HAVE_TRIG_PI__ 1
+#define __HAVE_TYPE_TRAIT_ADD_CONST__ 1
+#define __HAVE_TYPE_TRAIT_ADD_POINTER__ 1
+#define __HAVE_TYPE_TRAIT_COMMON_TYPE__ 1
+#define __HAVE_TYPE_TRAIT_IS_ABSTRACT__ 1
+#define __HAVE_TYPE_TRAIT_IS_ARRAY__ 1
+#define __HAVE_TYPE_TRAIT_IS_CONSTRUCTIBLE__ 1
+#define __HAVE_TYPE_TRAIT_REMOVE_EXTENT__ 1
+#define __HAVE_UNBOXED_PACKED_VECTORS__ 1
+#define __HAVE_UNIFORM__ 1
+#define __HAVE_UNIONS__ 1
+#define __HAVE_USER_ANNOTATION__ 1
+#define __HAVE_UTILITY_INDEX_SEQUENCE__ 1
+#define __HAVE_VERTEX_AMPLIFICATION__ 1
+#define __HAVE_VERTEX_VALUE__ 1
+#define __HAVE_VIEWPORT_ARRAY_INDEX__ 1
+#define __HAVE_VISIBLE_FUNCTIONS__ 1
+#define __HAVE_VISIBLE_FUNCTION_TABLE_RENDER__ 1
+#define __HAVE_VISIBLE_FUNCTION_TABLE__ 1
+#define __METAL_CONFIG 
+#define __METAL_EXTENDED_VECTOR 
+#define __METAL_PACKED_VECTOR 
+#define __METAL_TESSELLATION 
+#define __METAL_TYPES 
+#define __METAL_TYPE_TRAITS 
+#define is_function_constant_defined(c) __metal_is_function_constant_defined(c)
+)PREDEF";
+
+// What `#include <metal_stdlib>` and `#include <metal_matrix>` add, found the same way
+// with that include in the file.
+static const char kMetalStdlibMacros[] = R"PREDEF(#define METAL_ARG_UNIFORM(x,N) METAL_ENABLE_IF(_is_arg_uniform<remove_addrspace_t<decltype(x)>>::check(x), "operand " #N " is not a uniform value")
+#define METAL_VALID_COMPARE_EXCHANGE_FAILURE_ORDER(O) METAL_ENABLE_IF(O == memory_order_relaxed, "'" #O "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_VALID_COMPARE_EXCHANGE_SUCCESS_ORDER(S,_) METAL_ENABLE_IF(S == memory_order_relaxed, "'" #S "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_VALID_EXCHANGE_ORDER(O) METAL_ENABLE_IF(O == memory_order_relaxed, "'" #O "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_VALID_LEVEL_ARG(A) 
+#define METAL_VALID_LOAD_ORDER(O) METAL_ENABLE_IF(O == memory_order_relaxed, "'" #O "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_VALID_LOD_ARG(A) 
+#define METAL_VALID_MODIFY_ORDER(O) METAL_ENABLE_IF(O == memory_order_relaxed, "'" #O "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_VALID_RENDER_TARGET(A,E,T) METAL_ENABLE_IF(__metal_struct_has_render_target(index, (thread E *)nullptr, (thread T *)nullptr), "'" #A "' with right type must exist in the layout_implicit imageblock data struct")
+#define METAL_VALID_STORE_ORDER(O) METAL_ENABLE_IF(O == memory_order_relaxed, "'" #O "' argument must be 'metal::memory_order_relaxed'")
+#define METAL_ZERO_ARG(A) METAL_ENABLE_IF(_is_zero(A), "'" #A "' argument value must be 0")
+#define _METAL___MDSPAN_EXTENTS_H 
+#define __BITS_METAL_DEPTH2D 
+#define __BITS_METAL_DEPTH2D_ARRAY 
+#define __BITS_METAL_DEPTH2D_MS 
+#define __BITS_METAL_DEPTH2D_MS_ARRAY 
+#define __BITS_METAL_DEPTHCUBE 
+#define __BITS_METAL_DEPTHCUBE_ARRAY 
+#define __BITS_METAL_TEXTURE 
+#define __BITS_METAL_TEXTURE1D 
+#define __BITS_METAL_TEXTURE1D_ARRAY 
+#define __BITS_METAL_TEXTURE2D 
+#define __BITS_METAL_TEXTURE2D_ARRAY 
+#define __BITS_METAL_TEXTURE2D_MS 
+#define __BITS_METAL_TEXTURE2D_MS_ARRAY 
+#define __BITS_METAL_TEXTURE3D 
+#define __BITS_METAL_TEXTURECUBE 
+#define __BITS_METAL_TEXTURECUBE_ARRAY 
+#define __BITS_METAL_TEXTURE_BUFFER 
+#define __METAL_ARRAY 
+#define __METAL_ASSERT 
+#define __METAL_ATOMIC 
+#define __METAL_COMMAND_BUFFER 
+#define __METAL_COMMON 
+#define __METAL_COMPUTE 
+#define __METAL_COOPERATIVE_TENSOR 
+#define __METAL_CURVES 
+#define __METAL_FUNCTIONAL 
+#define __METAL_GEOMETRIC 
+#define __METAL_GRAPHICS 
+#define __METAL_IMAGEBLOCKS 
+#define __METAL_INITIALIZER_LIST 
+#define __METAL_INTEGER 
+#define __METAL_INTERPOLATE 
+#define __METAL_LIMITS 
+#define __METAL_LOGGING 
+#define __METAL_MATH 
+#define __METAL_MATRIX_H 
+#define __METAL_MAYBE_FAST_MATH__ __METAL_FAST_MATH__
+#define __METAL_MESH 
+#define __METAL_NUMERIC 
+#define __METAL_PACK 
+#define __METAL_PIXEL 
+#define __METAL_QUADGROUP 
+#define __METAL_RAYTRACING 
+#define __METAL_RELATIONAL 
+#define __METAL_SIMDGROUP 
+#define __METAL_SIMDGROUP_MATRIX 
+#define __METAL_STDLIB 
+#define __METAL_TENSOR 
+#define __METAL_TEXTURE 
+#define __METAL_UNIFORM 
+#define __METAL_UTILITY 
+#define __METAL_VERTEX_VALUE 
+#define __METAL_VISIBLE_FUNCTION_TABLE 
+#define _is_color_texture_atomic_channel_type(_t) (is_color_texture_atomic_channel_v<_t>)
+#define _is_valid_copy_assign(_a,_c) _is_valid_copy_assign_access(_a)
+#define _is_valid_copy_assign_access(a) _is_any_of(a, access::read, access::sample, access::write, access::read_write)
+#define _is_valid_default_construct(_a,_c) _is_valid_default_construct_access(_a)
+#define _is_valid_default_construct_access(_a) _is_any_of(_a, access::read, access::sample, access::write, access::read_write)
+#define _is_valid_depth_query(_a,_c) _is_valid_depth_query_access(_a)
+#define _is_valid_depth_query_access(_a) _is_any_of(_a, access::sample, access::read)
+#define _is_valid_gather(_a,_c) _is_valid_gather_access(_a) && _is_any_of(_c, memory_coherence_threadgroup)
+#define _is_valid_gather_access(_a) _is_any_of(_a, access::sample)
+#define _is_valid_imageblock_slice_write(_e,_t,_c) (is_color_texture_imageblock_slice_storage_valid_v<_e, _t>) && _is_any_of(_c, memory_coherence_threadgroup)
+#define _is_valid_imageblock_slice_write_access(_e,_t) (is_color_texture_imageblock_slice_storage_valid_v<_e, _t>)
+#define _is_valid_memory_coherence(_c) _is_any_of(_c, memory_coherence_threadgroup, memory_coherence_device)
+#define _is_valid_ms_query(_a,_c) _is_valid_ms_query_access(_a)
+#define _is_valid_ms_query_access(_a) _is_any_of(_a, access::read)
+#define _is_valid_read(_a,_c) _is_valid_read_access(_a)
+#define _is_valid_read_access(_a) _is_any_of(_a, access::sample, access::read, access::read_write)
+#define _is_valid_sample(_a,_c) _is_valid_sample_access(_a) && _is_any_of(_c, memory_coherence_threadgroup)
+#define _is_valid_sample_access(_a) _is_any_of(_a, access::sample)
+#define _is_valid_texture_buffer_query(_a,_c) _is_valid_texture_buffer_query_access(_a)
+#define _is_valid_texture_buffer_query_access(_a) _is_any_of(_a, access::read, access::write, access::read_write)
+#define _is_valid_write(_a,_c) _is_valid_write_access(_a)
+#define _is_valid_write_access(_a) _is_any_of(_a, access::write, access::read_write)
+#define assert(condition) ((void) 0)
+)PREDEF";
+static const char kMetalMatrixMacros[] = R"PREDEF(#define __METAL_FUNCTIONAL 
+#define __METAL_GEOMETRIC 
+#define __METAL_INITIALIZER_LIST 
+#define __METAL_LIMITS 
+#define __METAL_MATH 
+#define __METAL_MATRIX_H 
+#define __METAL_MAYBE_FAST_MATH__ __METAL_FAST_MATH__
+#define __METAL_NUMERIC 
+#define __METAL_RELATIONAL 
+#define __METAL_UTILITY 
+)PREDEF";

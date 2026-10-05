@@ -31,6 +31,9 @@ public:
 
 	TranslationUnit parse();
 
+	// Index of the token the parser is at, which is the one a failure is about.
+	size_t position() const { return _position; }
+
 private:
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;

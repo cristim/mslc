@@ -109,7 +109,16 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		const mslc::PreprocessedSource preprocessed = mslc::preprocess(view, preprocessOptions);
 
 		mslc::Parser parser(preprocessed.tokens);
-		const mslc::TranslationUnit unit = parser.parse();
+		// A parse error is about the token the parser stopped at, which the
+		// preprocessor can place in the file it was written in.
+		const mslc::TranslationUnit unit = [&]() {
+			try {
+				return parser.parse();
+			} catch (const mslc::CompileError& error) {
+				throw mslc::CompileError(mslc::describeOrigin(preprocessed, parser.position()) + ": "
+					+ error.what());
+			}
+		}();
 
 		const std::vector<const mslc::FunctionDecl*> entryPoints = mslc::selectEntryPoints(unit,
 			stageFromApi(effective.stage));
