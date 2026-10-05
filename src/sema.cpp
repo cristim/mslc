@@ -1505,7 +1505,8 @@ namespace {
 
 	// The struct an expression's value is, or null when it is not one. A '.' on
 	// anything else is a swizzle, which is why this is asked before any code for
-	// the left side is emitted.
+	// the left side is emitted. A member is never a struct: a struct field of
+	// struct type is rejected where the struct is declared.
 	const StructDecl* Emitter::structOf(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: {
@@ -1520,20 +1521,6 @@ namespace {
 
 			// An element of a buffer has the buffer's own type.
 			case ExpressionKind::Index: return structOf(*expression.left);
-
-			case ExpressionKind::Member: {
-				const StructDecl* outer = structOf(*expression.left);
-				if (!outer) {
-					return nullptr;
-				}
-				std::string declName;
-				const size_t field = fieldIndexOf(*outer, expression.memberName, declName);
-				if (field == outer->fields.size()) {
-					return nullptr;
-				}
-				const std::string& name = outer->fields[field].type.namedType;
-				return name.empty() ? nullptr : _unit.findStruct(name);
-			}
 
 			default: return nullptr;
 		}
