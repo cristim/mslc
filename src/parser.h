@@ -2,8 +2,11 @@
 
 #include "ast.h"
 
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <map>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -25,6 +28,20 @@ class Parser {
 	std::vector<Token> _tokens;
 	size_t _position = 0;
 	TranslationUnit _unit;
+
+	// Names the program has given a type with typedef, and the enums it declared.
+	// An enum's constants are folded as they are read and spelled as integer
+	// literals wherever they are used, so nothing after the parser sees them. The
+	// enum types themselves are only remembered by name, so that using one as a
+	// type is reported as what it is.
+	std::map<std::string, Type> _typedefs;
+	std::map<std::string, std::string> _enumTypes; // name or typedef name -> tag
+	std::map<std::string, int64_t> _enumConstants;
+
+	// Every file-scope name and what it names, so a typedef or an enum constant
+	// that collides with another declaration is reported, as it is in Apple's
+	// compiler, instead of the later one silently winning.
+	std::map<std::string, std::string> _declared;
 
 public:
 	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) {}
@@ -56,6 +73,28 @@ private:
 	// Top-level declarations
 	void parseDeclaration();
 	StructDecl parseStructDeclaration();
+	void parseStructBody(StructDecl& decl);
+	void parseTypedef();
+
+	// "enum Tag { A, B = 2 }" up to and including the closing brace, or just
+	// "enum Tag" when there is no brace, which says so in hadBody. Returns the
+	// tag, empty for an enum without one.
+	std::string parseEnumDeclaration(bool& hadBody);
+
+	// Records a file-scope name, or throws when it is already taken by something
+	// the typedef and enum support has to keep distinct from it.
+	void declareName(const std::string& name, const char* what);
+
+	// Throws when a variable or parameter would hide a typedef or an enum constant.
+	void rejectShadowing(const std::string& name) const;
+
+	// Resolves a scalar, vector, matrix or typedef name to its type.
+	bool resolveTypeName(std::string_view text, Type& out) const;
+
+	// A constant integer expression: literals, enum constants and the operators
+	// on them. Anything that is not a constant is a CompileError.
+	int64_t evaluateConstant(const Expression& expression, bool nested) const;
+	int64_t parseConstantIndex(const std::string& context);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	VariableDeclaration parseGlobalDeclaration();
 
