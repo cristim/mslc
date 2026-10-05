@@ -2841,11 +2841,10 @@ namespace {
 	}
 
 	// Locations are numbered by declaration order, where Apple pairs a vertex
-	// output with a fragment input by field name and type. The two agree when the
-	// fragment's fields are a leading run of the vertex function's, and any other
-	// pairing in one module is reported rather than wired by position. Every vertex
-	// function is checked against every fragment one, since the module does not say
-	// which pipelines pair them.
+	// output with a fragment input by field name and type. A vertex and a fragment
+	// function pair when every field the fragment reads is one the vertex function
+	// writes, and such a pair agrees only when the fragment's fields are a leading
+	// run of the vertex function's. A fragment in another library cannot be checked.
 	void Emitter::checkStageInterfacesAgree() const {
 		const auto interfaceFields = [this](const std::string& name) {
 			std::vector<std::pair<std::string, std::string>> fields;
@@ -2871,8 +2870,17 @@ namespace {
 
 				const auto outputs = interfaceFields(vertex->returnType.namedType);
 				for (const Parameter& parameter: fragment->parameters) {
+					if (!parameter.attributes.stageIn) {
+						continue;
+					}
+
+					// Apple pairs by name and type, so a fragment reading a field this
+					// vertex function does not write is not its pipeline partner.
 					const auto inputs = interfaceFields(parameter.type.namedType);
-					if (parameter.attributes.stageIn && std::mismatch(inputs.begin(), inputs.end(),
+					const bool pairs = std::all_of(inputs.begin(), inputs.end(), [&](const auto& input) {
+						return std::find(outputs.begin(), outputs.end(), input) != outputs.end();
+					});
+					if (pairs && std::mismatch(inputs.begin(), inputs.end(),
 						outputs.begin(), outputs.end()).first != inputs.end()) {
 						throw CompileError("vertex function \"" + vertex->name + "\" returns "
 							+ vertex->returnType.namedType + " and fragment function \"" + fragment->name
@@ -2913,6 +2921,13 @@ namespace {
 		Id initial = InvalidId;
 		if (declaration.initializer) {
 			const Id initializer = emitExpression(*declaration.initializer);
+			// convert() has no struct form and would emit an OpBitcast between them.
+			if (!declaration.type.namedType.empty() && _builder.typeOf(initializer) != typeId) {
+				throw CompileError("local \"" + declaration.name + "\" of type "
+					+ typeName(declaration.type) + " is initialised from another struct, or from one "
+					"read straight from a buffer, whose layout differs; mslc does not copy between "
+					"them yet");
+			}
 			initial = convert(initializer, _builder.typeOf(initializer), typeId);
 		} else {
 			initial = _types.zero(typeId);
