@@ -1103,6 +1103,7 @@ namespace {
 		Id emitCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
+		Id emitConstructList(const Expression& expression, Id toType);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
@@ -1226,11 +1227,9 @@ namespace {
 		const uint32_t toWidth = _types.vectorWidth(toType);
 		if (fromWidth != toWidth && (fromWidth > 1 || toWidth > 1)) {
 			throw CompileError(fromWidth == 1 || toWidth == 1
-				? "a scalar cannot be converted to a vector; mslc builds a vector from a "
-					"list of values, which it does not do yet"
+				? "a scalar cannot be converted to a vector"
 				: "a vector of " + std::to_string(fromWidth) + " components cannot be "
-					"converted to one of " + std::to_string(toWidth) + "; mslc builds a "
-					"vector from a list of values, which it does not do yet");
+					"converted to one of " + std::to_string(toWidth));
 		}
 
 		// A bool is neither floating point nor an integer, and no convert opcode
@@ -1710,12 +1709,8 @@ namespace {
 				"value to put in it; write the value you want, as " + spelled + "(0)");
 		}
 
-		// The list form, float4(a, b, c, 1), is a different capability: it builds a
-		// vector from one value per component rather than by broadcast.
 		if (expression.arguments.size() > 1) {
-			throw CompileError(spelled + " built from " + std::to_string(expression.arguments.size())
-				+ " values is not lowered yet; one value broadcasts, which is what "
-				+ spelled + "(0) does");
+			return emitConstructList(expression, toType);
 		}
 
 		const Id value = emitExpression(*expression.arguments.front());
@@ -1726,6 +1721,52 @@ namespace {
 		}
 
 		return convert(value, fromType, toType);
+	}
+
+	// float4(v3, 1), float4(v2, v2), float3(f, v2): the pieces fill the components
+	// in the order written. Apple's compiler converts a scalar piece but takes a
+	// vector piece only of the target's own component type, and the widths have to
+	// add up to the target's; mslc accepts the same and rejects the rest.
+	Id Emitter::emitConstructList(const Expression& expression, Id toType) {
+		const std::string spelled = typeName(*expression.constructType);
+		const Id component = _types.componentOf(toType);
+		if (component == InvalidId) {
+			throw CompileError(spelled + " is built from one value, and this passes "
+				+ std::to_string(expression.arguments.size()));
+		}
+
+		std::vector<uint32_t> pieces;
+		uint32_t components = 0;
+		for (const ExpressionPtr& argument: expression.arguments) {
+			const Id value = emitExpression(*argument);
+			const Id type = _builder.typeOf(value);
+
+			if (_types.componentOf(type) != InvalidId) {
+				if (_types.componentOf(type) != component) {
+					throw CompileError("a vector piece of " + spelled + " has to have its "
+						"component type; only a scalar piece is converted");
+				}
+				pieces.push_back(value);
+				components += _types.vectorWidth(type);
+				continue;
+			}
+
+			if (_types.isAggregate(type)) {
+				throw CompileError(spelled + " is built from scalars and vectors, not from "
+					"a matrix or a struct");
+			}
+
+			pieces.push_back(convert(value, type, component));
+			components += 1;
+		}
+
+		const uint32_t width = _types.vectorWidth(toType);
+		if (components != width) {
+			throw CompileError(spelled + " built from " + std::to_string(components)
+				+ " components needs " + std::to_string(width));
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, pieces);
 	}
 
 	Id Emitter::emitUnary(const Expression& expression) {
