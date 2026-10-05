@@ -33,17 +33,15 @@ namespace {
 	constexpr size_t kMaxConditionalDepth = 1000;
 	constexpr size_t kMaxExpressionDepth = 200;
 
-	// <simd/simd.h> as the Metal toolchain ships it: the guard macros and the matrix
-	// typedefs. Its vector typedefs (vector_float4, simd_uint2) are not here because
-	// Apple's compiler has them without any include, so the parser has them too.
-	// Written as the source it stands for, so the parser reads the typedefs like
-	// any other and the preprocessor needs no second path for them.
-	constexpr char kSimdHeader[] = R"SIMD(#include <metal_matrix>
-#ifndef __SIMD_HEADER__
-#define __SIMD_HEADER__
+	// The simd headers as the Metal toolchain ships them: each has its own guard
+	// macro, and <simd/simd.h> includes the other three. Only the matrix typedefs
+	// are declarations; the vector typedefs (vector_float4, simd_uint2) are not here
+	// because Apple's compiler has them without any include, so the parser has them
+	// too. They are written as the source they stand for, so the parser reads the
+	// typedefs like any other and the preprocessor needs no second path for them.
+	constexpr char kSimdMatrixTypesHeader[] = R"SIMD(#ifndef __SIMD_MATRIX_TYPES_HEADER__
 #define __SIMD_MATRIX_TYPES_HEADER__
-#define __SIMD_PACKED_HEADER__
-#define __SIMD_VECTOR_TYPES_HEADER__
+#include <metal_matrix>
 typedef half2x2 matrix_half2x2;
 typedef half3x2 matrix_half3x2;
 typedef half4x2 matrix_half4x2;
@@ -53,7 +51,6 @@ typedef half4x3 matrix_half4x3;
 typedef half2x4 matrix_half2x4;
 typedef half3x4 matrix_half3x4;
 typedef half4x4 matrix_half4x4;
-
 typedef float2x2 matrix_float2x2;
 typedef float3x2 matrix_float3x2;
 typedef float4x2 matrix_float4x2;
@@ -63,7 +60,6 @@ typedef float4x3 matrix_float4x3;
 typedef float2x4 matrix_float2x4;
 typedef float3x4 matrix_float3x4;
 typedef float4x4 matrix_float4x4;
-
 typedef half2x2 simd_half2x2;
 typedef half3x2 simd_half3x2;
 typedef half4x2 simd_half4x2;
@@ -73,7 +69,6 @@ typedef half4x3 simd_half4x3;
 typedef half2x4 simd_half2x4;
 typedef half3x4 simd_half3x4;
 typedef half4x4 simd_half4x4;
-
 typedef float2x2 simd_float2x2;
 typedef float3x2 simd_float3x2;
 typedef float4x2 simd_float4x2;
@@ -86,13 +81,35 @@ typedef float4x4 simd_float4x4;
 #endif
 )SIMD";
 
-	constexpr char kBuiltinHeaderList[] = "<metal_stdlib>, <metal_matrix> and <simd/simd.h>";
+	constexpr char kSimdPackedHeader[] = R"SIMD(#ifndef __SIMD_PACKED_HEADER__
+#define __SIMD_PACKED_HEADER__
+#endif
+)SIMD";
+
+	constexpr char kSimdVectorTypesHeader[] = R"SIMD(#ifndef __SIMD_VECTOR_TYPES_HEADER__
+#define __SIMD_VECTOR_TYPES_HEADER__
+#endif
+)SIMD";
+
+	constexpr char kSimdHeader[] = R"SIMD(#ifndef __SIMD_HEADER__
+#define __SIMD_HEADER__
+#include <simd/matrix_types.h>
+#include <simd/packed.h>
+#include <simd/vector_types.h>
+#endif
+)SIMD";
+
+	constexpr char kBuiltinHeaderList[] = "<metal_stdlib>, <metal_matrix>, <simd/simd.h>, <simd/matrix_types.h>, "
+		"<simd/packed.h> and <simd/vector_types.h>";
 
 	// The text of a header mslc has built in, or null for any other name.
 	const char* builtinHeaderText(const std::string& name) {
 		if (name == "<metal_stdlib>") { return kMetalStdlibMacros; }
 		if (name == "<metal_matrix>") { return kMetalMatrixMacros; }
 		if (name == "<simd/simd.h>") { return kSimdHeader; }
+		if (name == "<simd/matrix_types.h>") { return kSimdMatrixTypesHeader; }
+		if (name == "<simd/packed.h>") { return kSimdPackedHeader; }
+		if (name == "<simd/vector_types.h>") { return kSimdVectorTypesHeader; }
 		return nullptr;
 	}
 

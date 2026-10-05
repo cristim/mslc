@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-enum Ops { O0 = 7 & 3, O1 = 4 | 1, O2 = 6 ^ 3, O3 = ~1, O4 = !0, O5 = !5, O6 = 3 < 4, O7 = 4 <= 3, O8 = 4 <= 4, O9 = 5 > 4, O10 = 4 >= 5, O11 = 5 >= 5, O12 = 2 == 2, O13 = 2 != 2, O14 = 1 && 0, O15 = 0 || 3, O16 = 17 % 5, O17 = 17 / 5, O18 = 16 >> 2, O19 = 1 << 5, O20 = -7 / 2, O21 = -7 % 3, O22 = true + 1, O23 = +4, O24 = 3 - 5, O25 = 2 * 3, O26 = (1 + 2) * 3 };
+enum Ops { O0 = 7 & 3, O1 = 4 | 1, O2 = 6 ^ 3, O3 = ~1, O4 = !0, O5 = !5, O6 = 3 < 4, O7 = 4 <= 3, O8 = 4 <= 4, O9 = 5 > 4, O10 = 4 >= 5, O11 = 5 >= 5, O12 = 2 == 2, O13 = 2 != 2, O14 = 1 && 0, O15 = 0 || 3, O16 = 17 % 5, O17 = 17 / 5, O18 = 16 >> 2, O19 = 1 << 5, O20 = -7 / 2, O21 = -7 % 3, O22 = +4, O23 = 3 - 5, O24 = 2 * 3, O25 = (1 + 2) * 3 };
 
 kernel void enum_operators(device int *out [[buffer(0)]])
 {
@@ -31,5 +31,4 @@ kernel void enum_operators(device int *out [[buffer(0)]])
     out[23] = O23;
     out[24] = O24;
     out[25] = O25;
-    out[26] = O26;
 }

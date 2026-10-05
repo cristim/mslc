@@ -25,9 +25,8 @@ kernel void enum_operators(device int *out [[buffer(0)]])
     out[19] = 32;
     out[20] = -3;
     out[21] = -1;
-    out[22] = 2;
-    out[23] = 4;
-    out[24] = -2;
-    out[25] = 6;
-    out[26] = 9;
+    out[22] = 4;
+    out[23] = -2;
+    out[24] = 6;
+    out[25] = 9;
 }

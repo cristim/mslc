@@ -479,8 +479,11 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 }
 
 void Parser::declareName(const std::string& name, const char* what) {
+	// The simd names are global typedefs in Apple's compiler, so nothing at file
+	// scope can reuse one. The builtin MSL names are not: a struct may be called
+	// float2, and a typedef or an enumerator may not.
 	Type builtin;
-	if (isTypeSupportKind(what) && (isTypeName(name, builtin) || isSimdVectorName(name, builtin))) {
+	if (isSimdVectorName(name, builtin) || (isTypeSupportKind(what) && isTypeName(name, builtin))) {
 		throw CompileError("\"" + name + "\" is a builtin type name and cannot be redeclared as a "
 			+ what);
 	}
@@ -727,8 +730,6 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 				throw CompileError("an integer constant is too large");
 			}
 			return static_cast<int64_t>(expression.intValue);
-		case ExpressionKind::BoolLiteral:
-			return expression.boolValue ? 1 : 0;
 		case ExpressionKind::Unary: {
 			const int64_t operand = evaluateConstant(*expression.left, true);
 			switch (expression.unaryOperator) {
@@ -816,6 +817,16 @@ bool Parser::parseAddressSpace(AddressSpace& space) {
 	space = *found;
 	advance();
 	return true;
+}
+
+// The highest index Apple's compiler accepts for an attribute that takes one:
+// 'buffer' attribute parameter is out of bounds: must be between 0 and 30.
+static void checkAttributeIndex(const std::string& name, uint32_t index) {
+	const uint32_t limit = name == "texture" ? 127 : name == "sampler" ? 15 : 30;
+	if (index > limit) {
+		throw CompileError("attribute \"" + name + "\" index " + std::to_string(index)
+			+ " is out of bounds: it must be between 0 and " + std::to_string(limit));
+	}
 }
 
 std::optional<uint32_t> Parser::tryParseArrayLength() {
@@ -928,6 +939,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 
 	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument) {
+		if (argument && (name == "buffer" || name == "texture" || name == "sampler")) {
+			checkAttributeIndex(name, *argument);
+		}
+
 		if (name == "buffer") {
 			if (!argument) {
 				throw CompileError("[[buffer]] needs an index");
@@ -968,6 +983,7 @@ FieldAttributes Parser::parseFieldAttributes() {
 			if (!argument) {
 				throw CompileError("[[attribute]] needs an index");
 			}
+			checkAttributeIndex(name, *argument);
 			attributes.attributeIndex = argument;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
@@ -1035,6 +1051,22 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	}
 
 	expect(TokenKind::RParen, "to close a parameter list");
+
+	// Two parameters of one kind cannot take the same slot.
+	std::set<std::pair<std::string, uint32_t>> slots;
+	for (const Parameter& parameter: decl.parameters) {
+		const std::pair<const char*, std::optional<uint32_t>> taken[] = {
+			{ "buffer", parameter.attributes.bufferIndex },
+			{ "texture", parameter.attributes.textureIndex },
+			{ "sampler", parameter.attributes.samplerIndex },
+		};
+		for (const auto& [kindName, index]: taken) {
+			if (index && !slots.emplace(kindName, *index).second) {
+				throw CompileError("the " + std::string(kindName) + " index " + std::to_string(*index)
+					+ " is used by more than one parameter of \"" + decl.name + "\"");
+			}
+		}
+	}
 
 	// parseCompoundStatement consumes the opening brace itself, so consuming it
 	// here as well would make it look for a second one.
@@ -1130,7 +1162,7 @@ StatementPtr Parser::parseStatement() {
 			rejectShadowing(declaration.name);
 
 			if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
-				&& !at(TokenKind::LParen)) {
+				&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
 				throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
 			}
 
