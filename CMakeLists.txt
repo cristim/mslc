@@ -38,6 +38,12 @@ target_link_libraries(mslc-corpus PRIVATE mslc)
 
 enable_testing()
 
+# The library's preprocessing options on their own; the CLI always sets them
+# together.
+add_executable(mslc-api-test tests/preprocess_api.cpp)
+target_link_libraries(mslc-api-test PRIVATE mslc)
+add_test(NAME api/preprocess COMMAND mslc-api-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/include)
+
 # Tests that validate SPIR-V fail, never skip, when this is not found.
 find_program(SPIRV_VAL spirv-val)
 if(NOT SPIRV_VAL)
@@ -76,6 +82,34 @@ foreach(probe IN LISTS probes)
 		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/probes
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
 endforeach()
+
+# A source that uses macros must compile to the same module as the source with them
+# expanded by hand: one test per tests/equivalence/<name>.macro.metal, against its
+# <name>.expanded.metal.
+file(GLOB equivalences CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.macro.metal)
+foreach(macro IN LISTS equivalences)
+	get_filename_component(name ${macro} NAME)
+	string(REGEX REPLACE "\\.macro\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${macro}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.expanded.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
+# Negative control: a pair that does differ must fail, or the comparison above
+# could not tell a macro that expands wrongly from one that expands right.
+add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DSPIRV_DIS=${SPIRV_DIS}
+	-DMACRO=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/negative/differs.macro.metal
+	-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/negative/differs.expanded.metal
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/negative
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+set_tests_properties(equivalence-negative-control/differs PROPERTIES
+	PASS_REGULAR_EXPRESSION "sources differ")
 
 # Harness self-test: a compiler that prints the expected diagnostic and then
 # crashes must fail an "error" probe, not pass it.
