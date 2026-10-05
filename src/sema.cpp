@@ -900,6 +900,16 @@ namespace {
 		bool boolean = false;
 	};
 
+	// An Input or Output variable carrying one value across a stage boundary: a
+	// returned value, or one field of a returned or [[stage_in]] struct. The
+	// variable's type can differ from the value's, because a half crosses as a
+	// float.
+	struct StageVariable {
+		Id variable = InvalidId;
+		Id interfaceType = InvalidId;
+		Id valueType = InvalidId;
+	};
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -947,6 +957,13 @@ namespace {
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
 
+		// What a return statement writes: one variable for a returned scalar or
+		// vector, or one per field of a returned struct. Empty for a void function.
+		std::vector<StageVariable> _outputs;
+		// The fragment function's [[stage_in]] parameter and one Input per field.
+		const Parameter* _stageIn = nullptr;
+		std::vector<StageVariable> _stageInputs;
+
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
 			const std::vector<const FunctionDecl*>& entryPoints,
@@ -983,6 +1000,15 @@ namespace {
 		FoldedConstant foldBinary(const Expression& expression);
 		FoldedConstant foldUnary(const Expression& expression);
 		void declareParameters();
+		const StructDecl* structValue(const Type& type) const;
+		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
+			const std::string& what);
+		std::vector<StageVariable> declareStageStruct(const StructDecl& decl,
+			spirv::StorageClassValue storageClass);
+		void declareStageOutputs();
+		void loadStageInputs();
+		void emitReturn(const Statement& statement);
+		void checkStageInterfacesAgree() const;
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
@@ -2332,7 +2358,8 @@ namespace {
 
 		for (const Parameter& parameter: entryPoint.parameters) {
 			if (parameter.attributes.bufferIndex || parameter.attributes.textureIndex
-				|| parameter.attributes.samplerIndex || parameter.attributes.builtin) {
+				|| parameter.attributes.samplerIndex || parameter.attributes.builtin
+				|| parameter.attributes.stageIn) {
 				continue;
 			}
 
@@ -2350,6 +2377,31 @@ namespace {
 
 		for (size_t index = 0; index < _entryPoint->parameters.size(); ++index) {
 			const Parameter& parameter = _entryPoint->parameters[index];
+
+			if (parameter.attributes.stageIn) {
+				if (_entryPoint->stage != Stage::Fragment) {
+					throw CompileError("[[stage_in]] on a "
+						+ std::string(_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
+						+ " function is not lowered yet (parameter \"" + parameter.name
+						+ "\"); mslc lowers it on a fragment function only");
+				}
+
+				if (_stageIn) {
+					throw CompileError("a fragment function takes one [[stage_in]] parameter, and \""
+						+ _entryPoint->name + "\" has a second (\"" + parameter.name + "\")");
+				}
+
+				const StructDecl* decl = structValue(parameter.type);
+				if (!decl) {
+					throw CompileError("[[stage_in]] parameter \"" + parameter.name + "\" is a "
+						+ typeName(parameter.type) + "; mslc lowers a [[stage_in]] struct and no "
+							"other type");
+				}
+
+				_stageIn = &parameter;
+				_stageInputs = declareStageStruct(*decl, spirv::StorageClass::Input);
+				continue;
+			}
 
 			if (parameter.attributes.builtin) {
 				const spirv::BuiltInValue spvBuiltin = [&]() {
@@ -2582,6 +2634,257 @@ namespace {
 		}
 	}
 
+	// The struct a type names when it is a struct value, and not a pointer to one
+	// or an array of them.
+	const StructDecl* Emitter::structValue(const Type& type) const {
+		return type.isPointer || type.arrayLength ? nullptr : _unit.findStruct(type.namedType);
+	}
+
+	// A half crosses as a float: Vulkan's shaderFloat16 does not cover the Input
+	// and Output storage classes, which need storageInputOutput16, a feature a
+	// device need not have, and widening a half is exact. Narrower integers,
+	// 64-bit values, bools and anything wider than a vector are reported rather
+	// than given a layout guessed at.
+	StageVariable Emitter::declareStageVariable(const Type& type,
+		spirv::StorageClassValue storageClass, const std::string& what) {
+
+		const uint32_t bits = scalarBitWidth(type.scalar);
+		if (type.isPointer || type.arrayLength || !type.namedType.empty() || type.isMatrix()
+			|| type.scalar == ScalarKind::Bool || (bits != 32 && type.scalar != ScalarKind::Half)) {
+			throw CompileError(what + " is a " + typeName(type) + ", which mslc does not pass "
+				"between stages yet; it passes a scalar or a vector of 32-bit components or of half");
+		}
+
+		Type carried = type;
+		if (carried.scalar == ScalarKind::Half) {
+			carried.scalar = ScalarKind::Float;
+		}
+
+		StageVariable stage;
+		stage.valueType = declaredTypeOf(type);
+		stage.interfaceType = declaredTypeOf(carried);
+		stage.variable = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(storageClass, stage.interfaceType), { static_cast<uint32_t>(storageClass) });
+		_interface.push_back(stage.variable);
+		return stage;
+	}
+
+	// One variable per field. The [[position]] field is a builtin, Position on a
+	// vertex output and FragCoord on a fragment input; every other field takes the
+	// next Location in declaration order, which is how Iridium numbers them on
+	// both sides (indium src/iridium/air.cpp: the struct return loop and the
+	// air.fragment_input case), so the two stages agree when they share a struct.
+	std::vector<StageVariable> Emitter::declareStageStruct(const StructDecl& decl,
+		spirv::StorageClassValue storageClass) {
+
+		const bool isInput = storageClass == spirv::StorageClass::Input;
+		std::vector<StageVariable> variables;
+		uint32_t location = 0;
+		bool hasPosition = false;
+
+		for (const StructField& field: decl.fields) {
+			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
+
+			if (field.attributes.attributeIndex) {
+				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
+					"on a struct crossing from the vertex to the fragment stage");
+			}
+
+			const StageVariable variable = declareStageVariable(field.type, storageClass, what);
+
+			if (field.attributes.position) {
+				if (hasPosition) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[position]] field");
+				}
+				if (variable.valueType != _types.vector(ScalarKind::Float, 4)) {
+					throw CompileError(what + " is [[position]], which has to be a float4");
+				}
+
+				hasPosition = true;
+				_builder.emit(spirv::OpDecorate, { variable.variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(isInput ? spirv::BuiltIn::FragCoord : spirv::BuiltIn::Position) });
+			} else {
+				_builder.emit(spirv::OpDecorate, { variable.variable,
+					static_cast<uint32_t>(spirv::Decoration::Location), location++ });
+
+				// VUID-StandaloneSpirv-Flat-04744: an integer fragment input is not
+				// interpolated, and the module is rejected unless it says so.
+				if (isInput && !_types.isFloat(variable.interfaceType)) {
+					_builder.emit(spirv::OpDecorate, { variable.variable,
+						static_cast<uint32_t>(spirv::Decoration::Flat) });
+				}
+			}
+
+			variables.push_back(variable);
+		}
+
+		// Apple rejects a vertex function whose returned struct has no position
+		// ("invalid return type"), and a rasteriser has nothing to place without it.
+		if (!isInput && !hasPosition) {
+			throw CompileError("struct \"" + decl.name + "\" is returned by a vertex function and "
+				"has no [[position]] field");
+		}
+
+		return variables;
+	}
+
+	// The variables a return statement writes. A vertex function returns a struct
+	// with a [[position]] field, and a fragment function one colour, at Location 0.
+	void Emitter::declareStageOutputs() {
+		const Type& type = _entryPoint->returnType;
+		if (type.namedType.empty() && !type.isPointer && type.scalar == ScalarKind::Void) {
+			return;
+		}
+
+		const std::string spelled = typeName(type);
+		if (_entryPoint->stage == Stage::Kernel) {
+			throw CompileError("a kernel returns void, and \"" + _entryPoint->name + "\" returns "
+				+ spelled);
+		}
+
+		if (type.namedType.empty()) {
+			if (_entryPoint->stage == Stage::Vertex) {
+				throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
+					+ " rather than a struct, which is not lowered yet");
+			}
+
+			_outputs.push_back(declareStageVariable(type, spirv::StorageClass::Output,
+				"the value fragment function \"" + _entryPoint->name + "\" returns"));
+			_builder.emit(spirv::OpDecorate, { _outputs.back().variable,
+				static_cast<uint32_t>(spirv::Decoration::Location), 0u });
+			return;
+		}
+
+		if (_entryPoint->stage == Stage::Fragment) {
+			throw CompileError("fragment function \"" + _entryPoint->name + "\" returns the struct "
+				+ spelled + ", and a struct of several colour attachments is not lowered yet");
+		}
+
+		const StructDecl* decl = structValue(type);
+		if (!decl) {
+			throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
+				+ ", and mslc lowers a returned struct this source declares and nothing else");
+		}
+
+		_outputs = declareStageStruct(*decl, spirv::StorageClass::Output);
+	}
+
+	// The [[stage_in]] parameter becomes a local holding the struct, filled from
+	// the Input variables at the top of the function, so a field of it is read
+	// the way a field of any local is.
+	void Emitter::loadStageInputs() {
+		if (!_stageIn) {
+			return;
+		}
+
+		const Id structType = declaredTypeOf(_stageIn->type);
+		std::vector<uint32_t> fields;
+		for (const StageVariable& input: _stageInputs) {
+			const Id loaded = loadFrom(input.variable, input.interfaceType);
+			fields.push_back(convert(loaded, input.interfaceType, input.valueType));
+		}
+
+		const Id local = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Function, structType),
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		_builder.emit(spirv::OpStore, { local,
+			_builder.emitTyped(spirv::OpCompositeConstruct, structType, fields) });
+
+		bindLocal(_stageIn->name, local, structType, _stageIn->type);
+	}
+
+	// Every entry point is a void function, so a returned value is written to
+	// the Output variables and the function returns nothing.
+	void Emitter::emitReturn(const Statement& statement) {
+		if (!statement.expression) {
+			if (!_outputs.empty()) {
+				throw CompileError("\"" + _entryPoint->name + "\" returns "
+					+ typeName(_entryPoint->returnType) + ", so a return needs a value");
+			}
+
+			terminate(spirv::OpReturn, { });
+			return;
+		}
+
+		if (_outputs.empty()) {
+			throw CompileError("\"" + _entryPoint->name + "\" returns void, so its return "
+				"cannot carry a value");
+		}
+
+		const Id value = emitExpression(*statement.expression);
+		const Id declared = declaredTypeOf(_entryPoint->returnType);
+
+		if (!_entryPoint->returnType.namedType.empty()) {
+			if (_builder.typeOf(value) != declared) {
+				const std::string spelled = typeName(_entryPoint->returnType);
+				throw CompileError("\"" + _entryPoint->name + "\" returns " + spelled + ", and mslc "
+					"returns a local of that type; this return's value is another struct, or one "
+					"read straight from a buffer, whose layout differs");
+			}
+
+			for (size_t i = 0; i < _outputs.size(); ++i) {
+				const StageVariable& output = _outputs[i];
+				const Id field = _builder.emitTyped(spirv::OpCompositeExtract, output.valueType,
+					{ value, static_cast<uint32_t>(i) });
+				_builder.emit(spirv::OpStore, { output.variable,
+					convert(field, output.valueType, output.interfaceType) });
+			}
+		} else {
+			const StageVariable& output = _outputs.front();
+			const Id returned = convert(value, _builder.typeOf(value), declared);
+			_builder.emit(spirv::OpStore, { output.variable,
+				convert(returned, output.valueType, output.interfaceType) });
+		}
+
+		terminate(spirv::OpReturn, { });
+	}
+
+	// Locations are numbered by declaration order, where Apple pairs a vertex
+	// output with a fragment input by field name and type. The two agree when the
+	// fragment's fields are a leading run of the vertex function's, and any other
+	// pairing in one module is reported rather than wired by position. Every vertex
+	// function is checked against every fragment one, since the module does not say
+	// which pipelines pair them.
+	void Emitter::checkStageInterfacesAgree() const {
+		const auto interfaceFields = [this](const std::string& name) {
+			std::vector<std::pair<std::string, std::string>> fields;
+			if (const StructDecl* decl = _unit.findStruct(name)) {
+				for (const StructField& field: decl->fields) {
+					if (!field.attributes.position) {
+						fields.emplace_back(field.name, typeName(field.type));
+					}
+				}
+			}
+			return fields;
+		};
+
+		for (const FunctionDecl* vertex: _entryPoints) {
+			if (vertex->stage != Stage::Vertex || vertex->returnType.namedType.empty()) {
+				continue;
+			}
+
+			for (const FunctionDecl* fragment: _entryPoints) {
+				if (fragment->stage != Stage::Fragment) {
+					continue;
+				}
+
+				const auto outputs = interfaceFields(vertex->returnType.namedType);
+				for (const Parameter& parameter: fragment->parameters) {
+					const auto inputs = interfaceFields(parameter.type.namedType);
+					if (parameter.attributes.stageIn && std::mismatch(inputs.begin(), inputs.end(),
+						outputs.begin(), outputs.end()).first != inputs.end()) {
+						throw CompileError("vertex function \"" + vertex->name + "\" returns "
+							+ vertex->returnType.namedType + " and fragment function \"" + fragment->name
+							+ "\" takes " + typeName(parameter.type) + " as [[stage_in]]; mslc gives "
+							"their fields Locations by declaration order, so the fragment's fields, other "
+							"than [[position]], have to be the vertex function's first ones, in order");
+					}
+				}
+			}
+		}
+	}
+
 
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
@@ -2731,11 +3034,7 @@ namespace {
 				return;
 
 			case StatementKind::Return:
-				if (statement.expression) {
-					terminate(spirv::OpReturnValue, { emitExpression(*statement.expression) });
-				} else {
-					terminate(spirv::OpReturn, { });
-				}
+				emitReturn(statement);
 				return;
 
 			// Vulkan requires structured control flow: every conditional branch
@@ -2825,6 +3124,7 @@ namespace {
 	// is the module's one void function type.
 	void Emitter::emitEntryPoint(Id functionType) {
 		declareParameters();
+		declareStageOutputs();
 
 		spirv::ExecutionModelValue model = spirv::ExecutionModel::GLCompute;
 		if (_entryPoint->stage == Stage::Vertex) {
@@ -2903,6 +3203,7 @@ namespace {
 			{ kFunctionControlNone, functionType });
 		beginBlock(_builder.nextId());
 		preloadBufferBases();
+		loadStageInputs();
 		emitFunctionBody(*_entryPoint->body);
 		if (!_terminated) {
 			terminate(spirv::OpReturn, { });
@@ -2973,6 +3274,9 @@ namespace {
 			// the previous function's. Nothing reads it while _bufferMembers is
 			// empty today, so this is not a fix for an observable case.
 			_addressBlock = {};
+			_outputs.clear();
+			_stageIn = nullptr;
+			_stageInputs.clear();
 			_terminated = false;
 
 			emitEntryPoint(functionType);
@@ -2993,6 +3297,10 @@ namespace {
 		}
 
 		document += "\t]\n}\n";
+
+		// After every entry point, so a diagnostic about one function's own
+		// interface comes before one about how two of them pair up.
+		checkStageInterfacesAgree();
 
 		return document;
 	}
