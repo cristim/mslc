@@ -138,6 +138,11 @@ namespace {
 		}
 	}
 
+	bool isStep(UnaryOperator op) {
+		return op == UnaryOperator::PreIncrement || op == UnaryOperator::PreDecrement
+			|| op == UnaryOperator::PostIncrement || op == UnaryOperator::PostDecrement;
+	}
+
 	const char* binaryOperatorSpelling(BinaryOperator op) {
 		switch (op) {
 			case BinaryOperator::Add: return "+";
@@ -1337,6 +1342,8 @@ namespace {
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
+		void emitAssignment(const Expression& left, const Expression& right,
+			std::optional<BinaryOperator> compound);
 		Id emitPlaceAddress(const Expression& left);
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
@@ -2238,7 +2245,8 @@ namespace {
 			case UnaryOperator::BitNot:
 				return _builder.emitTyped(spirv::OpNot, type, { operand });
 			default:
-				throw CompileError("this unary operator is recognised but not lowered yet");
+				throw CompileError("++ and -- are lowered only as a statement or a for-loop "
+					"increment, not for their value");
 		}
 	}
 
@@ -4275,6 +4283,19 @@ namespace {
 	}
 
 	void Emitter::emitExpressionStatement(const Expression& expression) {
+		// ++x and x++ as a statement are x += 1; their value is not lowered.
+		if (expression.kind == ExpressionKind::Unary && isStep(expression.unaryOperator)) {
+			Expression one;
+			one.kind = ExpressionKind::IntLiteral;
+			one.intValue = 1;
+			one.line = expression.line;
+			const bool increment = expression.unaryOperator == UnaryOperator::PreIncrement
+				|| expression.unaryOperator == UnaryOperator::PostIncrement;
+			emitAssignment(*expression.left, one,
+				increment ? BinaryOperator::Add : BinaryOperator::Subtract);
+			return;
+		}
+
 		// An assignment yields an address rather than a value, so it is
 		// handled here rather than through emitExpression.
 		if (expression.kind != ExpressionKind::Assign) {
@@ -4282,13 +4303,18 @@ namespace {
 			return;
 		}
 
-		if (expression.left->kind == ExpressionKind::Member
-			&& !structOf(*expression.left->left)) {
-			emitSwizzleStore(*expression.left, *expression.right, expression.compoundOperator);
+		emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+	}
+
+	void Emitter::emitAssignment(const Expression& left, const Expression& right,
+		std::optional<BinaryOperator> compound) {
+		if (left.kind == ExpressionKind::Member
+			&& !structOf(*left.left)) {
+			emitSwizzleStore(left, right, compound);
 			return;
 		}
 
-		const Expression* root = expression.left.get();
+		const Expression* root = &left;
 		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
 			root = root->left.get();
 		}
@@ -4300,9 +4326,9 @@ namespace {
 			}
 		}
 
-		if (expression.compoundOperator && expression.left->kind == ExpressionKind::Index) {
-			const auto base = expression.left->left->kind == ExpressionKind::Identifier
-				? _bindings.find(expression.left->left->name) : _bindings.end();
+		if (compound && left.kind == ExpressionKind::Index) {
+			const auto base = left.left->kind == ExpressionKind::Identifier
+				? _bindings.find(left.left->name) : _bindings.end();
 			if (base != _bindings.end() && base->second.bufferPointeeType == InvalidId
 				&& _types.vectorWidth(base->second.pointeeType) > 1
 				&& !_types.matrixInfo(base->second.pointeeType)) {
@@ -4311,7 +4337,7 @@ namespace {
 			}
 		}
 
-		const Id address = emitPlaceAddress(*expression.left);
+		const Id address = emitPlaceAddress(left);
 
 		// A store's value has the type the address points at, not the type of
 		// the address, so the pointee is what the value is converted to.
@@ -4319,7 +4345,7 @@ namespace {
 		const Id pointeeType = _types.pointeeOf(addressType);
 		if (pointeeType == spirv::InvalidId) {
 			throw CompileError("cannot determine what \""
-				+ expression.left->name + "\" points at, so the store cannot be typed");
+				+ left.name + "\" points at, so the store cannot be typed");
 		}
 
 		// A store into a buffer carries the Aligned memory operand, which the
@@ -4327,15 +4353,15 @@ namespace {
 		const auto storageClass = _types.storageClassOf(addressType);
 
 		Id value = InvalidId;
-		if (expression.compoundOperator) {
+		if (compound) {
 			const bool inBuffer = storageClass
 				&& *storageClass == spirv::StorageClass::PhysicalStorageBuffer;
 			const Id current = inBuffer
 				? loadFromBuffer(address, pointeeType) : loadFrom(address, pointeeType);
-			value = emitCompoundOperation(*expression.compoundOperator, current,
-				emitExpression(*expression.right));
+			value = emitCompoundOperation(*compound, current,
+				emitExpression(right));
 		} else {
-			value = emitExpression(*expression.right);
+			value = emitExpression(right);
 		}
 
 		if (storageClass && *storageClass == spirv::StorageClass::PhysicalStorageBuffer) {

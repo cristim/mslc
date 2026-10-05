@@ -1761,6 +1761,17 @@ ExpressionPtr Parser::parsePostfix() {
 	auto expression = parsePrimary();
 
 	while (true) {
+		if (at(TokenKind::Increment) || at(TokenKind::Decrement)) {
+			auto step = std::make_unique<Expression>();
+			step->kind = ExpressionKind::Unary;
+			step->line = expression->line;
+			step->unaryOperator = at(TokenKind::Increment)
+				? UnaryOperator::PostIncrement : UnaryOperator::PostDecrement;
+			advance();
+			step->left = std::move(expression);
+			return step;
+		}
+
 		if (at(TokenKind::LBracket)) {
 			advance();
 			auto index = std::make_unique<Expression>();

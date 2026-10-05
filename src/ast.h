@@ -170,7 +170,7 @@ enum class BinaryOperator {
 };
 
 enum class UnaryOperator {
-	Negate, Plus, Not, BitNot, PreIncrement, PreDecrement,
+	Negate, Plus, Not, BitNot, PreIncrement, PreDecrement, PostIncrement, PostDecrement,
 };
 
 struct Expression {
