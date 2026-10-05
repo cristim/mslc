@@ -3458,6 +3458,18 @@ namespace {
 			return;
 		}
 
+		const Expression* root = expression.left.get();
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		if (root->kind == ExpressionKind::Identifier) {
+			const auto target = _bindings.find(root->name);
+			if (target != _bindings.end() && target->second.readOnly) {
+				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
+					"constant address space or declared const");
+			}
+		}
+
 		const Id address = emitPlaceAddress(*expression.left);
 
 		const Id value = emitExpression(*expression.right);
