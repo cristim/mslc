@@ -1333,6 +1333,7 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
 	};
 
@@ -1548,6 +1549,21 @@ namespace {
 			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
 			_types.scalar(*temporary), { value });
 		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
+	}
+
+	// A condition, !, && and || take a numeric scalar and compare it with zero, as
+	// C++ does. A vector is no condition: Apple rejects one.
+	Id Emitter::asCondition(Id value) {
+		const Id type = _builder.typeOf(value);
+		if (type == _boolType) {
+			return value;
+		}
+
+		if (_types.bitWidth(type) == 0 || _types.vectorWidth(type) > 1) {
+			throw CompileError("a condition has to be a bool or a numeric scalar");
+		}
+
+		return convert(value, type, _boolType);
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {
@@ -2149,7 +2165,10 @@ namespace {
 					? _builder.emitTyped(spirv::OpFNegate, type, { operand })
 					: _builder.emitTyped(spirv::OpSNegate, type, { operand });
 			case UnaryOperator::Not:
-				return _builder.emitTyped(spirv::OpLogicalNot, _boolType, { operand });
+				// A bool vector is negated componentwise, and stays one.
+				return _types.isBool(type)
+					? _builder.emitTyped(spirv::OpLogicalNot, type, { operand })
+					: _builder.emitTyped(spirv::OpLogicalNot, _boolType, { asCondition(operand) });
 			case UnaryOperator::BitNot:
 				return _builder.emitTyped(spirv::OpNot, type, { operand });
 			default:
@@ -2179,7 +2198,11 @@ namespace {
 		if (isLogical) {
 			const uint16_t opcode = expression.binaryOperator == BinaryOperator::LogicalAnd
 				? spirv::OpLogicalAnd : spirv::OpLogicalOr;
-			return _builder.emitTyped(opcode, _boolType, { left, right });
+			if (_types.isBool(leftType) && leftType == _builder.typeOf(right)) {
+				return _builder.emitTyped(opcode, leftType, { left, right });
+			}
+
+			return _builder.emitTyped(opcode, _boolType, { asCondition(left), asCondition(right) });
 		}
 
 		if (isComparison) {
@@ -4155,7 +4178,7 @@ namespace {
 			// Vulkan requires structured control flow: every conditional branch
 			// is preceded by a merge instruction naming where its paths rejoin.
 			case StatementKind::If: {
-				const Id condition = emitExpression(*statement.expression);
+				const Id condition = asCondition(emitExpression(*statement.expression));
 				const Id thenLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 				const Id elseLabel = statement.elseBranch ? _builder.nextId() : mergeLabel;
@@ -4200,7 +4223,7 @@ namespace {
 
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
-				const Id conditionValue = condition ? emitExpression(*condition) : InvalidId;
+				const Id conditionValue = condition ? asCondition(emitExpression(*condition)) : InvalidId;
 				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
 				if (condition) {
 					terminate(spirv::OpBranchConditional, { conditionValue, bodyLabel, mergeLabel });
