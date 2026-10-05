@@ -102,6 +102,19 @@ int main(int argc, char** argv) {
 	options.includeDirCount = 2;
 	expectError("null entry", translate("#define VALUE 1\n" + kernel, options), "NULL entry");
 
+	// A NUL inside the name would end it early in anything that took it as a C string.
+	mslc_default_options(&options);
+	options.includeDirs = directories;
+	options.includeDirCount = 1;
+	expectError("NUL in an include name",
+		translate(std::string("#include \"pp_defs.h\0evil\"\n", 26) + kernel, options), "NUL byte");
+
+	const char* empty[] = { "" };
+	mslc_default_options(&options);
+	options.includeDirs = empty;
+	options.includeDirCount = 1;
+	expectError("empty include directory", translate("#define VALUE 1\n" + kernel, options), "empty string");
+
 	if (failures == 0) {
 		std::printf("mslc-api-test: all passed\n");
 	}

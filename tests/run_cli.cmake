@@ -174,3 +174,92 @@ file(WRITE "${pp}/uses_big.metal" "#include \"big.h\"\n")
 run(include_too_large nonzero "-E;${pp}/uses_big.metal")
 run_expects(include_too_large "is larger than")
 file(REMOVE "${pp}/big.h")
+
+# ---------------------------------------------------------------------------
+# Hardening found in review.
+
+# A pasted token keeps the hide set both operands agree on: Xy here is pasted from
+# an X that came out of Xy and a y that did not, so it is free to expand again.
+# Apple's compiler prints the same.
+file(WRITE "${pp}/hide.metal" "#define CAT(a, b) a ## b\n#define Xy 1 CAT(X,\nXy y) end\n")
+run(paste_hide_set 0 "-E;${pp}/hide.metal")
+run_expects(paste_hide_set "1 1 CAT(X, end")
+
+# A carriage return alone ends a line, as in Apple's compiler.
+file(WRITE "${pp}/cr_error.metal" "int a;\r#error boom\r")
+run(lone_cr_directive nonzero "-E;${pp}/cr_error.metal")
+run_expects(lone_cr_directive "cr_error.metal:2:2: #error directive in this source: boom")
+file(WRITE "${pp}/cr_define.metal" "#define X 1\rint X;\r")
+run(lone_cr_define 0 "-E;${pp}/cr_define.metal")
+run_expects(lone_cr_define "int 1;")
+
+file(WRITE "${pp}/cr_splice.metal" "#define X 1 \\\r+ 2\rint X;\r")
+run(lone_cr_splice 0 "-E;${pp}/cr_splice.metal")
+run_expects(lone_cr_splice "int 1 + 2;")
+
+# x/../a.h is asked of the file system as written: the link leads to other/, so the
+# header is other/a.h, not the inc/a.h that cancelling the pair would name.
+file(WRITE "${pp}/inc/a.h" "from_lexical\n")
+file(WRITE "${pp}/other/a.h" "from_physical\n")
+file(MAKE_DIRECTORY "${pp}/other/deep")
+file(CREATE_LINK "${pp}/other/deep" "${pp}/inc/linkdir" SYMBOLIC)
+file(WRITE "${pp}/dotdot.metal" "#include \"linkdir/../a.h\"\n")
+run(include_dotdot_through_a_link 0 "-E;-I;${pp}/inc;${pp}/dotdot.metal")
+run_expects(include_dotdot_through_a_link "from_physical")
+
+# __FILE__ of a header found beside a source named without a directory.
+file(WRITE "${pp}/relh.h" "__FILE__\n")
+file(WRITE "${pp}/rel.metal" "#include \"relh.h\"\n")
+execute_process(COMMAND "${MSLC}" -E rel.metal WORKING_DIRECTORY "${pp}"
+	RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+set(LAST_OUTPUT "${output}")
+run_expects(relative_file_macro "\"./relh.h\"")
+
+# Include depth: 200 nested includes are allowed and 201 are not. The count: 10000
+# #include directives are allowed and 10001 are not.
+function(write_chain length)
+	foreach(n RANGE 1 ${length})
+		math(EXPR next "${n} + 1")
+		if(n LESS length)
+			file(WRITE "${pp}/chain${n}.h" "#include \"chain${next}.h\"\n")
+		else()
+			file(WRITE "${pp}/chain${n}.h" "int deepest;\n")
+		endif()
+	endforeach()
+endfunction()
+file(WRITE "${pp}/chain.metal" "#include \"chain1.h\"\n")
+write_chain(200)
+run(include_depth_at_the_limit 0 "-E;${pp}/chain.metal")
+run_expects(include_depth_at_the_limit "int deepest;")
+write_chain(201)
+run(include_depth_over_the_limit nonzero "-E;${pp}/chain.metal")
+run_expects(include_depth_over_the_limit "#include nested more than 200 deep")
+
+file(WRITE "${pp}/leaf.h" "")
+string(REPEAT "#include \"leaf.h\"\n" 10000 many)
+file(WRITE "${pp}/many.metal" "${many}")
+run(include_count_at_the_limit 0 "-E;${pp}/many.metal")
+file(WRITE "${pp}/toomany.metal" "${many}#include \"leaf.h\"\n")
+run(include_count_over_the_limit nonzero "-E;${pp}/toomany.metal")
+run_expects(include_count_over_the_limit "#include directives in one translation")
+
+# A FIFO is refused before it is opened, so reading it cannot block.
+find_program(MKFIFO mkfifo)
+if(MKFIFO)
+	execute_process(COMMAND "${MKFIFO}" "${pp}/pipe.h" RESULT_VARIABLE status)
+	file(WRITE "${pp}/uses_pipe.metal" "#include \"pipe.h\"\n")
+	execute_process(COMMAND "${MSLC}" -E "${pp}/uses_pipe.metal" TIMEOUT 20
+		RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE output)
+	if(NOT status EQUAL 1)
+		message(FATAL_ERROR "include_fifo: exit ${status}, expected 1:\n${output}")
+	endif()
+	set(LAST_OUTPUT "${output}")
+	run_expects(include_fifo "is not a regular file")
+endif()
+
+# One call with more argument tokens than the limit is refused while the arguments
+# are being collected, not after they have been copied.
+string(REPEAT "x " 600000 flat)
+file(WRITE "${pp}/flat.metal" "#define F(a) a\nF(${flat})\n")
+run(huge_argument_list nonzero "-E;${pp}/flat.metal")
+run_expects(huge_argument_list "hold more than")
