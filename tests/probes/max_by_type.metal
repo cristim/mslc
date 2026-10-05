@@ -2,6 +2,9 @@
 // DISASM: FMax
 // DISASM: SMax
 // DISASM: UMax
+// DISASM-MATCH: OpExtInst %float %[0-9]+ FMax %
+// DISASM-MATCH: OpExtInst %int %[0-9]+ SMax %
+// DISASM-MATCH: OpExtInst %uint %[0-9]+ UMax %
 // DISASM-NOT: FMin
 // DISASM-NOT: SMin
 // DISASM-NOT: UMin

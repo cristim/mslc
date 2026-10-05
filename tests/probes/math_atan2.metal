@@ -6,6 +6,8 @@
 // DISASM-MATCH: OpExtInst %v4half %[0-9]+ Atan2 %
 // DISASM-MATCH: OpExtInst %v3float %[0-9]+ Atan2 %
 // DISASM-MATCH: OpCompositeConstruct %v3float
+// y comes first, as in GLSL.std.450.
+// DISASM-MATCH: Atan2 %float_0_5[_0-9]* %[0-9]+
 kernel void math_atan2(
     device const float* f [[buffer(0)]],
     device const half4* h [[buffer(1)]],
@@ -18,4 +20,5 @@ kernel void math_atan2(
     fout[i] = atan2(f[i], f[i + 1u]);
     hout[i] = atan2(h[i], h[i + 1u]);
     vout[i] = atan2(v[i], f[i]);
+    fout[i + 1u] = atan2(0.5f, f[i]);
 }

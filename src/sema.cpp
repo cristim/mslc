@@ -2034,20 +2034,20 @@ namespace {
 		}
 
 		// A scalar beside a vector is broadcast, as Metal converts a scalar to any
-		// vector, and a scalar beside a scalar is converted, as min and max always
-		// did. Two vectors of different types are neither.
+		// vector. Scalars of different types are rejected: Apple reports
+		// min(int, float) or mix(half, half, float) as ambiguous.
 		for (size_t i = 0; i < sharing; ++i) {
 			const Id argumentType = _builder.typeOf(values[i]);
 			if (argumentType == type) {
 				continue;
 			}
 
-			if (_types.vectorWidth(argumentType) != 1) {
+			if (width == 1 || _types.vectorWidth(argumentType) != 1) {
 				throw CompileError("the arguments of " + name + " have to be one type, or a "
 					"scalar beside a vector");
 			}
 
-			values[i] = width > 1 ? broadcast(values[i], type) : convert(values[i], argumentType, type);
+			values[i] = broadcast(values[i], type);
 		}
 
 		if (builtin.shape == MathShape::Refract) {
