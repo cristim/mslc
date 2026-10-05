@@ -57,6 +57,14 @@ namespace {
 			(components >= 3 ? 4u : components) * scalarBytes };
 	}
 
+	// A matrix is its columns laid out as an array of column vectors, so a
+	// float3x3 is three 16-byte columns, 48 bytes, and not nine packed floats.
+	// The column's own size is the MatrixStride.
+	VectorLayout matrixLayoutFor(uint32_t scalarBytes, uint32_t columns, uint32_t rows) {
+		const VectorLayout column = vectorLayoutFor(scalarBytes, rows);
+		return { columns * column.size, column.alignment };
+	}
+
 	// The next multiple of the alignment at or after the offset, which is where
 	// a member of that alignment starts in a struct.
 	uint32_t alignTo(uint32_t offset, uint32_t alignment) {
@@ -285,6 +293,39 @@ Id TypeTable::vector(ScalarKind kind, uint32_t width) {
 	return id;
 }
 
+Id TypeTable::matrix(ScalarKind kind, uint32_t columns, uint32_t rows) {
+	const auto key = std::make_tuple(static_cast<uint32_t>(kind), columns, rows);
+	const auto cached = _matrices.find(key);
+	if (cached != _matrices.end()) {
+		return cached->second;
+	}
+
+	const Id column = vector(kind, rows);
+	const Id id = _builder.emitDecl(spirv::OpTypeMatrix, { column, columns });
+	_matrices.emplace(key, id);
+	_matrixInfo.emplace(id, MatrixInfo { kind, columns, rows, column });
+	return id;
+}
+
+const TypeTable::MatrixInfo* TypeTable::matrixInfo(Id type) const {
+	const auto it = _matrixInfo.find(type);
+	return it == _matrixInfo.end() ? nullptr : &it->second;
+}
+
+void TypeTable::decorateMatrixMember(Id structure, uint32_t member, Id type) {
+	const auto it = _matrixInfo.find(type);
+	if (it == _matrixInfo.end()) {
+		return;
+	}
+
+	const uint32_t scalarBytes = scalarBitWidth(it->second.scalar) / 8;
+	_builder.emit(spirv::OpMemberDecorate, { structure, member,
+		static_cast<uint32_t>(spirv::Decoration::ColMajor) });
+	_builder.emit(spirv::OpMemberDecorate, { structure, member,
+		static_cast<uint32_t>(spirv::Decoration::MatrixStride),
+		vectorLayoutFor(scalarBytes, it->second.rows).size });
+}
+
 spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	const auto cached = _blockStructs.find(elementType);
 	if (cached != _blockStructs.end()) {
@@ -314,6 +355,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 		}
 
 		stride = vectorLayoutFor(scalarBytes, it->second).size;
+	} else if (const auto it = _matrixInfo.find(elementType); it != _matrixInfo.end()) {
+		stride = matrixLayoutFor(scalarBitWidth(it->second.scalar) / 8,
+			it->second.columns, it->second.rows).size;
 	} else if (const auto it = _structSizes.find(elementType); it != _structSizes.end()) {
 		// Metal rounds a struct's size up to its own alignment, and structMembersFor
 		// has already done that, so this is the size and not a guess at it.
@@ -333,6 +377,7 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType) {
 	// A member offset is OpMemberDecorate; OpDecorate takes no member index.
 	_builder.emit(spirv::OpMemberDecorate, { structure, 0,
 		static_cast<uint32_t>(spirv::Decoration::Offset), 0u });
+	decorateMatrixMember(structure, 0, elementType);
 
 	_blockStructs.emplace(elementType, structure);
 	return structure;
@@ -428,7 +473,7 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 }
 
 bool TypeTable::isAggregate(spirv::Id type) const {
-	if (_widthOfVector.count(type) > 0) {
+	if (_widthOfVector.count(type) > 0 || _matrixInfo.count(type) > 0) {
 		return true;
 	}
 
@@ -613,10 +658,14 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-		const VectorLayout layout = vectorLayoutFor(
-			mappingFor(field.type.scalar).width / 8, components);
+		const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
+		const VectorLayout layout = field.type.isMatrix()
+			? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
+			: vectorLayoutFor(scalarBytes, components);
 
-		outTypes.push_back(components > 1
+		outTypes.push_back(field.type.isMatrix()
+			? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
+			: components > 1
 			? vector(field.type.scalar, field.type.vectorWidth)
 			: scalar(field.type.scalar));
 
@@ -655,6 +704,7 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
 			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+		decorateMatrixMember(id, static_cast<uint32_t>(i), fieldTypes[i]);
 	}
 
 	_elementStructs.emplace(name, id);
@@ -709,6 +759,7 @@ Id TypeTable::namedStruct(const std::string& name) {
 	for (size_t i = 0; i < fieldTypes.size(); ++i) {
 		_builder.emit(spirv::OpMemberDecorate, { id, static_cast<uint32_t>(i),
 			static_cast<uint32_t>(spirv::Decoration::Offset), offsets[i] });
+		decorateMatrixMember(id, static_cast<uint32_t>(i), fieldTypes[i]);
 	}
 
 	_structs.emplace(name, id);
@@ -947,6 +998,7 @@ namespace {
 		// the caller loads from it.
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
+		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		Id emitMember(const Expression& expression);
@@ -992,6 +1044,10 @@ namespace {
 			}
 
 			return id;
+		}
+
+		if (type.isMatrix()) {
+			return _types.matrix(type.scalar, type.matrixColumns, type.vectorWidth);
 		}
 
 		if (type.vectorWidth > 1) {
@@ -1057,6 +1113,14 @@ namespace {
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		// Every convert opcode takes a scalar or a vector, so a matrix of another
+		// shape or component type, or a matrix where a scalar or vector belongs, has
+		// no instruction to lower to.
+		if (_types.matrixInfo(fromType) || _types.matrixInfo(toType)) {
+			throw CompileError("a matrix is used where a value of another type is expected, "
+				"and mslc converts no matrix to or from another type");
 		}
 
 		// A scalar is not a value of a vector type, and neither vector is a value
@@ -1245,11 +1309,14 @@ namespace {
 			return asAddress ? address : loadFromBuffer(address, binding.pointeeType);
 		}
 
+		// Indexing a matrix names one of its columns, not another matrix.
+		const auto* matrix = _types.matrixInfo(binding.pointeeType);
+		const Id elementType = matrix ? matrix->column : binding.pointeeType;
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
-			_types.pointer(binding.storageClass, binding.pointeeType),
+			_types.pointer(binding.storageClass, elementType),
 			{ binding.id, index });
 
-		return asAddress ? address : loadFrom(address, binding.pointeeType);
+		return asAddress ? address : loadFrom(address, elementType);
 	}
 
 	// The index of a field, or the field count when the struct has no such
@@ -1508,6 +1575,31 @@ namespace {
 
 		const Id toType = declaredTypeOf(target);
 
+		// Only the column form, one vector per column. A single scalar is a
+		// diagonal matrix and a list of scalars fills it element by element; both
+		// are their own lowering and are reported rather than guessed at.
+		if (target.isMatrix()) {
+			if (expression.arguments.size() != target.matrixColumns) {
+				throw CompileError(spelled + " built from " + std::to_string(expression.arguments.size())
+					+ " values is not lowered yet; mslc builds a matrix from one "
+					+ std::string(scalarKindName(target.scalar)) + std::to_string(target.vectorWidth)
+					+ " per column");
+			}
+
+			std::vector<uint32_t> columns;
+			for (const ExpressionPtr& argument: expression.arguments) {
+				const Id column = emitExpression(*argument);
+				if (_builder.typeOf(column) != _types.matrixInfo(toType)->column) {
+					throw CompileError("a column of " + spelled + " has to be a "
+						+ std::string(scalarKindName(target.scalar))
+						+ std::to_string(target.vectorWidth) + " already; mslc converts no column");
+				}
+				columns.push_back(column);
+			}
+
+			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
+		}
+
 		// float3() and float3(0) are different values and mslc has no value to put
 		// in the components, so it says so rather than fabricating a zero. xcrun
 		// metal accepts the empty form and zero-fills it; a caller cannot tell
@@ -1540,6 +1632,12 @@ namespace {
 		const Id operand = emitExpression(*expression.left);
 		const Id type = _builder.typeOf(operand);
 
+		// Apple rejects every unary operator on a matrix, unary plus included, and
+		// OpFNegate takes no matrix.
+		if (_types.matrixInfo(type)) {
+			throw CompileError("a unary operator on a matrix is not lowered yet");
+		}
+
 		switch (expression.unaryOperator) {
 			case UnaryOperator::Plus: return operand;
 			case UnaryOperator::Negate:
@@ -1559,6 +1657,10 @@ namespace {
 		const Id left = emitExpression(*expression.left);
 		const Id right = emitExpression(*expression.right);
 		const Id leftType = _builder.typeOf(left);
+
+		if (_types.matrixInfo(leftType) || _types.matrixInfo(_builder.typeOf(right))) {
+			return emitMatrixProduct(expression.binaryOperator, left, right);
+		}
 
 		const bool isFloat = _types.isFloat(leftType);
 		const bool isSigned = _types.isSignedInt(leftType);
@@ -1696,6 +1798,69 @@ namespace {
 			leftType, { left, rightOperand });
 	}
 
+	// A product with a matrix on at least one side. SPIR-V has an opcode per
+	// shape, and each needs its operands to agree in component type and in the
+	// dimension the product runs over, so anything else is reported.
+	Id Emitter::emitMatrixProduct(BinaryOperator op, Id left, Id right) {
+		if (op != BinaryOperator::Multiply) {
+			throw CompileError("only * is lowered with a matrix operand; any other operator on a "
+				"matrix is not lowered yet");
+		}
+
+		const Id leftType = _builder.typeOf(left);
+		const Id rightType = _builder.typeOf(right);
+		const auto* leftMatrix = _types.matrixInfo(leftType);
+		const auto* rightMatrix = _types.matrixInfo(rightType);
+		const std::string mismatch = "the operands of a matrix product do not match: the "
+			"columns of the left have to equal the rows of the right, in the same component type";
+
+		const std::string scaleMismatch = "a matrix is scaled by a scalar of its own component "
+			"type, and this one is another type";
+
+		// The scalar has to be the matrix's own component type already: Apple's
+		// compiler rejects a float4x4 times an int or a half rather than converting.
+		if (leftMatrix && _types.vectorWidth(rightType) == 1 && !rightMatrix) {
+			if (rightType != _types.scalar(leftMatrix->scalar)) {
+				throw CompileError(scaleMismatch);
+			}
+			return _builder.emitTyped(spirv::OpMatrixTimesScalar, leftType, { left, right });
+		}
+
+		if (rightMatrix && _types.vectorWidth(leftType) == 1 && !leftMatrix) {
+			if (leftType != _types.scalar(rightMatrix->scalar)) {
+				throw CompileError(scaleMismatch);
+			}
+			return _builder.emitTyped(spirv::OpMatrixTimesScalar, rightType, { right, left });
+		}
+
+		if (leftMatrix && rightMatrix) {
+			if (leftMatrix->scalar != rightMatrix->scalar || leftMatrix->columns != rightMatrix->rows) {
+				throw CompileError(mismatch);
+			}
+
+			return _builder.emitTyped(spirv::OpMatrixTimesMatrix,
+				_types.matrix(leftMatrix->scalar, rightMatrix->columns, leftMatrix->rows),
+				{ left, right });
+		}
+
+		if (leftMatrix) {
+			if (_types.componentOf(rightType) != _types.scalar(leftMatrix->scalar)
+				|| _types.vectorWidth(rightType) != leftMatrix->columns) {
+				throw CompileError(mismatch);
+			}
+
+			return _builder.emitTyped(spirv::OpMatrixTimesVector, leftMatrix->column, { left, right });
+		}
+
+		if (_types.componentOf(leftType) != _types.scalar(rightMatrix->scalar)
+			|| _types.vectorWidth(leftType) != rightMatrix->rows) {
+			throw CompileError(mismatch);
+		}
+
+		return _builder.emitTyped(spirv::OpVectorTimesMatrix,
+			_types.vector(rightMatrix->scalar, rightMatrix->columns), { left, right });
+	}
+
 	Id Emitter::emitCall(const Expression& expression) {
 		if (expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError("only a direct function call is supported");
@@ -1710,6 +1875,9 @@ namespace {
 
 			const Id left = emitExpression(*expression.arguments[0]);
 			const Id type = _builder.typeOf(left);
+			if (_types.matrixInfo(type)) {
+				throw CompileError(expression.left->name + " takes scalars or vectors, not a matrix");
+			}
 			// GLSL.std.450 wants every operand of the result type.
 			const Id argument = emitExpression(*expression.arguments[1]);
 			const Id right = convert(argument, _builder.typeOf(argument), type);
@@ -1944,6 +2112,10 @@ namespace {
 	// vector or a struct is a composite, and anything else is a scalar, so the
 	// declared type is what says which the source wrote.
 	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer) {
+		if (type.isMatrix()) {
+			throw CompileError("a " + typeName(type) + " constant is not lowered yet");
+		}
+
 		if (initializer.kind != ExpressionKind::InitList) {
 			if (!type.namedType.empty()) {
 				throw CompileError("the struct \"" + type.namedType + "\" is initialised with a "
@@ -2317,6 +2489,14 @@ namespace {
 
 			structType = _unit.findStruct(parameter.type.namedType);
 		} else {
+			// A matrix's layout is a MatrixStride, which SPIR-V only allows on a
+			// struct member, and a buffer reached directly is not wrapped in one.
+			if (parameter.type.isMatrix() && !parameter.type.isPointer) {
+				throw CompileError("parameter \"" + parameter.name + "\" is a " + typeName(parameter.type)
+					+ " reached by reference, which is not lowered yet; pass a pointer to it, "
+						"or put it in a struct");
+			}
+
 			pointeeType = declaredTypeOf(parameter.type);
 		}
 

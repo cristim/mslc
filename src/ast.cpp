@@ -27,7 +27,9 @@ std::string typeName(const Type& type) {
 		? std::string(scalarKindName(type.scalar))
 		: type.namedType;
 
-	if (type.namedType.empty() && type.vectorWidth > 1) {
+	if (type.namedType.empty() && type.isMatrix()) {
+		name += std::to_string(type.matrixColumns) + "x" + std::to_string(type.vectorWidth);
+	} else if (type.namedType.empty() && type.vectorWidth > 1) {
 		name += std::to_string(type.vectorWidth);
 	}
 	if (type.arrayLength) {

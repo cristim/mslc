@@ -49,8 +49,12 @@ struct Type {
 	// element type and the wrappers below describe the rest.
 	ScalarKind scalar = ScalarKind::Void;
 
-	// 0 for a scalar, 2/3/4/8/16 for a vector.
+	// 0 for a scalar, 2/3/4/8/16 for a vector. For a matrix, the row count, which
+	// is the width of each column vector.
 	uint32_t vectorWidth = 0;
+
+	// 0 unless this is a matrix, which MSL spells floatCxR: C columns of R rows.
+	uint32_t matrixColumns = 0;
 
 	// Set for a type referred to by name, such as a struct. Resolved during
 	// semantic analysis.
@@ -65,6 +69,7 @@ struct Type {
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
+	bool isMatrix() const { return matrixColumns > 0; }
 };
 
 const char* scalarKindName(ScalarKind kind);
