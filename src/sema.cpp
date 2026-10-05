@@ -3364,7 +3364,7 @@ namespace {
 		}
 		requireLanesWithin(name, lanes, _types.vectorWidth(vectorType));
 
-		const Id value = emitExpression(valueExpression);
+		Id value = emitExpression(valueExpression);
 		const Id valueType = _builder.typeOf(value);
 		const Id component = _types.componentOf(vectorType);
 		const auto count = static_cast<uint32_t>(lanes.size());
@@ -3379,9 +3379,12 @@ namespace {
 			updated = _builder.emitTyped(spirv::OpCompositeInsert, vectorType,
 				{ convert(value, valueType, component), old, lanes[0] });
 		} else {
-			if (valueType != _types.withWidth(vectorType, count)) {
+			const Id lanesType = _types.withWidth(vectorType, count);
+			if (_types.vectorWidth(valueType) == 1) {
+				value = broadcast(value, lanesType);
+			} else if (valueType != lanesType) {
 				throw CompileError("assigning to " + quoted + " takes a vector of " + std::to_string(count)
-					+ " components of the same type as the target");
+					+ " components of the same type as the target, or a scalar");
 			}
 
 			// Lane j keeps the old vector's component unless the swizzle names it,
