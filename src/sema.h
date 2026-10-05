@@ -150,6 +150,12 @@ public:
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
 		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
 
+	// Throws when the struct has a bool member. Metal gives a bool one byte and
+	// a bool vector its own size and alignment in a buffer, and mslc has no
+	// storage form for either: a bool member in a Block takes the offset of the
+	// member before it, and SPIR-V gives a bool in memory no layout of its own.
+	void rejectBoolMembers(const std::string& structName) const;
+
 	// The same struct as the element of an array of it: the members with their
 	// offsets, and no Block decoration, since Vulkan requires a struct nested in
 	// a Block to be laid out and rejects a Block-decorated one inside an array.

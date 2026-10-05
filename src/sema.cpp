@@ -917,6 +917,21 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	return true;
 }
 
+void TypeTable::rejectBoolMembers(const std::string& structName) const {
+	const StructDecl* decl = _unit.findStruct(structName);
+	if (!decl) {
+		return;
+	}
+
+	for (const StructField& field: decl->fields) {
+		if (field.type.scalar == ScalarKind::Bool) {
+			throw CompileError("struct \"" + decl->name + "\" has the bool member \"" + field.name
+				+ "\" and is used as a buffer's layout, which mslc does not lay out yet; "
+					"keep the flag in a uint");
+		}
+	}
+}
+
 // A struct as the element of an array of it: the same members with their
 // offsets, and no Block decoration. Vulkan requires a struct nested inside a
 // Block to be laid out, and rejects a Block-decorated struct inside an array, so
@@ -926,6 +941,8 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	if (cached != _elementStructs.end()) {
 		return cached->second;
 	}
+
+	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -976,6 +993,8 @@ Id TypeTable::namedStruct(const std::string& name) {
 	if (cached != _structs.end()) {
 		return cached->second;
 	}
+
+	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -3211,6 +3230,11 @@ namespace {
 			}
 
 			pointeeType = declaredTypeOf(parameter.type);
+			if (_types.isBool(pointeeType)) {
+				throw CompileError("parameter \"" + parameter.name + "\" is a buffer of "
+					+ typeName(parameter.type) + ", which mslc does not lay out yet; "
+						"keep the flags in a uint");
+			}
 		}
 
 		// A buffer parameter's address is a member of the binding-0 block rather
