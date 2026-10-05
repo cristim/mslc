@@ -950,6 +950,21 @@ namespace {
 		bool readOnly = false;
 	};
 
+	// A name declared in a block or a for-loop header stops naming it when the
+	// scope ends, and a name it hid names what it did before.
+	class BindingScope {
+	public:
+		explicit BindingScope(std::map<std::string, Binding>& bindings)
+			: _bindings(bindings), _saved(bindings) {}
+		~BindingScope() { _bindings = std::move(_saved); }
+		BindingScope(const BindingScope&) = delete;
+		BindingScope& operator=(const BindingScope&) = delete;
+
+	private:
+		std::map<std::string, Binding>& _bindings;
+		std::map<std::string, Binding> _saved;
+	};
+
 	// A value rather than a place, so there is no address to load through and a
 	// member is taken from the value itself.
 	struct ConstantBinding {
@@ -3450,7 +3465,8 @@ namespace {
 
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
-			case StatementKind::Compound:
+			case StatementKind::Compound: {
+				const BindingScope scope(_bindings);
 				// Whatever follows a return in the same block is unreachable,
 				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
@@ -3460,6 +3476,7 @@ namespace {
 					emitStatement(*child);
 				}
 				return;
+			}
 
 			case StatementKind::ExpressionStatement:
 				if (statement.expression) {
@@ -3505,6 +3522,7 @@ namespace {
 			// continue block, and that block alone branches back to the header.
 			case StatementKind::For:
 			case StatementKind::While: {
+				const BindingScope scope(_bindings);
 				const bool isFor = statement.kind == StatementKind::For;
 
 				if (isFor && statement.forInitializer) {
