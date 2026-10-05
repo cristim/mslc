@@ -1,5 +1,6 @@
 #include "parser.h"
 
+#include <climits>
 #include <unordered_map>
 
 namespace mslc {
@@ -95,6 +96,27 @@ namespace {
 		outType.scalar = kind;
 		outType.vectorWidth = static_cast<uint32_t>(last - '0');
 		return true;
+	}
+
+	// The vector typedefs Apple's compiler has without any include: vector_float4,
+	// simd_uint2 and the rest. They name a vector of 2 to 4 components only, so
+	// vector_float and vector_float4x4 are not types, and neither are the double
+	// and 8 or 16 wide ones, which Apple declares as incomplete.
+	bool isSimdVectorName(std::string_view text, Type& outType) {
+		for (const std::string_view prefix: { std::string_view("vector_"), std::string_view("simd_") }) {
+			if (text.size() > prefix.size() && text.substr(0, prefix.size()) == prefix) {
+				Type vector;
+				if (isTypeName(text.substr(prefix.size()), vector) && vector.isVector() && !vector.isMatrix()
+					&& vector.vectorWidth <= 4 && vector.scalar != ScalarKind::Double
+					&& vector.scalar != ScalarKind::Void) {
+					outType.scalar = vector.scalar;
+					outType.vectorWidth = vector.vectorWidth;
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	// Whether a name is a scalar, vector or matrix type, for a caller that only
@@ -252,7 +274,9 @@ void Parser::parseDeclaration() {
 	}
 
 	if (matchIdentifier("struct")) {
-		_unit.structs.push_back(parseStructDeclaration());
+		StructDecl decl = parseStructDeclaration();
+		declareName(decl.name, "struct");
+		_unit.structs.push_back(std::move(decl));
 		return;
 	}
 
@@ -274,8 +298,19 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
-	if (atKeyword("typedef")) {
-		throw CompileError("typedef is not supported");
+	if (matchIdentifier("typedef")) {
+		parseTypedef();
+		return;
+	}
+
+	if (atKeyword("enum")) {
+		bool hadBody = false;
+		parseEnumDeclaration(hadBody);
+		if (!hadBody) {
+			throw CompileError("a bare enum declaration without enumerators is not supported");
+		}
+		expect(TokenKind::Semicolon, "after an enum declaration; a variable declared with it is not supported");
+		return;
 	}
 
 	// A file-scope constant. An address space or a type qualifier ahead of the
@@ -307,6 +342,7 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 	}
 
 	declaration.name = std::string(advance().text);
+	declareName(declaration.name, "variable");
 
 	if (!match(TokenKind::Assign)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
@@ -367,7 +403,15 @@ StructDecl Parser::parseStructDeclaration() {
 	}
 
 	decl.name = std::string(advance().text);
+	parseStructBody(decl);
+	match(TokenKind::Semicolon);
 
+	return decl;
+}
+
+// From the base list to the closing brace. A typedef reads the declarator after
+// that brace, so the semicolon is the caller's.
+void Parser::parseStructBody(StructDecl& decl) {
 	if (at(TokenKind::Colon)) {
 		// Inheritance is not part of the subset; consume the base list so the
 		// error names something useful rather than a stray colon.
@@ -397,9 +441,362 @@ StructDecl Parser::parseStructDeclaration() {
 	}
 
 	expect(TokenKind::RBrace, "to close a struct body");
-	match(TokenKind::Semicolon);
+}
 
-	return decl;
+namespace {
+
+	bool sameType(const Type& a, const Type& b) {
+		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth
+			&& a.matrixColumns == b.matrixColumns && a.namedType == b.namedType && a.isConst == b.isConst;
+	}
+
+	// Names the typedef and enum support has to keep distinct from everything else.
+	constexpr char kAnonymousStructTypedef[] = "typedef of an anonymous struct";
+
+	bool isTypeSupportKind(std::string_view what) {
+		return what == "typedef" || what == "enum" || what == "enum constant"
+			|| what == kAnonymousStructTypedef;
+	}
+
+}
+
+bool Parser::resolveTypeName(std::string_view text, Type& out) const {
+	if (isTypeName(text, out) || isSimdVectorName(text, out)) {
+		return true;
+	}
+
+	const auto alias = _typedefs.find(std::string(text));
+	if (alias == _typedefs.end()) {
+		return false;
+	}
+
+	out.scalar = alias->second.scalar;
+	out.vectorWidth = alias->second.vectorWidth;
+	out.matrixColumns = alias->second.matrixColumns;
+	out.namedType = alias->second.namedType;
+	out.isConst = out.isConst || alias->second.isConst;
+	return true;
+}
+
+void Parser::declareName(const std::string& name, const char* what) {
+	Type builtin;
+	if (isTypeSupportKind(what) && (isTypeName(name, builtin) || isSimdVectorName(name, builtin))) {
+		throw CompileError("\"" + name + "\" is a builtin type name and cannot be redeclared as a "
+			+ what);
+	}
+
+	// Functions overload, and a struct or enum tag may share a name with a function
+	// or a variable; every other pair of declarations of one name is a redefinition.
+	const auto [existing, inserted] = _declared.emplace(name, what);
+	const auto isTag = [](std::string_view kindName) { return kindName == "struct" || kindName == "enum"; };
+	const auto isObject = [](std::string_view kindName) { return kindName == "function" || kindName == "variable"; };
+	const std::string_view now(what);
+	const bool overload = now == "function" && existing->second == "function";
+	const bool tagBesideObject = (isTag(now) && isObject(existing->second))
+		|| (isObject(now) && isTag(existing->second));
+	if (!inserted && !overload && !tagBesideObject) {
+		throw CompileError("redefinition of \"" + name + "\": declared as " + existing->second
+			+ " and again as " + what);
+	}
+}
+
+void Parser::rejectShadowing(const std::string& name) const {
+	const char* what = _enumConstants.count(name) ? "enum constant"
+		: _typedefs.count(name) ? "typedef"
+		: _enumTypes.count(name) ? "enum type"
+		: nullptr;
+
+	if (what) {
+		throw CompileError("a variable named \"" + name + "\" would hide the " + std::string(what) + " of "
+			"that name, which mslc does not support");
+	}
+}
+
+// "typedef", already consumed, then a type and the one name it is given. What can
+// follow the type is deliberately narrow: a typedef of a pointer, an array or a
+// function pointer is reported, because each would need a type the AST has no
+// place for, and a typedef that declares several names is reported rather than
+// read as the first.
+void Parser::parseTypedef() {
+	Type target;
+	std::string enumTag;
+	bool isEnum = false;
+	bool anonymousStruct = false;
+	std::optional<StructDecl> definedStruct;
+
+	if (matchIdentifier("struct")) {
+		std::string tag;
+		if (kind() == TokenKind::Identifier) {
+			tag = std::string(advance().text);
+		}
+
+		if (at(TokenKind::LBrace)) {
+			StructDecl decl;
+			decl.name = tag;
+			parseStructBody(decl);
+			anonymousStruct = tag.empty();
+			if (!anonymousStruct) {
+				declareName(tag, "struct");
+			}
+			definedStruct = std::move(decl);
+		} else if (tag.empty() || !_unit.findStruct(tag)) {
+			throw CompileError("typedef of the struct \"" + tag + "\", which is not declared");
+		} else if (_declared[tag] == kAnonymousStructTypedef) {
+			throw CompileError("the typedef \"" + tag + "\" cannot be referenced with a struct specifier");
+		}
+
+		target.namedType = tag;
+	} else if (atKeyword("enum")) {
+		bool hadBody = false;
+		enumTag = parseEnumDeclaration(hadBody);
+		if (!hadBody && !_enumTypes.count(enumTag)) {
+			throw CompileError("typedef of the enum \"" + enumTag + "\", which is not declared");
+		}
+		isEnum = true;
+	} else {
+		target = parseType();
+		if (target.isPointer) {
+			throw CompileError("a typedef of a pointer type is not supported");
+		}
+		if (target.addressSpace != AddressSpace::None) {
+			throw CompileError("a typedef of a type with an address space is not supported");
+		}
+		if (!target.namedType.empty() && !_unit.findStruct(target.namedType)) {
+			throw CompileError("typedef of the type \"" + target.namedType + "\", which is not declared");
+		}
+	}
+
+	if (kind() != TokenKind::Identifier) {
+		if (at(TokenKind::LParen)) {
+			throw CompileError("a typedef of a function pointer is not supported");
+		}
+		if (at(TokenKind::Star)) {
+			throw CompileError("a typedef of a pointer type is not supported");
+		}
+		throw CompileError("expected a typedef name, found " + std::string(tokenKindName(kind())));
+	}
+
+	const std::string name(advance().text);
+
+	if (at(TokenKind::LBracket)) {
+		throw CompileError("a typedef of an array type is not supported (\"" + name + "\")");
+	}
+	if (at(TokenKind::Comma)) {
+		throw CompileError("a typedef that declares several names is not supported; split \"" + name
+			+ "\" and the names after it into separate typedefs");
+	}
+	expect(TokenKind::Semicolon, "after a typedef");
+
+	if (isEnum && enumTag.empty()) {
+		declareName(name, "typedef");
+		_enumTypes[name] = name;
+		return;
+	}
+
+	if (isEnum) {
+		const std::string tag = enumTag;
+		const auto known = _enumTypes.find(name);
+		if (known != _enumTypes.end()) {
+			if (known->second != tag) {
+				throw CompileError("typedef redefinition with different types ('" + known->second + "' vs '"
+					+ tag + "')");
+			}
+			return;
+		}
+
+		if (name != enumTag) {
+			declareName(name, "typedef");
+		} else {
+			_declared[name] = "typedef";
+		}
+		_enumTypes[name] = tag;
+		return;
+	}
+
+	if (definedStruct) {
+		if (anonymousStruct) {
+			// The typedef name is the struct's own, as it is for a linkage name.
+			declareName(name, kAnonymousStructTypedef);
+			definedStruct->name = name;
+		}
+		_unit.structs.push_back(std::move(*definedStruct));
+		if (anonymousStruct) {
+			return;
+		}
+	}
+
+	// A typedef under the name of the struct it names is the same type, but the
+	// name is then a typedef as well, which is what another declaration collides with.
+	if (name == target.namedType) {
+		_declared[name] = "typedef";
+		return;
+	}
+
+	Type existing;
+	if (resolveTypeName(name, existing)) {
+		if (!sameType(existing, target)) {
+			throw CompileError("typedef redefinition with different types ('" + typeName(target) + "' vs '"
+				+ typeName(existing) + "')");
+		}
+		return;
+	}
+
+	declareName(name, "typedef");
+	_typedefs[name] = target;
+}
+
+std::string Parser::parseEnumDeclaration(bool& hadBody) {
+	expectKeyword("enum", "to start an enum");
+
+	if (atKeyword("class") || atKeyword("struct")) {
+		throw CompileError("a scoped enum (enum " + std::string(current().text) + ") is not supported; "
+			"declare an unscoped enum");
+	}
+
+	std::string tag;
+	if (kind() == TokenKind::Identifier) {
+		tag = std::string(advance().text);
+	}
+
+	if (at(TokenKind::Colon)) {
+		throw CompileError("an enum with a fixed underlying type is not supported");
+	}
+
+	hadBody = at(TokenKind::LBrace);
+	if (!hadBody) {
+		return tag;
+	}
+
+	advance();
+	if (!tag.empty()) {
+		declareName(tag, "enum");
+		_enumTypes[tag] = tag;
+	}
+
+	// Each enumerator is the previous one plus one unless it says otherwise, and
+	// the first is zero. They are kept as 64-bit values and held to what an int
+	// holds, so a value that wrapped could never be mistaken for a small one.
+	int64_t next = 0;
+	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected an enumerator name, found " + std::string(tokenKindName(kind())));
+		}
+
+		const std::string name(advance().text);
+		int64_t value = next;
+		if (match(TokenKind::Assign)) {
+			value = evaluateConstant(*parseAssignment(), false);
+		}
+		if (value > INT_MAX || value < -INT_MAX) {
+			throw CompileError("the enumerator \"" + name + "\" does not fit in an int");
+		}
+
+		declareName(name, "enum constant");
+		_enumConstants[name] = value;
+		next = value + 1;
+
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+	}
+
+	expect(TokenKind::RBrace, "to close an enum body");
+	return tag;
+}
+
+// Folds the integer constant expressions an enumerator, an attribute index or an
+// array length may be. Every step is held to what an int holds, so a result that
+// would wrap is an error here, and that is narrower than Apple's compiler, which
+// widens. A `u` literal is only accepted as the whole expression, since mixing it
+// with a signed operand changes the arithmetic to unsigned, which this does not
+// model.
+int64_t Parser::evaluateConstant(const Expression& expression, bool nested) const {
+	const auto fit = [](int64_t value) {
+		if (value > INT_MAX || value < -INT_MAX) {
+			throw CompileError("an integer constant expression overflows an int");
+		}
+		return value;
+	};
+
+	switch (expression.kind) {
+		case ExpressionKind::IntLiteral:
+			if (nested && (expression.intIsUnsigned || expression.intValue > INT_MAX)) {
+				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+			}
+			if (expression.intValue > INT64_MAX) {
+				throw CompileError("an integer constant is too large");
+			}
+			return static_cast<int64_t>(expression.intValue);
+		case ExpressionKind::BoolLiteral:
+			return expression.boolValue ? 1 : 0;
+		case ExpressionKind::Unary: {
+			const int64_t operand = evaluateConstant(*expression.left, true);
+			switch (expression.unaryOperator) {
+				case UnaryOperator::Negate: return fit(-operand);
+				case UnaryOperator::Plus: return operand;
+				case UnaryOperator::Not: return operand == 0 ? 1 : 0;
+				case UnaryOperator::BitNot: return ~operand;
+				default: break;
+			}
+			break;
+		}
+		case ExpressionKind::Binary: {
+			const int64_t left = evaluateConstant(*expression.left, true);
+			const int64_t right = evaluateConstant(*expression.right, true);
+			switch (expression.binaryOperator) {
+				case BinaryOperator::Add: return fit(left + right);
+				case BinaryOperator::Subtract: return fit(left - right);
+				case BinaryOperator::Multiply: return fit(left * right);
+				case BinaryOperator::Divide:
+				case BinaryOperator::Modulo:
+					if (right == 0) {
+						throw CompileError("division by zero in a constant expression");
+					}
+					return expression.binaryOperator == BinaryOperator::Divide ? fit(left / right) : left % right;
+				case BinaryOperator::ShiftLeft:
+				case BinaryOperator::ShiftRight:
+					if (right < 0 || right > 31 || left < 0) {
+						throw CompileError("a shift in a constant expression has a negative operand or a "
+							"count outside 0 to 31");
+					}
+					return expression.binaryOperator == BinaryOperator::ShiftLeft ? fit(left << right) : left >> right;
+				case BinaryOperator::BitAnd: return left & right;
+				case BinaryOperator::BitOr: return left | right;
+				case BinaryOperator::BitXor: return left ^ right;
+				case BinaryOperator::Less: return left < right;
+				case BinaryOperator::LessEqual: return left <= right;
+				case BinaryOperator::Greater: return left > right;
+				case BinaryOperator::GreaterEqual: return left >= right;
+				case BinaryOperator::Equal: return left == right;
+				case BinaryOperator::NotEqual: return left != right;
+				case BinaryOperator::LogicalAnd: return left != 0 && right != 0;
+				case BinaryOperator::LogicalOr: return left != 0 || right != 0;
+			}
+			break;
+		}
+		default:
+			break;
+	}
+
+	throw CompileError("not an integer constant expression");
+}
+
+// The index an attribute or an array length takes: a constant that is not
+// negative and fits the 32 bits it is stored in.
+int64_t Parser::parseConstantIndex(const std::string& context) {
+	int64_t value = 0;
+	try {
+		value = evaluateConstant(*parseAssignment(), false);
+	} catch (const CompileError& error) {
+		throw CompileError(context + " needs a constant integer argument (" + error.what() + ")");
+	}
+
+	if (value < 0 || value > UINT32_MAX) {
+		throw CompileError(context + " needs a constant integer argument between 0 and 4294967295, found "
+			+ std::to_string(value));
+	}
+
+	return value;
 }
 
 void Parser::expectFieldName(std::string& out) {
@@ -428,11 +825,7 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 
 	advance();
 
-	if (!at(TokenKind::IntegerLiteral)) {
-		throw CompileError("only constant array lengths are supported");
-	}
-
-	auto length = static_cast<uint32_t>(advance().integerValue);
+	const auto length = static_cast<uint32_t>(parseConstantIndex("an array length"));
 	expect(TokenKind::RBracket, "to close an array length");
 	return length;
 }
@@ -473,8 +866,13 @@ Type Parser::parseType() {
 		advance();
 	}
 
-	if (kind() == TokenKind::Identifier && isTypeName(current().text, type)) {
+	if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
+	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
+		throw CompileError("the enum type \"" + std::string(current().text) + "\" is not supported as a "
+			"type; its enumerators are, as integer constants");
+	} else if (atKeyword("enum")) {
+		throw CompileError("an enum used as a type is not supported; its enumerators are, as integer constants");
 	} else if (kind() == TokenKind::Identifier) {
 		type.namedType = std::string(advance().text);
 	} else {
@@ -509,6 +907,7 @@ Parameter Parser::parseParameter() {
 	}
 
 	param.name = std::string(advance().text);
+	rejectShadowing(param.name);
 
 	// "float values[4]" is an array suffix, "[[buffer(0)]]" is an attribute
 	// list, and both start with a bracket, so the second one has to be
@@ -600,10 +999,7 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		std::optional<uint32_t> argument;
 		if (at(TokenKind::LParen)) {
 			advance();
-			if (!at(TokenKind::IntegerLiteral)) {
-				throw CompileError("attribute \"" + name + "\" needs a constant integer argument");
-			}
-			argument = static_cast<uint32_t>(advance().integerValue);
+			argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\""));
 			expect(TokenKind::RParen, "to close an attribute argument");
 		}
 
@@ -627,6 +1023,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	}
 
 	decl.name = std::string(advance().text);
+	declareName(decl.name, "function");
 
 	expect(TokenKind::LParen, "to open a parameter list");
 
@@ -676,6 +1073,11 @@ StatementPtr Parser::parseStatement() {
 		return statement;
 	}
 
+	if (atKeyword("typedef") || atKeyword("enum")) {
+		throw CompileError("\"" + std::string(current().text) + "\" inside a function is not supported; "
+			"declare it at file scope");
+	}
+
 	if (atKeyword("if")) {
 		return parseIfStatement();
 	}
@@ -707,9 +1109,11 @@ StatementPtr Parser::parseStatement() {
 	// declared earlier in the unit counts, since "Vertex vtx;" is a declaration
 	// and nothing else could start with those two words.
 	{
+		Type probe;
 		const bool looksLikeType =
-			(kind() == TokenKind::Identifier && (isTypeName(current().text)
+			(kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
 				|| isTypeQualifier(current().text)
+				|| _enumTypes.count(std::string(current().text)) > 0
 				|| _unit.findStruct(std::string(current().text)) != nullptr))
 			|| atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
@@ -723,6 +1127,12 @@ StatementPtr Parser::parseStatement() {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 			}
 			declaration.name = std::string(advance().text);
+			rejectShadowing(declaration.name);
+
+			if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
+				&& !at(TokenKind::LParen)) {
+				throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
+			}
 
 			if (match(TokenKind::Assign)) {
 				declaration.initializer = parseExpression();
@@ -782,8 +1192,10 @@ StatementPtr Parser::parseForStatement() {
 	expect(TokenKind::LParen, "after 'for'");
 
 	{
+		Type probe;
 		const bool looksLikeType =
-			kind() == TokenKind::Identifier && isTypeName(current().text);
+			kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
+				|| _enumTypes.count(std::string(current().text)) > 0);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -792,6 +1204,7 @@ StatementPtr Parser::parseForStatement() {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
 			declaration.name = std::string(advance().text);
+			rejectShadowing(declaration.name);
 			if (match(TokenKind::Assign)) {
 				declaration.initializer = parseExpression();
 			}
@@ -1053,7 +1466,7 @@ ExpressionPtr Parser::parsePrimary() {
 		std::string_view text = current().text;
 
 		Type type;
-		if (isTypeName(text, type)) {
+		if (resolveTypeName(text, type) && type.namedType.empty()) {
 			// A type name in expression position constructs a value: float(x),
 			// float3(0), float4(a, b, c, 1). Metal has no cast syntax, so T(...) is
 			// always a constructor call, and the parenthesised part is a list of
@@ -1071,6 +1484,26 @@ ExpressionPtr Parser::parsePrimary() {
 			expression->constructType = type;
 			expression->arguments = parseArgumentList("to close a constructor's argument list");
 			return expression;
+		}
+
+		// An enumerator is the integer it was declared with.
+		const auto constant = _enumConstants.find(std::string(text));
+		if (constant != _enumConstants.end()) {
+			auto expression = std::make_unique<Expression>();
+			expression->line = line();
+			advance();
+			expression->kind = ExpressionKind::IntLiteral;
+			expression->intValue = static_cast<uint64_t>(constant->second < 0 ? -constant->second : constant->second);
+			if (constant->second >= 0) {
+				return expression;
+			}
+
+			auto negated = std::make_unique<Expression>();
+			negated->kind = ExpressionKind::Unary;
+			negated->line = expression->line;
+			negated->unaryOperator = UnaryOperator::Negate;
+			negated->left = std::move(expression);
+			return negated;
 		}
 
 		// A name that is also an MSL builtin is a plain identifier here. Whether
