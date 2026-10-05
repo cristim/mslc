@@ -4,8 +4,7 @@
 //
 // The same construction in expression position, float3(0) on the right of an
 // assignment. This spelling already parsed before, as a cast, and then failed in
-// lowering with "a scalar cannot be converted to a vector; mslc builds a vector
-// from a list of values, which it does not do yet", which was the right
+// lowering with "a scalar cannot be converted to a vector", which was the right
 // diagnostic for a conversion and the wrong one for a constructor.
 //
 // Metal has no cast syntax, so T(...) is always a constructor call. A node

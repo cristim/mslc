@@ -94,6 +94,10 @@ public:
 	// reinterpreted as an int.
 	spirv::Id componentOf(spirv::Id vectorType);
 
+	// The vector of the given width with the same component, or that component
+	// for a width of 1. InvalidId when the id is not a vector this table created.
+	spirv::Id withWidth(spirv::Id vectorType, uint32_t width);
+
 	// True when the type is a vector or a struct, which a single scalar value
 	// cannot stand in for.
 	bool isAggregate(spirv::Id type) const;

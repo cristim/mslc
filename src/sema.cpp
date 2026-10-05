@@ -506,9 +506,14 @@ bool TypeTable::isSignedInt(spirv::Id type) const {
 }
 
 Id TypeTable::componentOf(Id vectorType) {
+	return withWidth(vectorType, 1);
+}
+
+Id TypeTable::withWidth(Id vectorType, uint32_t width) {
 	for (const auto& [key, id]: _vectors) {
 		if (id == vectorType) {
-			return scalar(static_cast<ScalarKind>(key.first));
+			const auto kind = static_cast<ScalarKind>(key.first);
+			return vector(kind, width);
 		}
 	}
 
@@ -1103,6 +1108,9 @@ namespace {
 		Id emitCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
+		Id emitConstructList(const Expression& expression, Id toType);
+		const StructDecl* structOf(const Expression& expression);
+		Id emitSwizzle(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
@@ -1226,11 +1234,9 @@ namespace {
 		const uint32_t toWidth = _types.vectorWidth(toType);
 		if (fromWidth != toWidth && (fromWidth > 1 || toWidth > 1)) {
 			throw CompileError(fromWidth == 1 || toWidth == 1
-				? "a scalar cannot be converted to a vector; mslc builds a vector from a "
-					"list of values, which it does not do yet"
+				? "a scalar cannot be converted to a vector"
 				: "a vector of " + std::to_string(fromWidth) + " components cannot be "
-					"converted to one of " + std::to_string(toWidth) + "; mslc builds a "
-					"vector from a list of values, which it does not do yet");
+					"converted to one of " + std::to_string(toWidth));
 		}
 
 		// A bool is neither floating point nor an integer, and no convert opcode
@@ -1333,6 +1339,13 @@ namespace {
 		}
 
 		const Binding& binding = it->second;
+
+		// A buffer is reached through the address block, so the binding has no id
+		// of its own to load, and loading it wrote an OpLoad of id 0.
+		if (binding.bufferPointeeType != InvalidId) {
+			throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
+				"which is not lowered yet");
+		}
 
 		if (!binding.isPointer) {
 			return binding.id;
@@ -1490,14 +1503,82 @@ namespace {
 		outSteps.assign(reversed.rbegin(), reversed.rend());
 	}
 
-	Id Emitter::emitMember(const Expression& expression) {
-		const ConstantBinding* constant = constantFor(expression.left.get());
-		if (constant) {
-			if (!constant->structType) {
-				throw CompileError("\"" + expression.left->name + "\" is a constant, so \"."
-					+ expression.memberName + "\" is not a member of it");
+	// The struct an expression's value is, or null when it is not one. A '.' on
+	// anything else is a swizzle, which is why this is asked before any code for
+	// the left side is emitted. A member is never a struct: a struct field of
+	// struct type is rejected where the struct is declared.
+	const StructDecl* Emitter::structOf(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Identifier: {
+				const auto it = _bindings.find(expression.name);
+				if (it != _bindings.end()) {
+					const std::string& name = it->second.pointeeMsl.namedType;
+					return name.empty() ? nullptr : _unit.findStruct(name);
+				}
+				const auto constant = _constants.find(expression.name);
+				return constant == _constants.end() ? nullptr : constant->second.structType;
 			}
 
+			// An element of a buffer has the buffer's own type.
+			case ExpressionKind::Index: return structOf(*expression.left);
+
+			default: return nullptr;
+		}
+	}
+
+	// v.zyx, (a * b).xyz, normalize(n).w: the components of a vector value, in
+	// the order named, from one of the two letter sets Metal allows.
+	Id Emitter::emitSwizzle(const Expression& expression) {
+		const std::string& name = expression.memberName;
+		const std::string quoted = "\"." + name + "\"";
+		if (name.size() > 4) {
+			throw CompileError(quoted + " names more than four components");
+		}
+
+		std::vector<uint32_t> indices;
+		const std::string_view set = std::string_view("xyzw").find(name[0]) != std::string_view::npos
+			? "xyzw" : "rgba";
+		for (const char letter: name) {
+			const size_t index = set.find(letter);
+			if (index == std::string_view::npos) {
+				throw CompileError(quoted + " is not a swizzle: each letter has to be one of "
+					"xyzw, or each one of rgba");
+			}
+			indices.push_back(static_cast<uint32_t>(index));
+		}
+
+		const Id vector = emitExpression(*expression.left);
+		const Id type = _builder.typeOf(vector);
+		if (_types.componentOf(type) == InvalidId) {
+			throw CompileError(quoted + " swizzles a value that is not a vector");
+		}
+
+		const uint32_t width = _types.vectorWidth(type);
+		for (const uint32_t index: indices) {
+			if (index >= width) {
+				throw CompileError(quoted + " names a component past the end of a vector of "
+					+ std::to_string(width));
+			}
+		}
+
+		if (indices.size() == 1) {
+			return _builder.emitTyped(spirv::OpCompositeExtract, _types.componentOf(type),
+				{ vector, indices[0] });
+		}
+
+		std::vector<uint32_t> operands = { vector, vector };
+		operands.insert(operands.end(), indices.begin(), indices.end());
+		return _builder.emitTyped(spirv::OpVectorShuffle,
+			_types.withWidth(type, static_cast<uint32_t>(indices.size())), operands);
+	}
+
+	Id Emitter::emitMember(const Expression& expression) {
+		if (!structOf(*expression.left)) {
+			return emitSwizzle(expression);
+		}
+
+		const ConstantBinding* constant = constantFor(expression.left.get());
+		if (constant) {
 			std::string declName;
 			const size_t field = fieldIndexOf(*constant->structType, expression.memberName, declName);
 			if (field == constant->structType->fields.size()) {
@@ -1703,12 +1784,8 @@ namespace {
 				"value to put in it; write the value you want, as " + spelled + "(0)");
 		}
 
-		// The list form, float4(a, b, c, 1), is a different capability: it builds a
-		// vector from one value per component rather than by broadcast.
 		if (expression.arguments.size() > 1) {
-			throw CompileError(spelled + " built from " + std::to_string(expression.arguments.size())
-				+ " values is not lowered yet; one value broadcasts, which is what "
-				+ spelled + "(0) does");
+			return emitConstructList(expression, toType);
 		}
 
 		const Id value = emitExpression(*expression.arguments.front());
@@ -1719,6 +1796,52 @@ namespace {
 		}
 
 		return convert(value, fromType, toType);
+	}
+
+	// float4(v3, 1), float4(v2, v2), float3(f, v2): the pieces fill the components
+	// in the order written. Apple's compiler converts a scalar piece but takes a
+	// vector piece only of the target's own component type, and the widths have to
+	// add up to the target's; mslc accepts the same and rejects the rest.
+	Id Emitter::emitConstructList(const Expression& expression, Id toType) {
+		const std::string spelled = typeName(*expression.constructType);
+		const Id component = _types.componentOf(toType);
+		if (component == InvalidId) {
+			throw CompileError(spelled + " is built from one value, and this passes "
+				+ std::to_string(expression.arguments.size()));
+		}
+
+		std::vector<uint32_t> pieces;
+		uint32_t components = 0;
+		for (const ExpressionPtr& argument: expression.arguments) {
+			const Id value = emitExpression(*argument);
+			const Id type = _builder.typeOf(value);
+
+			if (_types.componentOf(type) != InvalidId) {
+				if (_types.componentOf(type) != component) {
+					throw CompileError("a vector piece of " + spelled + " has to have its "
+						"component type; only a scalar piece is converted");
+				}
+				pieces.push_back(value);
+				components += _types.vectorWidth(type);
+				continue;
+			}
+
+			if (_types.isAggregate(type)) {
+				throw CompileError(spelled + " is built from scalars and vectors, not from "
+					"a matrix or a struct");
+			}
+
+			pieces.push_back(convert(value, type, component));
+			components += 1;
+		}
+
+		const uint32_t width = _types.vectorWidth(toType);
+		if (components != width) {
+			throw CompileError(spelled + " built from " + std::to_string(components)
+				+ " components needs " + std::to_string(width));
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, pieces);
 	}
 
 	Id Emitter::emitUnary(const Expression& expression) {
@@ -3165,6 +3288,10 @@ namespace {
 		if (expression.left->kind == ExpressionKind::Index) {
 			address = emitIndex(*expression.left, true);
 		} else if (expression.left->kind == ExpressionKind::Member) {
+			if (!structOf(*expression.left->left)) {
+				throw CompileError("assigning to \"." + expression.left->memberName
+					+ "\" of a value that is not a struct, a swizzle, is not lowered yet");
+			}
 			Id fieldType = InvalidId;
 			address = emitMemberAddress(*expression.left, fieldType);
 		} else if (expression.left->kind == ExpressionKind::Identifier) {

@@ -342,12 +342,13 @@ void Parser::parsePreprocessorDirective() {
 		// directive leaves the program compiling up to the first name it needed,
 		// and mslc hands back a library for source it did not read.
 		//
-		// Only <metal_stdlib> is honoured: it carries the MSL builtins, which mslc
-		// resolves from its own table rather than from a header. Compared as
-		// written, so the angled form only: a quoted include searches the
-		// includer's own directory in MSL, and an app shipping a file of that name
-		// would have it ignored here, which is the failure this rule removes.
-		if (raw != "<metal_stdlib>") {
+		// Only <metal_stdlib> and <metal_matrix> are honoured: they carry the MSL
+		// builtins and the matrix types, which mslc resolves from its own tables
+		// rather than from a header. Compared as written, so the angled form only: a
+		// quoted include searches the includer's own directory in MSL, and an app
+		// shipping a file of that name would have it ignored here, which is the
+		// failure this rule removes.
+		if (raw != "<metal_stdlib>" && raw != "<metal_matrix>") {
 			throw CompileError("cannot honour #include " + raw + ": mslc has no "
 				"preprocessor, and a header it does not read would leave the program "
 				"compiling up to the first name it needed");
