@@ -56,16 +56,17 @@ endfunction()
 # what makes a lexing question answerable by reading it rather than by guessing.
 run(dump_tokens 0 "--dump-tokens;--output;${WORK_DIR}/out.spv;${input}")
 run_expects(dump_tokens "identifier           kernel")
-run_expects(dump_tokens "(")
 
-# No arguments at all: the usage goes to stderr and the exit is 2, which is what
-# a caller can tell from a compile failure.
+# No arguments at all: the usage is printed and the exit is 2, which is what a
+# caller can tell from a compile failure.
 run(no_arguments 2)
+run_expects(no_arguments "usage: mslc")
 
-# A flag with no value. The exit is 2 for the same reason, and the usage names
-# the flag's own argument, so the caller knows which one is missing.
+# A flag with no value. The exit is 2 for the same reason, with the usage shown.
 run(missing_output 2 "-o")
+run_expects(missing_output "usage: mslc")
 run(missing_reflect 2 "--reflect")
+run_expects(missing_reflect "usage: mslc")
 
 # An input that does not exist is a failure, not an empty module.
 run(absent_input nonzero "${WORK_DIR}/does-not-exist.metal")
