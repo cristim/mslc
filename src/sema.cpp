@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 
 namespace mslc {
 
@@ -254,6 +255,42 @@ namespace {
 	// The Lod bit of the image operands mask, which an explicit-lod sample and
 	// an image fetch both carry.
 	constexpr uint32_t kImageOperandsLod = 0x2;
+
+	// Every name an expression or statement refers to. A constexpr sampler nothing
+	// refers to has no state in Apple's AIR, so it gets no binding either.
+	void collectIdentifiers(const Expression& expression, std::set<std::string>& names) {
+		if (expression.kind == ExpressionKind::Identifier) {
+			names.insert(expression.name);
+		}
+		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
+			if (child) collectIdentifiers(*child, names);
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			collectIdentifiers(*argument, names);
+		}
+		for (const InitializerElement& element: expression.elements) {
+			collectIdentifiers(*element.value, names);
+		}
+	}
+
+	void collectIdentifiers(const Statement& statement, std::set<std::string>& names) {
+		for (const Expression* expression: { statement.expression.get(), statement.forCondition.get(),
+			statement.forIncrement.get(), statement.whileCondition.get() }) {
+			if (expression) collectIdentifiers(*expression, names);
+		}
+		for (const std::optional<VariableDeclaration>* declaration: { &statement.declaration, &statement.forInitializer }) {
+			if (*declaration && (*declaration)->initializer) {
+				collectIdentifiers(*(*declaration)->initializer, names);
+			}
+		}
+		for (const StatementPtr& child: statement.children) {
+			collectIdentifiers(*child, names);
+		}
+		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
+			statement.forBody.get(), statement.whileBody.get() }) {
+			if (nested) collectIdentifiers(*nested, names);
+		}
+	}
 
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
@@ -1137,7 +1174,7 @@ namespace {
 		void declareParameters();
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
-		void reserveLocalSamplers(const Statement& statement);
+		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -3054,7 +3091,9 @@ namespace {
 		}
 
 		declareResources(resources);
-		reserveLocalSamplers(*_entryPoint->body);
+		std::set<std::string> used;
+		collectIdentifiers(*_entryPoint->body, used);
+		reserveLocalSamplers(*_entryPoint->body, used);
 	}
 
 	// One entry per binding goes in the reflection. The separator goes before the
@@ -3094,7 +3133,7 @@ namespace {
 	// That is Iridium's order (indium src/iridium/air.cpp: the texture loop, the
 	// sampler loop, then air.sampler_states), and it is what indium binds by.
 	// The index among its own kind is the Metal index, and an unattributed
-	// parameter takes the next one not claimed by an attribute, as Apple's does.
+	// parameter takes the smallest one no attribute claims, as Apple's does.
 	void Emitter::declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources) {
 		_nextBinding = _bufferMembers.empty() ? 0u : 1u;
 
@@ -3105,15 +3144,39 @@ namespace {
 		};
 		std::vector<Entry> textures;
 		std::vector<Entry> samplers;
-		uint32_t implicitTextures = 0;
-		uint32_t implicitSamplers = 0;
+		// An unattributed parameter takes the smallest index of its kind that no
+		// attribute anywhere in the list claims and no earlier parameter took.
+		std::set<uint32_t> taken[2];
+		for (const auto& [index, parameter]: resources) {
+			(void)index;
+			const bool isTexture = parameter->type.resource == ResourceKind::Texture2D;
+			const auto& declared = isTexture ? parameter->attributes.textureIndex
+				: parameter->attributes.samplerIndex;
+			if (declared) {
+				taken[isTexture ? 0 : 1].insert(*declared);
+			}
+		}
 
 		for (const auto& [index, parameter]: resources) {
 			const bool isTexture = parameter->type.resource == ResourceKind::Texture2D;
 			const auto& declared = isTexture ? parameter->attributes.textureIndex
 				: parameter->attributes.samplerIndex;
-			const uint32_t metalIndex = declared ? *declared
-				: (isTexture ? implicitTextures++ : implicitSamplers++);
+			uint32_t metalIndex = 0;
+			if (declared) {
+				metalIndex = *declared;
+			} else {
+				std::set<uint32_t>& claimed = taken[isTexture ? 0 : 1];
+				while (claimed.count(metalIndex)) {
+					++metalIndex;
+				}
+				const uint32_t limit = isTexture ? 127 : 15;
+				if (metalIndex > limit) {
+					throw CompileError(std::string("no '") + (isTexture ? "texture" : "sampler")
+						+ "' resource location is available for parameter \"" + parameter->name
+						+ "\": every index up to " + std::to_string(limit) + " is taken");
+				}
+				claimed.insert(metalIndex);
+			}
 			(isTexture ? textures : samplers).push_back({ index, parameter, metalIndex });
 		}
 
@@ -3164,8 +3227,9 @@ namespace {
 	//
 	// Every one in the body is reserved before the entry point is emitted, since
 	// the variable has to be in the OpEntryPoint interface, which comes first.
-	void Emitter::reserveLocalSamplers(const Statement& statement) {
-		if (statement.declaration && statement.declaration->sampler) {
+	void Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
+		if (statement.declaration && statement.declaration->sampler
+			&& used.count(statement.declaration->name)) {
 			const VariableDeclaration& declaration = *statement.declaration;
 			const bool known = std::any_of(_embeddedSamplers.begin(), _embeddedSamplers.end(),
 				[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
@@ -3181,12 +3245,12 @@ namespace {
 		}
 
 		for (const StatementPtr& child: statement.children) {
-			reserveLocalSamplers(*child);
+			reserveLocalSamplers(*child, used);
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
-				reserveLocalSamplers(*nested);
+				reserveLocalSamplers(*nested, used);
 			}
 		}
 	}
@@ -3195,7 +3259,7 @@ namespace {
 		const auto found = std::find_if(_embeddedSamplers.begin(), _embeddedSamplers.end(),
 			[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
 		if (found == _embeddedSamplers.end()) {
-			throw CompileError("the sampler \"" + declaration.name + "\" was not reserved a binding");
+			return;  // never named after its declaration, so Apple records no state for it
 		}
 
 		Binding bound;
@@ -3300,6 +3364,11 @@ namespace {
 				throw CompileError("the third argument of sample has to be level(lod); an offset "
 					"and the other options are not lowered yet");
 			}
+		}
+
+		// Vulkan requires Lod 0 through an unnormalized sampler, whatever level() says.
+		if (sampler.unnormalizedSampler) {
+			lod = _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Float), { 0u });
 		}
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
@@ -4204,6 +4273,8 @@ namespace {
 					+ "\", \"min_filter\": \"" + samplerFilterName(state.minFilter)
 					+ "\", \"mip_filter\": \"" + samplerMipFilterName(state.mipFilter)
 					+ "\", \"normalized_coordinates\": " + (state.normalizedCoordinates ? "true" : "false")
+					+ ", \"compare_function\": \"Never\", \"anisotropy\": 1"
+					+ ", \"border_color\": \"TransparentBlack\", \"lod_min\": 0, \"lod_max\": 65504"
 					+ " }";
 			}
 			document += _embeddedSamplers.empty() ? "]\n" : "\n\t\t\t]\n";

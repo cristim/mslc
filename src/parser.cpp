@@ -903,6 +903,10 @@ Type Parser::parseType(bool allowResource) {
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
 		}
 		parseResourceType(type);
+		if (atKeyword("const")) {
+			type.isConst = true;
+			advance();
+		}
 	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
 	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
@@ -958,6 +962,10 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	if (match(TokenKind::Comma)) {
+		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
+			advance();
+			advance();
+		}
 		if (kind() != TokenKind::Identifier || current().text != "access") {
 			throw CompileError("expected an access qualifier after the sampled type of texture2d");
 		}

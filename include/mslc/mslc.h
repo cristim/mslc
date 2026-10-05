@@ -27,10 +27,8 @@ typedef enum {
 	MSLC_STAGE_KERNEL = 3,
 } MslcStage;
 
-/* Descriptor set assignment. MSLC_SET_IMAGES lets image bindings occupy their
- * own set, which indium expects: it mirrors Metal's split between a vertex
- * stage's buffer bindings and a fragment stage's, which land in different
- * sets. */
+/* Descriptor set assignment. Not consulted yet: a vertex or kernel function's
+ * bindings are in set 0 and a fragment function's in set 1 under either value. */
 typedef enum {
 	MSLC_SET_COMBINED = 0,
 	MSLC_SET_IMAGES = 1,

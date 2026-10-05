@@ -234,6 +234,14 @@ struct ModuleOptions {
 	bool separateImageSet = false;
 };
 
+// The reflection's embedded_samplers entries carry the whole of indium's
+// EmbeddedSampler. The options that set compare_function, anisotropy,
+// border_color and the lod clamp are refused, so those fields hold Apple's
+// defaults for a sampler that does not set them: compare_function Never (8 in
+// Apple's sampler state word), anisotropy 1, border_color TransparentBlack,
+// lod_min 0 and lod_max 65504 (the largest half). A consumer must not zero-fill
+// them: lod_max 0 would restrict the sampler to mip level 0.
+//
 // Emits the module for every given entry point: one OpEntryPoint and one
 // function each, with the descriptor set, the execution modes and the interface
 // chosen per entry point's stage. Returns the reflection document, one entry per
