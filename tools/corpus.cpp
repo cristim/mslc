@@ -166,6 +166,9 @@ int main(int argc, char** argv) {
 		MslcOptions options;
 		mslc_default_options(&options);
 
+		// So a quoted #include finds the header beside the shader.
+		options.sourcePath = result.path.c_str();
+
 		uint8_t* spirv = nullptr;
 		size_t spirvSize = 0;
 		char* error = nullptr;

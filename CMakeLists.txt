@@ -10,6 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # directly by the CLI.
 add_library(mslc
 	src/lexer.cpp
+	src/preprocessor.cpp
 	src/ast.cpp
 	src/parser.cpp
 	src/sema.cpp

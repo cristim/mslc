@@ -6,6 +6,7 @@
 #include "mslc/mslc.h"
 
 #include "lexer.h"
+#include "preprocessor.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +54,17 @@ namespace {
 		return written == size;
 	}
 
+	// A diagnostic that already starts with the input's path (the preprocessor
+	// names file:line:col) is not prefixed with it a second time.
+	void reportError(const char* input, const std::string& message) {
+		const std::string located = std::string(input) + ":";
+		if (message.compare(0, located.size(), located) == 0) {
+			std::fprintf(stderr, "mslc: %s\n", message.c_str());
+		} else {
+			std::fprintf(stderr, "mslc: %s: %s\n", input, message.c_str());
+		}
+	}
+
 	void usage() {
 		std::fprintf(stderr,
 			"usage: mslc [options] <input.metal>\n"
@@ -61,6 +73,8 @@ namespace {
 			"      --stage <stage>   kernel, vertex or fragment; inferred when omitted\n"
 			"      --local-size <x> <y> <z>  workgroup size for a kernel (default 1 1 1)\n"
 			"  -V, --validate        run spirv-val on the result\n"
+			"  -I <dir>              also search <dir> for a quoted #include (repeatable)\n"
+			"  -E                    print the preprocessed source and exit\n"
 			"      --dump-tokens   print the token stream and exit\n"
 			"      --version         print the library version\n");
 	}
@@ -92,6 +106,8 @@ int main(int argc, char** argv) {
 	std::string reflectionPath;
 	bool validate = false;
 	bool dumpTokens = false;
+	bool preprocessOnly = false;
+	std::vector<std::string> includeDirs;
 
 	for (int i = 1; i < argc; ++i) {
 		const std::string argument = argv[i];
@@ -117,6 +133,13 @@ int main(int argc, char** argv) {
 			options.localSizeZ = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 		} else if (argument == "-V" || argument == "--validate") {
 			validate = true;
+		} else if (argument == "-I") {
+			if (++i >= argc) { usage(); return 2; }
+			includeDirs.push_back(argv[i]);
+		} else if (argument.size() > 2 && argument.compare(0, 2, "-I") == 0) {
+			includeDirs.push_back(argument.substr(2));
+		} else if (argument == "-E") {
+			preprocessOnly = true;
 		} else if (argument == "--dump-tokens") {
 			dumpTokens = true;
 		} else if (argument == "--version") {
@@ -143,6 +166,30 @@ int main(int argc, char** argv) {
 	if (!readFile(input, source)) {
 		std::fprintf(stderr, "mslc: cannot read \"%s\"\n", input);
 		return 2;
+	}
+
+	std::vector<const char*> includeDirPointers;
+	for (const std::string& directory: includeDirs) {
+		includeDirPointers.push_back(directory.c_str());
+	}
+	options.sourcePath = input;
+	options.includeDirs = includeDirPointers.empty() ? nullptr : includeDirPointers.data();
+	options.includeDirCount = includeDirPointers.size();
+
+	if (preprocessOnly) {
+		try {
+			mslc::PreprocessOptions preprocessOptions;
+			preprocessOptions.sourcePath = input;
+			preprocessOptions.includeDirs = includeDirs;
+			const mslc::PreprocessedSource result = mslc::preprocess(
+				std::string_view(source.data(), source.size()), preprocessOptions);
+			const std::string text = mslc::renderTokens(result.tokens);
+			std::fwrite(text.data(), 1, text.size(), stdout);
+			return 0;
+		} catch (const mslc::CompileError& error) {
+			reportError(input, error.what());
+			return 1;
+		}
 	}
 
 	if (dumpTokens) {
@@ -173,7 +220,7 @@ int main(int argc, char** argv) {
 		&spirv, &spirvSize, reflectionPath.empty() ? nullptr : &reflection, &error);
 
 	if (result != 0) {
-		std::fprintf(stderr, "mslc: %s: %s\n", input, error ? error : "unknown error");
+		reportError(input, error ? error : "unknown error");
 		mslc_free(error);
 		mslc_free(reflection);
 		return 1;

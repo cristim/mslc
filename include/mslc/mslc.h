@@ -50,10 +50,23 @@ typedef struct {
 	uint32_t localSizeZ;
 
 	MslcImageSetPolicy imageSetPolicy;
+
+	/* Path of the source passed to mslc_translate, or NULL when it did not come
+	 * from a file. A quoted #include is looked for first in this file's
+	 * directory, so a source with no path can include only from includeDirs. The
+	 * file is not read; the path is used for resolving includes and for naming
+	 * the source in diagnostics. */
+	const char* sourcePath;
+
+	/* Directories searched, in order, for a quoted #include after the source's
+	 * own directory. An include may resolve only inside the source's directory
+	 * and these; an absolute path, or one that escapes them, is an error. */
+	const char* const* includeDirs;
+	size_t includeDirCount;
 } MslcOptions;
 
 /* Fills options with the defaults: stage inferred, local size 1/1/1, combined
- * descriptor set. */
+ * descriptor set, no source path and no include directories. */
 void mslc_default_options(MslcOptions* options);
 
 /* Translates MSL source to a SPIR-V module.

@@ -2,6 +2,7 @@
 
 #include "lexer.h"
 #include "parser.h"
+#include "preprocessor.h"
 #include "sema.h"
 #include "spirv.h"
 
@@ -53,6 +54,9 @@ void mslc_default_options(MslcOptions* options) {
 	options->localSizeY = 1;
 	options->localSizeZ = 1;
 	options->imageSetPolicy = MSLC_SET_COMBINED;
+	options->sourcePath = nullptr;
+	options->includeDirs = nullptr;
+	options->includeDirCount = 0;
 }
 
 int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* options,
@@ -87,9 +91,24 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 	try {
 		const std::string_view view(source, sourceLength);
 
-		const std::vector<mslc::Token> tokens = mslc::tokenize(view);
+		mslc::PreprocessOptions preprocessOptions;
+		if (effective.sourcePath) {
+			preprocessOptions.sourcePath = effective.sourcePath;
+		}
+		if (effective.includeDirCount > 0 && !effective.includeDirs) {
+			throw mslc::CompileError("includeDirCount is nonzero but includeDirs is NULL");
+		}
+		for (size_t i = 0; i < effective.includeDirCount; ++i) {
+			if (!effective.includeDirs[i]) {
+				throw mslc::CompileError("includeDirs has a NULL entry");
+			}
+			preprocessOptions.includeDirs.emplace_back(effective.includeDirs[i]);
+		}
 
-		mslc::Parser parser(tokens);
+		// Holds the text the tokens point into, so it outlives the parse.
+		const mslc::PreprocessedSource preprocessed = mslc::preprocess(view, preprocessOptions);
+
+		mslc::Parser parser(preprocessed.tokens);
 		const mslc::TranslationUnit unit = parser.parse();
 
 		const std::vector<const mslc::FunctionDecl*> entryPoints = mslc::selectEntryPoints(unit,

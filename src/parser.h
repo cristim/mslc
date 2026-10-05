@@ -50,14 +50,8 @@ private:
 
 	size_t line() const;
 
-	// Advances past the rest of the current preprocessor directive. A directive
-	// ends at the end of its own line, so this stops at the first token on a
-	// later line instead of consuming the declarations that follow.
-	void skipDirectiveLine(size_t directiveLine);
-
 	// Top-level declarations
 	void parseDeclaration();
-	void parsePreprocessorDirective();
 	StructDecl parseStructDeclaration();
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	VariableDeclaration parseGlobalDeclaration();
