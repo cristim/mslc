@@ -945,6 +945,24 @@ namespace {
 		// True when the name is a descriptor over a wrapped buffer, so indexing
 		// it needs a struct member index before the element index.
 		bool isBuffer = false;
+		// True for a const local and for a buffer in constant memory or declared
+		// const: Metal rejects a store through it.
+		bool readOnly = false;
+	};
+
+	// A name declared in a block or a for-loop header stops naming it when the
+	// scope ends, and a name it hid names what it did before.
+	class BindingScope {
+	public:
+		explicit BindingScope(std::map<std::string, Binding>& bindings)
+			: _bindings(bindings), _saved(bindings) {}
+		~BindingScope() { _bindings = std::move(_saved); }
+		BindingScope(const BindingScope&) = delete;
+		BindingScope& operator=(const BindingScope&) = delete;
+
+	private:
+		std::map<std::string, Binding>& _bindings;
+		std::map<std::string, Binding> _saved;
 	};
 
 	// A value rather than a place, so there is no address to load through and a
@@ -1084,6 +1102,8 @@ namespace {
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
+		Id emitPlaceAddress(const Expression& left);
+		void emitSwizzleStore(const Expression& target, const Expression& valueExpression);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
@@ -1526,10 +1546,9 @@ namespace {
 		}
 	}
 
-	// v.zyx, (a * b).xyz, normalize(n).w: the components of a vector value, in
-	// the order named, from one of the two letter sets Metal allows.
-	Id Emitter::emitSwizzle(const Expression& expression) {
-		const std::string& name = expression.memberName;
+	// The lane each letter of a swizzle names, from one of the two letter sets
+	// Metal allows. Shared by a read and a store, so both reject the same spellings.
+	std::vector<uint32_t> swizzleLanes(const std::string& name) {
 		const std::string quoted = "\"." + name + "\"";
 		if (name.size() > 4) {
 			throw CompileError(quoted + " names more than four components");
@@ -1547,19 +1566,31 @@ namespace {
 			indices.push_back(static_cast<uint32_t>(index));
 		}
 
-		const Id vector = emitExpression(*expression.left);
-		const Id type = _builder.typeOf(vector);
-		if (_types.componentOf(type) == InvalidId) {
-			throw CompileError(quoted + " swizzles a value that is not a vector");
-		}
+		return indices;
+	}
 
-		const uint32_t width = _types.vectorWidth(type);
-		for (const uint32_t index: indices) {
-			if (index >= width) {
-				throw CompileError(quoted + " names a component past the end of a vector of "
+	void requireLanesWithin(const std::string& name, const std::vector<uint32_t>& lanes, uint32_t width) {
+		for (const uint32_t lane: lanes) {
+			if (lane >= width) {
+				throw CompileError("\"." + name + "\" names a component past the end of a vector of "
 					+ std::to_string(width));
 			}
 		}
+	}
+
+	// v.zyx, (a * b).xyz, normalize(n).w: the components of a vector value, in
+	// the order named, from one of the two letter sets Metal allows.
+	Id Emitter::emitSwizzle(const Expression& expression) {
+		const std::string& name = expression.memberName;
+		const std::vector<uint32_t> indices = swizzleLanes(name);
+
+		const Id vector = emitExpression(*expression.left);
+		const Id type = _builder.typeOf(vector);
+		if (_types.componentOf(type) == InvalidId) {
+			throw CompileError("\"." + name + "\" swizzles a value that is not a vector");
+		}
+
+		requireLanesWithin(name, indices, _types.vectorWidth(type));
 
 		if (indices.size() == 1) {
 			return _builder.emitTyped(spirv::OpCompositeExtract, _types.componentOf(type),
@@ -2885,6 +2916,8 @@ namespace {
 		binding.pointeeMsl = parameter.type;
 		binding.pointeeMsl.isPointer = false;
 		binding.pointeeMsl.isConst = false;
+		binding.readOnly = parameter.type.isConst
+			|| parameter.type.addressSpace == AddressSpace::Constant;
 		binding.memberIndex = memberIndex;
 		_bindings[parameter.name] = binding;
 
@@ -3252,6 +3285,7 @@ namespace {
 		binding.pointeeType = type;
 		binding.storageClass = spirv::StorageClass::Function;
 		binding.pointeeMsl = msl;
+		binding.readOnly = msl.isConst;
 		_bindings[name] = binding;
 	}
 
@@ -3274,6 +3308,122 @@ namespace {
 		}
 	}
 
+	// The left side of an assignment is a place, so it is emitted as an address
+	// rather than loaded.
+	Id Emitter::emitPlaceAddress(const Expression& left) {
+		Id address = InvalidId;
+		if (left.kind == ExpressionKind::Index) {
+			address = emitIndex(left, true);
+		} else if (left.kind == ExpressionKind::Member) {
+			Id fieldType = InvalidId;
+			address = emitMemberAddress(left, fieldType);
+		} else if (left.kind == ExpressionKind::Identifier) {
+			// A local names a Function-storage pointer, so the variable itself is
+			// the address to store to. A buffer parameter is a descriptor and a
+			// plain value is loaded, so only this case takes the binding.
+			const auto it = _bindings.find(left.name);
+			if (it != _bindings.end() && it->second.isPointer
+				&& it->second.storageClass == spirv::StorageClass::Function) {
+				address = it->second.id;
+			} else {
+				address = emitExpression(left);
+			}
+		} else {
+			address = emitExpression(left);
+		}
+
+		return address;
+	}
+
+	// v.xy = e, s.pos.zw = e, buf[i].w = e: the lanes the swizzle names are
+	// replaced in the whole vector and the vector is stored back, so the lanes it
+	// does not name keep their value. The address is computed once.
+	void Emitter::emitSwizzleStore(const Expression& target, const Expression& valueExpression) {
+		const std::string& name = target.memberName;
+		const std::string quoted = "\"." + name + "\"";
+		const std::vector<uint32_t> lanes = swizzleLanes(name);
+		for (size_t i = 0; i < lanes.size(); ++i) {
+			for (size_t j = i + 1; j < lanes.size(); ++j) {
+				if (lanes[i] == lanes[j]) {
+					throw CompileError("assigning to " + quoted + " names a component twice");
+				}
+			}
+		}
+
+		const Expression& base = *target.left;
+		if (base.kind == ExpressionKind::Member && !structOf(*base.left)) {
+			throw CompileError("assigning to " + quoted + " of a swizzle is not lowered yet");
+		}
+
+		const Expression* root = &base;
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		const auto rootBinding = _bindings.find(root->name);
+		if (rootBinding != _bindings.end() && rootBinding->second.readOnly) {
+			throw CompileError("assigning to " + quoted + " of \"" + root->name
+				+ "\", which is const or in constant memory");
+		}
+
+		const Id address = emitPlaceAddress(base);
+		const Id addressType = _builder.typeOf(address);
+		const Id vectorType = _types.pointeeOf(addressType);
+		const auto storageClass = _types.storageClassOf(addressType);
+		if (!storageClass) {
+			throw CompileError("assigning to " + quoted + " of a value that is not a local, "
+				"a struct member or a buffer element");
+		}
+		const bool inBuffer = *storageClass == spirv::StorageClass::PhysicalStorageBuffer;
+		if (_types.componentOf(vectorType) == InvalidId) {
+			throw CompileError("assigning to " + quoted + " of a value that is not a vector");
+		}
+		requireLanesWithin(name, lanes, _types.vectorWidth(vectorType));
+
+		Id value = emitExpression(valueExpression);
+		const Id valueType = _builder.typeOf(value);
+		const Id component = _types.componentOf(vectorType);
+		const auto count = static_cast<uint32_t>(lanes.size());
+
+		const Id old = inBuffer ? loadFromBuffer(address, vectorType) : loadFrom(address, vectorType);
+		Id updated = InvalidId;
+		if (count == 1) {
+			if (_types.vectorWidth(valueType) != 1) {
+				throw CompileError("assigning a vector of " + std::to_string(_types.vectorWidth(valueType))
+					+ " components to " + quoted + ", which names one");
+			}
+			updated = _builder.emitTyped(spirv::OpCompositeInsert, vectorType,
+				{ convert(value, valueType, component), old, lanes[0] });
+		} else {
+			const Id lanesType = _types.withWidth(vectorType, count);
+			if (_types.vectorWidth(valueType) == 1) {
+				value = broadcast(value, lanesType);
+			} else if (valueType != lanesType) {
+				throw CompileError("assigning to " + quoted + " takes a vector of " + std::to_string(count)
+					+ " components of the same type as the target, or a scalar");
+			}
+
+			// Lane j keeps the old vector's component unless the swizzle names it,
+			// in which case it takes the matching component of the value.
+			std::vector<uint32_t> operands = { old, value };
+			for (uint32_t lane = 0; lane < _types.vectorWidth(vectorType); ++lane) {
+				uint32_t source = lane;
+				for (uint32_t k = 0; k < count; ++k) {
+					if (lanes[k] == lane) {
+						source = _types.vectorWidth(vectorType) + k;
+					}
+				}
+				operands.push_back(source);
+			}
+			updated = _builder.emitTyped(spirv::OpVectorShuffle, vectorType, operands);
+		}
+
+		if (inBuffer) {
+			storeIntoBuffer(address, updated);
+		} else {
+			_builder.emit(spirv::OpStore, { address, updated });
+		}
+	}
+
 	void Emitter::emitExpressionStatement(const Expression& expression) {
 		// An assignment yields an address rather than a value, so it is
 		// handled here rather than through emitExpression.
@@ -3282,32 +3432,13 @@ namespace {
 			return;
 		}
 
-		// The left side is a place, so it is emitted as an address rather
-		// than loaded.
-		Id address = InvalidId;
-		if (expression.left->kind == ExpressionKind::Index) {
-			address = emitIndex(*expression.left, true);
-		} else if (expression.left->kind == ExpressionKind::Member) {
-			if (!structOf(*expression.left->left)) {
-				throw CompileError("assigning to \"." + expression.left->memberName
-					+ "\" of a value that is not a struct, a swizzle, is not lowered yet");
-			}
-			Id fieldType = InvalidId;
-			address = emitMemberAddress(*expression.left, fieldType);
-		} else if (expression.left->kind == ExpressionKind::Identifier) {
-			// A local names a Function-storage pointer, so the variable itself is
-			// the address to store to. A buffer parameter is a descriptor and a
-			// plain value is loaded, so only this case takes the binding.
-			const auto it = _bindings.find(expression.left->name);
-			if (it != _bindings.end() && it->second.isPointer
-				&& it->second.storageClass == spirv::StorageClass::Function) {
-				address = it->second.id;
-			} else {
-				address = emitExpression(*expression.left);
-			}
-		} else {
-			address = emitExpression(*expression.left);
+		if (expression.left->kind == ExpressionKind::Member
+			&& !structOf(*expression.left->left)) {
+			emitSwizzleStore(*expression.left, *expression.right);
+			return;
 		}
+
+		const Id address = emitPlaceAddress(*expression.left);
 
 		const Id value = emitExpression(*expression.right);
 
@@ -3334,7 +3465,8 @@ namespace {
 
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
-			case StatementKind::Compound:
+			case StatementKind::Compound: {
+				const BindingScope scope(_bindings);
 				// Whatever follows a return in the same block is unreachable,
 				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
@@ -3344,6 +3476,7 @@ namespace {
 					emitStatement(*child);
 				}
 				return;
+			}
 
 			case StatementKind::ExpressionStatement:
 				if (statement.expression) {
@@ -3389,6 +3522,7 @@ namespace {
 			// continue block, and that block alone branches back to the header.
 			case StatementKind::For:
 			case StatementKind::While: {
+				const BindingScope scope(_bindings);
 				const bool isFor = statement.kind == StatementKind::For;
 
 				if (isFor && statement.forInitializer) {
