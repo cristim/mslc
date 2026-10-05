@@ -52,6 +52,10 @@ const char* tokenKindName(TokenKind kind) {
 		case TokenKind::Increment: return "++";
 		case TokenKind::Decrement: return "--";
 		case TokenKind::Hash: return "#";
+		case TokenKind::HashHash: return "##";
+		case TokenKind::Ellipsis: return "...";
+		case TokenKind::Question: return "?";
+		case TokenKind::Invalid: return "invalid token";
 	}
 
 	return "token";
@@ -98,7 +102,26 @@ namespace {
 
 }
 
-std::vector<Token> tokenize(std::string_view source) {
+std::string describeInvalidToken(const Token& token) {
+	const std::string where = " at offset " + std::to_string(token.offset);
+
+	switch (token.invalidReason) {
+		case InvalidReason::UnexpectedCharacter:
+			return "unexpected character '" + std::string(token.text) + "'" + where;
+		case InvalidReason::NewlineInString:
+			return "newline in a string literal" + where;
+		case InvalidReason::UnterminatedString:
+			return "unterminated string literal" + where;
+		case InvalidReason::MalformedNumber:
+			return "invalid numeric literal \"" + std::string(token.text) + "\"";
+		case InvalidReason::None:
+			break;
+	}
+
+	return "invalid token" + where;
+}
+
+std::vector<Token> tokenize(std::string_view source, bool lenient) {
 	std::vector<Token> tokens;
 
 	size_t i = 0;
@@ -108,12 +131,41 @@ std::vector<Token> tokenize(std::string_view source) {
 	// it started on.
 	size_t line = 1;
 
+	// A newline outside a comment starts a new logical line; whitespace and
+	// comments separate the tokens either side of them.
+	bool atLineStart = true;
+	bool spaceBefore = false;
+
+	auto place = [&](Token& token) {
+		token.startOfLine = atLineStart;
+		token.spaceBefore = spaceBefore;
+		atLineStart = false;
+		spaceBefore = false;
+	};
+
 	auto makeToken = [&](TokenKind kind, size_t start) {
 		Token token;
 		token.kind = kind;
 		token.offset = start;
 		token.line = line;
 		token.text = source.substr(start, i - start);
+		place(token);
+		tokens.push_back(token);
+	};
+
+	// reported is the offset the diagnostic names, which is not always where
+	// the bad text starts.
+	auto invalid = [&](InvalidReason reason, size_t start, size_t reported) {
+		Token token;
+		token.kind = TokenKind::Invalid;
+		token.invalidReason = reason;
+		token.offset = reported;
+		token.line = line;
+		token.text = source.substr(start, i - start);
+		if (!lenient) {
+			throw CompileError(describeInvalidToken(token));
+		}
+		place(token);
 		tokens.push_back(token);
 	};
 
@@ -124,7 +176,9 @@ std::vector<Token> tokenize(std::string_view source) {
 		if (std::isspace(static_cast<unsigned char>(c))) {
 			if (c == '\n') {
 				++line;
+				atLineStart = true;
 			}
+			spaceBefore = true;
 			++i;
 			continue;
 		}
@@ -134,6 +188,7 @@ std::vector<Token> tokenize(std::string_view source) {
 			while (i < size && source[i] != '\n') {
 				++i;
 			}
+			spaceBefore = true;
 			continue;
 		}
 
@@ -157,8 +212,9 @@ std::vector<Token> tokenize(std::string_view source) {
 
 			if (!closed) {
 				i = size;
-				throw CompileError("unterminated block comment starting at offset " + std::to_string(start));
+				throw LexError("unterminated block comment starting at offset " + std::to_string(start), start);
 			}
+			spaceBefore = true;
 			continue;
 		}
 
@@ -169,6 +225,7 @@ std::vector<Token> tokenize(std::string_view source) {
 			++i;
 
 			bool closed = false;
+			bool newlineEnded = false;
 			while (i < size) {
 				if (source[i] == '\\' && i + 1 < size) {
 					// A backslash-newline splices two physical lines into one
@@ -183,8 +240,9 @@ std::vector<Token> tokenize(std::string_view source) {
 					// A raw newline is not legal in a string, and Apple's compiler
 					// rejects it. Reporting it keeps the line count meaningful
 					// rather than guessing where the token was meant to end.
-					throw CompileError("newline in a string literal at offset "
-						+ std::to_string(i));
+					invalid(InvalidReason::NewlineInString, start, i);
+					newlineEnded = true;
+					break;
 				}
 				if (source[i] == '"') {
 					++i;
@@ -194,8 +252,13 @@ std::vector<Token> tokenize(std::string_view source) {
 				++i;
 			}
 
+			if (newlineEnded) {
+				continue;
+			}
+
 			if (!closed) {
-				throw CompileError("unterminated string literal at offset " + std::to_string(start));
+				invalid(InvalidReason::UnterminatedString, start, start);
+				continue;
 			}
 
 			makeToken(TokenKind::Identifier, start);
@@ -256,6 +319,7 @@ std::vector<Token> tokenize(std::string_view source) {
 			token.line = line;
 			token.text = source.substr(start, i - start);
 			token.integerIsUnsigned = isUnsigned;
+			place(token);
 
 			if (isFloat) {
 				token.kind = TokenKind::FloatLiteral;
@@ -317,7 +381,14 @@ std::vector<Token> tokenize(std::string_view source) {
 				case ';': makeToken(TokenKind::Semicolon, start); continue;
 				case ',': makeToken(TokenKind::Comma, start); continue;
 				case ':': makeToken(TokenKind::Colon, start); continue;
-				case '.': makeToken(TokenKind::Dot, start); continue;
+				case '.':
+					if (source.substr(start, 3) == "...") {
+						i = start + 3;
+						makeToken(TokenKind::Ellipsis, start);
+					} else {
+						makeToken(TokenKind::Dot, start);
+					}
+					continue;
 				case '+': makeToken(TokenKind::Plus, start); continue;
 				case '-': makeToken(TokenKind::Minus, start); continue;
 				case '*': makeToken(TokenKind::Star, start); continue;
@@ -331,13 +402,20 @@ std::vector<Token> tokenize(std::string_view source) {
 				case '^': makeToken(TokenKind::Caret, start); continue;
 				case '~': makeToken(TokenKind::Tilde, start); continue;
 				case '!': makeToken(TokenKind::Bang, start); continue;
-				case '#': makeToken(TokenKind::Hash, start); continue;
+				case '#':
+					if (source.substr(start, 2) == "##") {
+						i = start + 2;
+						makeToken(TokenKind::HashHash, start);
+					} else {
+						makeToken(TokenKind::Hash, start);
+					}
+					continue;
+				case '?': makeToken(TokenKind::Question, start); continue;
 				default: break;
 			}
 		}
 
-		throw CompileError(std::string("unexpected character '") + c + "' at offset "
-			+ std::to_string(i - 1));
+		invalid(InvalidReason::UnexpectedCharacter, i - 1, i - 1);
 	}
 
 	Token end;
