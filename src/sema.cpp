@@ -164,16 +164,84 @@ namespace {
 		throw CompileError("this binary operator is recognised but not lowered yet");
 	}
 
-	// GLSL.std.450 instruction numbers, from the extended instruction set's
-	// grammar (FMin 37, UMin 38, SMin 39, FMax 40, UMax 41, SMax 42).
-	uint32_t minMaxInstruction(bool isMax, bool isFloat, bool isSigned) {
-		if (isFloat) {
-			return isMax ? 40u : 37u;
+	// How a math builtin's arguments relate to each other and to its result.
+	enum class MathShape {
+		// Every argument is the result type, or a scalar broadcast to it.
+		Componentwise,
+		// FClamp(x, 0, 1).
+		Saturate,
+		// Vectors of one type in, that type out: normalize, reflect.
+		Vector,
+		// Vectors of one type in, their component out: length, distance.
+		VectorToScalar,
+		// As VectorToScalar, but a core opcode rather than GLSL.std.450.
+		Dot,
+		// Two vectors of one type and a scalar eta.
+		Refract,
+		// Two three-component vectors.
+		Cross,
+	};
+
+	// GLSL.std.450 numbers its instructions from 1, so 0 marks a builtin with no
+	// integer form.
+	constexpr uint32_t kNoInstruction = 0;
+
+	struct MathBuiltin {
+		const char* name;
+		size_t arity;
+		MathShape shape;
+		// GLSL.std.450 instruction numbers, from the extended instruction set's
+		// grammar. A float-only builtin has no signed or unsigned instruction.
+		uint32_t floatInstruction;
+		uint32_t signedInstruction;
+		uint32_t unsignedInstruction;
+	};
+
+	constexpr MathBuiltin kMathBuiltins[] = {
+		{ "trunc", 1, MathShape::Componentwise, 3, kNoInstruction, kNoInstruction },
+		{ "abs", 1, MathShape::Componentwise, 4, 5, kNoInstruction },
+		{ "floor", 1, MathShape::Componentwise, 8, kNoInstruction, kNoInstruction },
+		{ "ceil", 1, MathShape::Componentwise, 9, kNoInstruction, kNoInstruction },
+		{ "fract", 1, MathShape::Componentwise, 10, kNoInstruction, kNoInstruction },
+		{ "sin", 1, MathShape::Componentwise, 13, kNoInstruction, kNoInstruction },
+		{ "cos", 1, MathShape::Componentwise, 14, kNoInstruction, kNoInstruction },
+		{ "tan", 1, MathShape::Componentwise, 15, kNoInstruction, kNoInstruction },
+		{ "asin", 1, MathShape::Componentwise, 16, kNoInstruction, kNoInstruction },
+		{ "acos", 1, MathShape::Componentwise, 17, kNoInstruction, kNoInstruction },
+		{ "atan", 1, MathShape::Componentwise, 18, kNoInstruction, kNoInstruction },
+		{ "atan2", 2, MathShape::Componentwise, 25, kNoInstruction, kNoInstruction },
+		{ "pow", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
+		{ "exp", 1, MathShape::Componentwise, 27, kNoInstruction, kNoInstruction },
+		{ "log", 1, MathShape::Componentwise, 28, kNoInstruction, kNoInstruction },
+		{ "exp2", 1, MathShape::Componentwise, 29, kNoInstruction, kNoInstruction },
+		{ "log2", 1, MathShape::Componentwise, 30, kNoInstruction, kNoInstruction },
+		{ "sqrt", 1, MathShape::Componentwise, 31, kNoInstruction, kNoInstruction },
+		{ "rsqrt", 1, MathShape::Componentwise, 32, kNoInstruction, kNoInstruction },
+		{ "min", 2, MathShape::Componentwise, 37, 39, 38 },
+		{ "max", 2, MathShape::Componentwise, 40, 42, 41 },
+		{ "clamp", 3, MathShape::Componentwise, 43, 45, 44 },
+		{ "saturate", 1, MathShape::Saturate, 43, kNoInstruction, kNoInstruction },
+		{ "mix", 3, MathShape::Componentwise, 46, kNoInstruction, kNoInstruction },
+		{ "step", 2, MathShape::Componentwise, 48, kNoInstruction, kNoInstruction },
+		{ "smoothstep", 3, MathShape::Componentwise, 49, kNoInstruction, kNoInstruction },
+		{ "fma", 3, MathShape::Componentwise, 50, kNoInstruction, kNoInstruction },
+		{ "length", 1, MathShape::VectorToScalar, 66, kNoInstruction, kNoInstruction },
+		{ "distance", 2, MathShape::VectorToScalar, 67, kNoInstruction, kNoInstruction },
+		{ "cross", 2, MathShape::Cross, 68, kNoInstruction, kNoInstruction },
+		{ "normalize", 1, MathShape::Vector, 69, kNoInstruction, kNoInstruction },
+		{ "reflect", 2, MathShape::Vector, 71, kNoInstruction, kNoInstruction },
+		{ "refract", 3, MathShape::Refract, 72, kNoInstruction, kNoInstruction },
+		{ "dot", 2, MathShape::Dot, kNoInstruction, kNoInstruction, kNoInstruction },
+	};
+
+	const MathBuiltin* findMathBuiltin(const std::string& name) {
+		for (const MathBuiltin& builtin: kMathBuiltins) {
+			if (name == builtin.name) {
+				return &builtin;
+			}
 		}
-		if (isSigned) {
-			return isMax ? 42u : 39u;
-		}
-		return isMax ? 41u : 38u;
+
+		return nullptr;
 	}
 
 	// The merge and function control masks. Every one of them is None: Pure
@@ -946,7 +1014,6 @@ namespace {
 		Id _voidType = InvalidId;
 		Id _functionId = InvalidId;
 		Id _entryPointId = InvalidId;
-		bool _glslImported = false;
 		spirv::Id _glslSet = InvalidId;
 
 		// Set once the current block has its terminator, so nothing more may be
@@ -1034,6 +1101,7 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
+		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
 		Id loadFrom(Id pointer, Id pointeeType);
@@ -1891,37 +1959,149 @@ namespace {
 			throw CompileError("only a direct function call is supported");
 		}
 
-		// The few intrinsics the corpus needs: min and max on scalars, which
-		// are GLSL.std.450 rather than core opcodes.
-		if (expression.left->name == "min" || expression.left->name == "max") {
-			if (expression.arguments.size() != 2) {
-				throw CompileError(expression.left->name + " takes two arguments");
-			}
-
-			const Id left = emitExpression(*expression.arguments[0]);
-			const Id type = _builder.typeOf(left);
-			if (_types.matrixInfo(type)) {
-				throw CompileError(expression.left->name + " takes scalars or vectors, not a matrix");
-			}
-			// GLSL.std.450 wants every operand of the result type.
-			const Id argument = emitExpression(*expression.arguments[1]);
-			const Id right = convert(argument, _builder.typeOf(argument), type);
-
-			if (!_glslImported) {
-				_glslImported = true;
-				// The set name is a literal string operand, not an OpString id.
-				std::vector<uint32_t> name;
-				spirv::Builder::appendString(name, "GLSL.std.450");
-				_glslSet = _builder.emitDecl(spirv::OpExtInstImport, name);
-			}
-
-			return _builder.emitTyped(spirv::OpExtInst, type,
-				{ _glslSet, minMaxInstruction(expression.left->name == "max",
-					_types.isFloat(type), _types.isSignedInt(type)), left, right });
+		// The parser takes no function but an entry point, so a call cannot name a
+		// user function a builtin would shadow.
+		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
+		if (!builtin) {
+			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
+				"recognises, and user functions are not lowered yet");
 		}
 
-		throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
-			"recognises, and user functions are not lowered yet");
+		return emitMathBuiltin(*builtin, expression.arguments);
+	}
+
+	Id Emitter::emitMathBuiltin(const MathBuiltin& builtin,
+		const std::vector<ExpressionPtr>& arguments) {
+
+		const std::string name = builtin.name;
+		if (arguments.size() != builtin.arity) {
+			throw CompileError(name + " takes " + std::to_string(builtin.arity) + " argument"
+				+ (builtin.arity == 1 ? "" : "s") + ", and this call passes "
+				+ std::to_string(arguments.size()));
+		}
+
+		std::vector<Id> values;
+		for (const ExpressionPtr& argument: arguments) {
+			const Id value = emitExpression(*argument);
+			const Id type = _builder.typeOf(value);
+			if (_types.matrixInfo(type)) {
+				throw CompileError(name + " takes scalars or vectors, not a matrix");
+			}
+			// A bool is one bit wide and a struct or pointer has no width at all.
+			if (!_types.isFloat(type) && _types.bitWidth(type) < 8) {
+				throw CompileError(name + " takes numeric scalars or vectors");
+			}
+			values.push_back(value);
+		}
+
+		// refract's eta is a scalar of its own, so only the first two of its
+		// arguments say what type the call is in.
+		const size_t sharing = builtin.shape == MathShape::Refract ? 2 : values.size();
+
+		const bool takesIntegers = builtin.signedInstruction != kNoInstruction;
+
+		// The type the call is in: the first vector argument's, since a scalar
+		// beside it is broadcast. Among scalars alone it is the first float
+		// argument's, as Apple types pow(x, 2) as float, or else the first's.
+		Id type = _builder.typeOf(values[0]);
+		for (size_t i = 0; i < sharing; ++i) {
+			const Id argumentType = _builder.typeOf(values[i]);
+			if (_types.vectorWidth(argumentType) > 1) {
+				type = argumentType;
+				break;
+			}
+			if (!_types.isFloat(type) && _types.isFloat(argumentType)) {
+				type = argumentType;
+			}
+		}
+
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = width > 1 ? _types.componentOf(type) : type;
+		const bool isFloat = _types.isFloat(type);
+		const bool isSigned = _types.isSignedInt(type);
+		const uint32_t bits = _types.bitWidth(type);
+
+		const bool takesScalars = builtin.shape == MathShape::Componentwise
+			|| builtin.shape == MathShape::Saturate;
+		// Metal has no double, and GLSL.std.450's transcendentals take only 16 and
+		// 32 bits.
+		if (isFloat ? bits > 32 : !takesIntegers) {
+			throw CompileError(name + " takes float or half" + (takesIntegers ? " or integer" : "")
+				+ (takesScalars ? " scalars or vectors" : " vectors"));
+		}
+
+		if (!takesScalars && width == 1) {
+			throw CompileError(name + " takes vectors, and Metal has no scalar " + name);
+		}
+
+		if (builtin.shape == MathShape::Cross && width != 3) {
+			throw CompileError("cross takes three-component vectors, and these have "
+				+ std::to_string(width));
+		}
+
+		// A scalar beside a vector is broadcast, as Metal converts a scalar to any
+		// vector. Beside a float scalar only an integer is converted, and only
+		// for a builtin with no integer form: Apple reports min(int, float) and
+		// mix(half, half, float) as ambiguous.
+		for (size_t i = 0; i < sharing; ++i) {
+			const Id argumentType = _builder.typeOf(values[i]);
+			if (argumentType == type) {
+				continue;
+			}
+
+			const bool converts = width == 1 && !takesIntegers && !_types.isFloat(argumentType);
+			if (_types.vectorWidth(argumentType) != 1 || (width == 1 && !converts)) {
+				throw CompileError("the arguments of " + name + " have to be one type, or a "
+					"scalar beside a vector");
+			}
+
+			values[i] = width > 1 ? broadcast(values[i], type) : convert(values[i], argumentType, type);
+		}
+
+		if (builtin.shape == MathShape::Refract) {
+			if (_types.vectorWidth(_builder.typeOf(values[2])) != 1) {
+				throw CompileError("refract's third argument is the scalar ratio of the indices "
+					"of refraction, not a vector");
+			}
+			values[2] = convert(values[2], _builder.typeOf(values[2]), component);
+		}
+
+		if (builtin.shape == MathShape::Dot) {
+			return _builder.emitTyped(spirv::OpDot, component, { values[0], values[1] });
+		}
+
+		if (builtin.shape == MathShape::Saturate) {
+			Id zero = _builder.emitDeclTyped(spirv::OpConstant, component, { 0u });
+			// 1.0 as a half is 0x3C00, not the float's bits; 0.0 is zero bits in both.
+			Id one = _builder.emitDeclTyped(spirv::OpConstant, component,
+				{ bits == 16 ? 0x3C00u : 0x3F800000u });
+			if (width > 1) {
+				zero = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+					std::vector<uint32_t>(width, zero));
+				one = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+					std::vector<uint32_t>(width, one));
+			}
+			values.push_back(zero);
+			values.push_back(one);
+		}
+
+		const uint32_t instruction = isFloat ? builtin.floatInstruction
+			: isSigned ? builtin.signedInstruction : builtin.unsignedInstruction;
+		if (instruction == kNoInstruction) {
+			throw CompileError(name + " of an unsigned integer is not lowered yet");
+		}
+
+		if (_glslSet == InvalidId) {
+			// The set name is a literal string operand, not an OpString id.
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+
+		const Id result = builtin.shape == MathShape::VectorToScalar ? component : type;
+		std::vector<uint32_t> operands { _glslSet, instruction };
+		operands.insert(operands.end(), values.begin(), values.end());
+		return _builder.emitTyped(spirv::OpExtInst, result, operands);
 	}
 
 	// The constant a folded value becomes: a scalar as an OpConstant of its kind,
