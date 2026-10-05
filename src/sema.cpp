@@ -597,12 +597,10 @@ uint32_t TypeTable::alignmentOf(Id type) const {
 }
 
 Id TypeTable::zero(Id type) {
-	// A vector or a struct has no single zero value: OpConstant is a scalar form,
-	// so an aggregate needs OpConstantComposite over its parts. No local of that
-	// shape parses yet, and reporting it beats emitting a scalar for it.
+	// OpConstant is a scalar form; OpConstantNull zeroes every component and
+	// member of a vector, matrix or struct.
 	if (isAggregate(type)) {
-		throw CompileError("a local of an aggregate type cannot be zero initialised yet; "
-			"give it an initialiser");
+		return _builder.emitDeclTyped(spirv::OpConstantNull, type, { });
 	}
 
 	// A bool has no literal form, so it needs its own opcode rather than a zero
@@ -989,6 +987,7 @@ namespace {
 		void emitStatement(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
 		void branchUnlessTerminated(Id label);
@@ -2621,12 +2620,18 @@ namespace {
 			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
 		_builder.emit(spirv::OpStore, { id, initial });
 
+		bindLocal(declaration.name, id, typeId, declaration.type);
+	}
+
+	// pointeeMsl is what a member access on the local resolves its fields against.
+	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl) {
 		Binding binding;
-		binding.id = id;
+		binding.id = variable;
 		binding.isPointer = true;
-		binding.pointeeType = typeId;
+		binding.pointeeType = type;
 		binding.storageClass = spirv::StorageClass::Function;
-		_bindings[declaration.name] = binding;
+		binding.pointeeMsl = msl;
+		_bindings[name] = binding;
 	}
 
 	// A label's id is allocated ahead of time so a branch can name it, which

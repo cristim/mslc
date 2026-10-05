@@ -98,10 +98,10 @@ public:
 	// cannot stand in for.
 	bool isAggregate(spirv::Id type) const;
 
-	// The zero value of a scalar type, for a local declared without an
-	// initialiser. Each scalar kind needs its own form: a bool has separate
-	// opcodes, and OpConstant's literal count follows the width, so a 64-bit
-	// value needs two words.
+	// The zero value of a type, for a local declared without an initialiser. Each
+	// scalar kind needs its own form: a bool has separate opcodes, and
+	// OpConstant's literal count follows the width, so a 64-bit value needs two
+	// words. A vector, a matrix or a struct is OpConstantNull.
 	spirv::Id zero(spirv::Id type);
 
 	// A struct by name. Returns InvalidId when the name is not declared in the

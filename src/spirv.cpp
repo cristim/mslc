@@ -36,6 +36,7 @@ namespace {
 			case OpConstantTrue:
 			case OpConstantFalse:
 			case OpConstantComposite:
+			case OpConstantNull:
 			case OpSpecConstant:
 			case OpSpecConstantTrue:
 			case OpSpecConstantFalse:
