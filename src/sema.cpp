@@ -581,6 +581,21 @@ bool TypeTable::isFloat(spirv::Id type) const {
 	return false;
 }
 
+bool TypeTable::isBool(spirv::Id type) const {
+	const auto boolScalar = _scalars.find(static_cast<uint32_t>(ScalarKind::Bool));
+	if (boolScalar != _scalars.end() && boolScalar->second == type) {
+		return true;
+	}
+
+	for (const auto& [key, id]: _vectors) {
+		if (id == type) {
+			return static_cast<ScalarKind>(key.first) == ScalarKind::Bool;
+		}
+	}
+
+	return false;
+}
+
 bool TypeTable::isSignedInt(spirv::Id type) const {
 	for (const auto& [kind, id]: _scalars) {
 		if (id == type) {
@@ -785,6 +800,32 @@ Id TypeTable::zero(Id type) {
 		std::vector<uint32_t>((bitWidth(type) + 31) / 32, 0u));
 }
 
+Id TypeTable::one(Id type) {
+	const Id vectorComponent = componentOf(type);
+	const Id component = vectorComponent == InvalidId ? type : vectorComponent;
+	const uint32_t bits = bitWidth(component);
+
+	std::vector<uint32_t> words;
+	if (isFloat(component)) {
+		if (bits == 64) {
+			throw CompileError("double is not supported");
+		}
+
+		words = { bits == 16 ? 0x3C00u : 0x3F800000u };
+	} else {
+		words = std::vector<uint32_t>((bits + 31) / 32, 0u);
+		words.front() = 1u;
+	}
+
+	const Id scalarOne = _builder.emitDeclTyped(spirv::OpConstant, component, words);
+	if (component == type) {
+		return scalarOne;
+	}
+
+	return _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+		std::vector<uint32_t>(vectorWidth(type), scalarOne));
+}
+
 Id TypeTable::image2D() {
 	if (_image2D == InvalidId) {
 		_image2D = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
@@ -877,6 +918,21 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	return true;
 }
 
+void TypeTable::rejectBoolMembers(const std::string& structName) const {
+	const StructDecl* decl = _unit.findStruct(structName);
+	if (!decl) {
+		return;
+	}
+
+	for (const StructField& field: decl->fields) {
+		if (field.type.scalar == ScalarKind::Bool) {
+			throw CompileError("struct \"" + decl->name + "\" has the bool member \"" + field.name
+				+ "\" and is used as a buffer's layout, which mslc does not lay out yet; "
+					"keep the flag in a uint");
+		}
+	}
+}
+
 // A struct as the element of an array of it: the same members with their
 // offsets, and no Block decoration. Vulkan requires a struct nested inside a
 // Block to be laid out, and rejects a Block-decorated struct inside an array, so
@@ -886,6 +942,8 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	if (cached != _elementStructs.end()) {
 		return cached->second;
 	}
+
+	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -936,6 +994,8 @@ Id TypeTable::namedStruct(const std::string& name) {
 	if (cached != _structs.end()) {
 		return cached->second;
 	}
+
+	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -1293,6 +1353,8 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id convertImplicit(Id value, Id toType);
+		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
 	};
 
@@ -1424,12 +1486,21 @@ namespace {
 					"converted to one of " + std::to_string(toWidth));
 		}
 
-		// A bool is neither floating point nor an integer, and no convert opcode
-		// accepts one, so reaching here means the shape is not lowered yet.
-		// Reporting it beats emitting an instruction spirv-val rejects.
-		if (fromType == _types.scalar(ScalarKind::Bool)
-			|| toType == _types.scalar(ScalarKind::Bool)) {
-			throw CompileError("converting to or from bool is not lowered yet");
+		// No convert opcode takes a bool, scalar or vector. To a bool, C++ says
+		// "not equal to zero", and a NaN is not equal to anything, so it is true:
+		// the float compare is the unordered one. From a bool, true is one.
+		const bool toBool = _types.isBool(toType);
+		if (toBool || _types.isBool(fromType)) {
+			if (_types.bitWidth(toBool ? fromType : toType) == 0) {
+				throw CompileError("a bool converts to and from a numeric scalar or vector only");
+			}
+
+			return toBool
+				? _builder.emitTyped(comparisonOpcode(BinaryOperator::NotEqual,
+						_types.isFloat(fromType), false),
+					toType, { value, _types.zero(fromType) })
+				: _builder.emitTyped(spirv::OpSelect, toType,
+					{ value, _types.one(toType), _types.zero(toType) });
 		}
 
 		// Integer and float conversions each have their own opcodes. OpBitcast is
@@ -1499,6 +1570,41 @@ namespace {
 			fromSigned ? spirv::OpSConvert : spirv::OpUConvert,
 			_types.scalar(*temporary), { value });
 		return _builder.emitTyped(spirv::OpBitcast, toType, { widened });
+	}
+
+	// The conversion an initialiser or an assignment makes without a cast. Apple
+	// takes a scalar there and fills every component with it, and rejects a
+	// vector of another component type, so int2 does not become float2 or bool2
+	// until it is written as one.
+	Id Emitter::convertImplicit(Id value, Id toType) {
+		const Id fromType = _builder.typeOf(value);
+		if (_types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) > 1
+			&& _types.bitWidth(fromType) != 0) {
+			return broadcast(value, toType);
+		}
+
+		if (fromType != toType && _types.vectorWidth(fromType) > 1 && _types.vectorWidth(toType) > 1
+			&& _types.vectorWidth(fromType) == _types.vectorWidth(toType)) {
+			throw CompileError("a vector is not implicitly converted to a vector of another "
+				"component type; write the conversion as a constructor");
+		}
+
+		return convert(value, fromType, toType);
+	}
+
+	// A condition, !, && and || take a numeric scalar and compare it with zero, as
+	// C++ does. A vector is no condition: Apple rejects one.
+	Id Emitter::asCondition(Id value) {
+		const Id type = _builder.typeOf(value);
+		if (type == _boolType) {
+			return value;
+		}
+
+		if (_types.vectorWidth(type) > 1) {
+			throw CompileError("a condition has to be a bool or a numeric scalar");
+		}
+
+		return convert(value, type, _boolType);
 	}
 
 	Id Emitter::emitIdentifier(const Expression& expression) {
@@ -2088,6 +2194,11 @@ namespace {
 			throw CompileError("a unary operator on a matrix is not lowered yet");
 		}
 
+		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
+			throw CompileError("a unary operator on a bool is not lowered yet; "
+				"convert the bool to an int first");
+		}
+
 		switch (expression.unaryOperator) {
 			case UnaryOperator::Plus: return operand;
 			case UnaryOperator::Negate:
@@ -2095,7 +2206,10 @@ namespace {
 					? _builder.emitTyped(spirv::OpFNegate, type, { operand })
 					: _builder.emitTyped(spirv::OpSNegate, type, { operand });
 			case UnaryOperator::Not:
-				return _builder.emitTyped(spirv::OpLogicalNot, _boolType, { operand });
+				// A bool vector is negated componentwise, and stays one.
+				return _types.isBool(type)
+					? _builder.emitTyped(spirv::OpLogicalNot, type, { operand })
+					: _builder.emitTyped(spirv::OpLogicalNot, _boolType, { asCondition(operand) });
 			case UnaryOperator::BitNot:
 				return _builder.emitTyped(spirv::OpNot, type, { operand });
 			default:
@@ -2125,7 +2239,11 @@ namespace {
 		if (isLogical) {
 			const uint16_t opcode = expression.binaryOperator == BinaryOperator::LogicalAnd
 				? spirv::OpLogicalAnd : spirv::OpLogicalOr;
-			return _builder.emitTyped(opcode, _boolType, { left, right });
+			if (_types.isBool(leftType) && leftType == _builder.typeOf(right)) {
+				return _builder.emitTyped(opcode, leftType, { left, right });
+			}
+
+			return _builder.emitTyped(opcode, _boolType, { asCondition(left), asCondition(right) });
 		}
 
 		if (isComparison) {
@@ -2225,6 +2343,13 @@ namespace {
 
 			return _builder.emitTyped(comparisonOpcode(expression.binaryOperator,
 				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
+		}
+
+		// Apple promotes a bool operand to int. mslc has no such promotion, and
+		// OpIAdd on a bool is a module spirv-val rejects.
+		if (_types.isBool(leftType) || _types.isBool(_builder.typeOf(right))) {
+			throw CompileError("an arithmetic, bitwise or comparison operator on a bool is not lowered yet; "
+				"convert the bool to an int first");
 		}
 
 		// OpUDiv and OpUMod need both operands of the result type, and a literal
@@ -3106,6 +3231,11 @@ namespace {
 			}
 
 			pointeeType = declaredTypeOf(parameter.type);
+			if (_types.isBool(pointeeType)) {
+				throw CompileError("parameter \"" + parameter.name + "\" is a buffer of "
+					+ typeName(parameter.type) + ", which mslc does not lay out yet; "
+						"keep the flags in a uint");
+			}
 		}
 
 		// A buffer parameter's address is a member of the binding-0 block rather
@@ -3851,7 +3981,7 @@ namespace {
 					"read straight from a buffer, whose layout differs; mslc does not copy between "
 					"them yet");
 			}
-			initial = convert(initializer, _builder.typeOf(initializer), typeId);
+			initial = convertImplicit(initializer, typeId);
 		} else {
 			initial = _types.zero(typeId);
 		}
@@ -4054,12 +4184,11 @@ namespace {
 		// same layout rule gives the access.
 		const auto storageClass = _types.storageClassOf(addressType);
 		if (storageClass && *storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
-			storeIntoBuffer(address, convert(value, _builder.typeOf(value), pointeeType));
+			storeIntoBuffer(address, convertImplicit(value, pointeeType));
 			return;
 		}
 
-		_builder.emit(spirv::OpStore, { address,
-			convert(value, _builder.typeOf(value), pointeeType) });
+		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
 	void Emitter::emitStatement(const Statement& statement) {
@@ -4094,7 +4223,7 @@ namespace {
 			// Vulkan requires structured control flow: every conditional branch
 			// is preceded by a merge instruction naming where its paths rejoin.
 			case StatementKind::If: {
-				const Id condition = emitExpression(*statement.expression);
+				const Id condition = asCondition(emitExpression(*statement.expression));
 				const Id thenLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 				const Id elseLabel = statement.elseBranch ? _builder.nextId() : mergeLabel;
@@ -4139,7 +4268,7 @@ namespace {
 
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
-				const Id conditionValue = condition ? emitExpression(*condition) : InvalidId;
+				const Id conditionValue = condition ? asCondition(emitExpression(*condition)) : InvalidId;
 				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
 				if (condition) {
 					terminate(spirv::OpBranchConditional, { conditionValue, bodyLabel, mergeLabel });

@@ -102,6 +102,7 @@ public:
 	std::optional<spirv::StorageClassValue> storageClassOf(spirv::Id pointerType) const;
 
 	bool isFloat(spirv::Id type) const;
+	bool isBool(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
 
@@ -129,6 +130,10 @@ public:
 	// words. A vector, a matrix or a struct is OpConstantNull.
 	spirv::Id zero(spirv::Id type);
 
+	// One in a numeric scalar or vector type, in every component. A bool
+	// converts to this where it is true.
+	spirv::Id one(spirv::Id type);
+
 	// A struct by name. Returns InvalidId when the name is not declared in the
 	// unit.
 	spirv::Id namedStruct(const std::string& name);
@@ -144,6 +149,12 @@ public:
 	// is not declared.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
 		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
+
+	// Throws when the struct has a bool member. Metal gives a bool one byte and
+	// a bool vector its own size and alignment in a buffer, and mslc has no
+	// storage form for either: a bool member in a Block takes the offset of the
+	// member before it, and SPIR-V gives a bool in memory no layout of its own.
+	void rejectBoolMembers(const std::string& structName) const;
 
 	// The same struct as the element of an array of it: the members with their
 	// offsets, and no Block decoration, since Vulkan requires a struct nested in
