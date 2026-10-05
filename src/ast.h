@@ -201,6 +201,9 @@ struct Expression {
 
 	// Binary, Unary, Assign
 	BinaryOperator binaryOperator = BinaryOperator::Add;
+	// Assign: set for "op=", where it names the operator, so "x <<= 3" is
+	// "x = x << 3" with x evaluated once.
+	std::optional<BinaryOperator> compoundOperator;
 	UnaryOperator unaryOperator = UnaryOperator::Negate;
 	ExpressionPtr left;
 	ExpressionPtr right;

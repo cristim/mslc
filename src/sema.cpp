@@ -138,6 +138,23 @@ namespace {
 		}
 	}
 
+	const char* binaryOperatorSpelling(BinaryOperator op) {
+		switch (op) {
+			case BinaryOperator::Add: return "+";
+			case BinaryOperator::Subtract: return "-";
+			case BinaryOperator::Multiply: return "*";
+			case BinaryOperator::Divide: return "/";
+			case BinaryOperator::Modulo: return "%";
+			case BinaryOperator::BitAnd: return "&";
+			case BinaryOperator::BitOr: return "|";
+			case BinaryOperator::BitXor: return "^";
+			case BinaryOperator::ShiftLeft: return "<<";
+			case BinaryOperator::ShiftRight: return ">>";
+			default: break;
+		}
+		throw CompileError("this operator has no compound assignment form");
+	}
+
 	// The SPIR-V opcode for a binary operation, given the operand type's kind.
 	// SPIR-V has separate opcodes for float, signed and unsigned operands, so
 	// the choice has to be made from the resolved operand type rather than
@@ -1321,7 +1338,8 @@ namespace {
 		void emitStatement(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
 		Id emitPlaceAddress(const Expression& left);
-		void emitSwizzleStore(const Expression& target, const Expression& valueExpression);
+		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
+			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
@@ -1333,6 +1351,13 @@ namespace {
 		// the caller loads from it.
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
+		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
+		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
+		struct ArithmeticConversion {
+			Id type;
+			bool isSigned;
+		};
+		ArithmeticConversion usualArithmeticConversion(Id leftType, Id rightType);
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
@@ -2217,27 +2242,120 @@ namespace {
 		}
 	}
 
+	Emitter::ArithmeticConversion Emitter::usualArithmeticConversion(Id leftOperandType, Id rightOperandType) {
+		// The two operands have to share a type, and the rule is C's usual
+		// arithmetic conversions: a float beats an integer, then the wider
+		// integer beats the narrower, and only then does signedness break a tie
+		// with both becoming unsigned. Neither direction narrows, which is what
+		// this used to do: it converted the right operand to the left one's type,
+		// so "3 < f" for a float f turned the 3 into an int and answered the
+		// wrong thing, and "b < v" for a uchar and an int turned the int into a
+		// uchar. Both validate.
+		Id leftType = leftOperandType;
+		Id rightType = rightOperandType;
+
+		// The integer promotions come before the usual arithmetic conversions,
+		// not after them, and skipping them loses a sign. Anything narrower than
+		// int becomes int whatever its signedness, so "char a = -1; ushort b = 0;
+		// a < b" compares -1 with 0 as two ints and is true. Going straight to the
+		// wider type instead widens -1 to 65535, which reads as false.
+		//
+		// It is only the narrower-than-int types that are wrong, because they are
+		// the only ones that fit in an int and so the only ones where the
+		// promotion changes the answer. A uint beside an int needs no promotion:
+		// the rank rule below leaves the wider type alone.
+		//
+		// Each operand is promoted on its own, and only the *types* are changed
+		// here: the conversions are emitted below, once, when both operands go to
+		// the common type. Promoting both sides to one int here instead of each
+		// on its own would replace the conversions rather than precede them, and
+		// then "char c = -1; uint u = 0; c < u" would compare two ints and answer
+		// true where MSL makes both sides unsigned and answers false. It would
+		// also truncate a 64-bit operand, which the conversions never do.
+		if (!_types.isFloat(leftType) && !_types.isFloat(rightType)) {
+			if (_types.bitWidth(leftType) < 32) {
+				leftType = promotedTo(_types.vectorWidth(leftType));
+			}
+			if (_types.bitWidth(rightType) < 32) {
+				rightType = promotedTo(_types.vectorWidth(rightType));
+			}
+		}
+
+		const bool leftIsFloat = _types.isFloat(leftType);
+		const bool rightIsFloat = _types.isFloat(rightType);
+		// Not named `signed`, which is a keyword.
+		bool operandsSigned = _types.isSignedInt(leftType);
+
+		// The type both operands end up in, which is also what the opcode is
+		// chosen from. Float wins over integer; then the wider integer; then the
+		// left one's own type.
+		Id commonType = leftType;
+		if (leftIsFloat != rightIsFloat) {
+			commonType = leftIsFloat ? leftType : rightType;
+			operandsSigned = false;
+		} else if (_types.bitWidth(rightType) > _types.bitWidth(leftType)) {
+			// The wider type wins outright, signedness and all. A long beside a
+			// uint is a signed comparison, because long has the higher rank and can
+			// represent every uint; making both sides unsigned here is what turned
+			// that pair wrong.
+			commonType = rightType;
+			operandsSigned = _types.isSignedInt(rightType);
+		} else if (_types.bitWidth(leftType) > _types.bitWidth(rightType)) {
+			// The left is already the wider, which the default above already says.
+		} else if (leftType != rightType) {
+			// Equal widths and opposite signedness, which is the only case signedness
+			// decides: C makes both sides unsigned.
+			operandsSigned = _types.isSignedInt(leftType) && _types.isSignedInt(rightType);
+		}
+
+		if (_types.isFloat(commonType)) {
+			operandsSigned = false;
+		} else if (_types.isSignedInt(commonType) != operandsSigned) {
+			// Same width, opposite signedness: the signed side becomes the
+			// unsigned kind of the same width, which is what makes "-1 < u" an
+			// unsigned comparison of 4294967295 against the value.
+			// The unsigned kind of the same width, taken from the width rather
+			// than named, so a 64-bit operand stays 64 bits.
+			uint32_t width = _types.bitWidth(commonType);
+			if (width == 64) {
+				commonType = _types.scalar(ScalarKind::ULong);
+			} else if (width == 16) {
+				commonType = _types.scalar(ScalarKind::UShort);
+			} else if (width == 8) {
+				commonType = _types.scalar(ScalarKind::UChar);
+			} else {
+				commonType = _types.scalar(ScalarKind::UInt);
+			}
+		}
+
+		return { commonType, operandsSigned };
+	}
+
 	Id Emitter::emitBinary(const Expression& expression) {
 		const Id left = emitExpression(*expression.left);
 		const Id right = emitExpression(*expression.right);
+		return emitBinaryOperation(expression.binaryOperator, left, right);
+	}
+
+	Id Emitter::emitBinaryOperation(BinaryOperator op, Id left, Id right) {
 		const Id leftType = _builder.typeOf(left);
 
 		if (_types.matrixInfo(leftType) || _types.matrixInfo(_builder.typeOf(right))) {
-			return emitMatrixProduct(expression.binaryOperator, left, right);
+			return emitMatrixProduct(op, left, right);
 		}
 
 		const bool isFloat = _types.isFloat(leftType);
 		const bool isSigned = _types.isSignedInt(leftType);
-		const bool isLogical = expression.binaryOperator == BinaryOperator::LogicalAnd
-			|| expression.binaryOperator == BinaryOperator::LogicalOr;
+		const bool isLogical = op == BinaryOperator::LogicalAnd
+			|| op == BinaryOperator::LogicalOr;
 
 		// A comparison or logical operator yields a bool regardless of operand
 		// type; an arithmetic one yields its operand type.
 		const bool isComparison = !isLogical && leftType != _boolType
-			&& isComparisonOperator(expression.binaryOperator);
+			&& isComparisonOperator(op);
 
 		if (isLogical) {
-			const uint16_t opcode = expression.binaryOperator == BinaryOperator::LogicalAnd
+			const uint16_t opcode = op == BinaryOperator::LogicalAnd
 				? spirv::OpLogicalAnd : spirv::OpLogicalOr;
 			if (_types.isBool(leftType) && leftType == _builder.typeOf(right)) {
 				return _builder.emitTyped(opcode, leftType, { left, right });
@@ -2247,92 +2365,11 @@ namespace {
 		}
 
 		if (isComparison) {
-			// The two operands have to share a type, and the rule is C's usual
-			// arithmetic conversions: a float beats an integer, then the wider
-			// integer beats the narrower, and only then does signedness break a tie
-			// with both becoming unsigned. Neither direction narrows, which is what
-			// this used to do: it converted the right operand to the left one's type,
-			// so "3 < f" for a float f turned the 3 into an int and answered the
-			// wrong thing, and "b < v" for a uchar and an int turned the int into a
-			// uchar. Both validate.
+			const ArithmeticConversion common = usualArithmeticConversion(_builder.typeOf(left), _builder.typeOf(right));
+			const Id commonType = common.type;
+			const bool operandsSigned = common.isSigned;
 			Id leftOperand = left;
 			Id rightOperand = right;
-			Id leftType = _builder.typeOf(left);
-			Id rightType = _builder.typeOf(right);
-
-			// The integer promotions come before the usual arithmetic conversions,
-			// not after them, and skipping them loses a sign. Anything narrower than
-			// int becomes int whatever its signedness, so "char a = -1; ushort b = 0;
-			// a < b" compares -1 with 0 as two ints and is true. Going straight to the
-			// wider type instead widens -1 to 65535, which reads as false.
-			//
-			// It is only the narrower-than-int types that are wrong, because they are
-			// the only ones that fit in an int and so the only ones where the
-			// promotion changes the answer. A uint beside an int needs no promotion:
-			// the rank rule below leaves the wider type alone.
-			//
-			// Each operand is promoted on its own, and only the *types* are changed
-			// here: the conversions are emitted below, once, when both operands go to
-			// the common type. Promoting both sides to one int here instead of each
-			// on its own would replace the conversions rather than precede them, and
-			// then "char c = -1; uint u = 0; c < u" would compare two ints and answer
-			// true where MSL makes both sides unsigned and answers false. It would
-			// also truncate a 64-bit operand, which the conversions never do.
-			if (!_types.isFloat(leftType) && !_types.isFloat(rightType)) {
-				if (_types.bitWidth(leftType) < 32) {
-					leftType = promotedTo(_types.vectorWidth(leftType));
-				}
-				if (_types.bitWidth(rightType) < 32) {
-					rightType = promotedTo(_types.vectorWidth(rightType));
-				}
-			}
-
-			const bool leftIsFloat = _types.isFloat(leftType);
-			const bool rightIsFloat = _types.isFloat(rightType);
-			// Not named `signed`, which is a keyword.
-			bool operandsSigned = _types.isSignedInt(leftType);
-
-			// The type both operands end up in, which is also what the opcode is
-			// chosen from. Float wins over integer; then the wider integer; then the
-			// left one's own type.
-			Id commonType = leftType;
-			if (leftIsFloat != rightIsFloat) {
-				commonType = leftIsFloat ? leftType : rightType;
-				operandsSigned = false;
-			} else if (_types.bitWidth(rightType) > _types.bitWidth(leftType)) {
-				// The wider type wins outright, signedness and all. A long beside a
-				// uint is a signed comparison, because long has the higher rank and can
-				// represent every uint; making both sides unsigned here is what turned
-				// that pair wrong.
-				commonType = rightType;
-				operandsSigned = _types.isSignedInt(rightType);
-			} else if (_types.bitWidth(leftType) > _types.bitWidth(rightType)) {
-				// The left is already the wider, which the default above already says.
-			} else if (leftType != rightType) {
-				// Equal widths and opposite signedness, which is the only case signedness
-				// decides: C makes both sides unsigned.
-				operandsSigned = _types.isSignedInt(leftType) && _types.isSignedInt(rightType);
-			}
-
-			if (_types.isFloat(commonType)) {
-				operandsSigned = false;
-			} else if (_types.isSignedInt(commonType) != operandsSigned) {
-				// Same width, opposite signedness: the signed side becomes the
-				// unsigned kind of the same width, which is what makes "-1 < u" an
-				// unsigned comparison of 4294967295 against the value.
-				// The unsigned kind of the same width, taken from the width rather
-				// than named, so a 64-bit operand stays 64 bits.
-				uint32_t width = _types.bitWidth(commonType);
-				if (width == 64) {
-					commonType = _types.scalar(ScalarKind::ULong);
-				} else if (width == 16) {
-					commonType = _types.scalar(ScalarKind::UShort);
-				} else if (width == 8) {
-					commonType = _types.scalar(ScalarKind::UChar);
-				} else {
-					commonType = _types.scalar(ScalarKind::UInt);
-				}
-			}
 
 			if (_builder.typeOf(left) != commonType) {
 				leftOperand = convert(left, _builder.typeOf(left), commonType);
@@ -2341,7 +2378,7 @@ namespace {
 				rightOperand = convert(right, _builder.typeOf(right), commonType);
 			}
 
-			return _builder.emitTyped(comparisonOpcode(expression.binaryOperator,
+			return _builder.emitTyped(comparisonOpcode(op,
 				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
 		}
 
@@ -2354,22 +2391,23 @@ namespace {
 
 		// OpUDiv and OpUMod need both operands of the result type, and a literal
 		// is always uint. A shift count is free to have its own type and width.
-		const bool isShift = expression.binaryOperator == BinaryOperator::ShiftLeft
-			|| expression.binaryOperator == BinaryOperator::ShiftRight;
+		const bool isShift = op == BinaryOperator::ShiftLeft
+			|| op == BinaryOperator::ShiftRight;
 
 		// A scalar beside a vector is a broadcast, which is what "v * 2.0" means
-		// in MSL, so the two cases share one rule below.
+		// in MSL, so the two cases share one rule below. A shift count is spread
+		// too: the opcode takes a count with as many lanes as the value.
 		const uint32_t rightWidth = _types.vectorWidth(_builder.typeOf(right));
 		if (_types.vectorWidth(leftType) > 1 && rightWidth == 1
-			&& !isShift && !isLogical && !isComparison) {
+			&& !isLogical && !isComparison) {
 
 			const Id splat = broadcast(right, leftType);
-			return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
+			return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
 				leftType, { left, splat });
 		}
 
 		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
-		return _builder.emitTyped(arithmeticOpcode(expression.binaryOperator, isFloat, isSigned),
+		return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
 			leftType, { left, rightOperand });
 	}
 
@@ -2434,6 +2472,86 @@ namespace {
 
 		return _builder.emitTyped(spirv::OpVectorTimesMatrix,
 			_types.vector(rightMatrix->scalar, rightMatrix->columns), { left, right });
+	}
+
+	// "x op= v": x holds the current value and the result is what to store back.
+	// The operation is the binary operator's own, applied after the usual
+	// arithmetic conversions, so "int x; x += 1.5f" adds in float; the store
+	// converts the sum back to int.
+	Id Emitter::emitCompoundOperation(BinaryOperator op, Id current, Id value) {
+		const Id targetType = _builder.typeOf(current);
+		const Id valueType = _builder.typeOf(value);
+		const std::string spelled = std::string(binaryOperatorSpelling(op)) + "=";
+
+		for (const Id type: { targetType, valueType }) {
+			const bool isMatrix = _types.matrixInfo(type) != nullptr;
+			const bool isNumeric = _types.bitWidth(type) != 0 && type != _boolType
+				&& _types.componentOf(type) != _boolType;
+			if (!isMatrix && !isNumeric) {
+				throw CompileError("operator " + spelled + " is lowered only for numeric scalars, "
+					"vectors and matrices; a bool, a pointer or a struct operand is not lowered yet");
+			}
+		}
+
+		const auto* targetMatrix = _types.matrixInfo(targetType);
+		const uint32_t targetWidth = _types.vectorWidth(targetType);
+		const uint32_t valueWidth = _types.vectorWidth(valueType);
+
+		// Apple's compiler scales a matrix in place by a scalar, converted to the
+		// matrix's component type, and takes a matrix only on the right of a
+		// vector ("v *= m"). A matrix times a matrix is not accepted in place.
+		if (targetMatrix) {
+			if (_types.matrixInfo(valueType) || valueWidth > 1) {
+				throw CompileError("operator " + spelled + " takes a scalar on the right of a matrix");
+			}
+			value = convert(value, valueType, _types.scalar(targetMatrix->scalar));
+		} else if (_types.matrixInfo(valueType)) {
+			if (targetWidth == 1) {
+				throw CompileError("operator " + spelled + " cannot take a matrix on the right of a scalar");
+			}
+		}
+		if (targetMatrix || _types.matrixInfo(valueType)) {
+			const Id product = emitBinaryOperation(op, current, value);
+			return convert(product, _builder.typeOf(product), targetType);
+		}
+
+		const bool isShift = op == BinaryOperator::ShiftLeft || op == BinaryOperator::ShiftRight;
+		const bool needsIntegers = isShift || op == BinaryOperator::Modulo
+			|| op == BinaryOperator::BitAnd || op == BinaryOperator::BitOr
+			|| op == BinaryOperator::BitXor;
+		if (needsIntegers && (_types.isFloat(targetType) || _types.isFloat(valueType))) {
+			throw CompileError("operator " + spelled + " needs integer operands");
+		}
+
+		if (targetWidth > 1) {
+			// A shift count is a vector of the same width, in any integer type; every
+			// other operator wants the vector's own type.
+			const bool countVector = isShift && valueWidth == targetWidth;
+			if (valueWidth > 1 && valueType != targetType && !countVector) {
+				throw CompileError("operator " + spelled + " on a vector takes a scalar or a vector "
+					"of the same type");
+			}
+			if (valueWidth == 1 && _types.isFloat(valueType) && !_types.isFloat(targetType)) {
+				throw CompileError("operator " + spelled + " cannot take a floating-point scalar on "
+					"the right of an integer vector");
+			}
+			return emitBinaryOperation(op, current, value);
+		}
+
+		if (valueWidth > 1) {
+			throw CompileError("operator " + spelled + " cannot take a vector on the right of a scalar");
+		}
+
+		// A shift takes its type from the promoted left operand alone, and the
+		// count keeps its own.
+		if (isShift) {
+			const Id promoted = _types.bitWidth(targetType) < 32 ? promotedTo(1) : targetType;
+			return emitBinaryOperation(op, convert(current, targetType, promoted), value);
+		}
+
+		const Id common = usualArithmeticConversion(targetType, valueType).type;
+		return emitBinaryOperation(op, convert(current, targetType, common),
+			convert(value, valueType, common));
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
@@ -4055,7 +4173,8 @@ namespace {
 	// v.xy = e, s.pos.zw = e, buf[i].w = e: the lanes the swizzle names are
 	// replaced in the whole vector and the vector is stored back, so the lanes it
 	// does not name keep their value. The address is computed once.
-	void Emitter::emitSwizzleStore(const Expression& target, const Expression& valueExpression) {
+	void Emitter::emitSwizzleStore(const Expression& target, const Expression& valueExpression,
+		std::optional<BinaryOperator> compound) {
 		const std::string& name = target.memberName;
 		const std::string quoted = "\"." + name + "\"";
 		const std::vector<uint32_t> lanes = swizzleLanes(name);
@@ -4097,11 +4216,25 @@ namespace {
 		requireLanesWithin(name, lanes, _types.vectorWidth(vectorType));
 
 		Id value = emitExpression(valueExpression);
-		const Id valueType = _builder.typeOf(value);
 		const Id component = _types.componentOf(vectorType);
 		const auto count = static_cast<uint32_t>(lanes.size());
 
 		const Id old = inBuffer ? loadFromBuffer(address, vectorType) : loadFrom(address, vectorType);
+		if (compound) {
+			// "v.xy += e" is "v.xy = v.xy + e": the lanes the swizzle names are
+			// read out of the one load, combined, and written back by the same
+			// shuffle a plain store uses.
+			const Id lanesType = _types.withWidth(vectorType, count);
+			const Id current = count == 1
+				? _builder.emitTyped(spirv::OpCompositeExtract, component, { old, lanes[0] })
+				: _builder.emitTyped(spirv::OpVectorShuffle, lanesType, [&] {
+					std::vector<uint32_t> operands = { old, old };
+					operands.insert(operands.end(), lanes.begin(), lanes.end());
+					return operands;
+				}());
+			value = emitCompoundOperation(*compound, current, value);
+		}
+		const Id valueType = _builder.typeOf(value);
 		Id updated = InvalidId;
 		if (count == 1) {
 			if (_types.vectorWidth(valueType) != 1) {
@@ -4151,7 +4284,7 @@ namespace {
 
 		if (expression.left->kind == ExpressionKind::Member
 			&& !structOf(*expression.left->left)) {
-			emitSwizzleStore(*expression.left, *expression.right);
+			emitSwizzleStore(*expression.left, *expression.right, expression.compoundOperator);
 			return;
 		}
 
@@ -4167,9 +4300,18 @@ namespace {
 			}
 		}
 
-		const Id address = emitPlaceAddress(*expression.left);
+		if (expression.compoundOperator && expression.left->kind == ExpressionKind::Index) {
+			const auto base = expression.left->left->kind == ExpressionKind::Identifier
+				? _bindings.find(expression.left->left->name) : _bindings.end();
+			if (base != _bindings.end() && base->second.bufferPointeeType == InvalidId
+				&& _types.vectorWidth(base->second.pointeeType) > 1
+				&& !_types.matrixInfo(base->second.pointeeType)) {
+				throw CompileError("a compound assignment to an element of the local vector \""
+					+ base->first + "\" is not lowered yet");
+			}
+		}
 
-		const Id value = emitExpression(*expression.right);
+		const Id address = emitPlaceAddress(*expression.left);
 
 		// A store's value has the type the address points at, not the type of
 		// the address, so the pointee is what the value is converted to.
@@ -4183,6 +4325,19 @@ namespace {
 		// A store into a buffer carries the Aligned memory operand, which the
 		// same layout rule gives the access.
 		const auto storageClass = _types.storageClassOf(addressType);
+
+		Id value = InvalidId;
+		if (expression.compoundOperator) {
+			const bool inBuffer = storageClass
+				&& *storageClass == spirv::StorageClass::PhysicalStorageBuffer;
+			const Id current = inBuffer
+				? loadFromBuffer(address, pointeeType) : loadFrom(address, pointeeType);
+			value = emitCompoundOperation(*expression.compoundOperator, current,
+				emitExpression(*expression.right));
+		} else {
+			value = emitExpression(*expression.right);
+		}
+
 		if (storageClass && *storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
 			storeIntoBuffer(address, convertImplicit(value, pointeeType));
 			return;

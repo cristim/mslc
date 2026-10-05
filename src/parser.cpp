@@ -1616,10 +1616,31 @@ ExpressionPtr Parser::parseExpression() {
 ExpressionPtr Parser::parseAssignment() {
 	auto left = parseLogicalOr();
 
-	if (at(TokenKind::Assign)) {
+	static const std::pair<TokenKind, BinaryOperator> compounds[] = {
+		{ TokenKind::PlusAssign, BinaryOperator::Add },
+		{ TokenKind::MinusAssign, BinaryOperator::Subtract },
+		{ TokenKind::StarAssign, BinaryOperator::Multiply },
+		{ TokenKind::SlashAssign, BinaryOperator::Divide },
+		{ TokenKind::PercentAssign, BinaryOperator::Modulo },
+		{ TokenKind::AmpersandAssign, BinaryOperator::BitAnd },
+		{ TokenKind::PipeAssign, BinaryOperator::BitOr },
+		{ TokenKind::CaretAssign, BinaryOperator::BitXor },
+		{ TokenKind::ShiftLeftAssign, BinaryOperator::ShiftLeft },
+		{ TokenKind::ShiftRightAssign, BinaryOperator::ShiftRight },
+	};
+
+	std::optional<BinaryOperator> compound;
+	for (const auto& [token, op]: compounds) {
+		if (at(token)) {
+			compound = op;
+		}
+	}
+
+	if (at(TokenKind::Assign) || compound) {
 		advance();
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::Assign;
+		expression->compoundOperator = compound;
 		expression->line = left->line;
 		expression->left = std::move(left);
 		expression->right = parseAssignment();
