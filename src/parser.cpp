@@ -2328,7 +2328,7 @@ ExpressionPtr Parser::parseExpression() {
 
 ExpressionPtr Parser::parseAssignment() {
 	const NestingScope scope(*this);
-	auto left = parseLogicalOr();
+	auto left = parseConditional();
 
 	static const std::pair<TokenKind, BinaryOperator> compounds[] = {
 		{ TokenKind::PlusAssign, BinaryOperator::Add },
@@ -2374,6 +2374,27 @@ ExpressionPtr Parser::parseAssignment() {
 
 
 
+
+// `c ? a : b` binds looser than ||, and right to left: the false arm is itself
+// an assignment-expression, so `c ? a : d ? b : e` nests to the right and
+// `c ? a : x = b` assigns inside the arm, as C++ parses it.
+ExpressionPtr Parser::parseConditional() {
+	auto condition = parseLogicalOr();
+	if (!at(TokenKind::Question)) {
+		return condition;
+	}
+
+	advance();
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::Conditional;
+	expression->line = condition->line;
+	expression->left = std::move(condition);
+	expression->arguments.push_back(parseExpression());
+	expect(TokenKind::Colon, "between the two values of a conditional");
+	expression->arguments.push_back(parseAssignment());
+	measure(*expression);
+	return expression;
+}
 
 ExpressionPtr Parser::parseLogicalOr() {
 	return parseBinaryLevel([](Parser& p) { return p.parseLogicalAnd(); }, { { TokenKind::OrOr, BinaryOperator::LogicalOr } });
@@ -2473,7 +2494,85 @@ ExpressionPtr Parser::parseUnary() {
 		return expression;
 	}
 
+	if (at(TokenKind::LParen)) {
+		if (auto cast = parseCast()) {
+			return cast;
+		}
+	}
+
 	return parsePostfix();
+}
+
+// `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
+// enum or a struct, is the functional cast T(operand). A type name cannot begin a
+// parenthesised expression, so "(" followed by one is always a cast. Returns null
+// when the parenthesis opens an expression.
+ExpressionPtr Parser::parseCast() {
+	const Token& first = lookahead(1);
+	if (first.kind != TokenKind::Identifier && first.kind != TokenKind::ColonColon) {
+		return nullptr;
+	}
+
+	const std::string head(first.text);
+	if (first.kind == TokenKind::Identifier) {
+		if (head == "unsigned" || head == "long" || head == "short" || head == "signed") {
+			throw CompileError("a cast to a multi-word type name is not supported yet");
+		}
+		if (isTypeQualifier(head) || addressSpaceFor(head)) {
+			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
+		}
+		if (head == "void") {
+			throw CompileError("a cast to void is not supported");
+		}
+	}
+
+	// Read the name, which may be namespace-qualified, from just past the '('.
+	const size_t open = _position;
+	++_position;
+	QualifiedName spelled;
+	if (!peekQualifiedName(spelled)) {
+		_position = open;
+		return nullptr;
+	}
+	size_t nameTokens = 0;
+	std::string name;
+	try {
+		name = peekResolved(nameTokens);
+	} catch (...) {
+		_position = open;
+		throw;
+	}
+	_position = open;
+
+	Type type;
+	if (!resolveTypeName(name, type)) {
+		if (!_unit.findStruct(name)) {
+			return nullptr;
+		}
+		type.namedType = name;
+	}
+
+	const Token& after = lookahead(1 + nameTokens);
+	if (after.kind == TokenKind::Star || after.kind == TokenKind::Ampersand || after.kind == TokenKind::Less) {
+		throw CompileError("a cast to a pointer, reference or template type is not supported");
+	}
+	if (after.kind != TokenKind::RParen) {
+		return nullptr;
+	}
+
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::Construct;
+	expression->line = line();
+	expression->constructType = type;
+	advance();
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	advance();
+	const NestingScope scope(*this);
+	expression->arguments.push_back(parseUnary());
+	measure(*expression);
+	return expression;
 }
 
 ExpressionPtr Parser::parsePostfix() {
@@ -2673,9 +2772,8 @@ ExpressionPtr Parser::parsePrimary() {
 		Type type;
 		if (resolveTypeName(text, type) && type.namedType.empty()) {
 			// A type name in expression position constructs a value: float(x),
-			// float3(0), float4(a, b, c, 1). Metal has no cast syntax, so T(...) is
-			// always a constructor call, and the parenthesised part is a list of
-			// arguments rather than the single operand a cast would take.
+			// float3(0), float4(a, b, c, 1). T(...) is a constructor call, and the
+			// parenthesised part is a list of arguments; (T)x is parseCast's.
 			consumeName();
 
 			if (!at(TokenKind::LParen)) {

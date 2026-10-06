@@ -248,6 +248,8 @@ private:
 	// not in how their arguments are separated.
 	std::vector<ExpressionPtr> parseArgumentList(const char* closing);
 	ExpressionPtr parseAssignment();
+	ExpressionPtr parseConditional();
+	ExpressionPtr parseCast();
 	ExpressionPtr parseLogicalOr();
 	ExpressionPtr parseLogicalAnd();
 	ExpressionPtr parseBitwiseOr();
