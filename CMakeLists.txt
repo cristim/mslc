@@ -107,6 +107,22 @@ foreach(macro IN LISTS equivalences)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# A multi-word integer type name is the single-token name it means: one test per
+# tests/equivalence/<name>.multiword.metal, against its <name>.single.metal, which
+# is the same program spelled with uint, ushort, uchar and the rest.
+file(GLOB multiwords CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.multiword.metal)
+foreach(multiword IN LISTS multiwords)
+	get_filename_component(name ${multiword} NAME)
+	string(REGEX REPLACE "\\.multiword\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${multiword}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.single.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # "*p" is "p[0]": one test per tests/equivalence/<name>.deref.metal, against its
 # <name>.index.metal, which is the same program with every dereference written as
 # an index. The two have to disassemble identically, not just both compile.
