@@ -2530,8 +2530,7 @@ ExpressionPtr Parser::parseCast() {
 	const size_t open = _position;
 	++_position;
 	QualifiedName spelled;
-	if (!peekQualifiedName(spelled)
-		|| (!spelled.global && spelled.parts.size() == 1 && isLocal(spelled.parts[0]))) {
+	if (!peekQualifiedName(spelled)) {
 		_position = open;
 		return nullptr;
 	}
