@@ -10,10 +10,15 @@
 // DISASM-NO-MATCH: Location 6[^%]*%[0-9]+ Sample[^%]*%[0-9]+ NoPerspective
 // DISASM-MATCH: Location 7[^%]*%[0-9]+ Sample[^%]*%[0-9]+ NoPerspective
 // DISASM: OpCapability SampleRateShading
+// DISASM-MATCH: OpDecorate %[0-9]+ Flat.*OpDecorate %[0-9]+ Flat
+// DISASM-MATCH: OpDecorate %[0-9]+ NoPerspective.*OpDecorate %[0-9]+ NoPerspective
+// DISASM-MATCH: OpDecorate %[0-9]+ Centroid.*OpDecorate %[0-9]+ Centroid
+// DISASM-MATCH: OpDecorate %[0-9]+ Sample.*OpDecorate %[0-9]+ Sample
 //
 // One field per qualifier. Location 0 is unqualified and Location 2 is
 // center_perspective, the default, which decorates nothing. Both stages share
-// the struct, so the Output and the Input variable carry the decoration.
+// the struct, so the Output and the Input variable carry the decoration: each
+// kind appears on at least two variables, one per stage.
 struct V {
     float4 p [[position]];
     float z;
