@@ -4,6 +4,7 @@
 #include "parser.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <set>
 
@@ -121,6 +122,56 @@ namespace {
 
 	bool isFloatKind(ScalarKind kind) {
 		return mappingFor(kind).isFloat;
+	}
+
+	// The IEEE half nearest to a value, ties to even, as the bits OpConstant takes.
+	// A finite value too large for a half becomes infinity.
+	uint32_t halfBitsOf(double value) {
+		if (std::isnan(value)) {
+			return 0x7E00u;
+		}
+
+		const uint32_t sign = std::signbit(value) ? 0x8000u : 0u;
+		const double magnitude = std::fabs(value);
+		if (std::isinf(magnitude)) {
+			return sign | 0x7C00u;
+		}
+
+		// Below the smallest normal the spacing is fixed at 2^-24, and a carry
+		// into 0x400 is the smallest normal.
+		if (magnitude < std::ldexp(1.0, -14)) {
+			return sign | static_cast<uint32_t>(std::nearbyint(std::ldexp(magnitude, 24)));
+		}
+
+		int exponent = std::ilogb(magnitude);
+		auto fraction = static_cast<uint32_t>(std::nearbyint(
+			(std::ldexp(magnitude, -exponent) - 1.0) * 1024.0));
+		if (fraction == 1024u) {
+			fraction = 0u;
+			++exponent;
+		}
+
+		if (exponent > 15) {
+			return sign | 0x7C00u;
+		}
+
+		return sign | (static_cast<uint32_t>(exponent + 15) << 10) | fraction;
+	}
+
+	// The value a half's bits stand for, so a half literal can be folded at the
+	// precision it really has.
+	double halfValueOf(uint32_t bits) {
+		const double sign = (bits & 0x8000u) ? -1.0 : 1.0;
+		const int exponent = static_cast<int>((bits >> 10) & 0x1Fu);
+		const uint32_t fraction = bits & 0x3FFu;
+		if (exponent == 0x1F) {
+			return fraction ? std::nan("") : sign * HUGE_VAL;
+		}
+		if (exponent == 0) {
+			return sign * std::ldexp(static_cast<double>(fraction), -24);
+		}
+
+		return sign * std::ldexp(static_cast<double>(fraction | 0x400u), exponent - 25);
 	}
 
 	// Whether an operator produces a bool rather than its operand's type.
@@ -2802,6 +2853,11 @@ namespace {
 				+ " is not lowered yet");
 		}
 
+		// A half's literal is its own 16 bits, not the low half of a float's.
+		if (kind == ScalarKind::Half) {
+			return halfBitsOf(value);
+		}
+
 		if (isFloatKind(kind)) {
 			const auto narrowed = static_cast<float>(value);
 			uint32_t bits = 0;
@@ -2858,6 +2914,12 @@ namespace {
 				return folded;
 
 			case ExpressionKind::FloatLiteral:
+				if (expression.floatIsHalf) {
+					folded.scalar = ScalarKind::Half;
+					folded.number = halfValueOf(halfBitsOf(expression.floatValue));
+					return folded;
+				}
+
 				folded.scalar = ScalarKind::Float;
 				folded.number = expression.floatValue;
 				return folded;
@@ -2919,7 +2981,10 @@ namespace {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
 		}
 
-		if (left.scalar != right.scalar) {
+		// A half beside a float is a float, as in C.
+		const bool mixedFloats = left.scalar != right.scalar
+			&& isFloatKind(left.scalar) && isFloatKind(right.scalar);
+		if (left.scalar != right.scalar && !mixedFloats) {
 			throw CompileError("a constant's operands have to be of the same type, found "
 				+ std::string(scalarKindName(left.scalar)) + " and "
 				+ std::string(scalarKindName(right.scalar)));
@@ -2929,6 +2994,9 @@ namespace {
 
 		if (isFloatKind(left.scalar)) {
 			FoldedConstant folded = left;
+			if (mixedFloats) {
+				folded.scalar = ScalarKind::Float;
+			}
 
 			switch (op) {
 				case BinaryOperator::Add: folded.number = left.number + right.number; break;
@@ -3120,6 +3188,11 @@ namespace {
 			}
 
 			case ExpressionKind::FloatLiteral: {
+				if (expression.floatIsHalf) {
+					return _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Half),
+						{ halfBitsOf(expression.floatValue) });
+				}
+
 				const auto value = static_cast<float>(expression.floatValue);
 				uint32_t bits = 0;
 				static_assert(sizeof(bits) == sizeof(value), "float is not 32 bits");

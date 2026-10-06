@@ -1852,7 +1852,9 @@ ExpressionPtr Parser::parsePrimary() {
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::FloatLiteral;
 		expression->line = line();
-		expression->floatValue = advance().floatValue;
+		const Token literal = advance();
+		expression->floatValue = literal.floatValue;
+		expression->floatIsHalf = literal.floatIsHalf;
 		return expression;
 	}
 

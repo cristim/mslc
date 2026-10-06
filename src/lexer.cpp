@@ -312,6 +312,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 
 			// MSL numeric suffixes
 			bool isUnsigned = false;
+			bool isHalf = false;
 			if (i < size) {
 				const char suffix = source[i];
 				if (suffix == 'u' || suffix == 'U') {
@@ -320,6 +321,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 					++i;
 				} else if (suffix == 'f' || suffix == 'F' || suffix == 'h' || suffix == 'H') {
 					isFloat = true;
+					isHalf = suffix == 'h' || suffix == 'H';
 					++i;
 				}
 			}
@@ -329,6 +331,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 			token.line = line;
 			token.text = source.substr(start, i - start);
 			token.integerIsUnsigned = isUnsigned;
+			token.floatIsHalf = isHalf;
 			place(token);
 
 			if (isFloat) {
