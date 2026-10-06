@@ -5385,9 +5385,72 @@ namespace {
 		}
 	}
 
+	// The "locnN" a [[user(...)]] name spells, N being the Location it gives. Only
+	// the canonical decimal spelling counts, so locn01 is a plain name, as it is a
+	// different name from locn1 on Apple; two fields cannot then claim one Location
+	// without repeating a name.
+	static std::optional<uint32_t> locnLocation(const std::string& name) {
+		constexpr size_t prefix = 4;
+		constexpr size_t maxDigits = 9;
+		if (name.compare(0, prefix, "locn") != 0 || name.size() == prefix) {
+			return std::nullopt;
+		}
+		const std::string digits = name.substr(prefix);
+		if (digits.find_first_not_of("0123456789") != std::string::npos
+			|| (digits.size() > 1 && digits[0] == '0')) {
+			return std::nullopt;
+		}
+		if (digits.size() > maxDigits) {
+			throw CompileError("[[user(" + name + ")]] names a Location too large to be one");
+		}
+		return static_cast<uint32_t>(std::stoul(digits));
+	}
+
+	// The Location of each field of a struct that crosses from the vertex to the
+	// fragment stage, nullopt for [[position]]. A [[user(locnN)]] field is at N;
+	// every other field takes the first Location no locnN field of the struct
+	// claims, in declaration order. A module sees only its own struct, so a
+	// Location has to follow from the struct alone: a name that is not locnN says
+	// nothing about where its partner stands in the other stage.
+	static std::vector<std::optional<uint32_t>> stageLocations(const StructDecl& decl) {
+		std::set<uint32_t> claimed;
+		std::set<std::string> names;
+		for (const StructField& field: decl.fields) {
+			if (!field.attributes.userName) {
+				continue;
+			}
+			if (!names.insert(*field.attributes.userName).second) {
+				throw CompileError("duplicated user-defined name \"" + *field.attributes.userName
+					+ "\" in struct \"" + decl.name + "\"");
+			}
+			const auto location = field.attributes.position
+				? std::nullopt : locnLocation(*field.attributes.userName);
+			if (location) {
+				claimed.insert(*location);
+			}
+		}
+
+		std::vector<std::optional<uint32_t>> locations;
+		uint32_t next = 0;
+		for (const StructField& field: decl.fields) {
+			if (field.attributes.position) {
+				locations.emplace_back(std::nullopt);
+			} else if (const auto named = field.attributes.userName
+				? locnLocation(*field.attributes.userName) : std::nullopt) {
+				locations.emplace_back(*named);
+			} else {
+				while (claimed.count(next) != 0) {
+					++next;
+				}
+				locations.emplace_back(next++);
+			}
+		}
+		return locations;
+	}
+
 	// One variable per field. The [[position]] field is a builtin, Position on a
 	// vertex output and FragCoord on a fragment input; every other field takes the
-	// next Location in declaration order, which is how Iridium numbers them on
+	// next Location in declaration order (stageLocations), which is how Iridium numbers them on
 	// both sides (indium src/iridium/air.cpp: the struct return loop and the
 	// air.fragment_input case), so the two stages agree when they share a struct.
 	std::vector<StageVariable> Emitter::declareStageStruct(const StructDecl& decl,
@@ -5395,10 +5458,11 @@ namespace {
 
 		const bool isInput = storageClass == spirv::StorageClass::Input;
 		std::vector<StageVariable> variables;
-		uint32_t location = 0;
+		const std::vector<std::optional<uint32_t>> locations = stageLocations(decl);
 		bool hasPosition = false;
 
-		for (const StructField& field: decl.fields) {
+		for (size_t index = 0; index < decl.fields.size(); ++index) {
+			const StructField& field = decl.fields[index];
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
 			if (field.attributes.attributeIndex) {
@@ -5436,7 +5500,7 @@ namespace {
 					static_cast<uint32_t>(isInput ? spirv::BuiltIn::FragCoord : spirv::BuiltIn::Position) });
 			} else {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
-					static_cast<uint32_t>(spirv::Decoration::Location), location++ });
+					static_cast<uint32_t>(spirv::Decoration::Location), *locations[index] });
 
 				if (integral && interpolation != Interpolation::None && interpolation != Interpolation::Flat) {
 					throw CompileError(what + " is " + typeName(field.type) + ", which requires [[flat]]; "
@@ -5699,18 +5763,31 @@ namespace {
 		terminate(spirv::OpReturn, { });
 	}
 
-	// Locations are numbered by declaration order, where Apple pairs a vertex
-	// output with a fragment input by field name and type. A vertex and a fragment
-	// function pair when every field the fragment reads is one the vertex function
-	// writes, and such a pair agrees only when the fragment's fields are a leading
-	// run of the vertex function's. A fragment in another library cannot be checked.
+	// Locations follow stageLocations, where Apple pairs a vertex output with a
+	// fragment input by name (the [[user(name)]] name where a field has one) and
+	// type. A vertex and a fragment function pair when every field the fragment
+	// reads is one the vertex function writes, and such a pair agrees only when
+	// each of those fields is at the same Location in both. A fragment in another
+	// library cannot be checked.
 	void Emitter::checkStageInterfacesAgree() const {
+		struct InterfaceField {
+			std::string name;
+			std::string type;
+			uint32_t location;
+			bool operator==(const InterfaceField& other) const {
+				return name == other.name && type == other.type;
+			}
+		};
+
 		const auto interfaceFields = [this](const std::string& name) {
-			std::vector<std::pair<std::string, std::string>> fields;
+			std::vector<InterfaceField> fields;
 			if (const StructDecl* decl = _unit.findStruct(name)) {
-				for (const StructField& field: decl->fields) {
+				const auto locations = stageLocations(*decl);
+				for (size_t index = 0; index < decl->fields.size(); ++index) {
+					const StructField& field = decl->fields[index];
 					if (!field.attributes.position) {
-						fields.emplace_back(field.name, typeName(field.type));
+						fields.push_back({ field.attributes.userName.value_or(field.name),
+							typeName(field.type), *locations[index] });
 					}
 				}
 			}
@@ -5739,13 +5816,18 @@ namespace {
 					const bool pairs = std::all_of(inputs.begin(), inputs.end(), [&](const auto& input) {
 						return std::find(outputs.begin(), outputs.end(), input) != outputs.end();
 					});
-					if (pairs && std::mismatch(inputs.begin(), inputs.end(),
-						outputs.begin(), outputs.end()).first != inputs.end()) {
+					const bool agrees = std::all_of(inputs.begin(), inputs.end(), [&](const auto& input) {
+						return std::find_if(outputs.begin(), outputs.end(), [&](const auto& output) {
+							return output == input && output.location == input.location;
+						}) != outputs.end();
+					});
+					if (pairs && !agrees) {
 						throw CompileError("vertex function \"" + vertex->name + "\" returns "
 							+ vertex->returnType.namedType + " and fragment function \"" + fragment->name
 							+ "\" takes " + typeName(parameter.type) + " as [[stage_in]]; mslc gives "
 							"their fields Locations by declaration order, so the fragment's fields, other "
-							"than [[position]], have to be the vertex function's first ones, in order");
+							"than [[position]], have to be the vertex function's first ones, in order "
+							"(or be named [[user(locnN)]], which is Location N in both)");
 					}
 				}
 			}

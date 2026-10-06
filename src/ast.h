@@ -346,6 +346,10 @@ struct FieldAttributes {
 
 	// [[color(n)]]: the field is colour attachment n of a fragment output.
 	std::optional<uint32_t> colorIndex;
+
+	// [[user(name)]]: the name Apple pairs a vertex output with a fragment input
+	// by, in place of the field's own name.
+	std::optional<std::string> userName;
 };
 
 struct StructField {
