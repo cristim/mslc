@@ -1639,6 +1639,8 @@ namespace {
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
 		Id emitPlaceAddress(const Expression& left);
+		const Expression& storeRoot(const Expression& target) const;
+		void requireStorable(const Expression& target) const;
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration);
@@ -4027,6 +4029,7 @@ namespace {
 				binding.storageClass = spirv::StorageClass::Input;
 				binding.scalarComponentOfVector = parameter.type.isScalar()
 					&& _types.vectorWidth(typeId) > 1;
+				binding.readOnly = parameter.type.isConst;
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
 				continue;
@@ -4997,10 +5000,7 @@ namespace {
 			throw CompileError("assigning to " + quoted + " of a swizzle is not lowered yet");
 		}
 
-		const Expression* root = &base;
-		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
-			root = root->left.get();
-		}
+		const Expression* root = &storeRoot(base);
 		const auto rootBinding = _bindings.find(root->name);
 		if (rootBinding != _bindings.end() && rootBinding->second.readOnly) {
 			throw CompileError("assigning to " + quoted + " of \"" + root->name
@@ -5104,18 +5104,41 @@ namespace {
 		emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
 	}
 
+	// The variable a store lands in: the head of a chain of member and element
+	// accesses, since constness and storage follow the chain.
+	const Expression& Emitter::storeRoot(const Expression& target) const {
+		const Expression* root = &target;
+		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+			root = root->left.get();
+		}
+		return *root;
+	}
+
+	// A store to something that is not a variable of the entry point: a literal,
+	// which is what an enumerator is by now, or a file-scope constant.
+	void Emitter::requireStorable(const Expression& target) const {
+		const Expression& root = storeRoot(target);
+		if (root.kind == ExpressionKind::IntLiteral || root.kind == ExpressionKind::FloatLiteral
+			|| root.kind == ExpressionKind::BoolLiteral) {
+			throw CompileError("cannot assign to a literal or an enumerator constant");
+		}
+		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
+			&& _constants.count(root.name)) {
+			throw CompileError("cannot store to \"" + root.name + "\", a constant declared at file scope");
+		}
+	}
+
 	void Emitter::emitAssignment(const Expression& left, const Expression& right,
 		std::optional<BinaryOperator> compound) {
+		requireStorable(left);
+
 		if (left.kind == ExpressionKind::Member
 			&& !structOf(*left.left)) {
 			emitSwizzleStore(left, right, compound);
 			return;
 		}
 
-		const Expression* root = &left;
-		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
-			root = root->left.get();
-		}
+		const Expression* root = &storeRoot(left);
 		if (root->kind == ExpressionKind::Identifier) {
 			const auto target = _bindings.find(root->name);
 			if (target != _bindings.end() && target->second.readOnly) {
