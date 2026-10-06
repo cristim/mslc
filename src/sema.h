@@ -49,9 +49,9 @@ private:
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _packedStorage;
 
 	spirv::Id _voidType = spirv::InvalidId;
-	spirv::Id _image2D = spirv::InvalidId;
+	std::map<ResourceKind, spirv::Id> _images;
+	std::map<ResourceKind, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
-	spirv::Id _sampledImage2D = spirv::InvalidId;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -71,14 +71,14 @@ public:
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
 
-	// The 2D image a texture2d<float> and a texture2d<half> are both declared as:
-	// a float sampled type, sampled by a sampler (Sampled 1), format Unknown and
-	// depth unspecified, which is what Iridium declares (indium src/iridium/
-	// air.cpp:771). The component type is not in the image type; a half texture's
-	// samples are narrowed after the lookup.
-	spirv::Id image2D();
+	// The image a texture2d or texturecube of float or half is declared as: a
+	// float sampled type, sampled by a sampler (Sampled 1), format Unknown and
+	// depth unspecified, in Dim 2D or Cube, which is what Iridium declares (indium
+	// src/iridium/air.cpp:771-785). The component type is not in the image type;
+	// a half texture's samples are narrowed after the lookup.
+	spirv::Id image(ResourceKind kind);
 	spirv::Id samplerType();
-	spirv::Id sampledImage2D();
+	spirv::Id sampledImage(ResourceKind kind);
 
 	// How a packed vector of the given type is stored in a laid-out struct or
 	// buffer: an array of its components, strided by the component's size.

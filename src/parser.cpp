@@ -157,7 +157,7 @@ namespace {
 			|| text == "volatile" || text == "restrict" || text == "__restrict";
 	}
 
-	// The texture and sampler type names. Only texture2d and sampler are lowered;
+	// The texture and sampler type names. Only texture2d, texturecube and sampler are lowered;
 	// the rest are recognised so they are reported by name rather than read as a
 	// struct type and failing later.
 	bool isResourceTypeName(std::string_view text) {
@@ -984,20 +984,20 @@ void Parser::parseResourceType(Type& type) {
 		return;
 	}
 
-	if (name != "texture2d") {
+	if (name != "texture2d" && name != "texturecube") {
 		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d<float>, "
-			"texture2d<half> and sampler");
+			"texture2d<half>, texturecube<float>, texturecube<half> and sampler");
 	}
 
-	expect(TokenKind::Less, "to open the sampled type of texture2d");
+	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());
 	if (kind() != TokenKind::Identifier) {
-		throw CompileError("expected the sampled type of texture2d, found "
+		throw CompileError("expected the sampled type of " + name + ", found "
 			+ std::string(tokenKindName(kind())));
 	}
 
 	const std::string component(advance().text);
 	if (component != "float" && component != "half") {
-		throw CompileError("texture2d<" + component + "> is not lowered yet; mslc lowers the "
+		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
 			"sampled types float and half");
 	}
 
@@ -1007,7 +1007,7 @@ void Parser::parseResourceType(Type& type) {
 			advance();
 		}
 		if (kind() != TokenKind::Identifier || current().text != "access") {
-			throw CompileError("expected an access qualifier after the sampled type of texture2d");
+			throw CompileError("expected an access qualifier after the sampled type of " + name);
 		}
 		advance();
 		expect(TokenKind::ColonColon, "after \"access\"");
@@ -1016,13 +1016,13 @@ void Parser::parseResourceType(Type& type) {
 		}
 		const std::string access(advance().text);
 		if (access != "sample") {
-			throw CompileError("texture2d access::" + access + " is not lowered yet; mslc lowers "
+			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
 				"access::sample, which is the default");
 		}
 	}
 
-	expect(TokenKind::Greater, "to close the sampled type of texture2d");
-	type.resource = ResourceKind::Texture2D;
+	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
+	type.resource = name == "texturecube" ? ResourceKind::TextureCube : ResourceKind::Texture2D;
 	type.scalar = component == "half" ? ScalarKind::Half : ScalarKind::Float;
 }
 

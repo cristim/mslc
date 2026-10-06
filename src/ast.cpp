@@ -29,6 +29,9 @@ std::string typeName(const Type& type) {
 	if (type.resource == ResourceKind::Texture2D) {
 		return std::string("texture2d<") + scalarKindName(type.scalar) + ">";
 	}
+	if (type.resource == ResourceKind::TextureCube) {
+		return std::string("texturecube<") + scalarKindName(type.scalar) + ">";
+	}
 
 	std::string name = type.namedType.empty()
 		? std::string(scalarKindName(type.scalar))
