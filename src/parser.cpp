@@ -390,7 +390,9 @@ void Parser::parseDeclaration() {
 	// MSL and would otherwise be read as the start of a function's return type.
 	if (at(TokenKind::Identifier)
 		&& (isTypeQualifier(current().text) || addressSpaceFor(current().text)
-			|| isResourceTypeName(current().text))) {
+			|| isResourceTypeName(current().text)
+			|| (current().text == "metal" && lookahead().kind == TokenKind::ColonColon
+				&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)))) {
 		_unit.globals.push_back(parseGlobalDeclaration());
 		return;
 	}

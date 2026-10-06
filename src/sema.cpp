@@ -464,10 +464,8 @@ namespace {
 		// the one around it.
 		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For;
 		if (opensScope) scopes.emplace_back();
-		for (const Expression* expression: { statement->expression.get(), statement->forCondition.get(),
-			statement->forIncrement.get(), statement->whileCondition.get() }) {
-			collectUnshadowed(expression, scopes, names);
-		}
+		collectUnshadowed(statement->expression.get(), scopes, names);
+		collectUnshadowed(statement->whileCondition.get(), scopes, names);
 		for (const std::optional<VariableDeclaration>* declaration: { &statement->declaration, &statement->forInitializer }) {
 			if (*declaration) {
 				// The name is in scope in its own initialiser.
@@ -475,6 +473,9 @@ namespace {
 				collectUnshadowed((*declaration)->initializer.get(), scopes, names);
 			}
 		}
+		// The condition and increment of a for loop follow its initialiser.
+		collectUnshadowed(statement->forCondition.get(), scopes, names);
+		collectUnshadowed(statement->forIncrement.get(), scopes, names);
 		for (const StatementPtr& child: statement->children) {
 			collectUnshadowed(child.get(), scopes, names);
 		}
