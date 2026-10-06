@@ -1,6 +1,9 @@
 // EXPECT: valid
+// DISASM-MATCH: = OpIEqual %bool
+// DISASM-NO-MATCH: = OpFOrdEqual
 //
-// "enum Mode m" names the same type as "Mode m", in a local and in a struct member.
+// "enum Mode m" names the same type as "Mode m", in a local and in a struct member,
+// so the comparison is an integer one.
 #include <metal_stdlib>
 using namespace metal;
 enum Mode { A, B };
