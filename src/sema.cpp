@@ -174,6 +174,70 @@ namespace {
 		return sign * std::ldexp(static_cast<double>(fraction | 0x400u), exponent - 25);
 	}
 
+	bool isIntegerKind(ScalarKind kind) {
+		return kind >= ScalarKind::Char && kind <= ScalarKind::ULong;
+	}
+
+	// The 64 bits of a value as the kind holds them: reduced to its width, then
+	// sign-extended for a signed kind and zero-extended for an unsigned one.
+	uint64_t normalizeInteger(ScalarKind kind, uint64_t bits) {
+		const uint32_t width = mappingFor(kind).width;
+		if (width < 64) {
+			bits &= (uint64_t{ 1 } << width) - 1;
+			if (isSignedInteger(kind) && (bits >> (width - 1)) != 0) {
+				bits |= ~uint64_t{ 0 } << width;
+			}
+		}
+
+		return bits;
+	}
+
+	// The integer promotions: anything narrower than an int is an int.
+	ScalarKind promotedKind(ScalarKind kind) {
+		return mappingFor(kind).width < 32 ? ScalarKind::Int : kind;
+	}
+
+	// C's usual arithmetic conversions between two promoted integer kinds, which
+	// is what usualArithmeticConversion does to the types of the same operands at
+	// run time: the wider kind wins with its own signedness, and equal widths with
+	// opposite signedness are both unsigned.
+	ScalarKind commonIntegerKind(ScalarKind left, ScalarKind right) {
+		const uint32_t leftWidth = mappingFor(left).width;
+		const uint32_t rightWidth = mappingFor(right).width;
+		if (leftWidth != rightWidth) {
+			return leftWidth > rightWidth ? left : right;
+		}
+
+		if (left == right) {
+			return left;
+		}
+
+		return leftWidth == 64 ? ScalarKind::ULong : ScalarKind::UInt;
+	}
+
+	// A float or half value rounded to what its own kind holds.
+	double roundedToKind(ScalarKind kind, double value) {
+		if (kind == ScalarKind::Half) {
+			return halfValueOf(halfBitsOf(value));
+		}
+
+		return kind == ScalarKind::Float ? static_cast<double>(static_cast<float>(value)) : value;
+	}
+
+	// An integer constant as the float or half kind it is converted to. It goes
+	// to a float from the integer itself rather than through a double, which
+	// would round twice.
+	double integerAsKind(ScalarKind kind, ScalarKind from, uint64_t integer) {
+		if (kind == ScalarKind::Float) {
+			return isSignedInteger(from)
+				? static_cast<double>(static_cast<float>(static_cast<int64_t>(integer)))
+				: static_cast<double>(static_cast<float>(integer));
+		}
+
+		return roundedToKind(kind, isSignedInteger(from)
+			? static_cast<double>(static_cast<int64_t>(integer)) : static_cast<double>(integer));
+	}
+
 	// Whether an operator produces a bool rather than its operand's type.
 	bool isComparisonOperator(BinaryOperator op) {
 		switch (op) {
@@ -1253,13 +1317,120 @@ namespace {
 		Id type = InvalidId;
 		std::vector<Id> parts;
 
-		// A scalar: the kind to declare it as, and its value. A double holds
-		// every 32-bit integer and every float exactly, which is the whole range
-		// of the scalar types a constant here can have.
+		// A scalar: the kind to declare it as, and its value. A float or half
+		// is a double that holds exactly what its own width does; an integer is
+		// its 64 bits, reduced to the kind's width and then sign-extended for a
+		// signed kind or zero-extended for an unsigned one, so that a signed
+		// value reads back through a cast to int64_t.
 		ScalarKind scalar = ScalarKind::Void;
 		double number = 0.0;
+		uint64_t integer = 0;
 		bool boolean = false;
 	};
+
+	// A scalar constant as the kind it is declared with. An integer wraps to the
+	// width it is stored in, as a conversion does at run time, and goes to a
+	// float or half with one rounding; a float may only become another float
+	// kind, which the caller has checked.
+	FoldedConstant convertConstant(FoldedConstant constant, ScalarKind to) {
+		if (to == ScalarKind::Bool || constant.scalar == ScalarKind::Bool) {
+			return constant;
+		}
+
+		if (isFloatKind(to)) {
+			constant.number = isFloatKind(constant.scalar) ? roundedToKind(to, constant.number)
+				: integerAsKind(to, constant.scalar, constant.integer);
+		} else {
+			constant.integer = normalizeInteger(to, constant.integer);
+		}
+
+		constant.scalar = to;
+		return constant;
+	}
+
+	const char* cxxTypeName(ScalarKind kind) {
+		switch (kind) {
+			case ScalarKind::Char: return "char";
+			case ScalarKind::UChar: return "unsigned char";
+			case ScalarKind::Short: return "short";
+			case ScalarKind::UShort: return "unsigned short";
+			case ScalarKind::Int: return "int";
+			case ScalarKind::UInt: return "unsigned int";
+			case ScalarKind::Long: return "long";
+			case ScalarKind::ULong: return "unsigned long";
+			default: return scalarKindName(kind);
+		}
+	}
+
+	std::string integerText(const FoldedConstant& constant) {
+		return isSignedInteger(constant.scalar) ? std::to_string(static_cast<int64_t>(constant.integer))
+			: std::to_string(constant.integer);
+	}
+
+	// A value inside a braced initialiser has to reach its element type without
+	// changing, as in C++11, and Apple's compiler makes it an error where a
+	// plain "constant int k = 2147483648;" is a warning. An integer has to fit
+	// an integer type and be exactly representable in a float type, a float is
+	// never narrowed to an integer, and a float only has to be in range for a
+	// narrower float.
+	void requireNotNarrowing(const FoldedConstant& constant, ScalarKind to) {
+		const ScalarKind from = constant.scalar;
+		const auto narrowed = [&]() {
+			return CompileError("constant expression evaluates to " + (isFloatKind(from)
+				? std::to_string(constant.number) : integerText(constant))
+				+ " which cannot be narrowed to type '" + cxxTypeName(to) + "' in an initializer list");
+		};
+
+		if (isFloatKind(from)) {
+			if (!isFloatKind(to)) {
+				throw CompileError("type '" + std::string(cxxTypeName(from)) + "' cannot be narrowed to '"
+					+ cxxTypeName(to) + "' in an initializer list");
+			}
+
+			if (std::isfinite(constant.number) && !std::isfinite(roundedToKind(to, constant.number))) {
+				throw narrowed();
+			}
+
+			return;
+		}
+
+		const bool fromSigned = isSignedInteger(from);
+		const bool negative = fromSigned && static_cast<int64_t>(constant.integer) < 0;
+		const bool beyondLong = !fromSigned && static_cast<int64_t>(constant.integer) < 0;
+
+		if (isFloatKind(to)) {
+			// Apple, as clang does, converts the float back to the integer's own type
+			// and compares. The conversion back saturates, so INT_MAX, which rounds
+			// to 2^31 as a float and to infinity as a half, comes back as INT_MAX
+			// and is let through.
+			const double converted = integerAsKind(to, from, constant.integer);
+			const __int128 value = fromSigned ? static_cast<__int128>(static_cast<int64_t>(constant.integer))
+				: static_cast<__int128>(constant.integer);
+			const __int128 width = static_cast<__int128>(1) << (mappingFor(from).width - (fromSigned ? 1 : 0));
+			const __int128 low = fromSigned ? -width : 0;
+			const __int128 high = width - 1;
+			__int128 back = 0;
+			if (converted >= static_cast<double>(high)) {
+				back = high;
+			} else if (converted <= static_cast<double>(low)) {
+				back = low;
+			} else {
+				back = static_cast<__int128>(converted);
+			}
+			const bool exact = back == value;
+			if (!exact) {
+				throw narrowed();
+			}
+
+			return;
+		}
+
+		const bool toSigned = isSignedInteger(to);
+		if ((negative && !toSigned) || (beyondLong && toSigned)
+			|| normalizeInteger(to, constant.integer) != constant.integer) {
+			throw narrowed();
+		}
+	}
 
 	// An Input or Output variable carrying one value across a stage boundary: a
 	// returned value, or one field of a returned or [[stage_in]] struct. The
@@ -1365,8 +1536,8 @@ namespace {
 		void declareGlobals();
 		Id declareGlobalConstant(const VariableDeclaration& declaration);
 		Id emitConstant(const FoldedConstant& folded);
-		uint32_t constantBits(ScalarKind kind, double value);
-		FoldedConstant foldInitializer(const Type& type, const Expression& initializer);
+		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
+		FoldedConstant foldInitializer(const Type& type, const Expression& initializer, bool braced = false);
 		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
 			const Expression& initializer);
 		FoldedConstant foldExpression(const Expression& expression);
@@ -2828,35 +2999,40 @@ namespace {
 		}
 
 		return _builder.emitDeclTyped(spirv::OpConstant,
-			_types.scalar(folded.scalar), { constantBits(folded.scalar, folded.number) });
+			_types.scalar(folded.scalar), constantWords(folded));
 	}
 
-	// The bits of a scalar constant of the given kind. A float is narrowed to its
-	// own width here, since the value was folded as a double and OpConstant takes
+	// The literal words of a scalar constant of its own kind: one for anything up
+	// to 32 bits and two, low then high, for a 64-bit integer. A float is narrowed
+	// to its own width here, since it was folded as a double and OpConstant takes
 	// the bits of the type it declares.
-	uint32_t Emitter::constantBits(ScalarKind kind, double value) {
-		// A 64-bit constant's literal is two words. Reporting is better than
-		// emitting one word of the two, which is a short instruction rather than a
-		// narrow constant.
-		if (scalarBitWidth(kind) > 32) {
+	std::vector<uint32_t> Emitter::constantWords(const FoldedConstant& folded) {
+		const ScalarKind kind = folded.scalar;
+
+		if (kind == ScalarKind::Double) {
 			throw CompileError("a constant of " + std::string(scalarKindName(kind))
 				+ " is not lowered yet");
 		}
 
 		// A half's literal is its own 16 bits, not the low half of a float's.
 		if (kind == ScalarKind::Half) {
-			return halfBitsOf(value);
+			return { halfBitsOf(folded.number) };
 		}
 
-		if (isFloatKind(kind)) {
-			const auto narrowed = static_cast<float>(value);
+		if (kind == ScalarKind::Float) {
+			const auto narrowed = static_cast<float>(folded.number);
 			uint32_t bits = 0;
 			static_assert(sizeof(bits) == sizeof(narrowed), "float is not 32 bits");
 			std::memcpy(&bits, &narrowed, sizeof(bits));
-			return bits;
+			return { bits };
 		}
 
-		return static_cast<uint32_t>(static_cast<int64_t>(value));
+		std::vector<uint32_t> words { static_cast<uint32_t>(folded.integer) };
+		if (scalarBitWidth(kind) == 64) {
+			words.push_back(static_cast<uint32_t>(folded.integer >> 32));
+		}
+
+		return words;
 	}
 
 	// A struct's fields are initialised by name in Metal, and every one of them
@@ -2885,7 +3061,7 @@ namespace {
 			}
 
 			folded.parts.push_back(emitConstant(
-				foldInitializer(decl.fields[i].type, *element.value)));
+				foldInitializer(decl.fields[i].type, *element.value, true)));
 		}
 	}
 
@@ -2897,21 +3073,19 @@ namespace {
 
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral:
-				// An integer literal is an int, as it is in C++, rather than the
-				// uint an emitted literal happens to be declared as.
-				folded.scalar = ScalarKind::Int;
-				folded.number = static_cast<double>(expression.intValue);
+				folded.scalar = expression.intKind;
+				folded.integer = normalizeInteger(expression.intKind, expression.intValue);
 				return folded;
 
 			case ExpressionKind::FloatLiteral:
 				if (expression.floatIsHalf) {
 					folded.scalar = ScalarKind::Half;
-					folded.number = halfValueOf(halfBitsOf(expression.floatValue));
+					folded.number = roundedToKind(ScalarKind::Half, expression.floatValue);
 					return folded;
 				}
 
 				folded.scalar = ScalarKind::Float;
-				folded.number = expression.floatValue;
+				folded.number = roundedToKind(ScalarKind::Float, expression.floatValue);
 				return folded;
 
 			case ExpressionKind::BoolLiteral:
@@ -2946,21 +3120,53 @@ namespace {
 	}
 
 	FoldedConstant Emitter::foldUnary(const Expression& expression) {
-		FoldedConstant folded = foldExpression(*expression.left);
+		FoldedConstant operand = foldExpression(*expression.left);
 
-		if (folded.isComposite) {
+		if (operand.isComposite) {
 			throw CompileError("a composite constant cannot have a unary operator applied to it");
 		}
 
-		switch (expression.unaryOperator) {
-			case UnaryOperator::Plus: return folded;
-			case UnaryOperator::Negate:
-				folded.number = -folded.number;
-				return folded;
-			default: break;
+		const UnaryOperator op = expression.unaryOperator;
+		const bool isBool = operand.scalar == ScalarKind::Bool;
+		const bool isFloat = isFloatKind(operand.scalar);
+
+		if (op == UnaryOperator::Not) {
+			FoldedConstant folded;
+			folded.scalar = ScalarKind::Bool;
+			folded.boolean = isBool ? !operand.boolean : isFloat ? operand.number == 0.0 : operand.integer == 0;
+			return folded;
 		}
 
-		throw CompileError("this unary operator is recognised but not folded yet");
+		if (op != UnaryOperator::Plus && op != UnaryOperator::Negate && op != UnaryOperator::BitNot) {
+			throw CompileError("this unary operator is recognised but not folded yet");
+		}
+
+		if (isBool) {
+			throw CompileError("a unary operator on a bool is not folded; convert the bool to an int first");
+		}
+
+		if (isFloat) {
+			if (op == UnaryOperator::BitNot) {
+				throw CompileError("operator ~ needs an integer operand");
+			}
+
+			if (op == UnaryOperator::Negate) {
+				operand.number = -operand.number;
+			}
+
+			return operand;
+		}
+
+		// The operand is promoted first, so -c for a char is an int, and the
+		// result wraps in its own width like the instruction the lowering emits.
+		operand.scalar = promotedKind(operand.scalar);
+		if (op == UnaryOperator::Negate) {
+			operand.integer = normalizeInteger(operand.scalar, uint64_t{ 0 } - operand.integer);
+		} else if (op == UnaryOperator::BitNot) {
+			operand.integer = normalizeInteger(operand.scalar, ~operand.integer);
+		}
+
+		return operand;
 	}
 
 	FoldedConstant Emitter::foldBinary(const Expression& expression) {
@@ -2971,62 +3177,97 @@ namespace {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
 		}
 
-		// A half beside a float is a float, as in C.
-		const bool mixedFloats = left.scalar != right.scalar
-			&& isFloatKind(left.scalar) && isFloatKind(right.scalar);
-		if (left.scalar != right.scalar && !mixedFloats) {
-			throw CompileError("a constant's operands have to be of the same type, found "
-				+ std::string(scalarKindName(left.scalar)) + " and "
-				+ std::string(scalarKindName(right.scalar)));
+		if (left.scalar == ScalarKind::Bool || right.scalar == ScalarKind::Bool) {
+			throw CompileError("an arithmetic or bitwise operator on a bool is not folded; "
+				"convert the bool to an int first");
 		}
 
 		const BinaryOperator op = expression.binaryOperator;
 
-		if (isFloatKind(left.scalar)) {
-			FoldedConstant folded = left;
-			if (mixedFloats) {
-				folded.scalar = ScalarKind::Float;
-			}
+		if (isFloatKind(left.scalar) || isFloatKind(right.scalar)) {
+			// A float beats a half, and either beats an integer, as in C.
+			FoldedConstant folded;
+			folded.scalar = left.scalar == ScalarKind::Float || right.scalar == ScalarKind::Float
+				? ScalarKind::Float : ScalarKind::Half;
+			const auto valueOf = [&](const FoldedConstant& operand) {
+				return isFloatKind(operand.scalar) ? operand.number
+					: integerAsKind(folded.scalar, operand.scalar, operand.integer);
+			};
 
+			const double l = valueOf(left);
+			const double r = valueOf(right);
 			switch (op) {
-				case BinaryOperator::Add: folded.number = left.number + right.number; break;
-				case BinaryOperator::Subtract: folded.number = left.number - right.number; break;
-				case BinaryOperator::Multiply: folded.number = left.number * right.number; break;
+				case BinaryOperator::Add: folded.number = l + r; break;
+				case BinaryOperator::Subtract: folded.number = l - r; break;
+				case BinaryOperator::Multiply: folded.number = l * r; break;
 				// A float division by zero is infinity, which is what the language
 				// says, so it is not treated as a mistake here.
-				case BinaryOperator::Divide: folded.number = left.number / right.number; break;
+				case BinaryOperator::Divide: folded.number = l / r; break;
 				default:
 					throw CompileError("this operator is recognised but not folded yet");
+			}
+
+			folded.number = roundedToKind(folded.scalar, folded.number);
+			return folded;
+		}
+
+		const bool isShift = op == BinaryOperator::ShiftLeft || op == BinaryOperator::ShiftRight;
+
+		// A shift takes its type from the promoted left operand alone, and a count
+		// of its own type that has to lie within that type's width.
+		if (isShift) {
+			FoldedConstant folded;
+			folded.scalar = promotedKind(left.scalar);
+			const uint32_t width = mappingFor(folded.scalar).width;
+			const bool negative = isSignedInteger(right.scalar) && static_cast<int64_t>(right.integer) < 0;
+			if (negative || right.integer >= width) {
+				throw CompileError("a shift of a constant is by a count outside 0 to "
+					+ std::to_string(width - 1));
+			}
+
+			const uint64_t count = right.integer;
+			if (op == BinaryOperator::ShiftLeft) {
+				folded.integer = normalizeInteger(folded.scalar, left.integer << count);
+			} else if (isSignedInteger(folded.scalar)) {
+				folded.integer = static_cast<uint64_t>(static_cast<int64_t>(left.integer) >> count);
+			} else {
+				folded.integer = left.integer >> count;
 			}
 
 			return folded;
 		}
 
-		// Integer arithmetic at the width the operands have, so a constant that
-		// overflows wraps the way it would at run time rather than in the double it
-		// was folded through.
-		const auto l = static_cast<uint32_t>(static_cast<int64_t>(left.number));
-		const auto r = static_cast<uint32_t>(static_cast<int64_t>(right.number));
+		FoldedConstant folded;
+		folded.scalar = commonIntegerKind(promotedKind(left.scalar), promotedKind(right.scalar));
+		const uint64_t l = normalizeInteger(folded.scalar, left.integer);
+		const uint64_t r = normalizeInteger(folded.scalar, right.integer);
+		const bool isSigned = isSignedInteger(folded.scalar);
 
-		uint32_t value = 0;
+		uint64_t value = 0;
 		switch (op) {
 			case BinaryOperator::Add: value = l + r; break;
 			case BinaryOperator::Subtract: value = l - r; break;
 			case BinaryOperator::Multiply: value = l * r; break;
 			case BinaryOperator::Modulo:
-				if (r == 0) {
-					throw CompileError("an integer constant divides by zero");
-				}
-				value = l % r;
-				break;
 			case BinaryOperator::Divide:
 				if (r == 0) {
 					throw CompileError("an integer constant divides by zero");
 				}
-				value = l / r;
+
+				if (isSigned) {
+					const auto sl = static_cast<int64_t>(l);
+					const auto sr = static_cast<int64_t>(r);
+					// The one quotient that does not fit is the most negative value
+					// over -1, which wraps to itself, with a remainder of 0.
+					const uint64_t most = normalizeInteger(folded.scalar,
+						uint64_t{ 1 } << (mappingFor(folded.scalar).width - 1));
+					const bool overflows = sr == -1 && l == most;
+					value = overflows ? (op == BinaryOperator::Divide ? l : 0)
+						: static_cast<uint64_t>(op == BinaryOperator::Divide ? sl / sr : sl % sr);
+				} else {
+					value = op == BinaryOperator::Divide ? l / r : l % r;
+				}
 				break;
-			case BinaryOperator::ShiftLeft: value = l << (r & 31u); break;
-			case BinaryOperator::ShiftRight: value = l >> (r & 31u); break;
 			case BinaryOperator::BitAnd: value = l & r; break;
 			case BinaryOperator::BitOr: value = l | r; break;
 			case BinaryOperator::BitXor: value = l ^ r; break;
@@ -3034,15 +3275,14 @@ namespace {
 				throw CompileError("this operator is recognised but not folded yet");
 		}
 
-		FoldedConstant folded = left;
-		folded.number = value;
+		folded.integer = normalizeInteger(folded.scalar, value);
 		return folded;
 	}
 
 	// Folds an initialiser of the given declared type. A list of values for a
 	// vector or a struct is a composite, and anything else is a scalar, so the
 	// declared type is what says which the source wrote.
-	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer) {
+	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer, bool braced) {
 		if (type.isMatrix()) {
 			throw CompileError("a " + typeName(type) + " constant is not lowered yet");
 		}
@@ -3074,6 +3314,10 @@ namespace {
 						+ std::string(scalarKindName(type.scalar)));
 			}
 
+			if (braced) {
+				requireNotNarrowing(folded, type.scalar);
+			}
+
 			// The declared type is what the constant is. An integer literal may
 			// initialise a float, since that is a widening; the other direction would
 			// have to round, which is not something to do silently.
@@ -3082,8 +3326,7 @@ namespace {
 					+ std::string(scalarKindName(type.scalar)));
 			}
 
-			folded.scalar = type.scalar;
-			return folded;
+			return convertConstant(folded, type.scalar);
 		}
 
 		FoldedConstant folded;
@@ -3108,7 +3351,7 @@ namespace {
 
 				Type component = type;
 				component.vectorWidth = 0;
-				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value)));
+				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value, true)));
 			}
 
 			return folded;
@@ -3153,28 +3396,18 @@ namespace {
 	Id Emitter::emitExpression(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
-				// The suffix decides, not the value. An unsuffixed integer literal
-				// is an int and a `u` one is a uint, which is what picks the
-				// opcode for "4294967295u / 3u" and what a literal's conversion
-				// reads it through.
-				//
-				// These were both wrong once and in opposite directions. Emitting
-				// every literal as %uint made a negative one wrap: "-1" was
-				// OpSNegate %uint %uint_1, and negating 1 as an unsigned is
-				// 4294967295. A declaration hid it, because the stored value is
-				// bitcast back to %int, so "int b = -1" read correctly while
-				// "float3 v(-1)" broadcast 4294967295.0f. Emitting every literal as
-				// %int hid nothing and broke unsigned arithmetic instead, because
-				// emitBinary takes the opcode from the left type, so
-				// "4294967295u / 3u" became OpSDiv.
-				//
-				// A literal that does not fit in an int is a long in Apple's
-				// compiler, with no suffix to ask for it, and mslc has no 64-bit
-				// literal. Both reads therefore give the wrong answer for one, and
-				// that gap is left for the 64-bit work rather than papered over here.
-				const Id type = expression.intIsUnsigned ? _uintType : _intType;
-				return _builder.emitDeclTyped(spirv::OpConstant, type,
-					{ static_cast<uint32_t>(expression.intValue) });
+				// The literal's own type, which the parser took from its spelling:
+				// "-1" is a negated int and "3000000000" a long, so neither wraps.
+				// Emitting every literal as %uint made "-1" OpSNegate %uint, which
+				// is 4294967295 as a float3 component, and as %int made
+				// "4294967295u / 3u" an OpSDiv, because emitBinary takes the opcode
+				// from the left operand's type.
+				const Id type = _types.scalar(expression.intKind);
+				std::vector<uint32_t> words { static_cast<uint32_t>(expression.intValue) };
+				if (scalarBitWidth(expression.intKind) == 64) {
+					words.push_back(static_cast<uint32_t>(expression.intValue >> 32));
+				}
+				return _builder.emitDeclTyped(spirv::OpConstant, type, words);
 			}
 
 			case ExpressionKind::FloatLiteral: {

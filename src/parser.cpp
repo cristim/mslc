@@ -776,7 +776,8 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
-			if (nested && (expression.intIsUnsigned || expression.intValue > INT_MAX)) {
+			if (nested && (expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong
+				|| expression.intValue > INT_MAX)) {
 				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
 			}
 			if (expression.intValue > INT64_MAX) {
@@ -835,12 +836,35 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 	throw CompileError("not an integer constant expression");
 }
 
+// Whether a constant expression has a long or ulong in it, which makes its
+// type one. A shift has the type of its left operand alone.
+static bool isSixtyFourBit(const Expression& expression) {
+	switch (expression.kind) {
+		case ExpressionKind::IntLiteral:
+			return expression.intKind == ScalarKind::Long || expression.intKind == ScalarKind::ULong;
+		case ExpressionKind::Unary:
+			return isSixtyFourBit(*expression.left);
+		case ExpressionKind::Binary: {
+			const bool isShift = expression.binaryOperator == BinaryOperator::ShiftLeft
+				|| expression.binaryOperator == BinaryOperator::ShiftRight;
+			return isSixtyFourBit(*expression.left) || (!isShift && isSixtyFourBit(*expression.right));
+		}
+		default:
+			return false;
+	}
+}
+
 // The index an attribute or an array length takes: a constant that is not
-// negative and fits the 32 bits it is stored in.
-int64_t Parser::parseConstantIndex(const std::string& context) {
+// negative and fits the 32 bits it is stored in. Apple takes an int or a uint
+// for an attribute and rejects a long, though an array length may be one.
+int64_t Parser::parseConstantIndex(const std::string& context, bool isAttribute) {
 	int64_t value = 0;
 	try {
-		value = evaluateConstant(*parseAssignment(), false);
+		const ExpressionPtr expression = parseAssignment();
+		if (isAttribute && isSixtyFourBit(*expression)) {
+			throw CompileError("a long is not an index; use an int or a uint");
+		}
+		value = evaluateConstant(*expression, false);
 	} catch (const CompileError& error) {
 		throw CompileError(context + " needs a constant integer argument (" + error.what() + ")");
 	}
@@ -1149,7 +1173,7 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		std::optional<uint32_t> argument;
 		if (at(TokenKind::LParen)) {
 			advance();
-			argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\""));
+			argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\"", true));
 			expect(TokenKind::RParen, "to close an attribute argument");
 		}
 
@@ -1837,6 +1861,60 @@ std::vector<ExpressionPtr> Parser::parseArgumentList(const char* closing) {
 	return arguments;
 }
 
+// The type of an integer literal, as C gives it and as Apple's compiler does.
+// An unsuffixed decimal is the first of int and long that holds it, where hex
+// and octal go on through uint and ulong; a decimal never becomes unsigned
+// without a `u`, and one too large for a long wraps, which is what Apple
+// compiles it to.
+static ScalarKind integerLiteralKind(const Token& literal) {
+	if (literal.integerDigitsInvalid) {
+		throw CompileError("invalid digit in integer constant \"" + std::string(literal.text) + "\"");
+	}
+
+	if (literal.integerSuffixInvalid) {
+		size_t digitsEnd = literal.text.size();
+		while (digitsEnd > 0 && (std::string_view("uUlL").find(literal.text[digitsEnd - 1]) != std::string_view::npos)) {
+			--digitsEnd;
+		}
+		throw CompileError("invalid suffix \"" + std::string(literal.text.substr(digitsEnd))
+			+ "\" on integer constant");
+	}
+
+	if (literal.integerOverflows) {
+		throw CompileError("integer literal is too large to be represented in any integer type");
+	}
+
+	const uint64_t value = literal.integerValue;
+	if (literal.integerIsUnsigned) {
+		return literal.integerLongCount == 0 && value <= UINT_MAX ? ScalarKind::UInt : ScalarKind::ULong;
+	}
+
+	// An l is a long, and a long long is one here too. Apple wraps a decimal or
+	// a long long that is too large rather than making it unsigned, and only a
+	// hex or octal l goes on to ulong.
+	if (literal.integerLongCount > 0) {
+		const bool wraps = literal.integerIsDecimal || literal.integerLongCount == 2;
+		return wraps || value <= INT64_MAX ? ScalarKind::Long : ScalarKind::ULong;
+	}
+
+	if (value <= INT_MAX) {
+		return ScalarKind::Int;
+	}
+
+	// A decimal from 2^63 to 2^64 - 1 is a long holding the wrapped bits, as in
+	// Apple's compiler, which says nothing about a bare literal and only warns
+	// when it is narrowed into a variable. C would make it unsigned.
+	if (literal.integerIsDecimal) {
+		return ScalarKind::Long;
+	}
+
+	if (value <= UINT_MAX) {
+		return ScalarKind::UInt;
+	}
+
+	return value <= INT64_MAX ? ScalarKind::Long : ScalarKind::ULong;
+}
+
 ExpressionPtr Parser::parsePrimary() {
 	if (at(TokenKind::IntegerLiteral)) {
 		auto expression = std::make_unique<Expression>();
@@ -1844,7 +1922,7 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->line = line();
 		const Token literal = advance();
 		expression->intValue = literal.integerValue;
-		expression->intIsUnsigned = literal.integerIsUnsigned;
+		expression->intKind = integerLiteralKind(literal);
 		return expression;
 	}
 

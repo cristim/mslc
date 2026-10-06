@@ -184,11 +184,9 @@ struct Expression {
 
 	// literals
 	uint64_t intValue = 0;
-	// Whether the literal was written with a `u` suffix, which is what makes it
-	// a uint rather than an int. MSL has no `l` suffix for a 64-bit literal, so
-	// an unsuffixed value that does not fit in an int is a long in Apple's
-	// compiler and nothing mslc can represent, which is its own gap.
-	bool intIsUnsigned = false;
+	// The type the literal has: int, uint, long or ulong, by C's rules for its
+	// spelling and value. A long that did not fit holds the wrapped bits.
+	ScalarKind intKind = ScalarKind::Int;
 	double floatValue = 0.0;
 	// Written with an `h` suffix: the literal is a half, not a float.
 	bool floatIsHalf = false;
