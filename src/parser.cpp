@@ -930,6 +930,7 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 
 Type Parser::parseType(bool allowResource) {
 	Type type;
+	bool isConstexpr = false;
 
 	// MSL writes the address space and the const qualifier in either order, and
 	// both orders are ordinary: "device const float*" and "const device Vertex *"
@@ -959,6 +960,9 @@ Type Parser::parseType(bool allowResource) {
 
 		if (text == "const") {
 			type.isConst = true;
+		}
+		if (text == "constexpr") {
+			isConstexpr = true;
 		}
 
 		advance();
@@ -1001,6 +1005,12 @@ Type Parser::parseType(bool allowResource) {
 		}
 		advance();
 		type.isPointer = true;
+	}
+
+	// constexpr makes the variable const, and on a pointer that is the pointer
+	// rather than what it points at, which is what isConst means there.
+	if (isConstexpr && !type.isPointer) {
+		type.isConst = true;
 	}
 
 	if (auto length = tryParseArrayLength()) {
