@@ -8,6 +8,17 @@
 namespace mslc {
 
 namespace {
+	constexpr const char* kStdlibNamespace = "metal";
+	constexpr const char* kAnonymousNamespace = "(anonymous namespace)";
+
+	std::string joinParts(const std::vector<std::string>& parts, size_t from, size_t to) {
+		std::string out;
+		for (size_t i = from; i < to; ++i) {
+			out += (out.empty() ? "" : "::") + parts[i];
+		}
+		return out;
+	}
+
 
 	// Bare type keywords, mapped to their scalar kind. MSL spells these
 	// without a typedef, so they are lexed as identifiers and recognised here.
@@ -338,11 +349,17 @@ void Parser::parseDeclaration() {
 	}
 
 	if (matchIdentifier("using")) {
-		// using namespace metal;
-		advance(); // namespace
-		advance(); // name
-		expect(TokenKind::Semicolon, "after using directive");
+		parseUsing();
 		return;
+	}
+
+	if (matchIdentifier("namespace")) {
+		parseNamespace();
+		return;
+	}
+
+	if (atKeyword("inline") && lookahead().kind == TokenKind::Identifier && lookahead().text == "namespace") {
+		throw CompileError("an inline namespace is not supported");
 	}
 
 	if (matchIdentifier("struct")) {
@@ -405,8 +422,100 @@ void Parser::parseDeclaration() {
 		"expected a struct, kernel, vertex, fragment or helper function declaration");
 }
 
+// "namespace" is consumed. A name declared in the body is stored under its
+// qualified name; an anonymous namespace is the namespace "(anonymous namespace)",
+// which its enclosing namespace uses, so its names are visible there unqualified.
+void Parser::parseNamespace() {
+	const NestingScope nesting(*this);
+
+	const size_t outer = _namespacePath.size();
+	if (at(TokenKind::LBrace)) {
+		_namespacePath.push_back(kAnonymousNamespace);
+		NamespaceScope& parent = _scopes[namespacePrefix(outer)];
+		const std::string path = namespacePrefix(outer + 1);
+		if (std::find(parent.directives.begin(), parent.directives.end(), path) == parent.directives.end()) {
+			parent.directives.push_back(path);
+		}
+		_namespaces.insert(path);
+	} else {
+		while (true) {
+			if (kind() != TokenKind::Identifier) {
+				throw CompileError("expected a namespace name, found " + std::string(tokenKindName(kind())));
+			}
+			if (_declared.count(qualify(std::string(current().text)))) {
+				throw CompileError("\"" + qualify(std::string(current().text)) + "\" is declared and "
+					"cannot also be a namespace");
+			}
+			_namespacePath.emplace_back(advance().text);
+			_namespaces.insert(namespacePrefix(_namespacePath.size()));
+			if (!match(TokenKind::ColonColon)) {
+				break;
+			}
+		}
+		if (at(TokenKind::Assign)) {
+			throw CompileError("a namespace alias is not supported");
+		}
+		if (at(TokenKind::LBracket)) {
+			throw CompileError("an attribute on a namespace is not supported");
+		}
+	}
+
+	expect(TokenKind::LBrace, "to open a namespace body");
+	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		parseDeclaration();
+	}
+	expect(TokenKind::RBrace, "to close a namespace body");
+	_namespacePath.resize(outer);
+}
+
+// "using" is consumed: "using namespace N;" or "using N::x;".
+void Parser::parseUsing() {
+	const std::string scope = namespacePrefix(_namespacePath.size());
+
+	if (matchIdentifier("namespace")) {
+		QualifiedName name;
+		if (!peekQualifiedName(name)) {
+			throw CompileError("expected a namespace name after \"using namespace\"");
+		}
+		for (size_t i = 0; i < name.tokens; ++i) {
+			advance();
+		}
+		const std::string spelled = (name.global ? "::" : "") + joinParts(name.parts, 0, name.parts.size());
+		expect(TokenKind::Semicolon, "after a using directive");
+
+		// Nothing is looked up through the standard library's own namespace, and a
+		// file that adds names to it is found by the same spelling.
+		if (name.parts.front() == kStdlibNamespace && name.parts.size() == 1) {
+			NamespaceScope& entry = _scopes[scope];
+			entry.directives.push_back(kStdlibNamespace);
+			return;
+		}
+
+		const std::string target = namespaceOf(name, name.parts.size());
+		if (target.empty()) {
+			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
+		}
+		_scopes[scope].directives.push_back(target);
+		return;
+	}
+
+	QualifiedName name;
+	if (!peekQualifiedName(name) || name.parts.size() < 2) {
+		throw CompileError("a using declaration has to name a member of a namespace, as \"using N::x;\"");
+	}
+	for (size_t i = 0; i < name.tokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Semicolon, "after a using declaration");
+	const std::string resolved = resolveName(name);
+	if (!_declared.count(resolved)) {
+		return; // a name of the standard library, which is visible already
+	}
+	_scopes[scope].declarations[name.parts.back()] = resolved;
+}
+
 bool Parser::tryParseHelperFunction() {
-	if (kind() != TokenKind::Identifier) {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
 	}
 
@@ -456,7 +565,9 @@ bool Parser::tryParseHelperFunction() {
 	if (isTypeName(decl.name, builtin) || isSimdVectorName(decl.name, builtin)) {
 		throw CompileError(quoted + " has the name of a builtin type");
 	}
+	decl.name = qualify(decl.name);
 	declareName(decl.name, "function");
+	const LocalScope parameters(*this);
 
 	// "(void)" is an empty parameter list.
 	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) {
@@ -516,7 +627,7 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 		if (kind() != TokenKind::Identifier) {
 			throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 		}
-		declaration.name = std::string(advance().text);
+		declaration.name = qualify(std::string(advance().text));
 		declareName(declaration.name, "variable");
 		parseSamplerLocal(declaration);
 		return declaration;
@@ -532,7 +643,7 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 		throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 	}
 
-	declaration.name = std::string(advance().text);
+	declaration.name = qualify(std::string(advance().text));
 	declareName(declaration.name, "variable");
 
 	if (!match(TokenKind::Assign)) {
@@ -595,7 +706,7 @@ StructDecl Parser::parseStructDeclaration() {
 		throw CompileError("expected a struct name, found " + std::string(tokenKindName(kind())));
 	}
 
-	decl.name = std::string(advance().text);
+	decl.name = qualify(std::string(advance().text));
 	parseStructBody(decl);
 	match(TokenKind::Semicolon);
 
@@ -704,7 +815,9 @@ void Parser::declareName(const std::string& name, const char* what) {
 	// scope can reuse one. The builtin MSL names are not: a struct may be called
 	// float2, and a typedef or an enumerator may not.
 	Type builtin;
-	if (isSimdVectorName(name, builtin) || (isTypeSupportKind(what) && isTypeName(name, builtin))) {
+	const size_t tail = name.rfind("::");
+	const std::string unqualified = tail == std::string::npos ? name : name.substr(tail + 2);
+	if (isSimdVectorName(unqualified, builtin) || (isTypeSupportKind(what) && isTypeName(unqualified, builtin))) {
 		throw CompileError("\"" + name + "\" is a builtin type name and cannot be redeclared as a "
 			+ what);
 	}
@@ -724,16 +837,183 @@ void Parser::declareName(const std::string& name, const char* what) {
 	}
 }
 
-void Parser::rejectShadowing(const std::string& name) const {
-	const char* what = _enumConstants.count(name) ? "enum constant"
-		: _typedefs.count(name) ? "typedef"
-		: _enumTypes.count(name) ? "enum type"
+void Parser::declareLocal(const std::string& name) {
+	// A name that resolves to a declaration inside a namespace is hidden the same way.
+	QualifiedName unqualified;
+	unqualified.parts = {name};
+	const std::string key = resolveName(unqualified);
+	const char* what = _enumConstants.count(key) ? "enum constant"
+		: _typedefs.count(key) ? "typedef"
+		: _enumTypes.count(key) ? "enum type"
 		: nullptr;
 
 	if (what) {
 		throw CompileError("a variable named \"" + name + "\" would hide the " + std::string(what) + " of "
 			"that name, which mslc does not support");
 	}
+
+	if (!_locals.empty()) {
+		_locals.back().insert(name);
+	}
+}
+
+bool Parser::isLocal(const std::string& name) const {
+	for (const std::set<std::string>& scope : _locals) {
+		if (scope.count(name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+std::string Parser::qualify(const std::string& name) const {
+	std::string out;
+	for (const std::string& part : _namespacePath) {
+		out += part + "::";
+	}
+	return out + name;
+}
+
+bool Parser::peekQualifiedName(QualifiedName& out) const {
+	size_t at = 0;
+	out = QualifiedName();
+	if (lookahead(at).kind == TokenKind::ColonColon) {
+		out.global = true;
+		++at;
+	}
+	while (lookahead(at).kind == TokenKind::Identifier) {
+		out.parts.emplace_back(lookahead(at).text);
+		++at;
+		if (lookahead(at).kind != TokenKind::ColonColon || lookahead(at + 1).kind != TokenKind::Identifier) {
+			break;
+		}
+		++at;
+	}
+	out.tokens = at;
+	return !out.parts.empty();
+}
+
+void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
+	std::set<std::string>& found) const {
+	if (!seen.insert(scope).second) {
+		return;
+	}
+
+	const std::string key = scope.empty() ? name : scope + "::" + name;
+	if (_declared.count(key)) {
+		found.insert(key);
+	}
+
+	const auto entry = _scopes.find(scope);
+	if (entry == _scopes.end()) {
+		return;
+	}
+	if (const auto brought = entry->second.declarations.find(name); brought != entry->second.declarations.end()) {
+		found.insert(brought->second);
+	}
+	for (const std::string& directive : entry->second.directives) {
+		collectMembers(directive, name, seen, found);
+	}
+}
+
+std::string Parser::namespacePrefix(size_t depth) const {
+	return joinParts(_namespacePath, 0, depth);
+}
+
+// The namespace the first "count" parts of a name spell, found from the current
+// namespace outward (or from the file, after a leading "::"), or "" when there is none.
+std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
+	const std::vector<std::string>& parts = name.parts;
+	const size_t outermost = name.global ? 0 : _namespacePath.size();
+	for (size_t depth = outermost + 1; depth-- > 0;) {
+		// A namespace that a using directive nominated is searched as well.
+		std::vector<std::string> bases = {namespacePrefix(depth)};
+		std::set<std::string> seen;
+		for (size_t i = 0; i < bases.size(); ++i) {
+			const std::string candidate = bases[i].empty() ? parts[0] : bases[i] + "::" + parts[0];
+			if (_namespaces.count(candidate)) {
+				std::string scope = candidate;
+				for (size_t part = 1; part < count; ++part) {
+					scope += "::" + parts[part];
+					if (!_namespaces.count(scope)) {
+						return "";
+					}
+				}
+				return scope;
+			}
+			if (!seen.insert(bases[i]).second) {
+				continue;
+			}
+			if (const auto entry = _scopes.find(bases[i]); entry != _scopes.end()) {
+				bases.insert(bases.end(), entry->second.directives.begin(), entry->second.directives.end());
+			}
+		}
+	}
+	return "";
+}
+
+std::string Parser::resolveName(const QualifiedName& name) const {
+	const auto pick = [&](const std::set<std::string>& found, const std::string& spelled) {
+		if (found.size() > 1) {
+			throw CompileError("reference to \"" + spelled + "\" is ambiguous: it names " + *found.begin()
+				+ " and " + *std::next(found.begin()));
+		}
+		return *found.begin();
+	};
+
+	const std::string& last = name.parts.back();
+	if (name.parts.size() == 1 && !name.global) {
+		// The enclosing namespaces from the innermost out, then the file.
+		for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
+			std::set<std::string> seen;
+			std::set<std::string> found;
+			collectMembers(joinParts(_namespacePath, 0, depth), last, seen, found);
+			if (!found.empty()) {
+				return pick(found, last);
+			}
+		}
+		return last;
+	}
+
+	const std::string spelled = (name.global ? "::" : "") + joinParts(name.parts, 0, name.parts.size());
+	const std::vector<std::string>& parts = name.parts;
+	const std::string scope = parts.size() > 1 ? namespaceOf(name, parts.size() - 1) : std::string();
+	const bool found = !scope.empty();
+
+	if (found) {
+		std::set<std::string> seen;
+		std::set<std::string> members;
+		collectMembers(scope, last, seen, members);
+		if (!members.empty()) {
+			return pick(members, spelled);
+		}
+	}
+
+	// "metal::sin" is the standard library's "sin", with or without a using
+	// directive, unless the file extends the namespace with a name of that spelling.
+	if (parts.front() == kStdlibNamespace && parts.size() > 1) {
+		return joinParts(parts, 1, parts.size());
+	}
+
+	if (parts.size() == 1) {
+		// "::x" names a file-scope declaration, or a builtin.
+		return last;
+	}
+	if (!found) {
+		throw CompileError("\"" + joinParts(parts, 0, parts.size() - 1) + "\" in \"" + spelled
+			+ "\" is not a namespace the file declares");
+	}
+	throw CompileError("no member named \"" + last + "\" in the namespace \"" + scope + "\" (in \"" + spelled + "\")");
+}
+
+std::string Parser::peekResolved(size_t& tokens) const {
+	QualifiedName name;
+	if (!peekQualifiedName(name)) {
+		throw CompileError("expected a name, found " + std::string(tokenKindName(kind())) + " \""
+			+ std::string(current().text) + "\"");
+	}
+	tokens = name.tokens;
+	return resolveName(name);
 }
 
 // "typedef", already consumed, then a type and the one name it is given. What can
@@ -752,6 +1032,12 @@ void Parser::parseTypedef() {
 		std::string tag;
 		if (kind() == TokenKind::Identifier) {
 			tag = std::string(advance().text);
+		}
+
+		if (!tag.empty()) {
+			QualifiedName spelled;
+			spelled.parts = {tag};
+			tag = at(TokenKind::LBrace) ? qualify(tag) : resolveName(spelled);
 		}
 
 		if (at(TokenKind::LBrace)) {
@@ -800,7 +1086,7 @@ void Parser::parseTypedef() {
 		throw CompileError("expected a typedef name, found " + std::string(tokenKindName(kind())));
 	}
 
-	const std::string name(advance().text);
+	const std::string name = qualify(std::string(advance().text));
 
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("a typedef of an array type is not supported (\"" + name + "\")");
@@ -888,6 +1174,11 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	}
 
 	hadBody = at(TokenKind::LBrace);
+	if (!tag.empty()) {
+		QualifiedName spelled;
+		spelled.parts = {tag};
+		tag = hadBody ? qualify(tag) : resolveName(spelled);
+	}
 	if (!hadBody) {
 		return tag;
 	}
@@ -914,7 +1205,7 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 			throw CompileError("expected an enumerator name, found " + std::string(tokenKindName(kind())));
 		}
 
-		const std::string name(advance().text);
+		const std::string name = qualify(std::string(advance().text));
 		int64_t value = next;
 		if (match(TokenKind::Assign)) {
 			value = evaluateConstant(*parseAssignment(), false);
@@ -1185,22 +1476,39 @@ Type Parser::parseType(bool allowResource) {
 		advance();
 	}
 
-	if (kind() == TokenKind::Identifier && isResourceTypeName(current().text)) {
+	size_t nameTokens = 0;
+	std::string name;
+	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {
+		name = peekResolved(nameTokens);
+	}
+	const auto consumeName = [&] {
+		for (size_t i = 0; i < nameTokens; ++i) {
+			advance();
+		}
+	};
+
+	if (kind() == TokenKind::Identifier && nameTokens == 1 && isResourceTypeName(current().text)) {
 		if (!allowResource) {
 			throw CompileError("\"" + std::string(current().text) + "\" is a texture or sampler type, "
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
 		}
 		parseResourceType(type);
-	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
-		advance();
+	} else if (!name.empty() && resolveTypeName(name, type)) {
+		consumeName();
 	} else if (atKeyword("enum")) {
 		advance();
-		if (kind() != TokenKind::Identifier || !_enumTypes.count(std::string(current().text))) {
+		if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 			throw CompileError("an elaborated enum type must name an enum declared earlier in the unit");
 		}
-		resolveTypeName(advance().text, type);
-	} else if (kind() == TokenKind::Identifier) {
-		type.namedType = std::string(advance().text);
+		const std::string tag = peekResolved(nameTokens);
+		if (!_enumTypes.count(tag)) {
+			throw CompileError("an elaborated enum type must name an enum declared earlier in the unit");
+		}
+		resolveTypeName(tag, type);
+		consumeName();
+	} else if (!name.empty()) {
+		type.namedType = name;
+		consumeName();
 	} else {
 		throw CompileError("expected a type, found " + std::string(tokenKindName(kind()))
 			+ " \"" + std::string(current().text) + "\"");
@@ -1310,7 +1618,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 	if (!unnamed) {
 		param.name = std::string(advance().text);
-		rejectShadowing(param.name);
+		declareLocal(param.name);
 	}
 
 	if (helper) {
@@ -1484,7 +1792,12 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	}
 
 	decl.name = std::string(advance().text);
+	if (std::find(_namespacePath.begin(), _namespacePath.end(), kAnonymousNamespace) != _namespacePath.end()) {
+		throw CompileError(std::string(stage == Stage::Kernel ? "kernel" : stage == Stage::Vertex ? "vertex" : "fragment") + " function cannot be declared in anonymous namespace");
+	}
+	decl.name = qualify(decl.name);
 	declareName(decl.name, "function");
+	const LocalScope parameters(*this);
 
 	expect(TokenKind::LParen, "to open a parameter list");
 
@@ -1564,6 +1877,7 @@ StatementPtr Parser::parseCompoundStatement() {
 	auto statement = std::make_unique<Statement>();
 	statement->kind = StatementKind::Compound;
 	statement->line = line();
+	const LocalScope locals(*this);
 
 	expect(TokenKind::LBrace, "to open a block");
 
@@ -1631,10 +1945,13 @@ StatementPtr Parser::parseStatement() {
 	// and nothing else could start with those two words.
 	{
 		Type probe;
+		size_t nameTokens = 0;
+		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
+			? peekResolved(nameTokens) : std::string();
 		const bool looksLikeType =
-			(kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
-				|| isTypeQualifier(current().text) || isResourceTypeName(current().text)
-				|| _unit.findStruct(std::string(current().text)) != nullptr))
+			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
+				|| isTypeQualifier(name) || isResourceTypeName(name)
+				|| _unit.findStruct(name) != nullptr))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 
@@ -1648,7 +1965,7 @@ StatementPtr Parser::parseStatement() {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 			}
 			declaration.name = std::string(advance().text);
-			rejectShadowing(declaration.name);
+			declareLocal(declaration.name);
 
 			if (declaration.type.resource != ResourceKind::None) {
 				parseSamplerLocal(declaration);
@@ -1883,14 +2200,16 @@ StatementPtr Parser::parseForStatement() {
 	auto statement = std::make_unique<Statement>();
 	statement->kind = StatementKind::For;
 	statement->line = line();
+	const LocalScope locals(*this);
 
 	expectKeyword("for", "at the start of a for");
 	expect(TokenKind::LParen, "after 'for'");
 
 	{
 		Type probe;
-		const bool looksLikeType =
-			kind() == TokenKind::Identifier && resolveTypeName(current().text, probe);
+		size_t nameTokens = 0;
+		const bool looksLikeType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+			&& resolveTypeName(peekResolved(nameTokens), probe);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -1900,7 +2219,7 @@ StatementPtr Parser::parseForStatement() {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
 			declaration.name = std::string(advance().text);
-			rejectShadowing(declaration.name);
+			declareLocal(declaration.name);
 			if (match(TokenKind::Assign)) {
 				declaration.initializer = parseExpression();
 			}
@@ -2287,8 +2606,24 @@ ExpressionPtr Parser::parsePrimary() {
 		return expression;
 	}
 
-	if (kind() == TokenKind::Identifier) {
-		std::string_view text = current().text;
+	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {
+		// A name written with namespaces is read whole; a plain one is looked up
+		// unless a parameter or local of that name is in scope.
+		size_t spelledTokens = 1;
+		QualifiedName spelled;
+		if (peekQualifiedName(spelled) && spelled.global && spelled.parts.size() == 1
+			&& isLocal(spelled.parts[0])) {
+			throw CompileError("\"::" + spelled.parts[0] + "\" names the file-scope declaration, which the local "
+				+ "of that name hides here; mslc keeps the two apart only under a namespace name");
+		}
+		const std::string resolved = kind() == TokenKind::Identifier && isLocal(std::string(current().text))
+			? std::string(current().text) : peekResolved(spelledTokens);
+		const auto consumeName = [&] {
+			for (size_t i = 0; i < spelledTokens; ++i) {
+				advance();
+			}
+		};
+		const std::string_view text = resolved;
 
 		Type type;
 		if (resolveTypeName(text, type) && type.namedType.empty()) {
@@ -2296,7 +2631,7 @@ ExpressionPtr Parser::parsePrimary() {
 			// float3(0), float4(a, b, c, 1). Metal has no cast syntax, so T(...) is
 			// always a constructor call, and the parenthesised part is a list of
 			// arguments rather than the single operand a cast would take.
-			advance();
+			consumeName();
 
 			if (!at(TokenKind::LParen)) {
 				throw CompileError("expected '(' after type \"" + std::string(text) + "\"");
@@ -2313,11 +2648,11 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 
 		// An enumerator is the integer it was declared with.
-		const auto constant = _enumConstants.find(std::string(text));
+		const auto constant = _enumConstants.find(resolved);
 		if (constant != _enumConstants.end()) {
 			auto expression = std::make_unique<Expression>();
 			expression->line = line();
-			advance();
+			consumeName();
 			expression->kind = ExpressionKind::IntLiteral;
 			const int64_t value = constant->second.value;
 			expression->intKind = constant->second.kind;
@@ -2341,7 +2676,8 @@ ExpressionPtr Parser::parsePrimary() {
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::Identifier;
 		expression->line = line();
-		expression->name = std::string(advance().text);
+		expression->name = resolved;
+		consumeName();
 		return expression;
 	}
 

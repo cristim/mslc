@@ -49,6 +49,23 @@ class Parser {
 	// compiler, instead of the later one silently winning.
 	std::map<std::string, std::string> _declared;
 
+	// The namespaces the file declares. A declaration inside one is stored under
+	// its qualified name, "A::B::x", in every table above, so a name lookup is a
+	// string lookup and a clash is found by declareName as it is at file scope.
+	// A scope is keyed by its qualified name, "" being the file; it holds the
+	// namespaces a using directive named and the names a using declaration brought in.
+	struct NamespaceScope {
+		std::vector<std::string> directives;
+		std::map<std::string, std::string> declarations;
+	};
+	std::vector<std::string> _namespacePath;
+	std::set<std::string> _namespaces;
+	std::map<std::string, NamespaceScope> _scopes;
+
+	// The names declared in the function being parsed, which hide a file-scope
+	// name of the same spelling that a namespace would otherwise resolve.
+	std::vector<std::set<std::string>> _locals;
+
 	// Levels of brackets, blocks and unbraced bodies the parser is inside, one
 	// per recursive call. Each structured construct the emitter writes (an if, a
 	// loop, the right operand of && or ||) needs at least one of them, so the cap
@@ -124,8 +141,47 @@ private:
 	// the typedef and enum support has to keep distinct from it.
 	void declareName(const std::string& name, const char* what);
 
-	// Throws when a variable or parameter would hide a typedef or an enum constant.
-	void rejectShadowing(const std::string& name) const;
+	// Records a parameter or a local, and throws when it would hide a typedef or an
+	// enum constant.
+	void declareLocal(const std::string& name);
+
+	// "[::] a [:: b ...]" at the current token, without consuming it.
+	struct QualifiedName {
+		std::vector<std::string> parts;
+		bool global = false;
+		size_t tokens = 0;
+	};
+
+	// A name as it is declared in the namespace the parser is in.
+	std::string qualify(const std::string& name) const;
+	std::string namespacePrefix(size_t depth) const;
+	std::string namespaceOf(const QualifiedName& name, size_t count) const;
+
+	void parseNamespace();
+	void parseUsing();
+
+	bool peekQualifiedName(QualifiedName& out) const;
+
+	// The file-scope name a spelling refers to from here: its qualified name, or the
+	// spelling itself when it names no declaration (a builtin). A qualified spelling
+	// that names nothing is a CompileError.
+	std::string resolveName(const QualifiedName& name) const;
+	// The name at the current token, resolved, and how many tokens spell it.
+	std::string peekResolved(size_t& tokens) const;
+	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
+		std::set<std::string>& found) const;
+	bool isLocal(const std::string& name) const;
+
+	// Opens the scope of a block, a for statement or a function's parameters.
+	class LocalScope {
+		Parser& _parser;
+
+	public:
+		explicit LocalScope(Parser& parser): _parser(parser) { _parser._locals.emplace_back(); }
+		~LocalScope() { _parser._locals.pop_back(); }
+		LocalScope(const LocalScope&) = delete;
+		LocalScope& operator=(const LocalScope&) = delete;
+	};
 
 	// Resolves a scalar, vector, matrix or typedef name to its type.
 	bool resolveTypeName(std::string_view text, Type& out) const;
