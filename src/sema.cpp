@@ -3677,6 +3677,11 @@ namespace {
 		const Binding& sampler = samplerIt->second;
 
 		const bool cube = texture.pointeeMsl.resource == ResourceKind::TextureCube;
+		if (cube && sampler.unnormalizedSampler) {
+			throw CompileError("a texturecube cannot be sampled with a coord::pixel sampler: Vulkan allows "
+				"unnormalized coordinates on 1D and 2D image views only. A sampler parameter is not "
+				"checked, since its state is the host's");
+		}
 		const Id coordinateVector = _types.vector(ScalarKind::Float, cube ? 3 : 2);
 		Id coordinate = emitExpression(*arguments[1]);
 		const Id coordinateType = _builder.typeOf(coordinate);
