@@ -1846,6 +1846,8 @@ namespace {
 		// Helpers called and not yet emitted. A body cannot be emitted while the
 		// function that calls it is half written, so they wait for its end.
 		std::vector<HelperFunction*> _helperQueue;
+		// A member call's receiver, evaluated early to learn its struct.
+		Id _pendingObject = InvalidId;
 		std::map<std::vector<Id>, Id> _functionTypes;
 		// The helper whose body is being emitted, or null inside an entry point.
 		const FunctionDecl* _helper = nullptr;
@@ -1986,8 +1988,8 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
-		HelperFunction* findHelper(const Expression& call);
-		Id emitHelperCall(const Expression& call, HelperFunction& helper);
+		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
+		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
 		bool returnsVoid(const FunctionDecl& function) const;
@@ -3764,22 +3766,24 @@ namespace {
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
-		if (expression.left->kind == ExpressionKind::Member) {
+		const Expression* receiver = nullptr;
+		HelperFunction* helper = findHelper(expression, receiver);
+		if (!helper && expression.left->kind == ExpressionKind::Member) {
 			return emitTextureCall(expression);
 		}
 
-		if (expression.left->kind != ExpressionKind::Identifier) {
+		if (!helper && expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError("only a direct function call is supported");
 		}
 
 		// A helper never has the name of a builtin, which validateHelpers refuses.
-		if (HelperFunction* helper = findHelper(expression)) {
+		if (helper) {
 			if (returnsVoid(*helper->definition)) {
-				throw CompileError("a call to \"" + expression.left->name + "\" returns void and has "
+				throw CompileError("a call to \"" + helper->definition->name + "\" returns void and has "
 					"no value");
 			}
 
-			return emitHelperCall(expression, *helper);
+			return emitHelperCall(expression, *helper, receiver);
 		}
 
 		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
@@ -3791,7 +3795,60 @@ namespace {
 		return emitMathBuiltin(*builtin, expression.arguments);
 	}
 
-	Emitter::HelperFunction* Emitter::findHelper(const Expression& call) {
+	// The helper a call names. A call through "." is a member function when the
+	// receiver is a struct value, and then receiver is the expression to be passed
+	// first.
+	Emitter::HelperFunction* Emitter::findHelper(const Expression& call, const Expression*& receiver) {
+		receiver = nullptr;
+		if (call.left->kind == ExpressionKind::Member) {
+			const Expression& member = *call.left;
+			const std::string suffix = "::" + member.memberName;
+			const auto isMember = [&](const auto& entry) {
+				const std::string& name = entry.first;
+				return name.size() > suffix.size()
+					&& name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+			};
+			const auto texture = member.left->kind == ExpressionKind::Identifier
+				? _bindings.find(member.left->name) : _bindings.end();
+			if ((texture != _bindings.end() && texture->second.pointeeMsl.isTexture())
+				|| std::none_of(_helpers.begin(), _helpers.end(), isMember)) {
+				return nullptr;
+			}
+
+			// A local names its struct, so the receiver is evaluated as the first
+			// argument is; any other receiver is evaluated to learn what it is.
+			std::string ownerName;
+			if (texture != _bindings.end() && !texture->second.pointeeMsl.namedType.empty()) {
+				ownerName = texture->second.pointeeMsl.namedType;
+			} else {
+				_pendingObject = emitExpression(*member.left);
+				if (const std::string* owner = _types.structNameOf(_builder.typeOf(_pendingObject), nullptr)) {
+					ownerName = *owner;
+				}
+			}
+			const auto found = ownerName.empty() ? _helpers.end() : _helpers.find(ownerName + suffix);
+			if (found == _helpers.end()) {
+				throw CompileError("the receiver of \"." + member.memberName + "\" is not a struct with a "
+					"member function of that name");
+			}
+			if (found->second.definition == _helper) {
+				throw CompileError("recursive call: \"" + found->first + "\" calls itself; SPIR-V for Vulkan "
+					"forbids recursion (Apple's compiler accepts it)");
+			}
+			const std::vector<Parameter>& parameters = found->second.definition->parameters;
+			if (parameters.empty() || parameters[0].name != "this") {
+				throw CompileError("\"" + found->first + "\" is a static member function; call it as "
+					+ found->first + "(...)");
+			}
+			if (call.arguments.size() + 1 != parameters.size()) {
+				throw CompileError("call to \"" + found->first + "\" passes " + std::to_string(call.arguments.size())
+					+ " arguments, and it takes " + std::to_string(parameters.size() - 1));
+			}
+
+			receiver = member.left.get();
+			return &found->second;
+		}
+
 		if (call.left->kind != ExpressionKind::Identifier) {
 			return nullptr;
 		}
@@ -3809,7 +3866,7 @@ namespace {
 	// another width. A helper has no side effects an argument could expose, since
 	// it takes values only and an assignment is not an expression here, so the
 	// order is not observable.
-	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper) {
+	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver) {
 		const FunctionDecl& definition = *helper.definition;
 
 		if (helper.id == InvalidId) {
@@ -3832,14 +3889,20 @@ namespace {
 		}
 
 		std::vector<uint32_t> operands { helper.id };
+		const size_t first = receiver ? 1 : 0;
+		if (first) {
+			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
+			_pendingObject = InvalidId;
+			operands.push_back(convertImplicit(object, helper.parameterTypes[0]));
+		}
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
 			const Id value = emitExpression(*call.arguments[i]);
 			try {
-				operands.push_back(convertImplicit(value, helper.parameterTypes[i]));
+				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
 			} catch (const CompileError& error) {
 				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \""
 					+ definition.name + "\" cannot be converted to the parameter type "
-					+ typeName(definition.parameters[i].type) + ": " + error.what());
+					+ typeName(definition.parameters[first + i].type) + ": " + error.what());
 			}
 		}
 
@@ -6059,8 +6122,9 @@ namespace {
 
 		// A call whose value is dropped, which is the only way to call a void helper.
 		if (expression.kind == ExpressionKind::Call) {
-			if (HelperFunction* helper = findHelper(expression)) {
-				emitHelperCall(expression, *helper);
+			const Expression* receiver = nullptr;
+			if (HelperFunction* helper = findHelper(expression, receiver)) {
+				emitHelperCall(expression, *helper, receiver);
 				return;
 			}
 		}

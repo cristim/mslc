@@ -366,6 +366,7 @@ void Parser::parseDeclaration() {
 		StructDecl decl = parseStructDeclaration();
 		declareName(decl.name, "struct");
 		_unit.structs.push_back(std::move(decl));
+		finishStructFunctions(_unit.structs.back());
 		return;
 	}
 
@@ -514,6 +515,42 @@ void Parser::parseUsing() {
 	_scopes[scope].declarations[name.parts.back()] = resolved;
 }
 
+static void rejectUnloweredReturn(const Type& returned, const std::string& quoted) {
+	if (returned.isPointer || returned.arrayLength || returned.resource != ResourceKind::None
+		|| returned.addressSpace != AddressSpace::None) {
+		throw CompileError(quoted + " returns a pointer, an array, a texture or sampler, or a value "
+			"in an address space, which is not lowered yet; a helper returns a scalar, vector, "
+			"matrix or struct value");
+	}
+}
+
+// The parameters of a helper function, after its opening parenthesis and through
+// the closing one.
+void Parser::parseHelperParameters(FunctionDecl& decl, const std::string& quoted) {
+	// "(void)" is an empty parameter list.
+	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) {
+		advance();
+	}
+
+	std::set<std::string> names;
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		decl.parameters.push_back(parseParameter(decl.name));
+		const Parameter& parameter = decl.parameters.back();
+		if (!parameter.name.empty() && !names.insert(parameter.name).second) {
+			throw CompileError("redefinition of parameter \"" + parameter.name + "\" of " + quoted);
+		}
+		if (at(TokenKind::Assign)) {
+			throw CompileError("a default argument is not lowered yet (parameter \"" + parameter.name
+				+ "\" of " + quoted + ")");
+		}
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+	}
+
+	expect(TokenKind::RParen, "to close a parameter list");
+}
+
 bool Parser::tryParseHelperFunction() {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
@@ -553,13 +590,7 @@ bool Parser::tryParseHelperFunction() {
 	decl.order = _functionOrder++;
 
 	const std::string quoted = "helper function \"" + decl.name + "\"";
-	const Type& returned = decl.returnType;
-	if (returned.isPointer || returned.arrayLength || returned.resource != ResourceKind::None
-		|| returned.addressSpace != AddressSpace::None) {
-		throw CompileError(quoted + " returns a pointer, an array, a texture or sampler, or a value "
-			"in an address space, which is not lowered yet; a helper returns a scalar, vector, "
-			"matrix or struct value");
-	}
+	rejectUnloweredReturn(decl.returnType, quoted);
 
 	Type builtin;
 	if (isTypeName(decl.name, builtin) || isSimdVectorName(decl.name, builtin)) {
@@ -568,29 +599,7 @@ bool Parser::tryParseHelperFunction() {
 	decl.name = qualify(decl.name);
 	declareName(decl.name, "function");
 	const LocalScope parameters(*this);
-
-	// "(void)" is an empty parameter list.
-	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) {
-		advance();
-	}
-
-	std::set<std::string> names;
-	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
-		decl.parameters.push_back(parseParameter(decl.name));
-		const Parameter& parameter = decl.parameters.back();
-		if (!parameter.name.empty() && !names.insert(parameter.name).second) {
-			throw CompileError("redefinition of parameter \"" + parameter.name + "\" of " + quoted);
-		}
-		if (at(TokenKind::Assign)) {
-			throw CompileError("a default argument is not lowered yet (parameter \"" + parameter.name
-				+ "\" of " + quoted + ")");
-		}
-		if (!match(TokenKind::Comma)) {
-			break;
-		}
-	}
-
-	expect(TokenKind::RParen, "to close a parameter list");
+	parseHelperParameters(decl, quoted);
 
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("attributes on " + quoted + " are not lowered yet");
@@ -761,8 +770,10 @@ void Parser::parseStructBody(StructDecl& decl) {
 	expect(TokenKind::RBrace, "to close a struct body");
 }
 
-// A member that is not a field: a constructor or a destructor, or a member
-// function. False, with nothing consumed, when the member is a field.
+// A member that is not a field: a constructor, a member function or a member
+// that cannot be lowered. False, with nothing consumed, when the member is a
+// field. A function is skipped here and parsed once the struct is complete, since
+// its body may name fields declared after it and the struct's own type.
 bool Parser::parseStructFunction(StructDecl& decl) {
 	const std::string quoted = "\"" + decl.name + "\"";
 	if (atKeyword("template")) {
@@ -772,51 +783,315 @@ bool Parser::parseStructFunction(StructDecl& decl) {
 		throw CompileError("a destructor is not supported (in " + quoted + ")");
 	}
 
-	const size_t tail = decl.name.rfind("::");
-	const std::string unqualified = tail == std::string::npos ? decl.name : decl.name.substr(tail + 2);
+	const size_t start = _position;
 	size_t ahead = 0;
 	while (lookahead(ahead).kind == TokenKind::Identifier
 		&& (lookahead(ahead).text == "explicit" || lookahead(ahead).text == "inline"
-			|| lookahead(ahead).text == "constexpr")) {
+			|| lookahead(ahead).text == "constexpr" || lookahead(ahead).text == "static")) {
 		++ahead;
 	}
 
-	const bool isConstructor = !unqualified.empty() && lookahead(ahead).kind == TokenKind::Identifier
+	const std::string unqualified = unqualifiedName(decl.name);
+	bool isFunction = !unqualified.empty() && lookahead(ahead).kind == TokenKind::Identifier
 		&& lookahead(ahead).text == unqualified && lookahead(ahead + 1).kind == TokenKind::LParen;
-	if (!isConstructor) {
+	bool isStatic = false;
+	for (size_t i = 0; i < ahead; ++i) {
+		isStatic = isStatic || lookahead(i).text == "static";
+	}
+	std::string functionName;
+	if (!isFunction) {
+		try {
+			_position = start + ahead;
+			parseType();
+			if (kind() == TokenKind::Identifier) {
+				if (current().text == "operator") {
+					throw CompileError("an operator overload is not lowered (in " + quoted + ")");
+				}
+				functionName = std::string(advance().text);
+				isFunction = at(TokenKind::LParen);
+			}
+		} catch (const CompileError& error) {
+			if (std::string_view(error.what()).find("operator overload") != std::string_view::npos) {
+				throw;
+			}
+		}
+		_position = start;
+	}
+	if (!isFunction) {
 		return false;
 	}
+	if (unqualified.empty()) {
+		throw CompileError("a member function or constructor of an unnamed struct is not lowered");
+	}
 
-	for (size_t i = 0; i <= ahead; ++i) {
+	size_t depth = 0;
+	while (!at(TokenKind::EndOfFile)) {
+		if (at(TokenKind::LParen)) {
+			++depth;
+		} else if (at(TokenKind::RParen) && depth > 0) {
+			--depth;
+		} else if (depth == 0 && at(TokenKind::Semicolon)) {
+			advance();
+			break;
+		} else if (depth == 0 && at(TokenKind::LBrace)) {
+			for (size_t open = 0; !at(TokenKind::EndOfFile); advance()) {
+				open += at(TokenKind::LBrace);
+				open -= at(TokenKind::RBrace);
+				if (open == 0) {
+					advance();
+					break;
+				}
+			}
+			break;
+		}
 		advance();
 	}
-	advance();
-	if (!at(TokenKind::RParen)) {
-		throw CompileError("a constructor with parameters is not lowered yet (in " + quoted + ")");
+
+	_pendingMembers.push_back(start);
+	if (!functionName.empty()) {
+		_memberFunctions[functionName] = isStatic;
+	}
+	return true;
+}
+
+std::string Parser::unqualifiedName(const std::string& name) {
+	const size_t tail = name.rfind("::");
+	return tail == std::string::npos ? name : name.substr(tail + 2);
+}
+
+void Parser::finishStructFunctions(const StructDecl& decl) {
+	const std::vector<size_t> starts = std::move(_pendingMembers);
+	_pendingMembers.clear();
+	if (starts.empty()) {
+		return;
+	}
+
+	_memberStruct = decl.name;
+	std::set<std::string> fields;
+	for (const StructField& field: decl.fields) {
+		fields.insert(field.name);
+	}
+
+	const size_t resume = _position;
+	_memberFields = &fields;
+	for (const size_t start: starts) {
+		parseStructMember(decl, start);
+	}
+	_memberFields = nullptr;
+	_memberFunctions.clear();
+	_position = resume;
+}
+
+namespace {
+
+	ExpressionPtr makeIdentifier(const std::string& name, size_t line) {
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Identifier;
+		expression->line = line;
+		expression->name = name;
+		return expression;
+	}
+
+	// "this.field": the object a member function or constructor works on is a
+	// parameter or a local named this.
+	ExpressionPtr makeThisMember(const std::string& field, size_t line) {
+		auto member = std::make_unique<Expression>();
+		member->kind = ExpressionKind::Member;
+		member->line = line;
+		member->left = makeIdentifier("this", line);
+		member->memberName = field;
+		member->height = 2;
+		return member;
+	}
+
+}
+
+// One member function or constructor, lowered to a helper function named
+// "Struct::member" in the helper list. A member function takes its object by
+// value as a first parameter called this; a constructor takes its own parameters,
+// declares a local this, assigns its initialiser list in field order, runs its
+// body and returns the object.
+void Parser::parseStructMember(const StructDecl& decl, size_t start) {
+	_position = start;
+	const std::string tag = unqualifiedName(decl.name);
+	bool isStatic = false;
+	while (atKeyword("explicit") || atKeyword("inline") || atKeyword("constexpr") || atKeyword("static")) {
+		isStatic = isStatic || atKeyword("static");
+		advance();
+	}
+
+	FunctionDecl fn;
+	fn.line = line();
+	Type self;
+	self.namedType = decl.name;
+	const bool isConstructor = atKeyword(tag.c_str()) && lookahead().kind == TokenKind::LParen;
+	std::string memberName = tag;
+	if (isConstructor) {
+		fn.returnType = self;
+		advance();
+	} else {
+		fn.returnType = parseType();
+		memberName = std::string(advance().text);
 	}
 	advance();
 
-	// A default constructor with nothing to do changes neither the layout nor the
-	// meaning of the struct, so it is read and dropped.
+	fn.name = decl.name + "::" + memberName;
+	const std::string quoted = std::string(isConstructor ? "constructor \"" : "member function \"") + fn.name + "\"";
+	rejectUnloweredReturn(fn.returnType, quoted);
+	fn.order = _functionOrder++;
+	declareName(fn.name, "function");
+
+	const LocalScope parameters(*this);
+	if (!isStatic) {
+		declareLocal("this");
+	}
+	if (!isStatic && !isConstructor) {
+		Parameter object;
+		object.type = self;
+		object.name = "this";
+		fn.parameters.push_back(std::move(object));
+	}
+	parseHelperParameters(fn, quoted);
+
+	std::vector<std::pair<std::string, ExpressionPtr>> initialisers;
+	if (isConstructor && match(TokenKind::Colon)) {
+		do {
+			if (kind() != TokenKind::Identifier) {
+				throw CompileError("expected a member name in the initialiser list of " + quoted);
+			}
+			const std::string field(advance().text);
+			if (!_memberFields->count(field)) {
+				throw CompileError("\"" + field + "\" in the initialiser list of " + quoted + " is not a member");
+			}
+			for (const auto& done: initialisers) {
+				if (done.first == field) {
+					throw CompileError("the member \"" + field + "\" is initialised twice in " + quoted);
+				}
+			}
+			if (!match(TokenKind::LParen)) {
+				throw CompileError("only \"member(value)\" is lowered in the initialiser list of " + quoted);
+			}
+			ExpressionPtr value = parseExpression();
+			expect(TokenKind::RParen, "to close a member initialiser");
+			initialisers.emplace_back(field, std::move(value));
+		} while (match(TokenKind::Comma));
+	}
+
+	if (!isConstructor && !isStatic) {
+		if (!matchIdentifier("const")) {
+			throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function "
+				"that could write it is not lowered (mark it const)");
+		}
+	}
+
+	ConstructorInfo* constructors = isConstructor ? &_constructors[decl.name] : nullptr;
 	if (match(TokenKind::Assign)) {
-		if (!matchIdentifier("default")) {
-			throw CompileError("only \"= default\" may follow a constructor's parameters (in " + quoted + ")");
+		if (!isConstructor || !matchIdentifier("default") || fn.parameters.size() != 0) {
+			throw CompileError("only a default constructor may be \"= default\" (" + quoted + ")");
 		}
 		expect(TokenKind::Semicolon, "after \"= default\"");
-		return true;
+		constructors->hasDefault = true;
+		return;
 	}
+
 	if (match(TokenKind::Semicolon)) {
-		return true;
+		if (isConstructor) {
+			if (!fn.parameters.empty()) {
+				throw CompileError(quoted + " is declared and never defined");
+			}
+			constructors->hasDefault = true;
+			return;
+		}
+		_unit.helpers.push_back(std::move(fn));
+		return;
 	}
-	if (at(TokenKind::Colon)) {
-		throw CompileError("a constructor with an initialiser list is not lowered yet (in " + quoted + ")");
+
+	fn.body = parseCompoundStatement();
+	if (!isConstructor) {
+		_unit.helpers.push_back(std::move(fn));
+		return;
 	}
-	expect(TokenKind::LBrace, "to open a constructor body");
-	if (!at(TokenKind::RBrace)) {
-		throw CompileError("a constructor with a body is not lowered yet (in " + quoted + ")");
+
+	if (fn.parameters.empty() && initialisers.empty() && fn.body->children.empty()) {
+		constructors->hasDefault = true;
+		return;
 	}
-	advance();
-	return true;
+	if (!constructors->helper.empty()) {
+		throw CompileError("overloading the constructors of \"" + decl.name + "\" is not lowered yet");
+	}
+	constructors->helper = fn.name;
+	constructors->parameters = fn.parameters.size();
+	constructors->hasDefault = constructors->hasDefault || fn.parameters.empty();
+
+	auto wrapper = std::make_unique<Statement>();
+	wrapper->kind = StatementKind::Compound;
+	wrapper->line = fn.line;
+	auto object = std::make_unique<Statement>();
+	object->kind = StatementKind::DeclarationStatement;
+	object->line = fn.line;
+	object->declaration = VariableDeclaration();
+	object->declaration->type = self;
+	object->declaration->name = "this";
+	wrapper->children.push_back(std::move(object));
+	for (const StructField& field: decl.fields) {
+		for (auto& [name, value]: initialisers) {
+			if (name != field.name) {
+				continue;
+			}
+			auto assign = std::make_unique<Expression>();
+			assign->kind = ExpressionKind::Assign;
+			assign->line = fn.line;
+			assign->left = makeThisMember(name, fn.line);
+			assign->right = std::move(value);
+			measure(*assign);
+			auto statement = std::make_unique<Statement>();
+			statement->kind = StatementKind::ExpressionStatement;
+			statement->line = fn.line;
+			statement->expression = std::move(assign);
+			wrapper->children.push_back(std::move(statement));
+		}
+	}
+	wrapper->children.push_back(std::move(fn.body));
+	auto result = std::make_unique<Statement>();
+	result->kind = StatementKind::Return;
+	result->line = fn.line;
+	result->expression = makeIdentifier("this", fn.line);
+	wrapper->children.push_back(std::move(result));
+	fn.body = std::move(wrapper);
+	_unit.helpers.push_back(std::move(fn));
+}
+
+// A construction of a struct that has a constructor with something to do: the
+// call of the helper that stands for it. Null for a struct with none, and for a
+// default construction that has nothing to do.
+ExpressionPtr Parser::constructWithConstructor(const Type& type, std::vector<ExpressionPtr>& arguments,
+	size_t atLine) {
+
+	if (type.namedType.empty() || type.isPointer || type.arrayLength) {
+		return nullptr;
+	}
+	const auto found = _constructors.find(type.namedType);
+	if (found == _constructors.end()) {
+		return nullptr;
+	}
+
+	const ConstructorInfo& info = found->second;
+	const bool constructs = arguments.empty() ? info.parameters == 0 && !info.helper.empty() : !info.helper.empty();
+	if (!constructs) {
+		if (arguments.empty() && info.hasDefault) {
+			return nullptr;
+		}
+		throw CompileError("no constructor of \"" + type.namedType + "\" takes " + std::to_string(arguments.size())
+			+ " arguments");
+	}
+
+	auto call = std::make_unique<Expression>();
+	call->kind = ExpressionKind::Call;
+	call->line = atLine;
+	call->left = makeIdentifier(info.helper, atLine);
+	call->arguments = std::move(arguments);
+	measure(*call);
+	return call;
 }
 
 namespace {
@@ -1116,6 +1391,15 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		// "::x" names a file-scope declaration, or a builtin.
 		return last;
 	}
+	// "S::member": a member function of a struct is named by the struct.
+	if (!found && parts.size() > 1 && !name.global) {
+		QualifiedName owner = name;
+		owner.parts.pop_back();
+		const std::string structName = resolveName(owner);
+		if (_unit.findStruct(structName)) {
+			return structName + "::" + last;
+		}
+	}
 	if (!found) {
 		throw CompileError("\"" + joinParts(parts, 0, parts.size() - 1) + "\" in \"" + spelled
 			+ "\" is not a namespace the file declares");
@@ -1248,6 +1532,7 @@ void Parser::parseTypedef() {
 			definedStruct->name = name;
 		}
 		_unit.structs.push_back(std::move(*definedStruct));
+		finishStructFunctions(_unit.structs.back());
 		if (anonymousStruct) {
 			return;
 		}
@@ -2124,13 +2409,21 @@ StatementPtr Parser::parseStatement() {
 				// value. Metal has no other form: "float3(0) specularTerm;" is a
 				// parse error there, which xcrun metal confirms.
 				advance();
-				auto construct = std::make_unique<Expression>();
-				construct->kind = ExpressionKind::Construct;
-				construct->line = line();
-				construct->constructType = declaration.type;
-				construct->arguments = parseArgumentList("to close a constructor's argument list");
-				measure(*construct);
-				declaration.initializer = std::move(construct);
+				const size_t atLine = line();
+				std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
+				declaration.initializer = constructWithConstructor(declaration.type, arguments, atLine);
+				if (!declaration.initializer) {
+					auto construct = std::make_unique<Expression>();
+					construct->kind = ExpressionKind::Construct;
+					construct->line = atLine;
+					construct->constructType = declaration.type;
+					construct->arguments = std::move(arguments);
+					measure(*construct);
+					declaration.initializer = std::move(construct);
+				}
+			} else {
+				std::vector<ExpressionPtr> none;
+				declaration.initializer = constructWithConstructor(declaration.type, none, line());
 			}
 
 			expect(TokenKind::Semicolon, "after a declaration");
@@ -2531,6 +2824,13 @@ ExpressionPtr Parser::parseMultiplicative() {
 }
 
 ExpressionPtr Parser::parseUnary() {
+	// "*this" is the object itself, which a member function holds by value.
+	if (at(TokenKind::Star) && lookahead().kind == TokenKind::Identifier && lookahead().text == "this"
+		&& isLocal("this")) {
+		advance();
+		return parseUnary();
+	}
+
 	// Only in prefix position: a '*' between two operands never gets here, because
 	// parseMultiplicative consumes it after the left operand is complete.
 	if (at(TokenKind::Star)) {
@@ -2852,6 +3152,26 @@ ExpressionPtr Parser::parsePrimary() {
 			throw CompileError("\"::" + spelled.parts[0] + "\" names the file-scope declaration, which the local "
 				+ "of that name hides here; mslc keeps the two apart only under a namespace name");
 		}
+		if (_memberFields && kind() == TokenKind::Identifier && !isLocal(std::string(current().text))
+			&& _memberFields->count(std::string(current().text)) && isLocal("this")) {
+			const size_t atLine = line();
+			auto member = makeThisMember(std::string(advance().text), atLine);
+			return member;
+		}
+		// A member function named bare calls that function on this, or the static
+		// one of the struct.
+		if (_memberFields && kind() == TokenKind::Identifier && !isLocal(std::string(current().text))
+			&& lookahead().kind == TokenKind::LParen) {
+			const auto function = _memberFunctions.find(std::string(current().text));
+			if (function != _memberFunctions.end()) {
+				const size_t atLine = line();
+				const std::string name(advance().text);
+				if (function->second) {
+					return makeIdentifier(_memberStruct + "::" + name, atLine);
+				}
+				return makeThisMember(name, atLine);
+			}
+		}
 		const std::string resolved = kind() == TokenKind::Identifier && isLocal(std::string(current().text))
 			? std::string(current().text) : peekResolved(spelledTokens);
 		const auto consumeName = [&] {
@@ -2880,6 +3200,21 @@ ExpressionPtr Parser::parsePrimary() {
 			expression->arguments = parseArgumentList("to close a constructor's argument list");
 			measure(*expression);
 			return expression;
+		}
+
+		// A struct's name and an argument list call its constructor.
+		if (!isLocal(resolved) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
+			const size_t atLine = line();
+			consumeName();
+			advance();
+			Type type;
+			type.namedType = resolved;
+			std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
+			ExpressionPtr call = constructWithConstructor(type, arguments, atLine);
+			if (!call) {
+				throw CompileError("\"" + resolved + "\" has a constructor with nothing to do, and a value of it is not lowered");
+			}
+			return call;
 		}
 
 		// An enumerator is the integer it was declared with.

@@ -131,6 +131,28 @@ private:
 	StructDecl parseStructDeclaration();
 	void parseStructBody(StructDecl& decl);
 	bool parseStructFunction(StructDecl& decl);
+	void finishStructFunctions(const StructDecl& decl);
+	void parseStructMember(const StructDecl& decl, size_t start);
+	static std::string unqualifiedName(const std::string& name);
+	void parseHelperParameters(FunctionDecl& decl, const std::string& quoted);
+	ExpressionPtr constructWithConstructor(const Type& type, std::vector<ExpressionPtr>& arguments, size_t atLine);
+
+	// What a struct's constructors lower to. A constructor with nothing to do is
+	// no helper at all; one with something to do is the helper that returns the
+	// built object, and a struct has at most one.
+	struct ConstructorInfo {
+		std::string helper;
+		size_t parameters = 0;
+		bool hasDefault = false;
+	};
+	std::map<std::string, ConstructorInfo> _constructors;
+	std::vector<size_t> _pendingMembers;
+	// The fields of the struct whose member function is being parsed: a bare use of
+	// one means this.field.
+	const std::set<std::string>* _memberFields = nullptr;
+	// The member functions of the struct being read, by name, and whether each is static.
+	std::map<std::string, bool> _memberFunctions;
+	std::string _memberStruct;
 	void parseTypedef();
 
 	// "enum Tag { A, B = 2 }" up to and including the closing brace, or just
