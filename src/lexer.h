@@ -63,6 +63,10 @@ struct Token {
 	uint64_t integerValue = 0;
 	double floatValue = 0.0;
 	bool integerIsUnsigned = false;
+	// How many l's the suffix has: a long is 1 and a long long 2.
+	size_t integerLongCount = 0;
+	// The suffix is not one the language has, such as lL or uu.
+	bool integerSuffixInvalid = false;
 	// Written in decimal, which is what keeps an unsuffixed literal out of the
 	// unsigned types; hex and octal may take them.
 	bool integerIsDecimal = true;

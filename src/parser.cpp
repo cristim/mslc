@@ -1848,13 +1848,30 @@ static ScalarKind integerLiteralKind(const Token& literal) {
 		throw CompileError("invalid digit in integer constant \"" + std::string(literal.text) + "\"");
 	}
 
+	if (literal.integerSuffixInvalid) {
+		size_t digitsEnd = literal.text.size();
+		while (digitsEnd > 0 && (std::string_view("uUlL").find(literal.text[digitsEnd - 1]) != std::string_view::npos)) {
+			--digitsEnd;
+		}
+		throw CompileError("invalid suffix \"" + std::string(literal.text.substr(digitsEnd))
+			+ "\" on integer constant");
+	}
+
 	if (literal.integerOverflows) {
 		throw CompileError("integer literal is too large to be represented in any integer type");
 	}
 
 	const uint64_t value = literal.integerValue;
 	if (literal.integerIsUnsigned) {
-		return value <= UINT_MAX ? ScalarKind::UInt : ScalarKind::ULong;
+		return literal.integerLongCount == 0 && value <= UINT_MAX ? ScalarKind::UInt : ScalarKind::ULong;
+	}
+
+	// An l is a long, and a long long is one here too. Apple wraps a decimal or
+	// a long long that is too large rather than making it unsigned, and only a
+	// hex or octal l goes on to ulong.
+	if (literal.integerLongCount > 0) {
+		const bool wraps = literal.integerIsDecimal || literal.integerLongCount == 2;
+		return wraps || value <= INT64_MAX ? ScalarKind::Long : ScalarKind::ULong;
 	}
 
 	if (value <= INT_MAX) {

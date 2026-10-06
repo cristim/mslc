@@ -110,6 +110,30 @@ namespace {
 		return table;
 	}
 
+	bool isIntegerSuffixChar(char c) {
+		return c == 'u' || c == 'U' || c == 'l' || c == 'L';
+	}
+
+	// An integer suffix is a u in either case, before or after one l or two
+	// written the same way: u, l, ll, ul, lu, ull and llu, and the capitals. lL
+	// and uu are not suffixes.
+	bool parseIntegerSuffix(std::string_view suffix, bool& isUnsigned, size_t& longCount) {
+		if (!suffix.empty() && (suffix.front() == 'u' || suffix.front() == 'U')) {
+			isUnsigned = true;
+			suffix.remove_prefix(1);
+		} else if (!suffix.empty() && (suffix.back() == 'u' || suffix.back() == 'U')) {
+			isUnsigned = true;
+			suffix.remove_suffix(1);
+		}
+
+		if (suffix.empty()) {
+			return true;
+		}
+
+		longCount = suffix.size();
+		return suffix == "l" || suffix == "L" || suffix == "ll" || suffix == "LL";
+	}
+
 	// The value and base of an integer literal's digits. A suffix, which is not
 	// a digit in any base, ends them.
 	void readInteger(Token& token) {
@@ -356,7 +380,15 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 			// MSL numeric suffixes
 			bool isUnsigned = false;
 			bool isHalf = false;
-			if (i < size) {
+			size_t longCount = 0;
+			bool suffixValid = true;
+			if (i < size && !isFloat && isIntegerSuffixChar(source[i])) {
+				const size_t suffixStart = i;
+				while (i < size && isIntegerSuffixChar(source[i])) {
+					++i;
+				}
+				suffixValid = parseIntegerSuffix(source.substr(suffixStart, i - suffixStart), isUnsigned, longCount);
+			} else if (i < size) {
 				const char suffix = source[i];
 				if (suffix == 'u' || suffix == 'U') {
 					isUnsigned = true;
@@ -374,6 +406,8 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 			token.line = line;
 			token.text = source.substr(start, i - start);
 			token.integerIsUnsigned = isUnsigned;
+			token.integerLongCount = longCount;
+			token.integerSuffixInvalid = !suffixValid;
 			token.floatIsHalf = isHalf;
 			place(token);
 
