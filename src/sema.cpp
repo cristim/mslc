@@ -1665,6 +1665,15 @@ namespace {
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		Id emitIndex(const Expression& expression, bool asAddress);
+		bool isElementAccess(const Expression& expression) const;
+		Id emitElementAccess(const Expression& expression, bool asAddress);
+		struct ElementIndex {
+			std::optional<uint32_t> constant;
+			Id id = InvalidId;
+		};
+		ElementIndex elementIndex(const Expression& expression, uint32_t width);
+		Id wordIndex(Id index, const char* what);
+		Id stepIndex(const Expression& expression, const char* what);
 		Id emitMember(const Expression& expression);
 		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
 
@@ -2058,6 +2067,10 @@ namespace {
 	// "a[i] + b[i]" would be pointers, and the addition would be typed as
 	// integer.
 	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
+		if (isElementAccess(expression)) {
+			return emitElementAccess(expression, asAddress);
+		}
+
 		if (expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError(expression.isDereference ? kDereferenceOperand
 				: "indexing an expression is not supported yet; index a parameter or local directly");
@@ -2080,8 +2093,8 @@ namespace {
 				std::to_string(expression.arguments.size()));
 		}
 
-		const Id index = emitExpression(*expression.arguments[0]);
-		_builder.setType(index, _uintType);
+		const Id index = stepIndex(*expression.arguments[0],
+			binding.bufferPointeeType != InvalidId ? "buffer element" : "matrix column");
 
 		// A buffer is reached through its address rather than a descriptor, so
 		// the access chain starts from the loaded pointer. The result is a
@@ -2116,6 +2129,129 @@ namespace {
 			{ binding.id, index });
 
 		return asAddress ? address : loadFrom(address, elementType);
+	}
+
+	// An index whose left side is a vector, as opposed to a buffer or a matrix. A
+	// buffer pointer and a matrix are the names whose index is one access
+	// chain step; anything else that is indexed is a value, and the element access
+	// finds out whether it is a vector.
+	bool Emitter::isElementAccess(const Expression& expression) const {
+		if (expression.isDereference) {
+			return false;
+		}
+
+		if (expression.left->kind != ExpressionKind::Identifier) {
+			return true;
+		}
+
+		const auto it = _bindings.find(expression.left->name);
+		return it != _bindings.end() && !it->second.isBuffer && !_types.matrixInfo(it->second.pointeeType);
+	}
+
+	// The index of a literal, with a sign. Anything else is not known here and is
+	// emitted and indexed at run time.
+	static std::optional<int64_t> literalIndex(const Expression& expression) {
+		constexpr uint64_t kBeyondAnyWidth = uint64_t(1) << 40;
+		switch (expression.kind) {
+			case ExpressionKind::BoolLiteral: return expression.boolValue ? 1 : 0;
+			case ExpressionKind::IntLiteral:
+				return static_cast<int64_t>(std::min(expression.intValue, kBeyondAnyWidth));
+			case ExpressionKind::Unary: {
+				const auto operand = literalIndex(*expression.left);
+				if (!operand) {
+					return std::nullopt;
+				}
+				if (expression.unaryOperator == UnaryOperator::Plus) {
+					return operand;
+				}
+				return expression.unaryOperator == UnaryOperator::Negate
+					? std::optional<int64_t>(-*operand) : std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	// Apple takes any integer, or a bool, as the index of a vector and leaves an
+	// out-of-range one undefined. A literal that is out of range cannot be
+	// lowered to a valid module, so it is rejected; a run-time one is not checked,
+	// which is the same undefined behaviour. The index is made 32 bits wide here
+	// and its own type is checked here, so the lowering does not depend on what
+	// the generic index path relabels it as.
+	Emitter::ElementIndex Emitter::elementIndex(const Expression& expression, uint32_t width) {
+		if (const auto literal = literalIndex(expression)) {
+			if (*literal < 0 || *literal >= static_cast<int64_t>(width)) {
+				throw CompileError("the index " + std::to_string(*literal) + " is outside a vector of "
+					+ std::to_string(width) + " components");
+			}
+			return { static_cast<uint32_t>(*literal), InvalidId };
+		}
+
+		return { std::nullopt, wordIndex(emitExpression(expression), "vector") };
+	}
+
+	// An index operand as a 32-bit integer id. Apple takes any integer, or a bool,
+	// and nothing else: a float, a vector, a struct or a pointer is not an index.
+	Id Emitter::wordIndex(Id index, const char* what) {
+		const Id type = _builder.typeOf(index);
+		if (type == _boolType) {
+			return convert(index, type, _uintType);
+		}
+
+		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) == 0 || _types.isFloat(type)) {
+			throw CompileError(std::string("the index of a ") + what + " has to be an integer or a bool");
+		}
+
+		return _types.bitWidth(type) == 32 ? index : convert(index, type, _uintType);
+	}
+
+	Id Emitter::stepIndex(const Expression& expression, const char* what) {
+		const Id index = wordIndex(emitExpression(expression), what);
+		_builder.setType(index, _uintType);
+		return index;
+	}
+
+	// v[i] where v is a vector: one component of it. As a value it is taken out of
+	// the loaded vector. As a place it is an access chain into the vector's own
+	// storage, so a store changes that lane and no other.
+	Id Emitter::emitElementAccess(const Expression& expression, bool asAddress) {
+		const Expression& base = *expression.left;
+		const std::string notAVector = "only an element of a vector is lowered here; a matrix element "
+			"of a buffer or a struct member is not lowered yet";
+
+		if (!asAddress) {
+			const Id vector = emitExpression(base);
+			const Id type = _builder.typeOf(vector);
+			const Id component = _types.componentOf(type);
+			if (component == InvalidId) {
+				throw CompileError(notAVector);
+			}
+
+			const ElementIndex index = elementIndex(*expression.arguments[0], _types.vectorWidth(type));
+			return index.constant
+				? _builder.emitTyped(spirv::OpCompositeExtract, component, { vector, *index.constant })
+				: _builder.emitTyped(spirv::OpVectorExtractDynamic, component, { vector, index.id });
+		}
+
+		if (base.kind == ExpressionKind::Member && !structOf(*base.left)) {
+			throw CompileError("assigning to an element of a swizzle is not lowered yet");
+		}
+
+		const Id address = emitPlaceAddress(base);
+		const Id vectorType = _types.pointeeOf(_builder.typeOf(address));
+		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
+		if (vectorType == InvalidId || !storageClass) {
+			throw CompileError("assigning to an element of a value that is not a local, a struct "
+				"member or a buffer element");
+		}
+
+		const Id component = _types.componentOf(vectorType);
+		if (component == InvalidId) {
+			throw CompileError(notAVector);
+		}
+
+		const ElementIndex index = elementIndex(*expression.arguments[0], _types.vectorWidth(vectorType));
+		return _builder.emitTyped(spirv::OpAccessChain, _types.pointer(*storageClass, component),
+			{ address, index.constant ? constantU32(*index.constant) : index.id });
 	}
 
 	// The index of a field, or the field count when the struct has no such
@@ -2376,9 +2512,7 @@ namespace {
 						"be indexed as an array");
 				}
 
-				const Id index = emitExpression(*step.index);
-				_builder.setType(index, _uintType);
-				operands.push_back(index);
+				operands.push_back(stepIndex(*step.index, "buffer element"));
 				continue;
 			}
 
@@ -4987,17 +5121,6 @@ namespace {
 			if (target != _bindings.end() && target->second.readOnly) {
 				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
 					"constant address space or declared const");
-			}
-		}
-
-		if (compound && left.kind == ExpressionKind::Index) {
-			const auto base = left.left->kind == ExpressionKind::Identifier
-				? _bindings.find(left.left->name) : _bindings.end();
-			if (base != _bindings.end() && base->second.bufferPointeeType == InvalidId
-				&& _types.vectorWidth(base->second.pointeeType) > 1
-				&& !_types.matrixInfo(base->second.pointeeType)) {
-				throw CompileError("a compound assignment to an element of the local vector \""
-					+ base->first + "\" is not lowered yet");
 			}
 		}
 
