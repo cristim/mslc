@@ -1,6 +1,7 @@
 #include "spirv.h"
 
 #include <cstring>
+#include <iterator>
 
 namespace mslc {
 namespace spirv {
@@ -195,6 +196,25 @@ void Builder::emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 	}
 
 	_valueTypes[resultId] = resultType;
+}
+
+size_t Builder::functionsMark() const {
+	const auto found = _sections.find(Section::Functions);
+	return found == _sections.end() ? 0 : found->second.size();
+}
+
+std::vector<Instruction> Builder::takeFunctionsFrom(size_t mark) {
+	std::vector<Instruction>& body = _sections[Section::Functions];
+	std::vector<Instruction> taken(std::make_move_iterator(body.begin() + static_cast<std::ptrdiff_t>(mark)),
+		std::make_move_iterator(body.end()));
+	body.erase(body.begin() + static_cast<std::ptrdiff_t>(mark), body.end());
+	return taken;
+}
+
+void Builder::appendFunctions(std::vector<Instruction> instructions) {
+	std::vector<Instruction>& body = _sections[Section::Functions];
+	body.insert(body.end(), std::make_move_iterator(instructions.begin()),
+		std::make_move_iterator(instructions.end()));
 }
 
 Id Builder::typeOf(Id value) const {

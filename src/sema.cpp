@@ -1954,6 +1954,9 @@ namespace {
 		Id emitBinary(const Expression& expression);
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
 		Id emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression);
+		Id emitConditional(const Expression& expression);
+		Id conditionalType(Id trueType, Id falseType);
+		Id toConditionalType(Id value, Id type);
 		Id emitArithmetic(BinaryOperator op, Id left, Id right);
 		Id emitVectorComparison(BinaryOperator op, Id left, Id right);
 		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
@@ -3252,15 +3255,176 @@ namespace {
 		return _builder.emitTyped(spirv::OpPhi, _boolType, { decided, leftBlock, right, rightBlock });
 	}
 
-	static bool containsLogicalOperator(const Expression& expression) {
-		if (expression.kind == ExpressionKind::Binary
-			&& (expression.binaryOperator == BinaryOperator::LogicalAnd
-				|| expression.binaryOperator == BinaryOperator::LogicalOr)) {
+	// Whether evaluating an expression whether or not it is chosen is harmless: it
+	// reads no memory through an index or a call, divides nothing and branches
+	// nowhere, so it cannot trap or touch an address the condition guards.
+	static bool isSafeToEvaluateUnchosen(const Expression& expression) {
+		const auto safe = [](const ExpressionPtr& child) {
+			return !child || isSafeToEvaluateUnchosen(*child);
+		};
+
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Identifier:
+				return true;
+			case ExpressionKind::Member:
+				return safe(expression.left);
+			case ExpressionKind::Unary:
+				// ++ and -- write, and are not values to compute and discard.
+				switch (expression.unaryOperator) {
+					case UnaryOperator::Negate:
+					case UnaryOperator::Plus:
+					case UnaryOperator::Not:
+					case UnaryOperator::BitNot:
+						return safe(expression.left);
+					default:
+						return false;
+				}
+			case ExpressionKind::Binary:
+				return expression.binaryOperator != BinaryOperator::Divide
+					&& expression.binaryOperator != BinaryOperator::Modulo
+					&& expression.binaryOperator != BinaryOperator::LogicalAnd
+					&& expression.binaryOperator != BinaryOperator::LogicalOr
+					&& safe(expression.left) && safe(expression.right);
+			case ExpressionKind::Construct:
+			case ExpressionKind::Conditional: {
+				if (!safe(expression.left)) {
+					return false;
+				}
+				for (const ExpressionPtr& argument: expression.arguments) {
+					if (!safe(argument)) {
+						return false;
+					}
+				}
+				return true;
+			}
+			case ExpressionKind::Index:
+			case ExpressionKind::Call:
+			case ExpressionKind::InitList:
+			case ExpressionKind::Assign:
+				return false;
+		}
+
+		return false;
+	}
+
+	// The type both values of a conditional have: the same type stays as it is,
+	// as in C++ where two shorts give a short, and two different scalars meet by
+	// the usual arithmetic conversions. A scalar beside a vector joins the
+	// vector's component type, and two vectors have to be one type.
+	Id Emitter::conditionalType(Id trueType, Id falseType) {
+		if (trueType == falseType) {
+			return trueType;
+		}
+
+		TypeTable::StructForm form;
+		if (_types.structForm(trueType, form) || _types.structForm(falseType, form)) {
+			// Forms of one struct convert to each other; convert() refuses anything else.
+			return trueType;
+		}
+
+		if (_types.matrixInfo(trueType) || _types.matrixInfo(falseType)) {
+			throw CompileError("the two values of a conditional are matrices of different types");
+		}
+
+		const uint32_t trueWidth = _types.vectorWidth(trueType);
+		const uint32_t falseWidth = _types.vectorWidth(falseType);
+
+		if (trueWidth > 1 && falseWidth > 1) {
+			throw CompileError(trueWidth != falseWidth
+				? "the two values of a conditional are vectors of different widths"
+				: "the two values of a conditional are vectors of different types");
+		}
+
+		if (trueWidth > 1 || falseWidth > 1) {
+			const Id vector = trueWidth > 1 ? trueType : falseType;
+			const Id scalar = trueWidth > 1 ? falseType : trueType;
+			if (_types.isFloat(scalar) && !_types.isFloat(vector)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			return vector;
+		}
+
+		return usualArithmeticConversion(trueType, falseType).type;
+	}
+
+	Id Emitter::toConditionalType(Id value, Id type) {
+		const Id from = _builder.typeOf(value);
+		if (_types.vectorWidth(type) > 1 && _types.vectorWidth(from) == 1) {
+			return broadcast(value, type);
+		}
+
+		return convert(value, from, type);
+	}
+
+	// `c ? a : b` evaluates one of its values. When neither can trap or touch
+	// memory, evaluating both and selecting is the same and costs no branch.
+	// Otherwise the values go in their own blocks and meet in an OpPhi, as in
+	// emitShortCircuit, so `i < n ? buf[i] : 0.0f` never reads buf[n].
+	Id Emitter::emitConditional(const Expression& expression) {
+		const Id condition = asCondition(emitExpression(*expression.left));
+		const Expression& whenTrue = *expression.arguments[0];
+		const Expression& whenFalse = *expression.arguments[1];
+
+		if (isSafeToEvaluateUnchosen(whenTrue) && isSafeToEvaluateUnchosen(whenFalse)) {
+			Id trueValue = emitExpression(whenTrue);
+			Id falseValue = emitExpression(whenFalse);
+			const Id type = conditionalType(_builder.typeOf(trueValue), _builder.typeOf(falseValue));
+			trueValue = toConditionalType(trueValue, type);
+			falseValue = toConditionalType(falseValue, type);
+			return _builder.emitTyped(spirv::OpSelect, type, { condition, trueValue, falseValue });
+		}
+
+		const Id trueLabel = _builder.nextId();
+		const Id falseLabel = _builder.nextId();
+		const Id mergeLabel = _builder.nextId();
+
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		terminate(spirv::OpBranchConditional, { condition, trueLabel, falseLabel });
+
+		const ControlDepthScope depth(_controlDepth);
+
+		// The common type is known only once the second value is emitted, and the
+		// first block must convert to it before it ends: emit the first, lift it
+		// out unfinished, emit the second, then put the first back ahead of it.
+		const size_t mark = _builder.functionsMark();
+		beginBlock(trueLabel);
+		Id trueValue = emitExpression(whenTrue);
+		const Id trueEnd = _currentBlock;
+		std::vector<spirv::Instruction> trueBody = _builder.takeFunctionsFrom(mark);
+
+		beginBlock(falseLabel);
+		Id falseValue = emitExpression(whenFalse);
+		const Id falseEnd = _currentBlock;
+		const Id type = conditionalType(_builder.typeOf(trueValue), _builder.typeOf(falseValue));
+		falseValue = toConditionalType(falseValue, type);
+		terminate(spirv::OpBranch, { mergeLabel });
+		std::vector<spirv::Instruction> falseBody = _builder.takeFunctionsFrom(mark);
+
+		_builder.appendFunctions(std::move(trueBody));
+		_currentBlock = trueEnd;
+		trueValue = toConditionalType(trueValue, type);
+		terminate(spirv::OpBranch, { mergeLabel });
+		_builder.appendFunctions(std::move(falseBody));
+
+		beginBlock(mergeLabel);
+		return _builder.emitTyped(spirv::OpPhi, type, { trueValue, trueEnd, falseValue, falseEnd });
+	}
+
+	// Whether an expression may split into several blocks: a && or || on scalars,
+	// or a conditional whose values branch. Counted whether or not it does.
+	static bool containsBranchingOperator(const Expression& expression) {
+		if (expression.kind == ExpressionKind::Conditional
+			|| (expression.kind == ExpressionKind::Binary
+				&& (expression.binaryOperator == BinaryOperator::LogicalAnd
+					|| expression.binaryOperator == BinaryOperator::LogicalOr))) {
 			return true;
 		}
 
 		const auto contains = [](const ExpressionPtr& child) {
-			return child && containsLogicalOperator(*child);
+			return child && containsBranchingOperator(*child);
 		};
 		if (contains(expression.left) || contains(expression.right)) {
 			return true;
@@ -4339,8 +4503,8 @@ namespace {
 			case ExpressionKind::Member: return emitMember(expression);
 			case ExpressionKind::Call: return emitCall(expression);
 			case ExpressionKind::Construct: return emitConstruct(expression);
+			case ExpressionKind::Conditional: return emitConditional(expression);
 			case ExpressionKind::InitList:
-			case ExpressionKind::Conditional:
 			case ExpressionKind::Assign: break;
 		}
 
@@ -5682,6 +5846,9 @@ namespace {
 			} else {
 				address = emitExpression(left);
 			}
+		} else if (left.kind == ExpressionKind::Conditional) {
+			throw CompileError("assigning to a conditional expression is not supported; "
+				"assign inside an if instead");
 		} else {
 			address = emitExpression(left);
 		}
@@ -5980,9 +6147,9 @@ namespace {
 				beginBlock(headerLabel);
 				const ControlDepthScope depth(_controlDepth);
 
-				// A && or || in the condition splits it over several blocks, and
+				// A &&, || or ?: in the condition splits it over several blocks, and
 				// OpLoopMerge has to end the header, so it goes in front of them.
-				const bool splitsCondition = condition && containsLogicalOperator(*condition);
+				const bool splitsCondition = condition && containsBranchingOperator(*condition);
 				Id conditionValue = InvalidId;
 				if (condition && !splitsCondition) {
 					conditionValue = asCondition(emitExpression(*condition));

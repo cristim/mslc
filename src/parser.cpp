@@ -2385,7 +2385,6 @@ ExpressionPtr Parser::parseConditional() {
 	}
 
 	advance();
-	const NestingScope scope(*this);
 	auto expression = std::make_unique<Expression>();
 	expression->kind = ExpressionKind::Conditional;
 	expression->line = condition->line;

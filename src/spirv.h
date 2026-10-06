@@ -113,6 +113,14 @@ public:
 	void emitDeclTypedAt(uint16_t opcode, Id resultType, Id resultId,
 		std::vector<uint32_t> operands);
 
+	// Instructions emitted into the function bodies so far, and the means to lift
+	// the ones after a mark out and put them back later. A conditional operator
+	// learns the type both of its values have to share only after emitting the
+	// second, and the first has to be converted before its block ends.
+	size_t functionsMark() const;
+	std::vector<Instruction> takeFunctionsFrom(size_t mark);
+	void appendFunctions(std::vector<Instruction> instructions);
+
 	// The recorded type of a value, or InvalidId when the id is unknown.
 	Id typeOf(Id value) const;
 
