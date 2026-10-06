@@ -1,4 +1,4 @@
-// EXPECT: error "sampler" is a texture or sampler type
+// EXPECT: error field "texCoord" of "Vertex" has [[attribute(n)]]
 using namespace metal;
 struct Vertex {
   float4 position [[position]];
