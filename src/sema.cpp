@@ -1492,6 +1492,10 @@ namespace {
 		// predecessor a value arrives from.
 		Id _currentBlock = InvalidId;
 
+		// How many short-circuit right operands enclose the one being emitted.
+		// Each is a selection construct, and spirv-val allows 1023 of them nested.
+		uint32_t _shortCircuitDepth = 0;
+
 		std::string _reflection;
 		// The next descriptor binding a texture or sampler takes, and the
 		// constexpr samplers declared so far in the entry point.
@@ -2583,8 +2587,16 @@ namespace {
 		terminate(spirv::OpBranchConditional, { condition,
 			isAnd ? rightLabel : mergeLabel, isAnd ? mergeLabel : rightLabel });
 
+		constexpr uint32_t kMaxShortCircuitDepth = 512;
+		if (_shortCircuitDepth >= kMaxShortCircuitDepth) {
+			throw CompileError("&& and || are nested more than " + std::to_string(kMaxShortCircuitDepth)
+				+ " deep in their right operands");
+		}
+
 		beginBlock(rightLabel);
+		++_shortCircuitDepth;
 		const Id right = asCondition(emitExpression(rightExpression));
+		--_shortCircuitDepth;
 		const Id rightBlock = _currentBlock;
 		terminate(spirv::OpBranch, { mergeLabel });
 
@@ -2610,11 +2622,6 @@ namespace {
 		}
 		for (const ExpressionPtr& argument: expression.arguments) {
 			if (contains(argument)) {
-				return true;
-			}
-		}
-		for (const InitializerElement& element: expression.elements) {
-			if (contains(element.value)) {
 				return true;
 			}
 		}
