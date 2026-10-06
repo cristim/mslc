@@ -789,6 +789,48 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	return 0;
 }
 
+const std::string* TypeTable::structNameOf(spirv::Id type, bool* laidOut) const {
+	const std::string* name = nullptr;
+	if (laidOut) {
+		*laidOut = true;
+	}
+	for (const auto& [key, id]: _structs) {
+		if (id == type) {
+			name = &key;
+		}
+	}
+	for (const auto& [key, id]: _elementStructs) {
+		if (id == type) {
+			name = &key;
+		}
+	}
+	for (const auto& [key, id]: _valueStructs) {
+		if (id == type) {
+			name = &key;
+			if (laidOut) {
+				*laidOut = false;
+			}
+		}
+	}
+	return name;
+}
+
+bool TypeTable::structForm(spirv::Id type, StructForm& out) {
+	bool laidOut = true;
+	const std::string* name = structNameOf(type, &laidOut);
+	if (!name) {
+		return false;
+	}
+
+	std::vector<uint32_t> offsets;
+	uint32_t size = 0;
+	out.name = *name;
+	out.value.clear();
+	structMembersFor(out.name, out.value, offsets, size);
+	out.declared = laidOut ? storageTypesFor(out.name, out.value) : out.value;
+	return true;
+}
+
 bool TypeTable::isAggregate(spirv::Id type) const {
 	if (_widthOfVector.count(type) > 0 || _matrixInfo.count(type) > 0) {
 		return true;
@@ -894,11 +936,28 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 }
 
 uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
-	// A struct's own alignment is not tracked, and 4 is the weaker claim, which
-	// is the safe direction: a claim below what the layout gives is always sound.
 	const uint32_t bits = bitWidth(type);
 	if (bits == 0) {
-		return 4;
+		// A struct is as aligned as its most aligned member, which spirv-val needs
+		// to be at least its largest scalar: 8 for a long.
+		const std::string* name = structNameOf(type, nullptr);
+		const StructDecl* decl = name ? _unit.findStruct(*name) : nullptr;
+		if (!decl) {
+			return 4;
+		}
+
+		uint32_t alignment = 1;
+		for (const StructField& field: decl->fields) {
+			const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
+			const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
+			const VectorLayout layout = field.type.isMatrix()
+				? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
+				: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
+				: vectorLayoutFor(scalarBytes, components);
+			alignment = std::max(alignment, layout.alignment);
+		}
+
+		return alignment;
 	}
 
 	// bitWidth is the component's width, so the element's own size comes from the
@@ -1623,6 +1682,7 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id convertStruct(Id value, const TypeTable::StructForm& from, const TypeTable::StructForm& to, Id toType);
 		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
@@ -1728,9 +1788,58 @@ namespace {
 		return cached->second;
 	}
 
+	// A struct is declared once as a value and once as a buffer's laid-out
+	// element, so a copy between a local and a buffer is two types for one struct.
+	// OpBitcast takes no struct, so the copy is member by member: the members are
+	// pulled out of the source and the target is built from them, with a packed
+	// vector turned between the array of components a laid-out struct stores and
+	// the vector a local holds.
+	Id Emitter::convertStruct(Id value, const TypeTable::StructForm& from,
+		const TypeTable::StructForm& to, Id toType) {
+		if (from.name != to.name) {
+			throw CompileError("the struct " + from.name + " is used where the struct " + to.name
+				+ " is expected, and mslc converts no struct to another");
+		}
+
+		std::vector<uint32_t> members;
+		for (size_t i = 0; i < from.declared.size(); ++i) {
+			Id member = _builder.emitTyped(spirv::OpCompositeExtract, from.declared[i],
+				{ value, static_cast<uint32_t>(i) });
+
+			if (from.declared[i] != to.declared[i]) {
+				const Id vector = from.value[i];
+				const Id component = _types.componentOf(vector);
+				const uint32_t width = _types.vectorWidth(vector);
+				std::vector<uint32_t> parts;
+				for (uint32_t lane = 0; lane < width; ++lane) {
+					parts.push_back(_builder.emitTyped(spirv::OpCompositeExtract, component,
+						{ member, lane }));
+				}
+				member = _builder.emitTyped(spirv::OpCompositeConstruct, to.declared[i], parts);
+			}
+
+			members.push_back(member);
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, members);
+	}
+
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		TypeTable::StructForm fromForm;
+		TypeTable::StructForm toForm;
+		if (_types.structForm(fromType, fromForm) && _types.structForm(toType, toForm)) {
+			return convertStruct(value, fromForm, toForm, toType);
+		}
+
+		// A struct converts to another form of itself and to nothing else. A bool
+		// keeps its own diagnostic below.
+		if ((_types.structForm(fromType, fromForm) && !_types.isBool(toType))
+			|| (_types.structForm(toType, toForm) && !_types.isBool(fromType))) {
+			throw CompileError("a struct converts to another form of itself only");
 		}
 
 		// Every convert opcode takes a scalar or a vector, so a matrix of another
@@ -2462,6 +2571,11 @@ namespace {
 		// OpFNegate takes no matrix.
 		if (_types.matrixInfo(type)) {
 			throw CompileError("a unary operator on a matrix is not lowered yet");
+		}
+
+		TypeTable::StructForm form;
+		if (_types.structForm(type, form)) {
+			throw CompileError("a unary operator on the struct " + form.name + " is not lowered");
 		}
 
 		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
@@ -4541,17 +4655,22 @@ namespace {
 		const Id declared = declaredTypeOf(_entryPoint->returnType);
 
 		if (!_entryPoint->returnType.namedType.empty()) {
-			if (_builder.typeOf(value) != declared) {
-				const std::string spelled = typeName(_entryPoint->returnType);
-				throw CompileError("\"" + _entryPoint->name + "\" returns " + spelled + ", and mslc "
-					"returns a local of that type; this return's value is another struct, or one "
-					"read straight from a buffer, whose layout differs");
+			// The fields are extracted one by one, so a buffer's form of the struct
+			// serves as it is unless a packed member has to change shape.
+			Id copy = value;
+			TypeTable::StructForm have;
+			TypeTable::StructForm want;
+			const bool sameMembers = _types.structForm(_builder.typeOf(value), have)
+				&& _types.structForm(declared, want)
+				&& have.name == want.name && have.declared == want.declared;
+			if (!sameMembers) {
+				copy = convertImplicit(value, declared);
 			}
 
 			for (size_t i = 0; i < _outputs.size(); ++i) {
 				const StageVariable& output = _outputs[i];
 				const Id field = _builder.emitTyped(spirv::OpCompositeExtract, output.valueType,
-					{ value, static_cast<uint32_t>(i) });
+					{ copy, static_cast<uint32_t>(i) });
 				_builder.emit(spirv::OpStore, { output.variable,
 					convert(field, output.valueType, output.interfaceType) });
 			}
@@ -4651,13 +4770,6 @@ namespace {
 		Id initial = InvalidId;
 		if (declaration.initializer) {
 			const Id initializer = emitExpression(*declaration.initializer);
-			// convert() has no struct form and would emit an OpBitcast between them.
-			if (!declaration.type.namedType.empty() && _builder.typeOf(initializer) != typeId) {
-				throw CompileError("local \"" + declaration.name + "\" of type "
-					+ typeName(declaration.type) + " is initialised from another struct, or from one "
-					"read straight from a buffer, whose layout differs; mslc does not copy between "
-					"them yet");
-			}
 			initial = convertImplicit(initializer, typeId);
 		} else {
 			initial = _types.zero(typeId);

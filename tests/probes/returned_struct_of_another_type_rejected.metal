@@ -1,10 +1,9 @@
-// EXPECT: error this return's value is another struct
+// EXPECT: error the struct Other is used where the struct Out is expected
 //
 // The returned value is split into the Output variables field by field, so it
 // has to be the struct the function is declared to return. Apple rejects this
 // source too. A struct read straight from a buffer ("return vertices[vid];") is
-// valid MSL and reaches the same diagnostic, because its SPIR-V type carries the
-// buffer's member offsets and mslc does not copy it into the plain form yet.
+// the same struct in another layout, and is copied member by member.
 struct Out { float4 p [[position]]; };
 struct Other { float4 p; };
 
