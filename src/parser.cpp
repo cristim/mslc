@@ -1718,7 +1718,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument) {
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
 		if (argument && (name == "buffer" || name == "texture" || name == "sampler")) {
 			checkAttributeIndex(name, *argument);
 		}
@@ -1760,8 +1760,17 @@ ParameterAttributes Parser::parseParameterAttributes() {
 FieldAttributes Parser::parseFieldAttributes() {
 	FieldAttributes attributes;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument) {
-		if (name == "position") {
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument,
+		const std::string& identifier) {
+		if (name == "user") {
+			if (identifier.empty()) {
+				throw CompileError("[[user]] needs a name: [[user(name)]]");
+			}
+			if (attributes.userName) {
+				throw CompileError("a struct field has more than one [[user]] attribute");
+			}
+			attributes.userName = identifier;
+		} else if (name == "position") {
 			attributes.position = true;
 		} else if (name == "attribute") {
 			if (!argument) {
@@ -1782,8 +1791,8 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]] and the interpolation "
-				"attributes are");
+				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[user(name)]] and the "
+				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
 		}
@@ -1792,7 +1801,8 @@ FieldAttributes Parser::parseFieldAttributes() {
 	return attributes;
 }
 
-void Parser::parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>)>& visit) {
+void Parser::parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>,
+	const std::string&)>& visit) {
 	expect(TokenKind::LBracket, "to open an attribute list");
 	expect(TokenKind::LBracket, "to open an attribute");
 
@@ -1809,13 +1819,23 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		const std::string name(advance().text);
 
 		std::optional<uint32_t> argument;
+		std::string identifier;
 		if (at(TokenKind::LParen)) {
 			advance();
-			argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\"", true));
+			if (name == "user") {
+				// [[user(name)]] takes an identifier, not an integer.
+				if (kind() != TokenKind::Identifier) {
+					throw CompileError("attribute \"user\" needs an identifier, found "
+						+ std::string(tokenKindName(kind())));
+				}
+				identifier = std::string(advance().text);
+			} else {
+				argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\"", true));
+			}
 			expect(TokenKind::RParen, "to close an attribute argument");
 		}
 
-		visit(name, argument);
+		visit(name, argument, identifier);
 
 		match(TokenKind::Comma);
 	}

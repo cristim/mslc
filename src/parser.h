@@ -230,7 +230,8 @@ private:
 	// One [[...]] attribute list, handing each attribute's name and its optional
 	// constant integer argument to visit. Parameters and struct fields spell the
 	// list the same way, so they share the scanner.
-	void parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>)>& visit);
+	void parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>,
+		const std::string&)>& visit);
 
 	// Statements
 	StatementPtr parseStatement();
