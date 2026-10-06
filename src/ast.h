@@ -316,6 +316,17 @@ struct Statement {
 // A struct field's attribute list. Metal attaches these to the fields of a
 // struct that crosses a stage boundary, and each one says where the field lands
 // in the interface, so they are kept rather than discarded.
+enum class Interpolation {
+	None,
+	Flat,
+	CenterPerspective,
+	CenterNoPerspective,
+	CentroidPerspective,
+	CentroidNoPerspective,
+	SamplePerspective,
+	SampleNoPerspective,
+};
+
 struct FieldAttributes {
 	// [[position]]: the field is the stage's own position. On a vertex output
 	// that is the BuiltIn Position; on a fragment input it is the FragCoord.
@@ -324,6 +335,13 @@ struct FieldAttributes {
 	// [[attribute(n)]]: the field is a vertex buffer input or a user output at
 	// location n.
 	std::optional<uint32_t> attributeIndex;
+
+	// [[flat]], [[center_no_perspective]] and the rest: how a stage-crossing
+	// field is interpolated. None when the field names no qualifier.
+	Interpolation interpolation = Interpolation::None;
+
+	// [[color(n)]]: the field is colour attachment n of a fragment output.
+	std::optional<uint32_t> colorIndex;
 };
 
 struct StructField {

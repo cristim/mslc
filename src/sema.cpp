@@ -1577,6 +1577,7 @@ namespace {
 		std::vector<EmbeddedSampler> _embeddedSamplers;
 		// Set once the module needs ImageQuery, which is declared once.
 		bool _imageQueryDeclared = false;
+		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
 
@@ -1649,6 +1650,7 @@ namespace {
 		const StructDecl* structValue(const Type& type) const;
 		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
 			const std::string& what);
+		void decorateInterpolation(Id variable, Interpolation interpolation);
 		std::vector<StageVariable> declareStageStruct(const StructDecl& decl,
 			spirv::StorageClassValue storageClass);
 		std::vector<StageVariable> declareVertexAttributes(const StructDecl& decl);
@@ -4724,6 +4726,47 @@ namespace {
 		return stage;
 	}
 
+	// An interpolation attribute as SPIR-V decorations. center_perspective is
+	// Vulkan's default and decorates nothing; the centroid and sample forms add
+	// Centroid or Sample, and the no_perspective forms add NoPerspective. Sample
+	// needs the SampleRateShading capability.
+	void Emitter::decorateInterpolation(Id variable, Interpolation interpolation) {
+		const auto decorate = [&](spirv::DecorationValue decoration) {
+			_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(decoration) });
+		};
+
+		switch (interpolation) {
+			case Interpolation::None:
+			case Interpolation::CenterPerspective:
+				return;
+			case Interpolation::Flat:
+				decorate(spirv::Decoration::Flat);
+				return;
+			case Interpolation::CenterNoPerspective:
+				decorate(spirv::Decoration::NoPerspective);
+				return;
+			case Interpolation::CentroidPerspective:
+				decorate(spirv::Decoration::Centroid);
+				return;
+			case Interpolation::CentroidNoPerspective:
+				decorate(spirv::Decoration::Centroid);
+				decorate(spirv::Decoration::NoPerspective);
+				return;
+			case Interpolation::SamplePerspective:
+			case Interpolation::SampleNoPerspective:
+				if (!_sampleRateShadingDeclared) {
+					_builder.emit(spirv::OpCapability,
+						{ static_cast<uint32_t>(spirv::Capability::SampleRateShading) });
+					_sampleRateShadingDeclared = true;
+				}
+				decorate(spirv::Decoration::Sample);
+				if (interpolation == Interpolation::SampleNoPerspective) {
+					decorate(spirv::Decoration::NoPerspective);
+				}
+				return;
+		}
+	}
+
 	// One variable per field. The [[position]] field is a builtin, Position on a
 	// vertex output and FragCoord on a fragment input; every other field takes the
 	// next Location in declaration order, which is how Iridium numbers them on
@@ -4745,7 +4788,21 @@ namespace {
 					"on a struct crossing from the vertex to the fragment stage");
 			}
 
+			if (field.attributes.colorIndex) {
+				throw CompileError(isInput
+					? what + " is [[color(n)]] on a fragment input, which is framebuffer fetch: mslc does "
+						"not lower it, because Vulkan reads a previous colour attachment only through a "
+						"subpass input attachment, which needs a descriptor mslc does not assign"
+					: what + " is [[color(n)]], which is not valid on a vertex output; it names a "
+						"fragment output's colour attachment");
+			}
+			const Interpolation interpolation = field.attributes.interpolation;
+			if (field.attributes.position && interpolation != Interpolation::None) {
+				throw CompileError(what + " is [[position]], which cannot also have an interpolation attribute");
+			}
+
 			const StageVariable variable = declareStageVariable(field.type, storageClass, what);
+			const bool integral = !_types.isFloat(variable.interfaceType);
 
 			if (field.attributes.position) {
 				if (hasPosition) {
@@ -4763,9 +4820,16 @@ namespace {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::Location), location++ });
 
+				if (integral && interpolation != Interpolation::None && interpolation != Interpolation::Flat) {
+					throw CompileError(what + " is " + typeName(field.type) + ", which requires [[flat]]; "
+						"an integer is not interpolated, and Apple's compiler rejects any other qualifier");
+				}
+
+				decorateInterpolation(variable.variable, interpolation);
+
 				// VUID-StandaloneSpirv-Flat-04744: an integer fragment input is not
 				// interpolated, and the module is rejected unless it says so.
-				if (isInput && !_types.isFloat(variable.interfaceType)) {
+				if (isInput && integral && interpolation == Interpolation::None) {
 					_builder.emit(spirv::OpDecorate, { variable.variable,
 						static_cast<uint32_t>(spirv::Decoration::Flat) });
 				}
@@ -4808,6 +4872,11 @@ namespace {
 			if (field.attributes.position) {
 				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
 					"struct cannot carry");
+			}
+			if (field.attributes.interpolation != Interpolation::None || field.attributes.colorIndex) {
+				throw CompileError(what + " has an interpolation or colour attribute, which is not "
+					"valid on a vertex attribute; an interpolation attribute belongs on a field "
+					"that crosses to the fragment stage");
 			}
 			if (!field.attributes.attributeIndex) {
 				throw CompileError(what + " has no [[attribute(n)]]; every field of a vertex "
