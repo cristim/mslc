@@ -1,4 +1,4 @@
-// EXPECT: error a type has one address space, found "constant" after another
+// EXPECT: error mslc does not support more than one address space on a type, found "constant" after another
 //
 // "device constant Vertex *" names one buffer, so which of the two was meant
 // decides which storage class its binding lands in. Resolving it would mean

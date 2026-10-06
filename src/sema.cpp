@@ -3864,6 +3864,18 @@ namespace {
 		return false;
 	}
 
+	// A parameter taken by value (a stage input, a builtin) lives in the thread
+	// address space, which is also what it gets with none written. Apple rejects
+	// any other, by name, so "device In in [[stage_in]]" is a mistake to report
+	// rather than a spelling to accept.
+	void requireThreadAddressSpace(const Parameter& parameter, const char* what) {
+		if (parameter.type.addressSpace != AddressSpace::None
+			&& parameter.type.addressSpace != AddressSpace::Thread) {
+			throw CompileError("parameter \"" + parameter.name + "\" takes " + what + " by value, so it "
+				"cannot be in the " + addressSpaceName(parameter.type.addressSpace) + " address space");
+		}
+	}
+
 	// MSL does not require [[buffer(n)]] on an entry point's device or
 	// constant parameters: an unbinding parameter's index is its position
 	// among the binding parameters, with builtins skipped. add.metal relies on
@@ -3930,6 +3942,8 @@ namespace {
 						"reference, which Apple's compiler does not allow; take the struct by value");
 				}
 
+				requireThreadAddressSpace(parameter, "[[stage_in]]");
+
 				const StructDecl* decl = structValue(parameter.type);
 				if (!decl) {
 					throw CompileError("[[stage_in]] parameter \"" + parameter.name + "\" is a "
@@ -3945,6 +3959,7 @@ namespace {
 			}
 
 			if (parameter.attributes.builtin) {
+				requireThreadAddressSpace(parameter, "a builtin");
 				const spirv::BuiltInValue spvBuiltin = [&]() {
 					switch (*parameter.attributes.builtin) {
 						case ParameterAttributes::Builtin::ThreadPositionInGrid:
@@ -4050,9 +4065,24 @@ namespace {
 				bindingIndex = static_cast<uint32_t>(it - implicitlyBound.begin());
 			}
 
-		if (!storageClassForAddressSpace(parameter.type.addressSpace)) {
-			throw CompileError("parameter \"" + parameter.name + "\" needs a device, constant "
-				"or threadgroup address space to be a buffer binding");
+		// Apple takes a threadgroup pointer on a kernel only as an argument of its
+		// own, with no [[buffer]], and takes thread and an unwritten address space
+		// nowhere.
+		const AddressSpace space = parameter.type.addressSpace;
+		const bool threadgroupArgument = space == AddressSpace::Threadgroup
+			&& !parameter.attributes.bufferIndex && _entryPoint->stage == Stage::Kernel;
+		if (space == AddressSpace::Threadgroup && !parameter.attributes.bufferIndex
+			&& _entryPoint->stage != Stage::Kernel) {
+			throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup parameter; "
+				"threadgroup parameters are only supported on kernel functions");
+		}
+		if (space == AddressSpace::None) {
+			throw CompileError("parameter \"" + parameter.name + "\": pointer parameter needs an "
+				"explicit address space (device or constant)");
+		}
+		if (space != AddressSpace::Device && space != AddressSpace::Constant && !threadgroupArgument) {
+			throw CompileError("parameter \"" + parameter.name + "\" needs a device or constant "
+				"address space to be a buffer binding, not " + std::string(addressSpaceName(space)));
 		}
 
 		Id pointeeType = InvalidId;

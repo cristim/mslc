@@ -154,7 +154,7 @@ namespace {
 	// Keywords that may appear before a type and are not address spaces.
 	bool isTypeQualifier(std::string_view text) {
 		return text == "const" || text == "static" || text == "constexpr"
-			|| text == "volatile" || text == "restrict" || text == "__restrict";
+			|| text == "volatile" || text == "__restrict";
 	}
 
 	// The texture and sampler type names. Only texture2d, texturecube and sampler are lowered;
@@ -204,6 +204,24 @@ namespace {
 		if (name == "thread") { return AddressSpace::Thread; }
 
 		return std::nullopt;
+	}
+
+	// A variable in a function lives in the thread address space, or in
+	// threadgroup, and is never static; Apple reports anything else. On a
+	// pointer the address space is the pointee's, which is free to be device.
+	// A reference is valid MSL that mslc does not lower, so it gets its own diagnostic
+	// rather than an address-space one.
+	void rejectLocalQualifiers(const Type& type, bool isReference) {
+		if (isReference) {
+			throw CompileError("a reference in function scope is not lowered yet");
+		}
+		if (type.isStatic) {
+			throw CompileError("variables in function scope cannot be declared static");
+		}
+		if (!type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+			throw CompileError(std::string("variables in function scope cannot be in the ")
+				+ addressSpaceName(type.addressSpace) + " address space");
+		}
 	}
 
 }
@@ -928,44 +946,59 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 	return length;
 }
 
+// One type qualifier or address space at the cursor, applied to the type. MSL
+// takes them on either side of the type name, so "In const in", "float const *p"
+// and "const In in" are the same declaration. Before a "*" they qualify the
+// type; after one they qualify the pointer, which none of the flags here track.
+bool Parser::parseQualifier(Type& type, bool afterPointer) {
+	if (kind() != TokenKind::Identifier) {
+		return false;
+	}
+
+	const std::string_view text = current().text;
+
+	AddressSpace space;
+	if (!afterPointer && addressSpaceFor(text)) {
+		parseAddressSpace(space);
+		// A different second address space is a mistake rather than an
+		// alternative spelling, and which one was meant decides which storage
+		// class a binding lands in, so it is reported rather than resolved.
+		if (type.addressSpace != AddressSpace::None && type.addressSpace != space) {
+			throw CompileError("mslc does not support more than one address space on a type, found \""
+				+ std::string(text) + "\" after another (Apple accepts this)");
+		}
+
+		type.addressSpace = space;
+		return true;
+	}
+
+	if (!isTypeQualifier(text)) {
+		return false;
+	}
+
+	if (text == "const" && !afterPointer) {
+		type.isConst = true;
+	}
+	if (text == "constexpr") {
+		type.isConstexpr = true;
+	}
+	if (text == "static") {
+		type.isStatic = true;
+	}
+
+	advance();
+	return true;
+}
+
 Type Parser::parseType(bool allowResource) {
 	Type type;
-	bool isConstexpr = false;
 
 	// MSL writes the address space and the const qualifier in either order, and
 	// both orders are ordinary: "device const float*" and "const device Vertex *"
 	// are the same declaration spelled two ways. Reading them as two fixed
 	// sequences took "const" as the whole prefix and then read "device" as a type
 	// name, so the parameter became "Vertex" and the list ended at the "*".
-	while (kind() == TokenKind::Identifier) {
-		const std::string_view text = current().text;
-
-		AddressSpace space;
-		if (parseAddressSpace(space)) {
-			// A second address space is a mistake rather than an alternative
-			// spelling, and which one was meant decides which storage class a
-			// binding lands in, so it is reported rather than resolved.
-			if (type.addressSpace != AddressSpace::None) {
-				throw CompileError("a type has one address space, found \"" + std::string(text)
-					+ "\" after another");
-			}
-
-			type.addressSpace = space;
-			continue;
-		}
-
-		if (!isTypeQualifier(text)) {
-			break;
-		}
-
-		if (text == "const") {
-			type.isConst = true;
-		}
-		if (text == "constexpr") {
-			isConstexpr = true;
-		}
-
-		advance();
+	while (parseQualifier(type, false)) {
 	}
 
 	// metal::sampler and metal::texture2d, which Apple takes as the unqualified names.
@@ -981,10 +1014,6 @@ Type Parser::parseType(bool allowResource) {
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
 		}
 		parseResourceType(type);
-		if (atKeyword("const")) {
-			type.isConst = true;
-			advance();
-		}
 	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
 	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
@@ -999,17 +1028,23 @@ Type Parser::parseType(bool allowResource) {
 			+ " \"" + std::string(current().text) + "\"");
 	}
 
+	while (parseQualifier(type, false)) {
+	}
+
 	while (at(TokenKind::Star)) {
 		if (type.isPointer) {
 			throw CompileError("a pointer to a pointer is not supported");
 		}
 		advance();
 		type.isPointer = true;
+
+		while (parseQualifier(type, true)) {
+		}
 	}
 
 	// constexpr makes the variable const, and on a pointer that is the pointer
 	// rather than what it points at, which is what isConst means there.
-	if (isConstexpr && !type.isPointer) {
+	if (type.isConstexpr && !type.isPointer) {
 		type.isConst = true;
 	}
 
@@ -1075,6 +1110,10 @@ Parameter Parser::parseParameter() {
 
 	param.type = parseType(true);
 
+	if (param.type.isStatic || param.type.isConstexpr) {
+		throw CompileError(std::string("a parameter cannot be ") + (param.type.isStatic ? "static" : "constexpr"));
+	}
+
 	// "constant BufferClearParams &params" and "constant BufferClearParams
 	// *params" name the same buffer and lower to the same descriptor, so a
 	// reference is consumed and nothing is recorded for it.
@@ -1092,10 +1131,11 @@ Parameter Parser::parseParameter() {
 	rejectShadowing(param.name);
 
 	if (param.type.resource != ResourceKind::None
-		&& (param.type.isPointer || param.type.arrayLength || param.type.addressSpace != AddressSpace::None)) {
+		&& (param.type.isPointer || param.type.arrayLength
+			|| (param.type.addressSpace != AddressSpace::None && param.type.addressSpace != AddressSpace::Thread))) {
 		throw CompileError("parameter \"" + param.name + "\" is a pointer to or an array of "
-			+ typeName(param.type) + " or has an address space, which is not lowered yet; mslc "
-			"takes a texture or sampler by value");
+			+ typeName(param.type) + " or has an address space other than thread, which is not lowered "
+			"yet; mslc takes a texture or sampler by value");
 	}
 
 	// "float values[4]" is an array suffix, "[[buffer(0)]]" is an attribute
@@ -1331,15 +1371,8 @@ StatementPtr Parser::parseStatement() {
 		if (looksLikeType) {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
-			const size_t typeStart = _position;
 			declaration.type = parseType(true);
-			if (declaration.type.resource != ResourceKind::None) {
-				for (size_t at = typeStart; at < _position; ++at) {
-					if (_tokens[at].text == "static") {
-						throw CompileError("variables in function scope cannot be declared static");
-					}
-				}
-			}
+			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
@@ -1591,6 +1624,7 @@ StatementPtr Parser::parseForStatement() {
 		if (looksLikeType) {
 			VariableDeclaration declaration;
 			declaration.type = parseType();
+			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
