@@ -115,6 +115,23 @@ foreach(deref IN LISTS dereferences)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# "x op= y" is "x = x op y": one test per tests/equivalence/<name>.compound.metal,
+# against <name>.plain.metal, which spells every compound assignment out. Where the
+# two have the same operand types they have to disassemble identically, so a result
+# that is computed and then not stored cannot pass.
+file(GLOB compounds CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.compound.metal)
+foreach(compound IN LISTS compounds)
+	get_filename_component(name ${compound} NAME)
+	string(REGEX REPLACE "\\.compound\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${compound}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.plain.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # Negative control: a pair that does differ must fail, or the comparison above
 # could not tell a macro that expands wrongly from one that expands right.
 add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}

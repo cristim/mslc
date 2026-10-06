@@ -167,6 +167,25 @@ file(WRITE "${pp}/rescan.metal" "#define f(a) a*g\n#define g(a) f(a)\nf(2)(9)\n"
 run(rescan 0 "-E;${pp}/rescan.metal")
 run_expects(rescan "2*9*g")
 
+# A compound assignment operator is one token. It used to lex as a shift or an
+# operator and an '=', so "x <<= 3" read as a shift. In an #if it is still no
+# operator, and pasting its two halves gives the one token.
+file(WRITE "${pp}/compound.metal" "x <<= 1; y >>= 2; a %= b; c &= d; e |= f; g ^= h;\n")
+run(compound_tokens 0 "--dump-tokens;${pp}/compound.metal")
+foreach(op "<<=" ">>=" "%=" "&=" "|=" "^=")
+	string(LENGTH "${op}" length)
+	math(EXPR padding "21 - ${length}")
+	string(REPEAT " " ${padding} gap)
+	run_expects(compound_tokens "${op}${gap}${op}")
+endforeach()
+file(WRITE "${pp}/compound_paste.metal"
+"#define CAT(a, b) a ## b\n#define S(x) #x\nCAT(<<, =) CAT(>>, =) CAT(%, =) CAT(&, =) CAT(|, =) CAT(^, =) S(x <<= 3)\n")
+run(compound_paste 0 "-E;${pp}/compound_paste.metal")
+run_expects(compound_paste "<<= >>= %= &= |= ^= \"x <<= 3\"")
+file(WRITE "${pp}/compound_in_if.metal" "#if 1 <<= 2\n#endif\n")
+run(compound_in_if nonzero "-E;${pp}/compound_in_if.metal")
+run_expects(compound_in_if "missing a binary operator before \"<<=\"")
+
 # A header over the size limit is refused rather than read into memory.
 string(REPEAT "0123456789abcdef" 2200000 big)
 file(WRITE "${pp}/big.h" "${big}")
