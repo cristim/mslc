@@ -893,17 +893,11 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 	return !out.parts.empty();
 }
 
-void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-	std::set<std::string>& found) const {
-	if (!seen.insert(scope).second) {
-		return;
-	}
-
+void Parser::collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const {
 	const std::string key = scope.empty() ? name : scope + "::" + name;
 	if (_declared.count(key)) {
 		found.insert(key);
 	}
-
 	const auto entry = _scopes.find(scope);
 	if (entry == _scopes.end()) {
 		return;
@@ -911,8 +905,43 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	if (const auto brought = entry->second.declarations.find(name); brought != entry->second.declarations.end()) {
 		found.insert(brought->second);
 	}
+}
+
+void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
+	std::set<std::string>& found) const {
+	if (!seen.insert(scope).second) {
+		return;
+	}
+	collectOwn(scope, name, found);
+	const auto entry = _scopes.find(scope);
+	if (entry == _scopes.end()) {
+		return;
+	}
 	for (const std::string& directive : entry->second.directives) {
 		collectMembers(directive, name, seen, found);
+	}
+}
+
+namespace {
+	// The nearest namespace that contains both "A::B" and "A::C" ("A"), or "" for the file.
+	std::string nearestCommon(const std::string& a, const std::string& b) {
+		size_t common = 0;
+		size_t at = 0;
+		while (true) {
+			const size_t endA = a.find("::", at);
+			const size_t endB = b.find("::", at);
+			const std::string partA = a.substr(at, endA == std::string::npos ? endA : endA - at);
+			const std::string partB = b.substr(at, endB == std::string::npos ? endB : endB - at);
+			if (partA.empty() || partA != partB) {
+				break;
+			}
+			common = at + partA.size();
+			if (endA == std::string::npos || endB == std::string::npos) {
+				break;
+			}
+			at = endA + 2;
+		}
+		return a.substr(0, common);
 	}
 }
 
@@ -963,11 +992,27 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 
 	const std::string& last = name.parts.back();
 	if (name.parts.size() == 1 && !name.global) {
-		// The enclosing namespaces from the innermost out, then the file.
+		// [namespace.udir]: a using directive in U nominating T makes T's names
+		// appear in the nearest namespace L containing both, for lookups from inside U.
+		// So each enclosing namespace L, innermost out, offers its own names plus
+		// those of directives that land in it; the first level that has any decides.
 		for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
-			std::set<std::string> seen;
+			const std::string level = joinParts(_namespacePath, 0, depth);
 			std::set<std::string> found;
-			collectMembers(joinParts(_namespacePath, 0, depth), last, seen, found);
+			collectOwn(level, last, found);
+			for (size_t user = 0; user <= _namespacePath.size(); ++user) {
+				const std::string from = joinParts(_namespacePath, 0, user);
+				const auto entry = _scopes.find(from);
+				if (entry == _scopes.end()) {
+					continue;
+				}
+				for (const std::string& target : entry->second.directives) {
+					if (nearestCommon(from, target) == level) {
+						std::set<std::string> seen;
+						collectMembers(target, last, seen, found);
+					}
+				}
+			}
 			if (!found.empty()) {
 				return pick(found, last);
 			}

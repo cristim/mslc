@@ -168,6 +168,7 @@ private:
 	std::string resolveName(const QualifiedName& name) const;
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens) const;
+	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
 		std::set<std::string>& found) const;
 	bool isLocal(const std::string& name) const;
