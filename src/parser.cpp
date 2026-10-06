@@ -538,11 +538,12 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 		}
 	}
 
-	// An unscoped enum without a fixed underlying type is stored as an int, and
-	// promotes to int in arithmetic, so it is an int here. Apple also refuses an
-	// int where an enum is expected; mslc does not track that distinction.
-	if (_enumTypes.count(std::string(text))) {
-		out.scalar = ScalarKind::Int;
+	// An unscoped enum without a fixed underlying type is stored as an int, or as
+	// an unsigned int when a value passes INT_MAX, and promotes to that type in
+	// arithmetic, so it is that type here. Apple also refuses an int where an enum
+	// is expected; mslc does not track that distinction.
+	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()) {
+		out.scalar = _enumUnderlying.at(enumType->second);
 		out.vectorWidth = 0;
 		out.matrixColumns = 0;
 		out.isPacked = false;
@@ -679,6 +680,7 @@ void Parser::parseTypedef() {
 	if (isEnum && enumTag.empty()) {
 		declareName(name, "typedef");
 		_enumTypes[name] = name;
+		_enumUnderlying[name] = _lastEnumUnderlying;
 		return;
 	}
 
@@ -760,12 +762,19 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	if (!tag.empty()) {
 		declareName(tag, "enum");
 		_enumTypes[tag] = tag;
+		_enumUnderlying[tag] = ScalarKind::Int;
 	}
 
 	// Each enumerator is the previous one plus one unless it says otherwise, and
-	// the first is zero. They are kept as 64-bit values and held to what an int
-	// holds, so a value that wrapped could never be mistaken for a small one.
+	// the first is zero. They are kept as 64-bit values and held to what an int or
+	// an unsigned int holds, so a value that wrapped could never be mistaken for a
+	// small one. An unfixed enum is an int unless a value passes INT_MAX, and then
+	// every enumerator of it is an unsigned int, the small ones too (Apple:
+	// "kSmall - 4 > 0" is true beside a 0xffffffff).
 	int64_t next = 0;
+	int64_t lowest = 0;
+	int64_t highest = 0;
+	std::vector<std::string> names;
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
 		if (kind() != TokenKind::Identifier) {
 			throw CompileError("expected an enumerator name, found " + std::string(tokenKindName(kind())));
@@ -776,12 +785,15 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 		if (match(TokenKind::Assign)) {
 			value = evaluateConstant(*parseAssignment(), false);
 		}
-		if (value > INT_MAX || value < -INT_MAX) {
-			throw CompileError("the enumerator \"" + name + "\" does not fit in an int");
+		if (value > UINT_MAX || value < -INT_MAX) {
+			throw CompileError("the enumerator \"" + name + "\" does not fit in an int or an unsigned int");
 		}
 
 		declareName(name, "enum constant");
-		_enumConstants[name] = value;
+		_enumConstants[name] = {value, ScalarKind::Int};
+		names.push_back(name);
+		lowest = std::min(lowest, value);
+		highest = std::max(highest, value);
 		next = value + 1;
 
 		if (!match(TokenKind::Comma)) {
@@ -790,6 +802,22 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	}
 
 	expect(TokenKind::RBrace, "to close an enum body");
+
+	ScalarKind underlying = ScalarKind::Int;
+	if (highest > INT_MAX) {
+		if (lowest < 0) {
+			throw CompileError("an enum with a negative enumerator and one past INT_MAX needs a 64-bit type, "
+				"which mslc has no enum for");
+		}
+		underlying = ScalarKind::UInt;
+		for (const std::string& name : names) {
+			_enumConstants[name].kind = underlying;
+		}
+	}
+	_lastEnumUnderlying = underlying;
+	if (!tag.empty()) {
+		_enumUnderlying[tag] = underlying;
+	}
 	return tag;
 }
 
@@ -2107,8 +2135,10 @@ ExpressionPtr Parser::parsePrimary() {
 			expression->line = line();
 			advance();
 			expression->kind = ExpressionKind::IntLiteral;
-			expression->intValue = static_cast<uint64_t>(constant->second < 0 ? -constant->second : constant->second);
-			if (constant->second >= 0) {
+			const int64_t value = constant->second.value;
+			expression->intKind = constant->second.kind;
+			expression->intValue = static_cast<uint64_t>(value < 0 ? -value : value);
+			if (value >= 0) {
 				return expression;
 			}
 
