@@ -442,6 +442,50 @@ namespace {
 		}
 	}
 
+	// The identifiers a body names where no parameter or local of that name is in
+	// scope, which is where a file-scope name is what they refer to. A local hides
+	// the file-scope name from its declaration on, its own initialiser included.
+	using ScopeStack = std::vector<std::set<std::string>>;
+
+	void collectUnshadowed(const Expression* expression, const ScopeStack& scopes, std::set<std::string>& names) {
+		if (!expression) return;
+		std::set<std::string> mentioned;
+		collectIdentifiers(*expression, mentioned);
+		for (const std::string& name: mentioned) {
+			const bool hidden = std::any_of(scopes.begin(), scopes.end(),
+				[&](const std::set<std::string>& scope) { return scope.count(name) != 0; });
+			if (!hidden) names.insert(name);
+		}
+	}
+
+	void collectUnshadowed(const Statement* statement, ScopeStack& scopes, std::set<std::string>& names) {
+		if (!statement) return;
+		// A compound statement and a for loop open a scope; a declaration belongs to
+		// the one around it.
+		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For;
+		if (opensScope) scopes.emplace_back();
+		collectUnshadowed(statement->expression.get(), scopes, names);
+		collectUnshadowed(statement->whileCondition.get(), scopes, names);
+		for (const std::optional<VariableDeclaration>* declaration: { &statement->declaration, &statement->forInitializer }) {
+			if (*declaration) {
+				// The name is in scope in its own initialiser.
+				scopes.back().insert((*declaration)->name);
+				collectUnshadowed((*declaration)->initializer.get(), scopes, names);
+			}
+		}
+		// The condition and increment of a for loop follow its initialiser.
+		collectUnshadowed(statement->forCondition.get(), scopes, names);
+		collectUnshadowed(statement->forIncrement.get(), scopes, names);
+		for (const StatementPtr& child: statement->children) {
+			collectUnshadowed(child.get(), scopes, names);
+		}
+		for (const Statement* nested: { statement->thenBranch.get(), statement->elseBranch.get(),
+			statement->forBody.get(), statement->whileBody.get() }) {
+			collectUnshadowed(nested, scopes, names);
+		}
+		if (opensScope) scopes.pop_back();
+	}
+
 	uint16_t comparisonOpcode(BinaryOperator op, bool isFloat, bool isSigned) {
 		using Op = uint16_t;
 
@@ -1530,6 +1574,10 @@ namespace {
 		// constant belongs to the module rather than to the entry point, and an
 		// entry point's own names are looked up first.
 		std::map<std::string, ConstantBinding> _constants;
+		// The file-scope samplers, by name, and the ones the entry point being
+		// emitted names, which are looked up after its own parameters and locals.
+		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
+		std::map<std::string, Binding> _fileScopeSamplerBindings;
 		// What each constant folded to, so a later constant referring to this one
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
@@ -1638,6 +1686,16 @@ namespace {
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
 		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
+		void reserveSampler(const VariableDeclaration& declaration);
+		// The entry point's own name first, then a file-scope sampler it names.
+		const Binding* findResourceBinding(const std::string& name) const {
+			const auto own = _bindings.find(name);
+			if (own != _bindings.end()) return &own->second;
+			const auto fileScope = _fileScopeSamplerBindings.find(name);
+			return fileScope == _fileScopeSamplerBindings.end() ? nullptr : &fileScope->second;
+		}
+		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
+		void reserveFileScopeSamplers();
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -2089,8 +2147,8 @@ namespace {
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		// The entry point's own names first, then the module's: a constant declared
 		// at file scope is not a parameter of the entry point that reads it.
-		const auto it = _bindings.find(expression.name);
-		if (it == _bindings.end()) {
+		const Binding* found = findResourceBinding(expression.name);
+		if (!found) {
 			const auto constant = _constants.find(expression.name);
 			if (constant != _constants.end()) {
 				return constant->second.id;
@@ -2108,7 +2166,7 @@ namespace {
 				"or builtin mslc knows about");
 		}
 
-		const Binding& binding = it->second;
+		const Binding& binding = *found;
 
 		if (binding.pointeeMsl.resource != ResourceKind::None) {
 			throw CompileError("\"" + expression.name + "\" is a " + typeName(binding.pointeeMsl)
@@ -3876,6 +3934,10 @@ namespace {
 	// one constant's initialiser against the ones above it.
 	void Emitter::declareGlobals() {
 		for (const VariableDeclaration& global: _unit.globals) {
+			if (global.sampler) {
+				_fileScopeSamplers[global.name] = &global;
+				continue;
+			}
 			_builder.setSection(spirv::Section::TypesGlobals);
 			declareGlobalConstant(global);
 		}
@@ -4304,6 +4366,7 @@ namespace {
 		std::set<std::string> used;
 		collectIdentifiers(*_entryPoint->body, used);
 		reserveLocalSamplers(*_entryPoint->body, used);
+		reserveFileScopeSamplers();
 	}
 
 	// One entry per binding goes in the reflection. The separator goes before the
@@ -4441,18 +4504,7 @@ namespace {
 	void Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
 		if (statement.declaration && statement.declaration->sampler
 			&& used.count(statement.declaration->name)) {
-			const VariableDeclaration& declaration = *statement.declaration;
-			const bool known = std::any_of(_embeddedSamplers.begin(), _embeddedSamplers.end(),
-				[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
-			if (!known) {
-				const uint32_t binding = _nextBinding++;
-				_embeddedSamplers.push_back({ *declaration.sampler,
-					declareDescriptorVariable(_types.samplerType(), binding) });
-
-				addReflectionEntry("{ \"kind\": \"Sampler\", \"descriptor\": " + descriptorJson(binding)
-					+ ", \"embedded_sampler\": " + std::to_string(_embeddedSamplers.size() - 1)
-					+ ", \"name\": \"" + declaration.name + "\" }");
-			}
+			reserveSampler(*statement.declaration);
 		}
 
 		for (const StatementPtr& child: statement.children) {
@@ -4466,12 +4518,46 @@ namespace {
 		}
 	}
 
-	void Emitter::declareLocalSampler(const VariableDeclaration& declaration) {
+	void Emitter::reserveSampler(const VariableDeclaration& declaration) {
+		const bool known = std::any_of(_embeddedSamplers.begin(), _embeddedSamplers.end(),
+			[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
+		if (known) {
+			return;
+		}
+
+		const uint32_t binding = _nextBinding++;
+		_embeddedSamplers.push_back({ *declaration.sampler,
+			declareDescriptorVariable(_types.samplerType(), binding) });
+
+		addReflectionEntry("{ \"kind\": \"Sampler\", \"descriptor\": " + descriptorJson(binding)
+			+ ", \"embedded_sampler\": " + std::to_string(_embeddedSamplers.size() - 1)
+			+ ", \"name\": \"" + declaration.name + "\" }");
+	}
+
+	// A file-scope sampler is reserved, once the entry point's own are, if the body
+	// names it where no parameter or local of that name hides it. They go in the
+	// order the file declares them. Which embedded samplers an entry point lists is
+	// per entry point, so a sampler two of them name is listed by each.
+	void Emitter::reserveFileScopeSamplers() {
+		ScopeStack scopes(1);
+		for (const Parameter& parameter: _entryPoint->parameters) {
+			scopes.back().insert(parameter.name);
+		}
+		std::set<std::string> names;
+		collectUnshadowed(_entryPoint->body.get(), scopes, names);
+
+		const auto declaredAbove = _unit.globals.begin() + _entryPoint->globalsBefore;
+		for (auto global = _unit.globals.begin(); global != declaredAbove; ++global) {
+			if (global->sampler && names.count(global->name)) {
+				reserveSampler(*global);
+				_fileScopeSamplerBindings[global->name] = embeddedSamplerBinding(*global);
+			}
+		}
+	}
+
+	Binding Emitter::embeddedSamplerBinding(const VariableDeclaration& declaration) const {
 		const auto found = std::find_if(_embeddedSamplers.begin(), _embeddedSamplers.end(),
 			[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
-		if (found == _embeddedSamplers.end()) {
-			return;  // never named after its declaration, so Apple records no state for it
-		}
 
 		Binding bound;
 		bound.id = found->variable;
@@ -4480,7 +4566,17 @@ namespace {
 		bound.storageClass = spirv::StorageClass::UniformConstant;
 		bound.pointeeMsl = declaration.type;
 		bound.unnormalizedSampler = !declaration.sampler->normalizedCoordinates;
-		_bindings[declaration.name] = bound;
+		return bound;
+	}
+
+	void Emitter::declareLocalSampler(const VariableDeclaration& declaration) {
+		const bool reserved = std::any_of(_embeddedSamplers.begin(), _embeddedSamplers.end(),
+			[&](const EmbeddedSampler& other) { return other.state == *declaration.sampler; });
+		if (!reserved) {
+			return;  // never named after its declaration, so Apple records no state for it
+		}
+
+		_bindings[declaration.name] = embeddedSamplerBinding(declaration);
 	}
 
 	// A half texture is sampled as a float image and narrowed here, because the
@@ -4540,12 +4636,12 @@ namespace {
 		if (arguments[0]->kind != ExpressionKind::Identifier) {
 			throw CompileError("the first argument of sample has to name a sampler");
 		}
-		const auto samplerIt = _bindings.find(arguments[0]->name);
-		if (samplerIt == _bindings.end() || samplerIt->second.pointeeMsl.resource != ResourceKind::Sampler) {
+		const Binding* samplerBinding = findResourceBinding(arguments[0]->name);
+		if (!samplerBinding || samplerBinding->pointeeMsl.resource != ResourceKind::Sampler) {
 			throw CompileError("\"" + arguments[0]->name + "\" is not a sampler, and sample takes one "
 				"as its first argument");
 		}
-		const Binding& sampler = samplerIt->second;
+		const Binding& sampler = *samplerBinding;
 
 		const bool cube = texture.pointeeMsl.resource == ResourceKind::TextureCube;
 		if (cube && sampler.unnormalizedSampler) {

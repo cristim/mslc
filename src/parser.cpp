@@ -389,7 +389,10 @@ void Parser::parseDeclaration() {
 	// type is what marks one, since a bare "float kX" at file scope is not valid
 	// MSL and would otherwise be read as the start of a function's return type.
 	if (at(TokenKind::Identifier)
-		&& (isTypeQualifier(current().text) || addressSpaceFor(current().text))) {
+		&& (isTypeQualifier(current().text) || addressSpaceFor(current().text)
+			|| isResourceTypeName(current().text)
+			|| (current().text == "metal" && lookahead().kind == TokenKind::ColonColon
+				&& lookahead(2).kind == TokenKind::Identifier && isResourceTypeName(lookahead(2).text)))) {
 		_unit.globals.push_back(parseGlobalDeclaration());
 		return;
 	}
@@ -401,7 +404,29 @@ void Parser::parseDeclaration() {
 VariableDeclaration Parser::parseGlobalDeclaration() {
 	VariableDeclaration declaration;
 
-	declaration.type = parseType();
+	declaration.type = parseType(true);
+
+	// A sampler is the one resource lowered at file scope, as an embedded sampler.
+	// Apple takes it with or without constexpr, in the constant address space or
+	// none, and "thread" is accepted too, as for a local.
+	if (declaration.type.resource != ResourceKind::None) {
+		if (declaration.type.resource != ResourceKind::Sampler) {
+			throw CompileError("a file-scope " + typeName(declaration.type) + " is not lowered; a texture is "
+				"an entry point parameter");
+		}
+		if (declaration.type.addressSpace == AddressSpace::Device
+			|| declaration.type.addressSpace == AddressSpace::Threadgroup) {
+			throw CompileError("only a constant can be declared at file scope, and a "
+				+ std::string(addressSpaceName(declaration.type.addressSpace)) + " sampler is not one");
+		}
+		if (kind() != TokenKind::Identifier) {
+			throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+		}
+		declaration.name = std::string(advance().text);
+		declareName(declaration.name, "variable");
+		parseSamplerLocal(declaration);
+		return declaration;
+	}
 
 	if (declaration.type.addressSpace != AddressSpace::Constant) {
 		throw CompileError("only a constant can be declared at file scope, and a "
@@ -1324,6 +1349,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	FunctionDecl decl;
 	decl.stage = stage;
 	decl.line = line();
+	decl.globalsBefore = _unit.globals.size();
 
 	decl.returnType = parseType();
 
@@ -1550,7 +1576,8 @@ void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 			+ " is not lowered yet; a texture is an entry point parameter");
 	}
 	if (type.isPointer || type.arrayLength
-		|| (type.addressSpace != AddressSpace::None && type.addressSpace != AddressSpace::Thread)) {
+		|| (type.addressSpace != AddressSpace::None && type.addressSpace != AddressSpace::Thread
+			&& type.addressSpace != AddressSpace::Constant)) {
 		throw CompileError("a local sampler \"" + declaration.name + "\" with a pointer, an array "
 			"or an address space other than thread is not lowered yet");
 	}
