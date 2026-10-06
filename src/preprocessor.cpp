@@ -100,10 +100,28 @@ typedef float4x4 simd_float4x4;
 )SIMD";
 
 	constexpr char kBuiltinHeaderList[] = "<metal_stdlib>, <metal_matrix>, <simd/simd.h>, <simd/matrix_types.h>, "
-		"<simd/packed.h> and <simd/vector_types.h>";
+		"<simd/packed.h>, <simd/vector_types.h> and the <metal_stdlib> sub-headers <metal_texture>, "
+		"<metal_math>, <metal_common>, <metal_geometric>, <metal_integer>, <metal_relational>, "
+		"<metal_graphics> and <metal_types>";
+
+	// The <metal_stdlib> sub-headers whose declarations <metal_stdlib> already has built in.
+	// Each reads as <metal_stdlib> itself, so the two share one include-once state.
+	// Apple has the rest of the metal_* family; mslc does not declare what they hold.
+	constexpr const char* kStdlibSubHeaders[] = {"<metal_texture>", "<metal_math>", "<metal_common>",
+		"<metal_geometric>", "<metal_integer>", "<metal_relational>", "<metal_graphics>", "<metal_types>"};
+
+	// The built-in header a name stands for: a stdlib sub-header is <metal_stdlib>.
+	const std::string& builtinHeaderKey(const std::string& name) {
+		static const std::string stdlib = "<metal_stdlib>";
+		for (const char* sub : kStdlibSubHeaders) {
+			if (name == sub) { return stdlib; }
+		}
+		return name;
+	}
 
 	// The text of a header mslc has built in, or null for any other name.
-	const char* builtinHeaderText(const std::string& name) {
+	const char* builtinHeaderText(const std::string& rawName) {
+		const std::string& name = builtinHeaderKey(rawName);
 		if (name == "<metal_stdlib>") { return kMetalStdlibMacros; }
 		if (name == "<metal_matrix>") { return kMetalMatrixMacros; }
 		if (name == "<simd/simd.h>") { return kSimdHeader; }
@@ -888,7 +906,7 @@ void Preprocessor::includeDirective(Cursor& cursor, const std::vector<Token>& li
 		// The header's declarations are built in, but its macros are real, and a
 		// shader may test them. <simd/simd.h> also carries its typedefs, which the
 		// parser reads like any other source.
-		SourceFile*& builtin = _builtinHeaders[header.name];
+		SourceFile*& builtin = _builtinHeaders[builtinHeaderKey(header.name)];
 		if (!builtin) {
 			builtin = &loadText("<built-in>", "", text);
 		}
