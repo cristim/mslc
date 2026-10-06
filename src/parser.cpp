@@ -2654,7 +2654,7 @@ StatementPtr Parser::parseForStatement() {
 				declaration.initializer = parseExpression();
 			}
 			statement->forInitializer = std::move(declaration);
-		} else {
+		} else if (!at(TokenKind::Semicolon)) {
 			statement->expression = parseExpression();
 		}
 	}
