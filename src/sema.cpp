@@ -1555,6 +1555,203 @@ namespace {
 		Id valueType = InvalidId;
 	};
 
+
+	// Every call a statement or an expression makes, by name, in source order.
+	void collectCalls(const Expression& expression, std::vector<const Expression*>& out) {
+		if (expression.kind == ExpressionKind::Call) {
+			out.push_back(&expression);
+		}
+
+		for (const ExpressionPtr* child: { &expression.left, &expression.right }) {
+			if (*child) {
+				collectCalls(**child, out);
+			}
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			collectCalls(*argument, out);
+		}
+		for (const InitializerElement& element: expression.elements) {
+			collectCalls(*element.value, out);
+		}
+	}
+
+	void collectCalls(const VariableDeclaration& declaration, std::vector<const Expression*>& out) {
+		if (declaration.initializer) {
+			collectCalls(*declaration.initializer, out);
+		}
+	}
+
+	void collectCalls(const Statement& statement, std::vector<const Expression*>& out) {
+		for (const StatementPtr& child: statement.children) {
+			collectCalls(*child, out);
+		}
+		for (const ExpressionPtr* expression: { &statement.expression, &statement.forCondition,
+			&statement.forIncrement, &statement.whileCondition }) {
+			if (*expression) {
+				collectCalls(**expression, out);
+			}
+		}
+		if (statement.declaration) {
+			collectCalls(*statement.declaration, out);
+		}
+		if (statement.forInitializer) {
+			collectCalls(*statement.forInitializer, out);
+		}
+		for (const StatementPtr* branch: { &statement.thenBranch, &statement.elseBranch,
+			&statement.forBody, &statement.whileBody }) {
+			if (*branch) {
+				collectCalls(**branch, out);
+			}
+		}
+	}
+
+	bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
+		if (a.parameters.size() != b.parameters.size()) {
+			return false;
+		}
+
+		for (size_t i = 0; i < a.parameters.size(); ++i) {
+			const Type& x = a.parameters[i].type;
+			const Type& y = b.parameters[i].type;
+			if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
+				|| x.isPacked != y.isPacked || x.namedType != y.namedType) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	// Everything about the helper functions that the source alone decides, checked
+	// for all of them whether or not an entry point reaches one: the declarations
+	// of a name agree, a call names a function declared above it with the right
+	// number of arguments, and no function reaches itself. Apple accepts a
+	// recursive call, but SPIR-V for Vulkan forbids one, and a module with it
+	// fails validation, so it is refused here with the cycle named.
+	void validateHelpers(const TranslationUnit& unit) {
+		std::map<std::string, const FunctionDecl*> first;
+		std::map<std::string, const FunctionDecl*> defined;
+
+		for (const FunctionDecl& helper: unit.helpers) {
+			const auto declared = [&](const Type& type) {
+				if (!type.namedType.empty() && !unit.findStruct(type.namedType)) {
+					throw CompileError("undeclared type \"" + type.namedType + "\" in helper function \""
+						+ helper.name + "\"");
+				}
+			};
+			declared(helper.returnType);
+			for (const Parameter& parameter: helper.parameters) {
+				declared(parameter.type);
+			}
+
+			if (findMathBuiltin(helper.name)) {
+				throw CompileError("helper function \"" + helper.name + "\" has the name of a builtin "
+					"function; Apple's compiler reports a call that matches both as ambiguous, "
+					"which mslc does not model");
+			}
+			if (unit.findFunction(helper.name)) {
+				throw CompileError("\"" + helper.name + "\" names both an entry point and a helper function");
+			}
+
+			const auto previous = first.emplace(helper.name, &helper);
+			if (!previous.second) {
+				if (!sameParameterTypes(*previous.first->second, helper)) {
+					throw CompileError("overloading \"" + helper.name + "\" is not lowered yet; Apple "
+						"accepts a function declared again with other parameters, mslc takes one "
+						"signature per name");
+				}
+
+				const Type& was = previous.first->second->returnType;
+				const Type& now = helper.returnType;
+				if (was.scalar != now.scalar || was.vectorWidth != now.vectorWidth
+					|| was.matrixColumns != now.matrixColumns || was.namedType != now.namedType) {
+					throw CompileError("\"" + helper.name + "\" is declared again with a different "
+						"return type");
+				}
+			}
+
+			if (helper.body && !defined.emplace(helper.name, &helper).second) {
+				throw CompileError("redefinition of \"" + helper.name + "\"");
+			}
+		}
+
+		std::map<std::string, std::set<std::string>> calls;
+		const auto check = [&](const FunctionDecl& caller) {
+			std::vector<const Expression*> found;
+			collectCalls(*caller.body, found);
+
+			for (const Expression* call: found) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+
+				const std::string& name = call->left->name;
+				if (unit.findFunction(name)) {
+					throw CompileError("cannot call the entry point \"" + name + "\"");
+				}
+
+				const auto declared = first.find(name);
+				if (declared == first.end()) {
+					continue;
+				}
+
+				if (declared->second->order > caller.order) {
+					throw CompileError("\"" + name + "\" is called before it is declared; declare it "
+						"above its first use");
+				}
+				if (call->arguments.size() != declared->second->parameters.size()) {
+					throw CompileError("call to \"" + name + "\" passes " + std::to_string(call->arguments.size())
+						+ " arguments, and it takes " + std::to_string(declared->second->parameters.size()));
+				}
+				if (!defined.count(name)) {
+					throw CompileError("\"" + name + "\" is declared but never defined");
+				}
+
+				if (caller.isHelper()) {
+					calls[caller.name].insert(name);
+				}
+			}
+		};
+
+		for (const FunctionDecl& function: unit.functions) {
+			check(function);
+		}
+		for (const auto& [name, definition]: defined) {
+			check(*definition);
+		}
+
+		enum class Visit { Open, Done };
+		std::map<std::string, Visit> state;
+		std::vector<std::string> path;
+		const auto visit = [&](const auto& self, const std::string& name) -> void {
+			const auto known = state.find(name);
+			if (known != state.end()) {
+				if (known->second == Visit::Done) {
+					return;
+				}
+
+				std::string cycle;
+				const auto start = std::find(path.begin(), path.end(), name);
+				for (auto it = start; it != path.end(); ++it) {
+					cycle += *it + " -> ";
+				}
+				throw CompileError("recursive call: " + cycle + name + "; SPIR-V for Vulkan forbids "
+					"recursion (Apple's compiler accepts it)");
+			}
+
+			state[name] = Visit::Open;
+			path.push_back(name);
+			for (const std::string& callee: calls[name]) {
+				self(self, callee);
+			}
+			path.pop_back();
+			state[name] = Visit::Done;
+		};
+		for (const auto& [name, definition]: defined) {
+			visit(visit, name);
+		}
+	}
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -1635,6 +1832,23 @@ namespace {
 		// The [[stage_in]] parameter and one Input per field.
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
+
+		// A helper function of the unit, as one module holds it: emitted once, on
+		// the first call from an entry point or from another helper that is emitted.
+		struct HelperFunction {
+			const FunctionDecl* definition = nullptr;
+			Id id = InvalidId;
+			Id returnType = InvalidId;
+			std::vector<Id> parameterTypes;
+			Id type = InvalidId;
+		};
+		std::map<std::string, HelperFunction> _helpers;
+		// Helpers called and not yet emitted. A body cannot be emitted while the
+		// function that calls it is half written, so they wait for its end.
+		std::vector<HelperFunction*> _helperQueue;
+		std::map<std::vector<Id>, Id> _functionTypes;
+		// The helper whose body is being emitted, or null inside an entry point.
+		const FunctionDecl* _helper = nullptr;
 
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
@@ -1768,6 +1982,11 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
+		HelperFunction* findHelper(const Expression& call);
+		Id emitHelperCall(const Expression& call, HelperFunction& helper);
+		void emitHelper(const HelperFunction& helper);
+		void emitHelperReturn(const Statement& statement);
+		bool returnsVoid(const FunctionDecl& function) const;
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
@@ -3385,15 +3604,148 @@ namespace {
 			throw CompileError("only a direct function call is supported");
 		}
 
-		// The parser takes no function but an entry point, so a call cannot name a
-		// user function a builtin would shadow.
+		// A helper never has the name of a builtin, which validateHelpers refuses.
+		if (HelperFunction* helper = findHelper(expression)) {
+			if (returnsVoid(*helper->definition)) {
+				throw CompileError("a call to \"" + expression.left->name + "\" returns void and has "
+					"no value");
+			}
+
+			return emitHelperCall(expression, *helper);
+		}
+
 		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
-				"recognises, and user functions are not lowered yet");
+				"recognises, and it is not a function declared in this file");
 		}
 
 		return emitMathBuiltin(*builtin, expression.arguments);
+	}
+
+	Emitter::HelperFunction* Emitter::findHelper(const Expression& call) {
+		if (call.left->kind != ExpressionKind::Identifier) {
+			return nullptr;
+		}
+
+		const auto found = _helpers.find(call.left->name);
+		return found == _helpers.end() ? nullptr : &found->second;
+	}
+
+	bool Emitter::returnsVoid(const FunctionDecl& function) const {
+		return function.returnType.scalar == ScalarKind::Void && function.returnType.namedType.empty();
+	}
+
+	// The arguments are evaluated left to right and converted to the parameter
+	// types as an initialiser would be; Apple does the same and refuses a vector of
+	// another width. A helper has no side effects an argument could expose, since
+	// it takes values only and an assignment is not an expression here, so the
+	// order is not observable.
+	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper) {
+		const FunctionDecl& definition = *helper.definition;
+
+		if (helper.id == InvalidId) {
+			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
+			std::vector<Id> signature { helper.returnType };
+			for (const Parameter& parameter: definition.parameters) {
+				helper.parameterTypes.push_back(declaredTypeOf(parameter.type));
+				signature.push_back(helper.parameterTypes.back());
+			}
+
+			// One OpTypeFunction per distinct signature: a duplicate fails validation.
+			const auto slot = _functionTypes.emplace(signature, InvalidId);
+			if (slot.second) {
+				slot.first->second = _builder.emitDecl(spirv::OpTypeFunction, signature);
+			}
+
+			helper.type = slot.first->second;
+			helper.id = _builder.nextId();
+			_helperQueue.push_back(&helper);
+		}
+
+		std::vector<uint32_t> operands { helper.id };
+		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			const Id value = emitExpression(*call.arguments[i]);
+			try {
+				operands.push_back(convertImplicit(value, helper.parameterTypes[i]));
+			} catch (const CompileError& error) {
+				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \""
+					+ definition.name + "\" cannot be converted to the parameter type "
+					+ typeName(definition.parameters[i].type) + ": " + error.what());
+			}
+		}
+
+		return _builder.emitTyped(spirv::OpFunctionCall, helper.returnType, operands);
+	}
+
+	// A parameter is a value the body may assign to, as in C++, and the caller's
+	// copy must not change, so each named one is copied into a variable of the
+	// helper's own and the body reads and writes that.
+	void Emitter::emitHelper(const HelperFunction& helper) {
+		const FunctionDecl& definition = *helper.definition;
+
+		_helper = &definition;
+		_bindings.clear();
+		_terminated = false;
+		_controlDepth = 0;
+
+		_builder.setSection(spirv::Section::Functions);
+		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.id,
+			{ kFunctionControlNone, helper.type });
+
+		std::vector<Id> values;
+		for (const Id type: helper.parameterTypes) {
+			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, type, { }));
+		}
+
+		beginBlock(_builder.nextId());
+		for (size_t i = 0; i < values.size(); ++i) {
+			const Parameter& parameter = definition.parameters[i];
+			if (parameter.name.empty()) {
+				continue;
+			}
+
+			const Id type = helper.parameterTypes[i];
+			const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(spirv::StorageClass::Function, type),
+				{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+			_builder.emit(spirv::OpStore, { variable, values[i] });
+			bindLocal(parameter.name, variable, type, parameter.type);
+		}
+
+		emitFunctionBody(*definition.body);
+
+		// A path that reaches the end of a function returning a value is undefined
+		// in C++ and Apple only warns for it, so it is not made up a value. A block
+		// left open by a structured if whose branches all return is dead, and this
+		// terminates that too.
+		if (!_terminated) {
+			terminate(returnsVoid(definition) ? spirv::OpReturn : spirv::OpUnreachable, { });
+		}
+		_builder.emit(spirv::OpFunctionEnd, { });
+
+		_helper = nullptr;
+	}
+
+	void Emitter::emitHelperReturn(const Statement& statement) {
+		const std::string quoted = "\"" + _helper->name + "\"";
+
+		if (returnsVoid(*_helper)) {
+			if (statement.expression) {
+				throw CompileError(quoted + " returns void, so its return cannot carry a value");
+			}
+
+			terminate(spirv::OpReturn, { });
+			return;
+		}
+
+		if (!statement.expression) {
+			throw CompileError(quoted + " returns " + typeName(_helper->returnType)
+				+ ", so a return needs a value");
+		}
+
+		const Id value = emitExpression(*statement.expression);
+		terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(_helper->returnType)) });
 	}
 
 	Id Emitter::emitMathBuiltin(const MathBuiltin& builtin,
@@ -5125,6 +5477,11 @@ namespace {
 	// Every entry point is a void function, so a returned value is written to
 	// the Output variables and the function returns nothing.
 	void Emitter::emitReturn(const Statement& statement) {
+		if (_helper) {
+			emitHelperReturn(statement);
+			return;
+		}
+
 		if (!statement.expression) {
 			if (!_outputs.empty()) {
 				throw CompileError("\"" + _entryPoint->name + "\" returns "
@@ -5446,6 +5803,14 @@ namespace {
 			return;
 		}
 
+		// A call whose value is dropped, which is the only way to call a void helper.
+		if (expression.kind == ExpressionKind::Call) {
+			if (HelperFunction* helper = findHelper(expression)) {
+				emitHelperCall(expression, *helper);
+				return;
+			}
+		}
+
 		// An assignment yields an address rather than a value, so it is
 		// handled here rather than through emitExpression.
 		if (expression.kind != ExpressionKind::Assign) {
@@ -5751,6 +6116,12 @@ namespace {
 			terminate(spirv::OpReturn, { });
 		}
 		_builder.emit(spirv::OpFunctionEnd, { });
+
+		// The helpers this entry point called, and the ones those called.
+		for (size_t i = 0; i < _helperQueue.size(); ++i) {
+			emitHelper(*_helperQueue[i]);
+		}
+		_helperQueue.clear();
 	}
 
 	// Emits the whole module: the capabilities, the memory model and the
@@ -5794,6 +6165,13 @@ namespace {
 		// derived from the instruction's word count and is not in the binary.
 		// Writing one is read as a parameter type, which shows up as "Id is 0".
 		const Id functionType = _builder.emitDecl(spirv::OpTypeFunction, { _voidType });
+		_functionTypes[{ _voidType }] = functionType;
+
+		for (const FunctionDecl& helper: _unit.helpers) {
+			if (helper.body) {
+				_helpers[helper.name].definition = &helper;
+			}
+		}
 
 		// One reflection entry per entry point, in the order they were selected.
 		std::string document = "{\n";
@@ -5869,6 +6247,7 @@ namespace {
 
 std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
 	const std::vector<const FunctionDecl*>& entryPoints, const ModuleOptions& options) {
+	validateHelpers(unit);
 	TypeTable types(builder, unit);
 	Emitter emitter(builder, unit, entryPoints, options, types);
 	return emitter.run();

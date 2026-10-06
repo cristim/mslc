@@ -385,6 +385,10 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
+	if (tryParseHelperFunction()) {
+		return;
+	}
+
 	// A file-scope constant. An address space or a type qualifier ahead of the
 	// type is what marks one, since a bare "float kX" at file scope is not valid
 	// MSL and would otherwise be read as the start of a function's return type.
@@ -398,7 +402,97 @@ void Parser::parseDeclaration() {
 	}
 
 	throw CompileError("unexpected \"" + std::string(current().text) + "\" at top level; "
-		"expected a struct, kernel, vertex or fragment declaration");
+		"expected a struct, kernel, vertex, fragment or helper function declaration");
+}
+
+bool Parser::tryParseHelperFunction() {
+	if (kind() != TokenKind::Identifier) {
+		return false;
+	}
+
+	if (atKeyword("template")) {
+		throw CompileError("a template is not lowered yet");
+	}
+
+	const size_t start = _position;
+	FunctionDecl decl;
+	decl.line = line();
+
+	try {
+		// inline, static and constexpr in any order, ahead of the return type.
+		while (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+			advance();
+		}
+
+		decl.returnType = parseType();
+		if (kind() != TokenKind::Identifier) {
+			_position = start;
+			return false;
+		}
+
+		decl.name = std::string(advance().text);
+		if (!at(TokenKind::LParen)) {
+			_position = start;
+			return false;
+		}
+	} catch (const CompileError&) {
+		_position = start;
+		return false;
+	}
+
+	advance();
+	decl.order = _functionOrder++;
+
+	const std::string quoted = "helper function \"" + decl.name + "\"";
+	const Type& returned = decl.returnType;
+	if (returned.isPointer || returned.arrayLength || returned.resource != ResourceKind::None
+		|| returned.addressSpace != AddressSpace::None) {
+		throw CompileError(quoted + " returns a pointer, an array, a texture or sampler, or a value "
+			"in an address space, which is not lowered yet; a helper returns a scalar, vector, "
+			"matrix or struct value");
+	}
+
+	Type builtin;
+	if (isTypeName(decl.name, builtin) || isSimdVectorName(decl.name, builtin)) {
+		throw CompileError(quoted + " has the name of a builtin type");
+	}
+	declareName(decl.name, "function");
+
+	// "(void)" is an empty parameter list.
+	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) {
+		advance();
+	}
+
+	std::set<std::string> names;
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		decl.parameters.push_back(parseParameter(decl.name));
+		const Parameter& parameter = decl.parameters.back();
+		if (!parameter.name.empty() && !names.insert(parameter.name).second) {
+			throw CompileError("redefinition of parameter \"" + parameter.name + "\" of " + quoted);
+		}
+		if (at(TokenKind::Assign)) {
+			throw CompileError("a default argument is not lowered yet (parameter \"" + parameter.name
+				+ "\" of " + quoted + ")");
+		}
+		if (!match(TokenKind::Comma)) {
+			break;
+		}
+	}
+
+	expect(TokenKind::RParen, "to close a parameter list");
+
+	if (at(TokenKind::LBracket)) {
+		throw CompileError("attributes on " + quoted + " are not lowered yet");
+	}
+
+	if (match(TokenKind::Semicolon)) {
+		_unit.helpers.push_back(std::move(decl));
+		return true;
+	}
+
+	decl.body = parseCompoundStatement();
+	_unit.helpers.push_back(std::move(decl));
+	return true;
 }
 
 VariableDeclaration Parser::parseGlobalDeclaration() {
@@ -1189,8 +1283,9 @@ void Parser::parseResourceType(Type& type) {
 	type.scalar = component == "half" ? ScalarKind::Half : ScalarKind::Float;
 }
 
-Parameter Parser::parseParameter() {
+Parameter Parser::parseParameter(const std::string& helperName) {
 	Parameter param;
+	const bool helper = !helperName.empty();
 
 	param.type = parseType(true);
 
@@ -1207,12 +1302,42 @@ Parameter Parser::parseParameter() {
 	}
 	param.isReference = match(TokenKind::Ampersand);
 
-	if (kind() != TokenKind::Identifier) {
+	// A prototype and an unused parameter may leave the name out.
+	const bool unnamed = helper && (at(TokenKind::Comma) || at(TokenKind::RParen));
+	if (!unnamed && kind() != TokenKind::Identifier) {
 		throw CompileError("expected a parameter name, found " + std::string(tokenKindName(kind())));
 	}
 
-	param.name = std::string(advance().text);
-	rejectShadowing(param.name);
+	if (!unnamed) {
+		param.name = std::string(advance().text);
+		rejectShadowing(param.name);
+	}
+
+	if (helper) {
+		const std::string what = "parameter \"" + param.name + "\" of helper function \"" + helperName + "\" ";
+		if (param.type.resource != ResourceKind::None) {
+			throw CompileError(what + "is a texture or sampler, which a helper function does not take yet");
+		}
+		if (param.type.isPointer) {
+			throw CompileError(what + "is a pointer, which a helper function does not take yet; "
+				"it takes scalar, vector, matrix and struct values");
+		}
+		if (param.isReference) {
+			throw CompileError(what + "is a reference, which a helper function does not take yet; "
+				"it takes scalar, vector, matrix and struct values");
+		}
+		if (param.type.arrayLength || (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket)) {
+			throw CompileError(what + "is an array, which a helper function does not take yet");
+		}
+		if (param.type.addressSpace != AddressSpace::None) {
+			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
+				+ " address space, which a helper function does not take yet");
+		}
+		if (at(TokenKind::LBracket)) {
+			throw CompileError(what + "has an attribute, which only an entry point's parameter can have");
+		}
+		return param;
+	}
 
 	if (param.type.resource != ResourceKind::None
 		&& (param.type.isPointer || param.type.arrayLength
@@ -1350,6 +1475,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	decl.stage = stage;
 	decl.line = line();
 	decl.globalsBefore = _unit.globals.size();
+	decl.order = _functionOrder++;
 
 	decl.returnType = parseType();
 
