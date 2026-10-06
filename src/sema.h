@@ -120,6 +120,17 @@ public:
 	// for a width of 1. InvalidId when the id is not a vector this table created.
 	spirv::Id withWidth(spirv::Id vectorType, uint32_t width);
 
+	// What a struct type id is: which declared struct it is a form of, the member
+	// types that form has, and the member types of the plain value form. They
+	// differ for a packed vector, which a laid-out form holds as an array of its
+	// components. False when the id is not a struct this table created.
+	struct StructForm {
+		std::string name;
+		std::vector<spirv::Id> declared;
+		std::vector<spirv::Id> value;
+	};
+	bool structForm(spirv::Id type, StructForm& out);
+
 	// True when the type is a vector or a struct, which a single scalar value
 	// cannot stand in for.
 	bool isAggregate(spirv::Id type) const;

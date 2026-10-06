@@ -789,6 +789,38 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	return 0;
 }
 
+bool TypeTable::structForm(spirv::Id type, StructForm& out) {
+	bool laidOut = true;
+	const std::string* name = nullptr;
+	for (const auto& [key, id]: _structs) {
+		if (id == type) {
+			name = &key;
+		}
+	}
+	for (const auto& [key, id]: _elementStructs) {
+		if (id == type) {
+			name = &key;
+		}
+	}
+	for (const auto& [key, id]: _valueStructs) {
+		if (id == type) {
+			name = &key;
+			laidOut = false;
+		}
+	}
+	if (!name) {
+		return false;
+	}
+
+	std::vector<uint32_t> offsets;
+	uint32_t size = 0;
+	out.name = *name;
+	out.value.clear();
+	structMembersFor(out.name, out.value, offsets, size);
+	out.declared = laidOut ? storageTypesFor(out.name, out.value) : out.value;
+	return true;
+}
+
 bool TypeTable::isAggregate(spirv::Id type) const {
 	if (_widthOfVector.count(type) > 0 || _matrixInfo.count(type) > 0) {
 		return true;
@@ -1623,6 +1655,7 @@ namespace {
 		Id loadFrom(Id pointer, Id pointeeType);
 		Id promotedTo(uint32_t components) const;
 		Id convert(Id value, Id fromType, Id toType);
+		Id convertStruct(Id value, const TypeTable::StructForm& from, const TypeTable::StructForm& to, Id toType);
 		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
@@ -1728,9 +1761,51 @@ namespace {
 		return cached->second;
 	}
 
+	// A struct is declared once as a value and once as a buffer's laid-out
+	// element, so a copy between a local and a buffer is two types for one struct.
+	// OpBitcast takes no struct, so the copy is member by member: the members are
+	// pulled out of the source and the target is built from them, with a packed
+	// vector turned between the array of components a laid-out struct stores and
+	// the vector a local holds.
+	Id Emitter::convertStruct(Id value, const TypeTable::StructForm& from,
+		const TypeTable::StructForm& to, Id toType) {
+		if (from.name != to.name) {
+			throw CompileError("the struct " + from.name + " is used where the struct " + to.name
+				+ " is expected, and mslc converts no struct to another");
+		}
+
+		std::vector<uint32_t> members;
+		for (size_t i = 0; i < from.declared.size(); ++i) {
+			Id member = _builder.emitTyped(spirv::OpCompositeExtract, from.declared[i],
+				{ value, static_cast<uint32_t>(i) });
+
+			if (from.declared[i] != to.declared[i]) {
+				const Id vector = from.value[i];
+				const Id component = _types.componentOf(vector);
+				const uint32_t width = _types.vectorWidth(vector);
+				std::vector<uint32_t> parts;
+				for (uint32_t lane = 0; lane < width; ++lane) {
+					parts.push_back(_builder.emitTyped(spirv::OpCompositeExtract, component,
+						{ member, lane }));
+				}
+				member = _builder.emitTyped(spirv::OpCompositeConstruct, to.declared[i], parts);
+			}
+
+			members.push_back(member);
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, members);
+	}
+
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
 		if (fromType == toType) {
 			return value;
+		}
+
+		TypeTable::StructForm fromForm;
+		TypeTable::StructForm toForm;
+		if (_types.structForm(fromType, fromForm) && _types.structForm(toType, toForm)) {
+			return convertStruct(value, fromForm, toForm, toType);
 		}
 
 		// Every convert opcode takes a scalar or a vector, so a matrix of another
@@ -4541,17 +4616,12 @@ namespace {
 		const Id declared = declaredTypeOf(_entryPoint->returnType);
 
 		if (!_entryPoint->returnType.namedType.empty()) {
-			if (_builder.typeOf(value) != declared) {
-				const std::string spelled = typeName(_entryPoint->returnType);
-				throw CompileError("\"" + _entryPoint->name + "\" returns " + spelled + ", and mslc "
-					"returns a local of that type; this return's value is another struct, or one "
-					"read straight from a buffer, whose layout differs");
-			}
+			const Id copy = convertImplicit(value, declared);
 
 			for (size_t i = 0; i < _outputs.size(); ++i) {
 				const StageVariable& output = _outputs[i];
 				const Id field = _builder.emitTyped(spirv::OpCompositeExtract, output.valueType,
-					{ value, static_cast<uint32_t>(i) });
+					{ copy, static_cast<uint32_t>(i) });
 				_builder.emit(spirv::OpStore, { output.variable,
 					convert(field, output.valueType, output.interfaceType) });
 			}
@@ -4651,13 +4721,6 @@ namespace {
 		Id initial = InvalidId;
 		if (declaration.initializer) {
 			const Id initializer = emitExpression(*declaration.initializer);
-			// convert() has no struct form and would emit an OpBitcast between them.
-			if (!declaration.type.namedType.empty() && _builder.typeOf(initializer) != typeId) {
-				throw CompileError("local \"" + declaration.name + "\" of type "
-					+ typeName(declaration.type) + " is initialised from another struct, or from one "
-					"read straight from a buffer, whose layout differs; mslc does not copy between "
-					"them yet");
-			}
 			initial = convertImplicit(initializer, typeId);
 		} else {
 			initial = _types.zero(typeId);
