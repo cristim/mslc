@@ -1,4 +1,6 @@
 // EXPECT: valid
+// DISASM-LOOP-MERGE-REACHED: yes
+// A loop with no condition leaves only through the break, so the merge block must be a branch target.
 kernel void break_in_conditionless_for(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]])
 {
     uint n = 0u;
