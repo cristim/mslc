@@ -1672,6 +1672,8 @@ namespace {
 			Id id = InvalidId;
 		};
 		ElementIndex elementIndex(const Expression& expression, uint32_t width);
+		Id wordIndex(Id index, const char* what);
+		Id stepIndex(const Expression& expression, const char* what);
 		Id emitMember(const Expression& expression);
 		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
 
@@ -2091,8 +2093,8 @@ namespace {
 				std::to_string(expression.arguments.size()));
 		}
 
-		const Id index = emitExpression(*expression.arguments[0]);
-		_builder.setType(index, _uintType);
+		const Id index = stepIndex(*expression.arguments[0],
+			binding.bufferPointeeType != InvalidId ? "buffer element" : "matrix column");
 
 		// A buffer is reached through its address rather than a descriptor, so
 		// the access chain starts from the loaded pointer. The result is a
@@ -2130,7 +2132,7 @@ namespace {
 	}
 
 	// An index whose left side is a vector, as opposed to a buffer or a matrix. A
-	// buffer pointer and a local matrix are the names whose index is one access
+	// buffer pointer and a matrix are the names whose index is one access
 	// chain step; anything else that is indexed is a value, and the element access
 	// finds out whether it is a vector.
 	bool Emitter::isElementAccess(const Expression& expression) const {
@@ -2143,8 +2145,7 @@ namespace {
 		}
 
 		const auto it = _bindings.find(expression.left->name);
-		return it != _bindings.end() && it->second.bufferPointeeType == InvalidId
-			&& !_types.matrixInfo(it->second.pointeeType);
+		return it != _bindings.end() && !it->second.isBuffer && !_types.matrixInfo(it->second.pointeeType);
 	}
 
 	// The index of a literal, with a sign. Anything else is not known here and is
@@ -2185,37 +2186,43 @@ namespace {
 			return { static_cast<uint32_t>(*literal), InvalidId };
 		}
 
-		Id index = emitExpression(expression);
+		return { std::nullopt, wordIndex(emitExpression(expression), "vector") };
+	}
+
+	// An index operand as a 32-bit integer id. Apple takes any integer, or a bool,
+	// and nothing else: a float, a vector, a struct or a pointer is not an index.
+	Id Emitter::wordIndex(Id index, const char* what) {
 		const Id type = _builder.typeOf(index);
 		if (type == _boolType) {
-			return { std::nullopt, convert(index, type, _uintType) };
+			return convert(index, type, _uintType);
 		}
 
 		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) == 0 || _types.isFloat(type)) {
-			throw CompileError("the index of a vector has to be an integer or a bool");
+			throw CompileError(std::string("the index of a ") + what + " has to be an integer or a bool");
 		}
 
-		return { std::nullopt, _types.bitWidth(type) == 32 ? index : convert(index, type, _uintType) };
+		return _types.bitWidth(type) == 32 ? index : convert(index, type, _uintType);
+	}
+
+	Id Emitter::stepIndex(const Expression& expression, const char* what) {
+		const Id index = wordIndex(emitExpression(expression), what);
+		_builder.setType(index, _uintType);
+		return index;
 	}
 
 	// v[i] where v is a vector: one component of it. As a value it is taken out of
 	// the loaded vector. As a place it is an access chain into the vector's own
 	// storage, so a store changes that lane and no other.
 	Id Emitter::emitElementAccess(const Expression& expression, bool asAddress) {
-		if (expression.arguments.size() != 1) {
-			throw CompileError("expected exactly one index, found " +
-				std::to_string(expression.arguments.size()));
-		}
-
 		const Expression& base = *expression.left;
-		const std::string notAVector = "only a vector is indexed here; a matrix is indexed through a "
-			"local or a parameter, and anything else is not a vector";
+		const std::string notAVector = "only an element of a vector is lowered here; a matrix element "
+			"of a buffer or a struct member is not lowered yet";
 
 		if (!asAddress) {
 			const Id vector = emitExpression(base);
 			const Id type = _builder.typeOf(vector);
 			const Id component = _types.componentOf(type);
-			if (_types.matrixInfo(type) || component == InvalidId) {
+			if (component == InvalidId) {
 				throw CompileError(notAVector);
 			}
 
@@ -2238,7 +2245,7 @@ namespace {
 		}
 
 		const Id component = _types.componentOf(vectorType);
-		if (_types.matrixInfo(vectorType) || component == InvalidId) {
+		if (component == InvalidId) {
 			throw CompileError(notAVector);
 		}
 
@@ -2505,9 +2512,7 @@ namespace {
 						"be indexed as an array");
 				}
 
-				const Id index = emitExpression(*step.index);
-				_builder.setType(index, _uintType);
-				operands.push_back(index);
+				operands.push_back(stepIndex(*step.index, "buffer element"));
 				continue;
 			}
 
