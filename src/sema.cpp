@@ -444,7 +444,7 @@ namespace {
 
 	// The identifiers a body names where no parameter or local of that name is in
 	// scope, which is where a file-scope name is what they refer to. A local hides
-	// the file-scope name from its declaration on, so a use above it still counts.
+	// the file-scope name from its declaration on, its own initialiser included.
 	using ScopeStack = std::vector<std::set<std::string>>;
 
 	void collectUnshadowed(const Expression* expression, const ScopeStack& scopes, std::set<std::string>& names) {
@@ -470,8 +470,9 @@ namespace {
 		}
 		for (const std::optional<VariableDeclaration>* declaration: { &statement->declaration, &statement->forInitializer }) {
 			if (*declaration) {
-				collectUnshadowed((*declaration)->initializer.get(), scopes, names);
+				// The name is in scope in its own initialiser.
 				scopes.back().insert((*declaration)->name);
+				collectUnshadowed((*declaration)->initializer.get(), scopes, names);
 			}
 		}
 		for (const StatementPtr& child: statement->children) {
@@ -4544,10 +4545,11 @@ namespace {
 		std::set<std::string> names;
 		collectUnshadowed(_entryPoint->body.get(), scopes, names);
 
-		for (const VariableDeclaration& global: _unit.globals) {
-			if (global.sampler && names.count(global.name)) {
-				reserveSampler(global);
-				_fileScopeSamplerBindings[global.name] = embeddedSamplerBinding(global);
+		const auto declaredAbove = _unit.globals.begin() + _entryPoint->globalsBefore;
+		for (auto global = _unit.globals.begin(); global != declaredAbove; ++global) {
+			if (global->sampler && names.count(global->name)) {
+				reserveSampler(*global);
+				_fileScopeSamplerBindings[global->name] = embeddedSamplerBinding(*global);
 			}
 		}
 	}

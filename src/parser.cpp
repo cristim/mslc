@@ -1347,6 +1347,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	FunctionDecl decl;
 	decl.stage = stage;
 	decl.line = line();
+	decl.globalsBefore = _unit.globals.size();
 
 	decl.returnType = parseType();
 

@@ -362,6 +362,10 @@ struct FunctionDecl {
 	std::vector<Parameter> parameters;
 	StatementPtr body;
 	size_t line = 0;
+
+	// How many of the unit's globals the source declares above this function: the
+	// ones its body can name.
+	size_t globalsBefore = 0;
 };
 
 struct TranslationUnit {
