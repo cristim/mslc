@@ -120,6 +120,8 @@ typedef float4x4 simd_float4x4;
 		std::vector<size_t> lineStarts;
 		std::vector<Token> tokens;
 		bool once = false;
+		// Read at least once, by #include or #import.
+		bool included = false;
 	};
 
 	struct Loc {
@@ -354,7 +356,7 @@ typedef float4x4 simd_float4x4;
 	}
 
 	enum class Directive {
-		Define, Undef, Include, If, Ifdef, Ifndef, Elif, Else, Endif, Line, Error, Warning,
+		Define, Undef, Include, Import, If, Ifdef, Ifndef, Elif, Else, Endif, Line, Error, Warning,
 		Pragma, Unsupported, Unknown,
 	};
 
@@ -367,7 +369,7 @@ typedef float4x4 simd_float4x4;
 			{ "endif", Directive::Endif }, { "line", Directive::Line },
 			{ "error", Directive::Error }, { "warning", Directive::Warning },
 			{ "pragma", Directive::Pragma },
-			{ "include_next", Directive::Unsupported }, { "import", Directive::Unsupported },
+			{ "import", Directive::Import }, { "include_next", Directive::Unsupported },
 			{ "ident", Directive::Unsupported }, { "sccs", Directive::Unsupported },
 			{ "assert", Directive::Unsupported }, { "unassert", Directive::Unsupported },
 		};
@@ -519,7 +521,8 @@ private:
 	void directive(Cursor& cursor);
 	void defineMacro(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
 	void undefMacro(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
-	void includeDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
+	bool admit(SourceFile& file, bool import);
+	void includeDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at, bool import);
 	void lineDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
 	void pragmaDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
 	bool evaluateCondition(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
@@ -531,9 +534,12 @@ private:
 		bool angled = false;
 		std::string name;
 	};
-	Header parseHeaderName(const std::vector<Token>& line, size_t first, const Loc& at) const;
-	SourceFile* resolveQuoted(const SourceFile& includer, const std::string& name, const Loc& at);
-	SourceFile* loadFile(const fs::path& path, const std::string& displayPath, const Loc& at);
+	Header parseHeaderName(const std::vector<Token>& line, size_t first, const Loc& at,
+		const std::string& directive) const;
+	SourceFile* resolveQuoted(const SourceFile& includer, const std::string& name, const Loc& at,
+		const std::string& directive);
+	SourceFile* loadFile(const fs::path& path, const std::string& displayPath, const Loc& at,
+		const std::string& directive);
 
 	// Macro expansion
 	bool isDefinedName(std::string_view name, const Loc& at) const;
@@ -693,11 +699,12 @@ PPTok Preprocessor::synthesize(const std::string& text, const PPTok& like) {
 // ---------------------------------------------------------------------------
 // Files and includes
 
-SourceFile* Preprocessor::loadFile(const fs::path& path, const std::string& displayPath, const Loc& at) {
+SourceFile* Preprocessor::loadFile(const fs::path& path, const std::string& displayPath, const Loc& at,
+	const std::string& directive) {
 	std::error_code ec;
 	const std::string canonical = fs::canonical(path, ec).string();
 	if (ec) {
-		fail(at, "cannot resolve #include \"" + displayPath + "\": " + ec.message());
+		fail(at, "cannot resolve " + directive + " \"" + displayPath + "\": " + ec.message());
 	}
 
 	const auto cached = _files.find(canonical);
@@ -706,18 +713,18 @@ SourceFile* Preprocessor::loadFile(const fs::path& path, const std::string& disp
 	}
 
 	if (!fs::is_regular_file(canonical, ec)) {
-		fail(at, "#include \"" + displayPath + "\" is not a regular file");
+		fail(at, directive + " \"" + displayPath + "\" is not a regular file");
 	}
 	const auto size = fs::file_size(canonical, ec);
 	if (ec || size > kMaxFileBytes) {
-		fail(at, "#include \"" + displayPath + "\" is larger than " + std::to_string(kMaxFileBytes)
+		fail(at, directive + " \"" + displayPath + "\" is larger than " + std::to_string(kMaxFileBytes)
 			+ " bytes or cannot be sized");
 	}
 
 	std::ifstream stream(canonical, std::ios::binary);
 	std::string raw((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
 	if (!stream && !stream.eof()) {
-		fail(at, "cannot read #include \"" + displayPath + "\"");
+		fail(at, "cannot read " + directive + " \"" + displayPath + "\"");
 	}
 
 	return &loadText(displayPath, canonical, raw);
@@ -728,15 +735,16 @@ SourceFile* Preprocessor::loadFile(const fs::path& path, const std::string& disp
 // absolute, or that reaches outside the allowed roots by "..", a symlink or
 // otherwise, is an error: it is the boundary between the shader and the rest of
 // the filesystem.
-SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::string& name, const Loc& at) {
+SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::string& name, const Loc& at,
+	const std::string& directive) {
 	if (name.empty()) {
-		fail(at, "#include with an empty file name");
+		fail(at, directive + " with an empty file name");
 	}
 	if (name.find('\0') != std::string::npos) {
-		fail(at, "#include file name contains a NUL byte");
+		fail(at, directive + " file name contains a NUL byte");
 	}
 	if (name[0] == '/') {
-		fail(at, "#include \"" + name + "\" is an absolute path, which is not allowed; use a path "
+		fail(at, directive + " \"" + name + "\" is an absolute path, which is not allowed; use a path "
 			"relative to the including file or to an include directory");
 	}
 
@@ -783,21 +791,21 @@ SourceFile* Preprocessor::resolveQuoted(const SourceFile& includer, const std::s
 		}
 
 		const std::string display = (fs::path(base.display.empty() ? "." : base.display) / name).string();
-		return loadFile(real, display, at);
+		return loadFile(real, display, at, directive);
 	}
 
 	if (escaped) {
-		fail(at, "#include \"" + name + "\" resolves outside the directories it may include from "
+		fail(at, directive + " \"" + name + "\" resolves outside the directories it may include from "
 			"(the including file's and the include directories)");
 	}
 	return nullptr;
 }
 
 Preprocessor::Header Preprocessor::parseHeaderName(const std::vector<Token>& line, size_t first,
-	const Loc& at) const {
+	const Loc& at, const std::string& directive) const {
 
 	if (first >= line.size()) {
-		fail(at, "#include with no file name");
+		fail(at, directive + " with no file name");
 	}
 
 	Header header;
@@ -805,13 +813,13 @@ Preprocessor::Header Preprocessor::parseHeaderName(const std::vector<Token>& lin
 		header.angled = false;
 		header.name = std::string(line[first].text.substr(1, line[first].text.size() - 2));
 		if (first + 1 < line.size()) {
-			fail(at, "extra tokens at the end of the #include");
+			fail(at, "extra tokens at the end of the " + directive);
 		}
 		return header;
 	}
 
 	if (line[first].kind != TokenKind::Less) {
-		fail(at, "#include expects \"file\" or <file>; a header named by a macro is not supported");
+		fail(at, directive + " expects \"file\" or <file>; a header named by a macro is not supported");
 	}
 
 	// Closed by the first '>' on the line. A name with a gap in it is a
@@ -825,15 +833,15 @@ Preprocessor::Header Preprocessor::parseHeaderName(const std::vector<Token>& lin
 		}
 	}
 	if (last == first) {
-		fail(at, "the #include has no '>' on its line, so the header name does not end here");
+		fail(at, "the " + directive + " has no '>' on its line, so the header name does not end here");
 	}
 	if (last + 1 < line.size()) {
-		fail(at, "extra tokens at the end of the #include");
+		fail(at, "extra tokens at the end of the " + directive);
 	}
 
 	for (size_t i = first + 1; i <= last; ++i) {
 		if (line[i].spaceBefore) {
-			fail(at, "the #include has whitespace in the header name, which is part of the name it "
+			fail(at, "the " + directive + " has whitespace in the header name, which is part of the name it "
 				"looks for");
 		}
 	}
@@ -846,15 +854,30 @@ Preprocessor::Header Preprocessor::parseHeaderName(const std::vector<Token>& lin
 	return header;
 }
 
-void Preprocessor::includeDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at) {
-	const Header header = parseHeaderName(line, 1, at);
+// Whether a directive reads the file now. #pragma once and #import both stop every
+// later #include or #import of the file; #import also yields to an earlier #include
+// of it, which is what Apple's compiler does.
+bool Preprocessor::admit(SourceFile& file, bool import) {
+	if (file.once || (import && file.included)) {
+		return false;
+	}
+	file.included = true;
+	file.once = file.once || import;
+	return true;
+}
+
+void Preprocessor::includeDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at,
+	bool import) {
+
+	const std::string directive = import ? "#import" : "#include";
+	const Header header = parseHeaderName(line, 1, at, directive);
 
 	if (header.angled) {
 		// The headers whose contents mslc has built in. Any other angled name
 		// would have to come from a system header search mslc does not have.
 		const char* text = builtinHeaderText(header.name);
 		if (!text) {
-			fail(at, "cannot honour #include " + header.name + ": mslc provides " + kBuiltinHeaderList
+			fail(at, "cannot honour " + directive + " " + header.name + ": mslc provides " + kBuiltinHeaderList
 				+ " only, and a header it does not read would leave the program compiling up to the "
 				"first name it needed");
 		}
@@ -866,23 +889,26 @@ void Preprocessor::includeDirective(Cursor& cursor, const std::vector<Token>& li
 		if (!builtin) {
 			builtin = &loadText("<built-in>", "", text);
 		}
+		if (!admit(*builtin, import)) {
+			return;
+		}
 		processFile(*builtin, internName(builtin->displayPath));
 		return;
 	}
 
 	if (_includes.size() >= kMaxIncludeDepth) {
-		fail(at, "#include nested more than " + std::to_string(kMaxIncludeDepth) + " deep; is there "
+		fail(at, directive + " nested more than " + std::to_string(kMaxIncludeDepth) + " deep; is there "
 			"an include cycle with no guard?");
 	}
 	if (++_includeCount > kMaxIncludes) {
 		fail(at, "more than " + std::to_string(kMaxIncludes) + " #include directives in one translation");
 	}
 
-	SourceFile* target = resolveQuoted(cursor.file, header.name, at);
+	SourceFile* target = resolveQuoted(cursor.file, header.name, at, directive);
 	if (!target) {
-		fail(at, "#include \"" + header.name + "\" not found");
+		fail(at, directive + " \"" + header.name + "\" not found");
 	}
-	if (target->once) {
+	if (!admit(*target, import)) {
 		return;
 	}
 
@@ -1018,7 +1044,8 @@ void Preprocessor::directive(Cursor& cursor) {
 	switch (kind) {
 		case Directive::Define: defineMacro(cursor, line, nameLoc); return;
 		case Directive::Undef: undefMacro(cursor, line, nameLoc); return;
-		case Directive::Include: includeDirective(cursor, line, nameLoc); return;
+		case Directive::Include: includeDirective(cursor, line, nameLoc, false); return;
+		case Directive::Import: includeDirective(cursor, line, nameLoc, true); return;
 		case Directive::Line: lineDirective(cursor, line, nameLoc); return;
 		case Directive::Pragma: pragmaDirective(cursor, line, nameLoc); return;
 
@@ -1033,7 +1060,7 @@ void Preprocessor::directive(Cursor& cursor) {
 
 		case Directive::Unsupported:
 			fail(nameLoc, "unsupported preprocessor directive \"#" + std::string(line[0].text)
-				+ "\"; mslc handles #include, #define, #undef, #if, #ifdef, #ifndef, #elif, #else, "
+				+ "\"; mslc handles #include, #import, #define, #undef, #if, #ifdef, #ifndef, #elif, #else, "
 				"#endif, #line, #error, #warning and #pragma");
 
 		default:
@@ -1041,7 +1068,7 @@ void Preprocessor::directive(Cursor& cursor) {
 	}
 
 	fail(nameLoc, "unknown preprocessor directive \"#" + std::string(line[0].text)
-		+ "\"; mslc handles #include, #define, #undef, #if, #ifdef, #ifndef, #elif, #else, #endif, "
+		+ "\"; mslc handles #include, #import, #define, #undef, #if, #ifdef, #ifndef, #elif, #else, #endif, "
 		"#line, #error, #warning and #pragma");
 }
 
@@ -1360,7 +1387,7 @@ bool Preprocessor::evaluateCondition(Cursor& cursor, const std::vector<Token>& l
 
 			const std::vector<Token> argument(line.begin() + i + 2, line.begin() + close);
 			const Loc here = locate(cursor, token);
-			const Header header = parseHeaderName(argument, 0, here);
+			const Header header = parseHeaderName(argument, 0, here, "#include");
 
 			bool found = false;
 			if (header.angled) {
@@ -1370,7 +1397,7 @@ bool Preprocessor::evaluateCondition(Cursor& cursor, const std::vector<Token>& l
 				}
 				found = true;
 			} else {
-				found = resolveQuoted(cursor.file, header.name, here) != nullptr;
+				found = resolveQuoted(cursor.file, header.name, here, "#include") != nullptr;
 			}
 
 			work.push_back(synthesize(found ? "1" : "0", fromFile(cursor, token)));
