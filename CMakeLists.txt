@@ -187,6 +187,22 @@ foreach(source IN LISTS namespaced)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# A struct's constructors and member functions are the helper functions and the
+# initialisation they stand for: one test per tests/equivalence/<name>.member.metal,
+# against <name>.plain.metal, which spells that by hand.
+file(GLOB members CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.member.metal)
+foreach(source IN LISTS members)
+	get_filename_component(name ${source} NAME)
+	string(REGEX REPLACE "\\.member\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${source}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.plain.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # Negative control: a pair that does differ must fail, or the comparison above
 # could not tell a macro that expands wrongly from one that expands right.
 add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}
