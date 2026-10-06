@@ -1348,6 +1348,90 @@ namespace {
 		return constant;
 	}
 
+	const char* cxxTypeName(ScalarKind kind) {
+		switch (kind) {
+			case ScalarKind::Char: return "char";
+			case ScalarKind::UChar: return "unsigned char";
+			case ScalarKind::Short: return "short";
+			case ScalarKind::UShort: return "unsigned short";
+			case ScalarKind::Int: return "int";
+			case ScalarKind::UInt: return "unsigned int";
+			case ScalarKind::Long: return "long";
+			case ScalarKind::ULong: return "unsigned long";
+			default: return scalarKindName(kind);
+		}
+	}
+
+	std::string integerText(const FoldedConstant& constant) {
+		return isSignedInteger(constant.scalar) ? std::to_string(static_cast<int64_t>(constant.integer))
+			: std::to_string(constant.integer);
+	}
+
+	// A value inside a braced initialiser has to reach its element type without
+	// changing, as in C++11, and Apple's compiler makes it an error where a
+	// plain "constant int k = 2147483648;" is a warning. An integer has to fit
+	// an integer type and be exactly representable in a float type, a float is
+	// never narrowed to an integer, and a float only has to be in range for a
+	// narrower float.
+	void requireNotNarrowing(const FoldedConstant& constant, ScalarKind to) {
+		const ScalarKind from = constant.scalar;
+		const auto narrowed = [&]() {
+			return CompileError("constant expression evaluates to " + (isFloatKind(from)
+				? std::to_string(constant.number) : integerText(constant))
+				+ " which cannot be narrowed to type '" + cxxTypeName(to) + "' in an initializer list");
+		};
+
+		if (isFloatKind(from)) {
+			if (!isFloatKind(to)) {
+				throw CompileError("type '" + std::string(cxxTypeName(from)) + "' cannot be narrowed to '"
+					+ cxxTypeName(to) + "' in an initializer list");
+			}
+
+			if (std::isfinite(constant.number) && !std::isfinite(roundedToKind(to, constant.number))) {
+				throw narrowed();
+			}
+
+			return;
+		}
+
+		const bool fromSigned = isSignedInteger(from);
+		const bool negative = fromSigned && static_cast<int64_t>(constant.integer) < 0;
+		const bool beyondLong = !fromSigned && static_cast<int64_t>(constant.integer) < 0;
+
+		if (isFloatKind(to)) {
+			// Apple, as clang does, converts the float back to the integer's own type
+			// and compares. The conversion back saturates, so INT_MAX, which rounds
+			// to 2^31 as a float and to infinity as a half, comes back as INT_MAX
+			// and is let through.
+			const double converted = integerAsKind(to, from, constant.integer);
+			const __int128 value = fromSigned ? static_cast<__int128>(static_cast<int64_t>(constant.integer))
+				: static_cast<__int128>(constant.integer);
+			const __int128 width = static_cast<__int128>(1) << (mappingFor(from).width - (fromSigned ? 1 : 0));
+			const __int128 low = fromSigned ? -width : 0;
+			const __int128 high = width - 1;
+			__int128 back = 0;
+			if (converted >= static_cast<double>(high)) {
+				back = high;
+			} else if (converted <= static_cast<double>(low)) {
+				back = low;
+			} else {
+				back = static_cast<__int128>(converted);
+			}
+			const bool exact = back == value;
+			if (!exact) {
+				throw narrowed();
+			}
+
+			return;
+		}
+
+		const bool toSigned = isSignedInteger(to);
+		if ((negative && !toSigned) || (beyondLong && toSigned)
+			|| normalizeInteger(to, constant.integer) != constant.integer) {
+			throw narrowed();
+		}
+	}
+
 	// An Input or Output variable carrying one value across a stage boundary: a
 	// returned value, or one field of a returned or [[stage_in]] struct. The
 	// variable's type can differ from the value's, because a half crosses as a
@@ -1453,7 +1537,7 @@ namespace {
 		Id declareGlobalConstant(const VariableDeclaration& declaration);
 		Id emitConstant(const FoldedConstant& folded);
 		std::vector<uint32_t> constantWords(const FoldedConstant& folded);
-		FoldedConstant foldInitializer(const Type& type, const Expression& initializer);
+		FoldedConstant foldInitializer(const Type& type, const Expression& initializer, bool braced = false);
 		void foldStructInitializer(FoldedConstant& folded, const StructDecl& decl,
 			const Expression& initializer);
 		FoldedConstant foldExpression(const Expression& expression);
@@ -2977,7 +3061,7 @@ namespace {
 			}
 
 			folded.parts.push_back(emitConstant(
-				foldInitializer(decl.fields[i].type, *element.value)));
+				foldInitializer(decl.fields[i].type, *element.value, true)));
 		}
 	}
 
@@ -3198,7 +3282,7 @@ namespace {
 	// Folds an initialiser of the given declared type. A list of values for a
 	// vector or a struct is a composite, and anything else is a scalar, so the
 	// declared type is what says which the source wrote.
-	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer) {
+	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer, bool braced) {
 		if (type.isMatrix()) {
 			throw CompileError("a " + typeName(type) + " constant is not lowered yet");
 		}
@@ -3228,6 +3312,10 @@ namespace {
 					? "a bool constant is initialised with true or false"
 					: std::string("a bool cannot initialise a ")
 						+ std::string(scalarKindName(type.scalar)));
+			}
+
+			if (braced) {
+				requireNotNarrowing(folded, type.scalar);
 			}
 
 			// The declared type is what the constant is. An integer literal may
@@ -3263,7 +3351,7 @@ namespace {
 
 				Type component = type;
 				component.vectorWidth = 0;
-				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value)));
+				folded.parts.push_back(emitConstant(foldInitializer(component, *element.value, true)));
 			}
 
 			return folded;
