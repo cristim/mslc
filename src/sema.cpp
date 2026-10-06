@@ -5385,7 +5385,10 @@ namespace {
 		}
 	}
 
-	// The "locnN" a [[user(...)]] name spells, N being the Location it gives.
+	// The "locnN" a [[user(...)]] name spells, N being the Location it gives. Only
+	// the canonical decimal spelling counts, so locn01 is a plain name, as it is a
+	// different name from locn1 on Apple; two fields cannot then claim one Location
+	// without repeating a name.
 	static std::optional<uint32_t> locnLocation(const std::string& name) {
 		constexpr size_t prefix = 4;
 		constexpr size_t maxDigits = 9;
@@ -5393,7 +5396,8 @@ namespace {
 			return std::nullopt;
 		}
 		const std::string digits = name.substr(prefix);
-		if (digits.find_first_not_of("0123456789") != std::string::npos) {
+		if (digits.find_first_not_of("0123456789") != std::string::npos
+			|| (digits.size() > 1 && digits[0] == '0')) {
 			return std::nullopt;
 		}
 		if (digits.size() > maxDigits) {
