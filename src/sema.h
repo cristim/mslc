@@ -264,6 +264,11 @@ struct ModuleOptions {
 // lod_min 0 and lod_max 65504 (the largest half). A consumer must not zero-fill
 // them: lod_max 0 would restrict the sampler to mip level 0.
 //
+// A vertex function's [[stage_in]] struct adds one binding per field, in
+// declaration order: { "kind": "VertexInput", "metal_index": n, "location": n,
+// "name": field }. n is the field's [[attribute(n)]], the key of indium's vertex
+// descriptor attribute, and is also the Location of the Input variable.
+//
 // Emits the module for every given entry point: one OpEntryPoint and one
 // function each, with the descriptor set, the execution modes and the interface
 // chosen per entry point's stage. Returns the reflection document, one entry per
