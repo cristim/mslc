@@ -789,9 +789,11 @@ uint32_t TypeTable::vectorWidth(spirv::Id type) const {
 	return 0;
 }
 
-bool TypeTable::structForm(spirv::Id type, StructForm& out) {
-	bool laidOut = true;
+const std::string* TypeTable::structNameOf(spirv::Id type, bool* laidOut) const {
 	const std::string* name = nullptr;
+	if (laidOut) {
+		*laidOut = true;
+	}
 	for (const auto& [key, id]: _structs) {
 		if (id == type) {
 			name = &key;
@@ -805,9 +807,17 @@ bool TypeTable::structForm(spirv::Id type, StructForm& out) {
 	for (const auto& [key, id]: _valueStructs) {
 		if (id == type) {
 			name = &key;
-			laidOut = false;
+			if (laidOut) {
+				*laidOut = false;
+			}
 		}
 	}
+	return name;
+}
+
+bool TypeTable::structForm(spirv::Id type, StructForm& out) {
+	bool laidOut = true;
+	const std::string* name = structNameOf(type, &laidOut);
 	if (!name) {
 		return false;
 	}
@@ -926,11 +936,28 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 }
 
 uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
-	// A struct's own alignment is not tracked, and 4 is the weaker claim, which
-	// is the safe direction: a claim below what the layout gives is always sound.
 	const uint32_t bits = bitWidth(type);
 	if (bits == 0) {
-		return 4;
+		// A struct is as aligned as its most aligned member, which spirv-val needs
+		// to be at least its largest scalar: 8 for a long.
+		const std::string* name = structNameOf(type, nullptr);
+		const StructDecl* decl = name ? _unit.findStruct(*name) : nullptr;
+		if (!decl) {
+			return 4;
+		}
+
+		uint32_t alignment = 1;
+		for (const StructField& field: decl->fields) {
+			const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
+			const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
+			const VectorLayout layout = field.type.isMatrix()
+				? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
+				: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
+				: vectorLayoutFor(scalarBytes, components);
+			alignment = std::max(alignment, layout.alignment);
+		}
+
+		return alignment;
 	}
 
 	// bitWidth is the component's width, so the element's own size comes from the
@@ -1808,6 +1835,13 @@ namespace {
 			return convertStruct(value, fromForm, toForm, toType);
 		}
 
+		// A struct converts to another form of itself and to nothing else. A bool
+		// keeps its own diagnostic below.
+		if ((_types.structForm(fromType, fromForm) && !_types.isBool(toType))
+			|| (_types.structForm(toType, toForm) && !_types.isBool(fromType))) {
+			throw CompileError("a struct converts to another form of itself only");
+		}
+
 		// Every convert opcode takes a scalar or a vector, so a matrix of another
 		// shape or component type, or a matrix where a scalar or vector belongs, has
 		// no instruction to lower to.
@@ -2537,6 +2571,11 @@ namespace {
 		// OpFNegate takes no matrix.
 		if (_types.matrixInfo(type)) {
 			throw CompileError("a unary operator on a matrix is not lowered yet");
+		}
+
+		TypeTable::StructForm form;
+		if (_types.structForm(type, form)) {
+			throw CompileError("a unary operator on the struct " + form.name + " is not lowered");
 		}
 
 		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
@@ -4616,7 +4655,17 @@ namespace {
 		const Id declared = declaredTypeOf(_entryPoint->returnType);
 
 		if (!_entryPoint->returnType.namedType.empty()) {
-			const Id copy = convertImplicit(value, declared);
+			// The fields are extracted one by one, so a buffer's form of the struct
+			// serves as it is unless a packed member has to change shape.
+			Id copy = value;
+			TypeTable::StructForm have;
+			TypeTable::StructForm want;
+			const bool sameMembers = _types.structForm(_builder.typeOf(value), have)
+				&& _types.structForm(declared, want)
+				&& have.name == want.name && have.declared == want.declared;
+			if (!sameMembers) {
+				copy = convertImplicit(value, declared);
+			}
 
 			for (size_t i = 0; i < _outputs.size(); ++i) {
 				const StageVariable& output = _outputs[i];

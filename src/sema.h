@@ -130,6 +130,9 @@ public:
 		std::vector<spirv::Id> value;
 	};
 	bool structForm(spirv::Id type, StructForm& out);
+	// The declared struct's name a type id is a form of, or null; laidOut says
+	// whether it is a buffer's form.
+	const std::string* structNameOf(spirv::Id type, bool* laidOut) const;
 
 	// True when the type is a vector or a struct, which a single scalar value
 	// cannot stand in for.
