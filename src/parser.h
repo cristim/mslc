@@ -130,6 +130,7 @@ private:
 	void parseDeclaration();
 	StructDecl parseStructDeclaration();
 	void parseStructBody(StructDecl& decl);
+	bool parseStructFunction(StructDecl& decl);
 	void parseTypedef();
 
 	// "enum Tag { A, B = 2 }" up to and including the closing brace, or just

@@ -730,9 +730,23 @@ void Parser::parseStructBody(StructDecl& decl) {
 	expect(TokenKind::LBrace, "to open a struct body");
 
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		if (parseStructFunction(decl)) {
+			continue;
+		}
+
 		StructField field;
 		field.type = parseType();
 		expectFieldName(field.name);
+		if (field.type.isStatic) {
+			throw CompileError("a static data member is not supported (\"" + field.name + "\" in \""
+				+ decl.name + "\")");
+		}
+		if (at(TokenKind::LParen)) {
+			throw CompileError("a member function is not lowered yet (\"" + field.name + "\" in \"" + decl.name + "\")");
+		}
+		if (field.name == "operator") {
+			throw CompileError("an operator overload is not lowered (in \"" + decl.name + "\")");
+		}
 
 		// An attribute list and an array suffix both open with a bracket, but an
 		// attribute list opens with two, which is what tells them apart.
@@ -745,6 +759,64 @@ void Parser::parseStructBody(StructDecl& decl) {
 	}
 
 	expect(TokenKind::RBrace, "to close a struct body");
+}
+
+// A member that is not a field: a constructor or a destructor, or a member
+// function. False, with nothing consumed, when the member is a field.
+bool Parser::parseStructFunction(StructDecl& decl) {
+	const std::string quoted = "\"" + decl.name + "\"";
+	if (atKeyword("template")) {
+		throw CompileError("a member template is not lowered (in " + quoted + ")");
+	}
+	if (at(TokenKind::Tilde)) {
+		throw CompileError("a destructor is not supported (in " + quoted + ")");
+	}
+
+	const size_t tail = decl.name.rfind("::");
+	const std::string unqualified = tail == std::string::npos ? decl.name : decl.name.substr(tail + 2);
+	size_t ahead = 0;
+	while (lookahead(ahead).kind == TokenKind::Identifier
+		&& (lookahead(ahead).text == "explicit" || lookahead(ahead).text == "inline"
+			|| lookahead(ahead).text == "constexpr")) {
+		++ahead;
+	}
+
+	const bool isConstructor = !unqualified.empty() && lookahead(ahead).kind == TokenKind::Identifier
+		&& lookahead(ahead).text == unqualified && lookahead(ahead + 1).kind == TokenKind::LParen;
+	if (!isConstructor) {
+		return false;
+	}
+
+	for (size_t i = 0; i <= ahead; ++i) {
+		advance();
+	}
+	advance();
+	if (!at(TokenKind::RParen)) {
+		throw CompileError("a constructor with parameters is not lowered yet (in " + quoted + ")");
+	}
+	advance();
+
+	// A default constructor with nothing to do changes neither the layout nor the
+	// meaning of the struct, so it is read and dropped.
+	if (match(TokenKind::Assign)) {
+		if (!matchIdentifier("default")) {
+			throw CompileError("only \"= default\" may follow a constructor's parameters (in " + quoted + ")");
+		}
+		expect(TokenKind::Semicolon, "after \"= default\"");
+		return true;
+	}
+	if (match(TokenKind::Semicolon)) {
+		return true;
+	}
+	if (at(TokenKind::Colon)) {
+		throw CompileError("a constructor with an initialiser list is not lowered yet (in " + quoted + ")");
+	}
+	expect(TokenKind::LBrace, "to open a constructor body");
+	if (!at(TokenKind::RBrace)) {
+		throw CompileError("a constructor with a body is not lowered yet (in " + quoted + ")");
+	}
+	advance();
+	return true;
 }
 
 namespace {
