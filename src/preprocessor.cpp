@@ -858,11 +858,14 @@ Preprocessor::Header Preprocessor::parseHeaderName(const std::vector<Token>& lin
 // later #include or #import of the file; #import also yields to an earlier #include
 // of it, which is what Apple's compiler does.
 bool Preprocessor::admit(SourceFile& file, bool import) {
-	if (file.once || (import && file.included)) {
+	// An #import marks the file whether or not it reads it: Clang decides to skip
+	// after marking, so a later #include of the file is skipped too.
+	const bool skip = file.once || (import && file.included);
+	file.once = file.once || import;
+	if (skip) {
 		return false;
 	}
 	file.included = true;
-	file.once = file.once || import;
 	return true;
 }
 
@@ -2170,6 +2173,7 @@ void Preprocessor::run(std::string_view source) {
 
 	_basePath = _options.sourcePath.empty() ? "<source>" : _options.sourcePath;
 	SourceFile& root = loadText(_basePath, sourceCanonical, source);
+	root.included = true;
 	processFile(root, internName(_basePath));
 
 	Token end;
