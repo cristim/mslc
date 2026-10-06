@@ -3203,6 +3203,11 @@ namespace {
 						+ _entryPoint->name + "\" has a second (\"" + parameter.name + "\")");
 				}
 
+				if (parameter.isReference) {
+					throw CompileError("[[stage_in]] parameter \"" + parameter.name + "\" is a "
+						"reference, which Apple's compiler does not allow; take the struct by value");
+				}
+
 				const StructDecl* decl = structValue(parameter.type);
 				if (!decl) {
 					throw CompileError("[[stage_in]] parameter \"" + parameter.name + "\" is a "
@@ -3954,6 +3959,11 @@ namespace {
 			if (type.isPointer || !type.namedType.empty() || type.isMatrix() || type.isPacked) {
 				throw CompileError(what + " is a " + typeName(type) + ", which Apple's compiler does "
 					"not allow as a vertex attribute; use a scalar or a vector");
+			}
+			if (type.scalar != ScalarKind::Half && scalarBitWidth(type.scalar) != 32
+				&& type.scalar != ScalarKind::Bool) {
+				throw CompileError(what + " is a " + typeName(type) + ", which mslc does not lower as "
+					"a vertex attribute yet; use a 32-bit scalar or vector, or half");
 			}
 			if (type.scalar == ScalarKind::Bool) {
 				throw CompileError(what + " is a " + typeName(type) + ", which mslc does not lower as "

@@ -138,6 +138,8 @@ struct Parameter {
 	Type type;
 	std::string name;
 	ParameterAttributes attributes;
+	// Declared with "&". Only a [[stage_in]] parameter reads it.
+	bool isReference = false;
 };
 
 struct Expression;

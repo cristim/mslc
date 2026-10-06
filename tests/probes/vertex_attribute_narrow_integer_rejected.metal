@@ -1,4 +1,4 @@
-// EXPECT: error which mslc does not pass between stages yet
+// EXPECT: error which mslc does not lower as a vertex attribute yet
 //
 // Apple accepts a short attribute; mslc does not widen narrow integers across the stage interface.
 #include <metal_stdlib>
