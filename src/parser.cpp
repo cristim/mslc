@@ -776,7 +776,8 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
-			if (nested && (expression.intIsUnsigned || expression.intValue > INT_MAX)) {
+			if (nested && (expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong
+				|| expression.intValue > INT_MAX)) {
 				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
 			}
 			if (expression.intValue > INT64_MAX) {
@@ -1837,6 +1838,40 @@ std::vector<ExpressionPtr> Parser::parseArgumentList(const char* closing) {
 	return arguments;
 }
 
+// The type of an integer literal, as C gives it and as Apple's compiler does.
+// An unsuffixed decimal is the first of int and long that holds it, where hex
+// and octal go on through uint and ulong; a decimal never becomes unsigned
+// without a `u`, and one too large for a long wraps, which is what Apple
+// compiles it to.
+static ScalarKind integerLiteralKind(const Token& literal) {
+	if (literal.integerDigitsInvalid) {
+		throw CompileError("invalid digit in integer constant \"" + std::string(literal.text) + "\"");
+	}
+
+	if (literal.integerOverflows) {
+		throw CompileError("integer literal is too large to be represented in any integer type");
+	}
+
+	const uint64_t value = literal.integerValue;
+	if (literal.integerIsUnsigned) {
+		return value <= UINT_MAX ? ScalarKind::UInt : ScalarKind::ULong;
+	}
+
+	if (value <= INT_MAX) {
+		return ScalarKind::Int;
+	}
+
+	if (literal.integerIsDecimal) {
+		return ScalarKind::Long;
+	}
+
+	if (value <= UINT_MAX) {
+		return ScalarKind::UInt;
+	}
+
+	return value <= INT64_MAX ? ScalarKind::Long : ScalarKind::ULong;
+}
+
 ExpressionPtr Parser::parsePrimary() {
 	if (at(TokenKind::IntegerLiteral)) {
 		auto expression = std::make_unique<Expression>();
@@ -1844,7 +1879,7 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->line = line();
 		const Token literal = advance();
 		expression->intValue = literal.integerValue;
-		expression->intIsUnsigned = literal.integerIsUnsigned;
+		expression->intKind = integerLiteralKind(literal);
 		return expression;
 	}
 

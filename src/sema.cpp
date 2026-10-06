@@ -3153,28 +3153,18 @@ namespace {
 	Id Emitter::emitExpression(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::IntLiteral: {
-				// The suffix decides, not the value. An unsuffixed integer literal
-				// is an int and a `u` one is a uint, which is what picks the
-				// opcode for "4294967295u / 3u" and what a literal's conversion
-				// reads it through.
-				//
-				// These were both wrong once and in opposite directions. Emitting
-				// every literal as %uint made a negative one wrap: "-1" was
-				// OpSNegate %uint %uint_1, and negating 1 as an unsigned is
-				// 4294967295. A declaration hid it, because the stored value is
-				// bitcast back to %int, so "int b = -1" read correctly while
-				// "float3 v(-1)" broadcast 4294967295.0f. Emitting every literal as
-				// %int hid nothing and broke unsigned arithmetic instead, because
-				// emitBinary takes the opcode from the left type, so
-				// "4294967295u / 3u" became OpSDiv.
-				//
-				// A literal that does not fit in an int is a long in Apple's
-				// compiler, with no suffix to ask for it, and mslc has no 64-bit
-				// literal. Both reads therefore give the wrong answer for one, and
-				// that gap is left for the 64-bit work rather than papered over here.
-				const Id type = expression.intIsUnsigned ? _uintType : _intType;
-				return _builder.emitDeclTyped(spirv::OpConstant, type,
-					{ static_cast<uint32_t>(expression.intValue) });
+				// The literal's own type, which the parser took from its spelling:
+				// "-1" is a negated int and "3000000000" a long, so neither wraps.
+				// Emitting every literal as %uint made "-1" OpSNegate %uint, which
+				// is 4294967295 as a float3 component, and as %int made
+				// "4294967295u / 3u" an OpSDiv, because emitBinary takes the opcode
+				// from the left operand's type.
+				const Id type = _types.scalar(expression.intKind);
+				std::vector<uint32_t> words { static_cast<uint32_t>(expression.intValue) };
+				if (scalarBitWidth(expression.intKind) == 64) {
+					words.push_back(static_cast<uint32_t>(expression.intValue >> 32));
+				}
+				return _builder.emitDeclTyped(spirv::OpConstant, type, words);
 			}
 
 			case ExpressionKind::FloatLiteral: {

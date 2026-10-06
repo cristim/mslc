@@ -110,6 +110,49 @@ namespace {
 		return table;
 	}
 
+	// The value and base of an integer literal's digits. A suffix, which is not
+	// a digit in any base, ends them.
+	void readInteger(Token& token) {
+		const std::string_view text = token.text;
+		unsigned base = 10;
+		size_t i = 0;
+		if (text.size() > 1 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+			base = 16;
+			i = 2;
+		} else if (text.size() > 1 && text[0] == '0') {
+			base = 8;
+			i = 1;
+		}
+
+		token.integerIsDecimal = base == 10;
+		const size_t first = i;
+		uint64_t value = 0;
+		for (; i < text.size(); ++i) {
+			const char c = text[i];
+			unsigned digit = 0;
+			if (c >= '0' && c <= '9') {
+				digit = static_cast<unsigned>(c - '0');
+			} else if (base == 16 && std::isxdigit(static_cast<unsigned char>(c))) {
+				digit = static_cast<unsigned>(std::tolower(c) - 'a') + 10;
+			} else {
+				break;
+			}
+
+			if (digit >= base) {
+				token.integerDigitsInvalid = true;
+				break;
+			}
+
+			if (value > (UINT64_MAX - digit) / base) {
+				token.integerOverflows = true;
+			}
+			value = value * base + digit;
+		}
+
+		token.integerDigitsInvalid = token.integerDigitsInvalid || (base == 16 && i == first);
+		token.integerValue = value;
+	}
+
 }
 
 std::string describeInvalidToken(const Token& token) {
@@ -339,7 +382,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 				token.floatValue = std::strtod(std::string(token.text).c_str(), nullptr);
 			} else {
 				token.kind = TokenKind::IntegerLiteral;
-				token.integerValue = std::strtoull(std::string(token.text).c_str(), nullptr, 0);
+				readInteger(token);
 			}
 
 			tokens.push_back(token);

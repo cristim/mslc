@@ -63,6 +63,13 @@ struct Token {
 	uint64_t integerValue = 0;
 	double floatValue = 0.0;
 	bool integerIsUnsigned = false;
+	// Written in decimal, which is what keeps an unsuffixed literal out of the
+	// unsigned types; hex and octal may take them.
+	bool integerIsDecimal = true;
+	// The value did not fit in 64 bits, and integerValue is not it.
+	bool integerOverflows = false;
+	// A digit the base does not have (the 9 in 09), or none at all (0x).
+	bool integerDigitsInvalid = false;
 	// A float literal written with an `h` suffix, which is a half rather than a float.
 	bool floatIsHalf = false;
 
