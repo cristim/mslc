@@ -848,14 +848,16 @@ Id TypeTable::one(Id type) {
 		std::vector<uint32_t>(vectorWidth(type), scalarOne));
 }
 
-Id TypeTable::image2D() {
-	if (_image2D == InvalidId) {
-		_image2D = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
-			static_cast<uint32_t>(spirv::Dim::Dim2D), 2u, 0u, 0u, 1u,
+Id TypeTable::image(ResourceKind kind) {
+	Id& cached = _images[kind];
+	if (cached == InvalidId) {
+		const uint32_t dimension = kind == ResourceKind::TextureCube ? spirv::Dim::Cube : spirv::Dim::Dim2D;
+		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
+			dimension, 2u, 0u, 0u, 1u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
 
-	return _image2D;
+	return cached;
 }
 
 Id TypeTable::samplerType() {
@@ -866,12 +868,14 @@ Id TypeTable::samplerType() {
 	return _samplerType;
 }
 
-Id TypeTable::sampledImage2D() {
-	if (_sampledImage2D == InvalidId) {
-		_sampledImage2D = _builder.emitDecl(spirv::OpTypeSampledImage, { image2D() });
+Id TypeTable::sampledImage(ResourceKind kind) {
+	const Id imageType = image(kind);
+	Id& cached = _sampledImages[kind];
+	if (cached == InvalidId) {
+		cached = _builder.emitDecl(spirv::OpTypeSampledImage, { imageType });
 	}
 
-	return _sampledImage2D;
+	return cached;
 }
 
 Id TypeTable::pointer(spirv::StorageClassValue storageClass, Id pointee) {
@@ -3172,7 +3176,7 @@ namespace {
 			// Apple takes [[texture]] on a texture and [[sampler]] on a sampler and
 			// nothing else: "type 'device float *' is not valid for attribute
 			// 'texture'".
-			const bool isTexture = parameter.type.resource == ResourceKind::Texture2D;
+			const bool isTexture = parameter.type.isTexture();
 			const bool isSampler = parameter.type.resource == ResourceKind::Sampler;
 			if (isTexture || isSampler || attributes.textureIndex || attributes.samplerIndex) {
 				const char* expected = isTexture ? "texture" : "sampler";
@@ -3484,7 +3488,7 @@ namespace {
 		std::set<uint32_t> taken[2];
 		for (const auto& [index, parameter]: resources) {
 			(void)index;
-			const bool isTexture = parameter->type.resource == ResourceKind::Texture2D;
+			const bool isTexture = parameter->type.isTexture();
 			const auto& declared = isTexture ? parameter->attributes.textureIndex
 				: parameter->attributes.samplerIndex;
 			if (declared) {
@@ -3493,7 +3497,7 @@ namespace {
 		}
 
 		for (const auto& [index, parameter]: resources) {
-			const bool isTexture = parameter->type.resource == ResourceKind::Texture2D;
+			const bool isTexture = parameter->type.isTexture();
 			const auto& declared = isTexture ? parameter->attributes.textureIndex
 				: parameter->attributes.samplerIndex;
 			uint32_t metalIndex = 0;
@@ -3517,12 +3521,13 @@ namespace {
 
 		for (const Entry& entry: textures) {
 			const uint32_t binding = _nextBinding++;
-			const Id variable = declareDescriptorVariable(_types.image2D(), binding);
+			const Id imageType = _types.image(entry.parameter->type.resource);
+			const Id variable = declareDescriptorVariable(imageType, binding);
 
 			Binding bound;
 			bound.id = variable;
 			bound.isPointer = true;
-			bound.pointeeType = _types.image2D();
+			bound.pointeeType = imageType;
 			bound.storageClass = spirv::StorageClass::UniformConstant;
 			bound.pointeeMsl = entry.parameter->type;
 			_bindings[entry.parameter->name] = bound;
@@ -3624,7 +3629,7 @@ namespace {
 		}
 
 		const auto it = _bindings.find(member.left->name);
-		if (it == _bindings.end() || it->second.pointeeMsl.resource != ResourceKind::Texture2D) {
+		if (it == _bindings.end() || !it->second.pointeeMsl.isTexture()) {
 			throw CompileError("\"" + member.left->name + "\" is not a texture parameter, so "
 				"\"." + member.memberName + "\" is not a call mslc lowers");
 		}
@@ -3632,6 +3637,10 @@ namespace {
 		const std::string& method = member.memberName;
 		if (method == "sample") {
 			return emitTextureSample(call, it->second);
+		}
+		if (it->second.pointeeMsl.resource == ResourceKind::TextureCube) {
+			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
+				"lowers sample on a texturecube");
 		}
 		if (method == "read") {
 			return emitTextureRead(call, it->second);
@@ -3644,7 +3653,8 @@ namespace {
 			"sample, read, get_width and get_height");
 	}
 
-	// sample(sampler, float2 coordinate [, level(lod)]). A fragment function takes
+	// sample(sampler, float2 coordinate [, level(lod)]), or a float3 coordinate on a
+	// texturecube. A fragment function takes
 	// the level from the derivatives, which is OpImageSampleImplicitLod; a vertex
 	// or kernel function has none, so it samples level 0 with an explicit lod,
 	// and so does a sampler with pixel coordinates, which Vulkan does not allow
@@ -3666,14 +3676,16 @@ namespace {
 		}
 		const Binding& sampler = samplerIt->second;
 
-		const Id float2 = _types.vector(ScalarKind::Float, 2);
+		const bool cube = texture.pointeeMsl.resource == ResourceKind::TextureCube;
+		const Id coordinateVector = _types.vector(ScalarKind::Float, cube ? 3 : 2);
 		Id coordinate = emitExpression(*arguments[1]);
 		const Id coordinateType = _builder.typeOf(coordinate);
-		if (coordinateType != float2) {
+		if (coordinateType != coordinateVector) {
 			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
-				throw CompileError("the coordinate of sample has to be a float2 or a number");
+				throw CompileError(std::string("the coordinate of sample has to be a ")
+					+ (cube ? "float3" : "float2") + " or a number");
 			}
-			coordinate = broadcast(coordinate, float2);
+			coordinate = broadcast(coordinate, coordinateVector);
 		}
 
 		Id lod = InvalidId;
@@ -3708,7 +3720,7 @@ namespace {
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id loadedSampler = loadFrom(sampler.id, sampler.pointeeType);
-		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage2D(),
+		const Id combined = _builder.emitTyped(spirv::OpSampledImage, _types.sampledImage(texture.pointeeMsl.resource),
 			{ image, loadedSampler });
 
 		const Id float4 = _types.vector(ScalarKind::Float, 4);
