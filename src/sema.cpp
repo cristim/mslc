@@ -4,6 +4,7 @@
 #include "parser.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <set>
 
@@ -121,6 +122,56 @@ namespace {
 
 	bool isFloatKind(ScalarKind kind) {
 		return mappingFor(kind).isFloat;
+	}
+
+	// The IEEE half nearest to a value, ties to even, as the bits OpConstant takes.
+	// A finite value too large for a half becomes infinity.
+	uint32_t halfBitsOf(double value) {
+		if (std::isnan(value)) {
+			return 0x7E00u;
+		}
+
+		const uint32_t sign = std::signbit(value) ? 0x8000u : 0u;
+		const double magnitude = std::fabs(value);
+		if (std::isinf(magnitude)) {
+			return sign | 0x7C00u;
+		}
+
+		// Below the smallest normal the spacing is fixed at 2^-24, and a carry
+		// into 0x400 is the smallest normal.
+		if (magnitude < std::ldexp(1.0, -14)) {
+			return sign | static_cast<uint32_t>(std::nearbyint(std::ldexp(magnitude, 24)));
+		}
+
+		int exponent = std::ilogb(magnitude);
+		auto fraction = static_cast<uint32_t>(std::nearbyint(
+			(std::ldexp(magnitude, -exponent) - 1.0) * 1024.0));
+		if (fraction == 1024u) {
+			fraction = 0u;
+			++exponent;
+		}
+
+		if (exponent > 15) {
+			return sign | 0x7C00u;
+		}
+
+		return sign | (static_cast<uint32_t>(exponent + 15) << 10) | fraction;
+	}
+
+	// The value a half's bits stand for, so a half literal can be folded at the
+	// precision it really has.
+	double halfValueOf(uint32_t bits) {
+		const double sign = (bits & 0x8000u) ? -1.0 : 1.0;
+		const int exponent = static_cast<int>((bits >> 10) & 0x1Fu);
+		const uint32_t fraction = bits & 0x3FFu;
+		if (exponent == 0x1F) {
+			return fraction ? std::nan("") : sign * HUGE_VAL;
+		}
+		if (exponent == 0) {
+			return sign * std::ldexp(static_cast<double>(fraction), -24);
+		}
+
+		return sign * std::ldexp(static_cast<double>(fraction | 0x400u), exponent - 25);
 	}
 
 	// Whether an operator produces a bool rather than its operand's type.
@@ -1364,6 +1415,7 @@ namespace {
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
+		Id emitArithmetic(BinaryOperator op, Id left, Id right);
 		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
 		struct ArithmeticConversion {
 			Id type;
@@ -2354,8 +2406,6 @@ namespace {
 			return emitMatrixProduct(op, left, right);
 		}
 
-		const bool isFloat = _types.isFloat(leftType);
-		const bool isSigned = _types.isSignedInt(leftType);
 		const bool isLogical = op == BinaryOperator::LogicalAnd
 			|| op == BinaryOperator::LogicalOr;
 
@@ -2399,26 +2449,81 @@ namespace {
 				"convert the bool to an int first");
 		}
 
-		// OpUDiv and OpUMod need both operands of the result type, and a literal
-		// is always uint. A shift count is free to have its own type and width.
-		const bool isShift = op == BinaryOperator::ShiftLeft
-			|| op == BinaryOperator::ShiftRight;
+		return emitArithmetic(op, left, right);
+	}
 
-		// A scalar beside a vector is a broadcast, which is what "v * 2.0" means
-		// in MSL, so the two cases share one rule below. A shift count is spread
-		// too: the opcode takes a count with as many lanes as the value.
-		const uint32_t rightWidth = _types.vectorWidth(_builder.typeOf(right));
-		if (_types.vectorWidth(leftType) > 1 && rightWidth == 1
-			&& !isLogical && !isComparison) {
+	// The operators + - * / % & | ^ << >> on numeric scalars and vectors, with
+	// the operand rules of C and of Apple's compiler. Scalars undergo the integer
+	// promotions and then the usual arithmetic conversions, so "int + float" adds
+	// in float. A vector keeps its own type: a scalar beside it is converted to
+	// the vector's component type, and two vectors have to be the same type.
+	Id Emitter::emitArithmetic(BinaryOperator op, Id left, Id right) {
+		const Id leftType = _builder.typeOf(left);
+		const Id rightType = _builder.typeOf(right);
 
-			const Id splat = broadcast(right, leftType);
-			return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
-				leftType, { left, splat });
+		for (const Id type: { leftType, rightType }) {
+			if (_types.bitWidth(type) == 0) {
+				throw CompileError("an arithmetic or bitwise operator is lowered only for "
+					"numeric scalars, vectors and matrices");
+			}
 		}
 
-		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
-		return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
-			leftType, { left, rightOperand });
+		const bool isShift = op == BinaryOperator::ShiftLeft
+			|| op == BinaryOperator::ShiftRight;
+		// % on a float is rejected by arithmeticOpcode, which knows to name fmod.
+		const bool needsIntegers = isShift || op == BinaryOperator::BitAnd
+			|| op == BinaryOperator::BitOr || op == BinaryOperator::BitXor;
+		if (needsIntegers && (_types.isFloat(leftType) || _types.isFloat(rightType))) {
+			throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
+				+ " needs integer operands");
+		}
+
+		const uint32_t leftWidth = _types.vectorWidth(leftType);
+		const uint32_t rightWidth = _types.vectorWidth(rightType);
+		const auto emit = [&](Id type, Id leftOperand, Id rightOperand) {
+			return _builder.emitTyped(arithmeticOpcode(op, _types.isFloat(type),
+				_types.isSignedInt(type)), type, { leftOperand, rightOperand });
+		};
+
+		if (leftWidth > 1 && rightWidth > 1) {
+			if (leftWidth != rightWidth) {
+				throw CompileError("the operands of an operator are vectors of different widths");
+			}
+
+			// A shift count may be any integer type; every other operator wants the
+			// same vector type on both sides.
+			if (!isShift && leftType != rightType) {
+				throw CompileError("an operator takes two vectors of the same type");
+			}
+			return emit(leftType, left, right);
+		}
+
+		if (leftWidth > 1) {
+			if (_types.isFloat(rightType) && !_types.isFloat(leftType)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			return emit(leftType, left, broadcast(right, leftType));
+		}
+
+		if (rightWidth > 1) {
+			if (isShift) {
+				throw CompileError("a scalar cannot be shifted by a vector");
+			}
+			if (_types.isFloat(leftType) && !_types.isFloat(rightType)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			return emit(rightType, broadcast(left, rightType), right);
+		}
+
+		// A shift takes its type from the promoted left operand alone, and the
+		// count keeps its own.
+		if (isShift) {
+			const Id promoted = _types.bitWidth(leftType) < 32 ? promotedTo(1) : leftType;
+			return emit(promoted, convert(left, leftType, promoted), right);
+		}
+
+		const Id common = usualArithmeticConversion(leftType, rightType).type;
+		return emit(common, convert(left, leftType, common), convert(right, rightType, common));
 	}
 
 	// A product with a matrix on at least one side. SPIR-V has an opcode per
@@ -2551,16 +2656,7 @@ namespace {
 			throw CompileError("operator " + spelled + " cannot take a vector on the right of a scalar");
 		}
 
-		// A shift takes its type from the promoted left operand alone, and the
-		// count keeps its own.
-		if (isShift) {
-			const Id promoted = _types.bitWidth(targetType) < 32 ? promotedTo(1) : targetType;
-			return emitBinaryOperation(op, convert(current, targetType, promoted), value);
-		}
-
-		const Id common = usualArithmeticConversion(targetType, valueType).type;
-		return emitBinaryOperation(op, convert(current, targetType, common),
-			convert(value, valueType, common));
+		return emitBinaryOperation(op, current, value);
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
@@ -2747,6 +2843,11 @@ namespace {
 				+ " is not lowered yet");
 		}
 
+		// A half's literal is its own 16 bits, not the low half of a float's.
+		if (kind == ScalarKind::Half) {
+			return halfBitsOf(value);
+		}
+
 		if (isFloatKind(kind)) {
 			const auto narrowed = static_cast<float>(value);
 			uint32_t bits = 0;
@@ -2803,6 +2904,12 @@ namespace {
 				return folded;
 
 			case ExpressionKind::FloatLiteral:
+				if (expression.floatIsHalf) {
+					folded.scalar = ScalarKind::Half;
+					folded.number = halfValueOf(halfBitsOf(expression.floatValue));
+					return folded;
+				}
+
 				folded.scalar = ScalarKind::Float;
 				folded.number = expression.floatValue;
 				return folded;
@@ -2864,7 +2971,10 @@ namespace {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
 		}
 
-		if (left.scalar != right.scalar) {
+		// A half beside a float is a float, as in C.
+		const bool mixedFloats = left.scalar != right.scalar
+			&& isFloatKind(left.scalar) && isFloatKind(right.scalar);
+		if (left.scalar != right.scalar && !mixedFloats) {
 			throw CompileError("a constant's operands have to be of the same type, found "
 				+ std::string(scalarKindName(left.scalar)) + " and "
 				+ std::string(scalarKindName(right.scalar)));
@@ -2874,6 +2984,9 @@ namespace {
 
 		if (isFloatKind(left.scalar)) {
 			FoldedConstant folded = left;
+			if (mixedFloats) {
+				folded.scalar = ScalarKind::Float;
+			}
 
 			switch (op) {
 				case BinaryOperator::Add: folded.number = left.number + right.number; break;
@@ -3065,6 +3178,11 @@ namespace {
 			}
 
 			case ExpressionKind::FloatLiteral: {
+				if (expression.floatIsHalf) {
+					return _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::Half),
+						{ halfBitsOf(expression.floatValue) });
+				}
+
 				const auto value = static_cast<float>(expression.floatValue);
 				uint32_t bits = 0;
 				static_assert(sizeof(bits) == sizeof(value), "float is not 32 bits");

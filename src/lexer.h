@@ -63,6 +63,8 @@ struct Token {
 	uint64_t integerValue = 0;
 	double floatValue = 0.0;
 	bool integerIsUnsigned = false;
+	// A float literal written with an `h` suffix, which is a half rather than a float.
+	bool floatIsHalf = false;
 
 	// byte offset of the token start, for diagnostics
 	size_t offset = 0;

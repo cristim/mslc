@@ -190,6 +190,8 @@ struct Expression {
 	// compiler and nothing mslc can represent, which is its own gap.
 	bool intIsUnsigned = false;
 	double floatValue = 0.0;
+	// Written with an `h` suffix: the literal is a half, not a float.
+	bool floatIsHalf = false;
 	bool boolValue = false;
 
 	// Identifier, Member, Index, Call

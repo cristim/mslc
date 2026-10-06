@@ -132,6 +132,22 @@ foreach(compound IN LISTS compounds)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# An implicit arithmetic conversion is the explicit one: one test per
+# tests/equivalence/<name>.implicit.metal, against <name>.explicit.metal, which
+# spells the conversions out. "x + 1.5f" must disassemble as "float(x) + 1.5f".
+file(GLOB conversions CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.implicit.metal)
+foreach(conversion IN LISTS conversions)
+	get_filename_component(name ${conversion} NAME)
+	string(REGEX REPLACE "\\.implicit\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${conversion}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.explicit.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # Negative control: a pair that does differ must fail, or the comparison above
 # could not tell a macro that expands wrongly from one that expands right.
 add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}
