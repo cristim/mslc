@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-BRANCH-FALLTHROUGH: OpSelectionMerge
 // DISASM-ORDER: = OpConvertSToF %float
 // DISASM-ORDER: = OpPhi %float
 //

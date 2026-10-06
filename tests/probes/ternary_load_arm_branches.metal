@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-BRANCH-FALLTHROUGH: OpSelectionMerge
 // DISASM: = OpPhi %float
 // DISASM: OpBranchConditional
 // DISASM-NOT: = OpSelect 

@@ -17,6 +17,15 @@
 #                                 literal indices of the extracts that feed it
 #   // DISASM-LANES: <text> <n>   the instructions "<text> %id <index>" come in
 #                                 groups of <n> with indices 0 to <n>-1 in order
+#   // DISASM-BRANCH-FALLTHROUGH: <text>
+#                              every "<text> %m <mask>" immediately followed by
+#                              "OpBranchConditional %c %A %B" has %A as the next
+#                              OpLabel after the branch. The blocks of a
+#                              selection are emitted true arm first, so this is
+#                              what says the condition was not inverted and the
+#                              arm blocks were not swapped. It does not say what
+#                              either block computes, and it fails when no such
+#                              branch exists.
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -78,13 +87,14 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
 	file(STRINGS "${PROBE}" ascendingNeedles REGEX "^// DISASM-ASCENDING: ")
 	file(STRINGS "${PROBE}" laneNeedles REGEX "^// DISASM-LANES: ")
+	file(STRINGS "${PROBE}" fallthroughNeedles REGEX "^// DISASM-BRANCH-FALLTHROUGH: ")
 	# Collected on whitespace after the prefix rather than one literal space, so a
 	# tab-separated needle is collected instead of silently skipped. A line whose
 	# prefix is not followed by whitespace is not a needle at all and is reported
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -171,6 +181,26 @@ if(expectation STREQUAL "valid")
 					message(FATAL_ERROR "${name}: \"${found}\" takes lane ${index} where lane ${expected} is due")
 				endif()
 				math(EXPR position "${position} + 1")
+			endforeach()
+		endforeach()
+		foreach(line IN LISTS fallthroughNeedles)
+			string(REGEX REPLACE "^// DISASM-BRANCH-FALLTHROUGH: " "" needle "${line}")
+			string(REGEX MATCHALL "${needle} %[0-9]+ [A-Za-z]+\n *OpBranchConditional %[0-9]+ %[0-9]+ %[0-9]+" branches "${disassembly}")
+			if(branches STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly lacks \"${needle}\" followed by an OpBranchConditional:\n${disassembly}")
+			endif()
+			set(searchFrom 0)
+			foreach(branch IN LISTS branches)
+				string(REGEX MATCH "OpBranchConditional %[0-9]+ %([0-9]+) %[0-9]+" ignored "${branch}")
+				set(trueTarget "${CMAKE_MATCH_1}")
+				string(FIND "${disassembly}" "${branch}" at)
+				string(LENGTH "${branch}" branchLength)
+				math(EXPR after "${at} + ${branchLength}")
+				string(SUBSTRING "${disassembly}" ${after} -1 rest)
+				string(REGEX MATCH "%([0-9]+) = OpLabel" ignored "${rest}")
+				if(NOT CMAKE_MATCH_1 STREQUAL trueTarget)
+					message(FATAL_ERROR "${name}: after \"${branch}\" the next block is %${CMAKE_MATCH_1}, not the true target %${trueTarget}:\n${disassembly}")
+				endif()
 			endforeach()
 		endforeach()
 		# Every other needle answers whether a string is present, which cannot say
