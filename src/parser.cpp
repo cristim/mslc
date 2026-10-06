@@ -164,6 +164,13 @@ namespace {
 		return isTypeName(text, type);
 	}
 
+	// The words C++ combines, in any order, into one integer type name:
+	// "unsigned long int" is a ulong, and so is "int long unsigned".
+	bool isIntegerSpecifier(std::string_view text) {
+		return text == "unsigned" || text == "signed" || text == "short" || text == "long"
+			|| text == "int" || text == "char";
+	}
+
 	// Keywords that may appear before a type and are not address spaces.
 	bool isTypeQualifier(std::string_view text) {
 		return text == "const" || text == "static" || text == "constexpr"
@@ -1860,6 +1867,83 @@ bool Parser::parseQualifier(Type& type, bool afterPointer) {
 	return true;
 }
 
+// Reads a run of integer specifier words, with const and volatile among them,
+// into type.scalar. Apple takes the words in any order and the same signedness
+// or "short" twice with only a warning, so those are accepted; "long long" is
+// not supported by Metal, and short, long, char and int combine only as C++ allows.
+// A run of one word is "unsigned" or "signed" alone (an int) or a single-token name.
+size_t Parser::parseSpecifierRun(Type& type) {
+	size_t unsignedCount = 0, signedCount = 0, shortCount = 0, longCount = 0, intCount = 0, charCount = 0;
+	std::string spelling;
+	size_t words = 0;
+
+	while (kind() == TokenKind::Identifier) {
+		const std::string_view text = current().text;
+		if (isIntegerSpecifier(text)) {
+			++words;
+			spelling += (spelling.empty() ? "" : " ") + std::string(text);
+			if (text == "unsigned") {
+				++unsignedCount;
+			} else if (text == "signed") {
+				++signedCount;
+			} else if (text == "short") {
+				++shortCount;
+			} else if (text == "long") {
+				++longCount;
+			} else if (text == "int") {
+				++intCount;
+			} else {
+				++charCount;
+			}
+			advance();
+		} else if (text == "const" || text == "volatile") {
+			parseQualifier(type, false);
+		} else {
+			break;
+		}
+	}
+
+	const auto invalid = [&](const std::string& why) {
+		return CompileError("\"" + spelling + "\" cannot be combined: " + why);
+	};
+
+	// A bare "int" or "char" may be followed by the name a typedef declares, which
+	// can be a builtin's, so only a run that takes a modifier is checked for a
+	// type name of its own after it.
+	ScalarKind following;
+	if (words > intCount + charCount && kind() == TokenKind::Identifier && isScalarTypeName(current().text, following)) {
+		throw invalid("\"" + std::string(current().text) + "\" is a complete type name of its own");
+	}
+	if (unsignedCount > 0 && signedCount > 0) {
+		throw invalid("a type is either signed or unsigned");
+	}
+	if (longCount > 1) {
+		throw CompileError("\"" + spelling + "\": long long is not supported in Metal");
+	}
+	if (shortCount > 0 && longCount > 0) {
+		throw invalid("short and long exclude each other");
+	}
+	if (charCount > 0 && (shortCount > 0 || longCount > 0 || intCount > 0 || charCount > 1)) {
+		throw invalid("char takes only signed or unsigned");
+	}
+	if (intCount > 1) {
+		throw invalid("int appears twice");
+	}
+
+	const bool isUnsigned = unsignedCount > 0;
+	if (charCount > 0) {
+		type.scalar = isUnsigned ? ScalarKind::UChar : ScalarKind::Char;
+	} else if (shortCount > 0) {
+		type.scalar = isUnsigned ? ScalarKind::UShort : ScalarKind::Short;
+	} else if (longCount > 0) {
+		type.scalar = isUnsigned ? ScalarKind::ULong : ScalarKind::Long;
+	} else {
+		type.scalar = isUnsigned ? ScalarKind::UInt : ScalarKind::Int;
+	}
+
+	return words;
+}
+
 Type Parser::parseType(bool allowResource) {
 	Type type;
 
@@ -1889,7 +1973,9 @@ Type Parser::parseType(bool allowResource) {
 		}
 	};
 
-	if (kind() == TokenKind::Identifier && nameTokens == 1 && isResourceTypeName(current().text)) {
+	if (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) {
+		parseSpecifierRun(type);
+	} else if (kind() == TokenKind::Identifier && nameTokens == 1 && isResourceTypeName(current().text)) {
 		if (!allowResource) {
 			throw CompileError("\"" + std::string(current().text) + "\" is a texture or sampler type, "
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
@@ -1962,7 +2048,14 @@ void Parser::parseResourceType(Type& type) {
 			+ std::string(tokenKindName(kind())));
 	}
 
-	const std::string component(advance().text);
+	std::string component(current().text);
+	if (isIntegerSpecifier(component)) {
+		Type channel;
+		parseSpecifierRun(channel);
+		component = typeName(channel);
+	} else {
+		advance();
+	}
 	if (component != "float" && component != "half") {
 		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
 			"sampled types float and half");
@@ -2374,6 +2467,7 @@ StatementPtr Parser::parseStatement() {
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
 				|| _unit.findStruct(name) != nullptr))
+			|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 
@@ -2638,8 +2732,9 @@ StatementPtr Parser::parseForStatement() {
 	{
 		Type probe;
 		size_t nameTokens = 0;
-		const bool looksLikeType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-			&& resolveTypeName(peekResolved(nameTokens), probe);
+		const bool looksLikeType = (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
+			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+				&& resolveTypeName(peekResolved(nameTokens), probe));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -2905,11 +3000,35 @@ ExpressionPtr Parser::parseCast() {
 		return nullptr;
 	}
 
+	// "(unsigned int)x" and "(const unsigned char)x": a run of integer specifier
+	// words, which only a type can begin. A qualifier may come first.
+	{
+		size_t skip = 1;
+		while (lookahead(skip).kind == TokenKind::Identifier
+			&& (lookahead(skip).text == "const" || lookahead(skip).text == "volatile")) {
+			++skip;
+		}
+		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
+			advance();
+			Type type;
+			parseSpecifierRun(type);
+			if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
+				throw CompileError("a cast to a pointer, reference or template type is not supported");
+			}
+			expect(TokenKind::RParen, "to close a cast");
+			auto expression = std::make_unique<Expression>();
+			expression->kind = ExpressionKind::Construct;
+			expression->line = line();
+			expression->constructType = type;
+			const NestingScope scope(*this);
+			expression->arguments.push_back(parseUnary());
+			measure(*expression);
+			return expression;
+		}
+	}
+
 	const std::string head(first.text);
 	if (first.kind == TokenKind::Identifier) {
-		if (head == "unsigned" || head == "long" || head == "short" || head == "signed") {
-			throw CompileError("a cast to a multi-word type name is not supported yet");
-		}
 		if (isTypeQualifier(head) || addressSpaceFor(head)) {
 			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
 		}
@@ -3139,6 +3258,27 @@ ExpressionPtr Parser::parsePrimary() {
 		advance();
 		auto expression = parseExpression();
 		expect(TokenKind::RParen, "to close a parenthesised expression");
+		return expression;
+	}
+
+	if (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) {
+		// unsigned(x) and short(x) are functional casts; a run of more words is
+		// not one, as in C++, and Apple rejects it.
+		Type type;
+		if (parseSpecifierRun(type) > 1) {
+			throw CompileError("a functional cast takes a single-word type name; write (" + typeName(type)
+				+ ")x instead");
+		}
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Construct;
+		expression->line = line();
+		expression->constructType = type;
+		if (!at(TokenKind::LParen)) {
+			throw CompileError("expected '(' after type \"" + typeName(type) + "\"");
+		}
+		advance();
+		expression->arguments = parseArgumentList("to close a constructor's argument list");
+		measure(*expression);
 		return expression;
 	}
 
