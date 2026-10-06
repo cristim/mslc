@@ -2825,9 +2825,6 @@ namespace {
 		return { commonType, operandsSigned };
 	}
 
-	// A scalar && or || evaluates its right operand only when the left does not
-	// decide the result, so a guard such as `i < n && buf[i] > 0` is one. A vector
-	// operand is componentwise and evaluates both, as in Metal.
 	// Holds one level of structured control flow for as long as it lives.
 	class ControlDepthScope {
 	public:
@@ -2847,6 +2844,9 @@ namespace {
 		uint32_t& _depth;
 	};
 
+	// A scalar && or || evaluates its right operand only when the left does not
+	// decide the result, so a guard such as `i < n && buf[i] > 0` is one. A vector
+	// operand is componentwise and evaluates both, as in Metal.
 	Id Emitter::emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression) {
 		const bool isAnd = op == BinaryOperator::LogicalAnd;
 		const Id condition = asCondition(left);
