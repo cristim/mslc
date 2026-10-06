@@ -1,5 +1,6 @@
 // EXPECT: valid
 // DISASM-NO-MATCH: OpBitcast %_struct
+// DISASM-NO-MATCH: OpCompositeConstruct %_struct
 //
 // A struct read straight from a buffer is returned. Its SPIR-V type carries the
 // buffer's member offsets, so it is copied into the plain form first. Apple
