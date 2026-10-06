@@ -43,7 +43,23 @@ class Parser {
 	// compiler, instead of the later one silently winning.
 	std::map<std::string, std::string> _declared;
 
+	// Levels of brackets, blocks and unbraced bodies the parser is inside, one
+	// per recursive call. Each structured construct the emitter writes (an if, a
+	// loop, the right operand of && or ||) needs at least one of them, so the cap
+	// also keeps spirv-val's limit of 1023 nested constructs out of reach.
+	uint32_t _nesting = 0;
+
 public:
+	// Apple's compiler stops at 256 of each of ( [ and { nested, so this is above
+	// the 767 a program it accepts can reach. It is under spirv-val's 1023 and
+	// leaves the parser's own stack a wide margin.
+	static constexpr uint32_t kMaxNestingDepth = 1000;
+	// Taller than any tree a source Apple accepts is likely to need, and a third
+	// of what the emitter and the tree's destructor can recurse through on an
+	// 8 MiB stack. Reached only by operators chained one after another, since
+	// nesting is capped by kMaxNestingDepth.
+	static constexpr uint32_t kMaxExpressionHeight = 4000;
+
 	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) {}
 
 	TranslationUnit parse();
@@ -52,6 +68,23 @@ public:
 	size_t position() const { return _position; }
 
 private:
+	class NestingScope {
+		Parser& _parser;
+
+	public:
+		explicit NestingScope(Parser& parser);
+		~NestingScope() { --_parser._nesting; }
+		NestingScope(const NestingScope&) = delete;
+		NestingScope& operator=(const NestingScope&) = delete;
+	};
+
+	// Sets the height of an expression whose children are all in place.
+	void measure(Expression& expression) const;
+
+	// The body of an if, else, for or while: a block counts itself, anything else
+	// counts here.
+	StatementPtr parseBody();
+
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
 	TokenKind kind() const { return current().kind; }
@@ -190,6 +223,7 @@ private:
 			expression->binaryOperator = chosen;
 			expression->left = std::move(left);
 			expression->right = next(*this);
+			measure(*expression);
 
 			left = std::move(expression);
 		}

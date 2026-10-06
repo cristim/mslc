@@ -1,7 +1,7 @@
 // EXPECT: valid
 //
-// Exactly 512 right-operand nesting of && : the limit is 512, well under the 1023
-// control-flow nesting depth spirv-val allows.
+// 512 levels of right-operand nesting of &&, each a selection construct, well under
+// the 1023 nested constructs spirv-val allows and the 999 mslc accepts.
 kernel void logical_and_nested_512_deep_valid(device uint *out [[buffer(0)]], constant int *v [[buffer(1)]], uint i [[thread_position_in_grid]])
 {
     bool a = v[i] > 0;
