@@ -928,44 +928,59 @@ std::optional<uint32_t> Parser::tryParseArrayLength() {
 	return length;
 }
 
+// One type qualifier or address space at the cursor, applied to the type. MSL
+// takes them on either side of the type name, so "In const in", "float const *p"
+// and "const In in" are the same declaration. Before a "*" they qualify the
+// type; after one they qualify the pointer, which none of the flags here track.
+bool Parser::parseQualifier(Type& type, bool afterPointer) {
+	if (kind() != TokenKind::Identifier) {
+		return false;
+	}
+
+	const std::string_view text = current().text;
+
+	AddressSpace space;
+	if (!afterPointer && addressSpaceFor(text)) {
+		parseAddressSpace(space);
+		// A different second address space is a mistake rather than an
+		// alternative spelling, and which one was meant decides which storage
+		// class a binding lands in, so it is reported rather than resolved.
+		if (type.addressSpace != AddressSpace::None && type.addressSpace != space) {
+			throw CompileError("a type has one address space, found \"" + std::string(text)
+				+ "\" after another");
+		}
+
+		type.addressSpace = space;
+		return true;
+	}
+
+	if (!isTypeQualifier(text)) {
+		return false;
+	}
+
+	if (text == "const" && !afterPointer) {
+		type.isConst = true;
+	}
+	if (text == "constexpr") {
+		type.isConstexpr = true;
+	}
+	if (text == "static") {
+		type.isStatic = true;
+	}
+
+	advance();
+	return true;
+}
+
 Type Parser::parseType(bool allowResource) {
 	Type type;
-	bool isConstexpr = false;
 
 	// MSL writes the address space and the const qualifier in either order, and
 	// both orders are ordinary: "device const float*" and "const device Vertex *"
 	// are the same declaration spelled two ways. Reading them as two fixed
 	// sequences took "const" as the whole prefix and then read "device" as a type
 	// name, so the parameter became "Vertex" and the list ended at the "*".
-	while (kind() == TokenKind::Identifier) {
-		const std::string_view text = current().text;
-
-		AddressSpace space;
-		if (parseAddressSpace(space)) {
-			// A second address space is a mistake rather than an alternative
-			// spelling, and which one was meant decides which storage class a
-			// binding lands in, so it is reported rather than resolved.
-			if (type.addressSpace != AddressSpace::None) {
-				throw CompileError("a type has one address space, found \"" + std::string(text)
-					+ "\" after another");
-			}
-
-			type.addressSpace = space;
-			continue;
-		}
-
-		if (!isTypeQualifier(text)) {
-			break;
-		}
-
-		if (text == "const") {
-			type.isConst = true;
-		}
-		if (text == "constexpr") {
-			isConstexpr = true;
-		}
-
-		advance();
+	while (parseQualifier(type, false)) {
 	}
 
 	// metal::sampler and metal::texture2d, which Apple takes as the unqualified names.
@@ -981,10 +996,6 @@ Type Parser::parseType(bool allowResource) {
 				"which mslc takes as an entry point parameter only, and a sampler also as a local");
 		}
 		parseResourceType(type);
-		if (atKeyword("const")) {
-			type.isConst = true;
-			advance();
-		}
 	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
 	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
@@ -999,17 +1010,23 @@ Type Parser::parseType(bool allowResource) {
 			+ " \"" + std::string(current().text) + "\"");
 	}
 
+	while (parseQualifier(type, false)) {
+	}
+
 	while (at(TokenKind::Star)) {
 		if (type.isPointer) {
 			throw CompileError("a pointer to a pointer is not supported");
 		}
 		advance();
 		type.isPointer = true;
+
+		while (parseQualifier(type, true)) {
+		}
 	}
 
 	// constexpr makes the variable const, and on a pointer that is the pointer
 	// rather than what it points at, which is what isConst means there.
-	if (isConstexpr && !type.isPointer) {
+	if (type.isConstexpr && !type.isPointer) {
 		type.isConst = true;
 	}
 

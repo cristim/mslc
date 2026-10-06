@@ -77,6 +77,12 @@ struct Type {
 
 	bool isPointer = false;
 	bool isConst = false;
+
+	// As written. Only a local or a file-scope constant can be constexpr, and
+	// nothing inside a function can be static; the parser reports both where
+	// the context is known.
+	bool isConstexpr = false;
+	bool isStatic = false;
 	AddressSpace addressSpace = AddressSpace::None;
 
 	// Set for an array type; the element type is described by the rest.

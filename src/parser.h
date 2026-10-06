@@ -111,6 +111,7 @@ private:
 	// entry point parameter, and a local declaration, which only a sampler may be.
 	Type parseType(bool allowResource = false);
 	void parseResourceType(Type& type);
+	bool parseQualifier(Type& type, bool afterPointer);
 	void parseSamplerLocal(VariableDeclaration& declaration);
 	SamplerState parseSamplerOptions(TokenKind closing);
 	bool parseAddressSpace(AddressSpace& space);

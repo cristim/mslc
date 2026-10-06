@@ -148,6 +148,21 @@ foreach(conversion IN LISTS conversions)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
 endforeach()
 
+# A qualifier written after the type name is the one written before it: one test per
+# tests/equivalence/<name>.trailing.metal, against <name>.leading.metal.
+file(GLOB trailings CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/*.trailing.metal)
+foreach(trailing IN LISTS trailings)
+	get_filename_component(name ${trailing} NAME)
+	string(REGEX REPLACE "\\.trailing\\.metal$" "" name ${name})
+	add_test(NAME equivalence/${name} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DMACRO=${trailing}
+		-DEXPANDED=${CMAKE_CURRENT_SOURCE_DIR}/tests/equivalence/${name}.leading.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/equivalence/${name}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_equivalence.cmake)
+endforeach()
+
 # Negative control: a pair that does differ must fail, or the comparison above
 # could not tell a macro that expands wrongly from one that expands right.
 add_test(NAME equivalence-negative-control/differs COMMAND ${CMAKE_COMMAND}
