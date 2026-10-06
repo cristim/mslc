@@ -12,6 +12,9 @@
 #   // DISASM-ORDER: <text>      a later DISASM-ORDER line appears after this one
 #   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
 #   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
+#   // DISASM-ASCENDING: <text>   an instruction starting with <text> lists ids
+#                                 that rise left to right, for a value built lane by
+#                                 lane in lane order
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -71,13 +74,14 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
 	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
 	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
+	file(STRINGS "${PROBE}" ascendingNeedles REGEX "^// DISASM-ASCENDING: ")
 	# Collected on whitespace after the prefix rather than one literal space, so a
 	# tab-separated needle is collected instead of silently skipped. A line whose
 	# prefix is not followed by whitespace is not a needle at all and is reported
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -121,6 +125,24 @@ if(expectation STREQUAL "valid")
 			if(NOT found STREQUAL "")
 				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
 			endif()
+		endforeach()
+		# A regex cannot compare two ids, so lane order is checked here: the lanes
+		# are emitted in order, so the ids a construct lists must rise.
+		foreach(line IN LISTS ascendingNeedles)
+			string(REGEX REPLACE "^// DISASM-ASCENDING: " "" needle "${line}")
+			string(REGEX MATCH "${needle}( %[0-9]+)+" found "${disassembly}")
+			if(found STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly lacks an instruction \"${needle}\" with ids:\n${disassembly}")
+			endif()
+			string(REGEX REPLACE "^${needle}" "" idText "${found}")
+			string(REGEX MATCHALL "[0-9]+" ids "${idText}")
+			set(previous -1)
+			foreach(id IN LISTS ids)
+				if(NOT id GREATER previous)
+					message(FATAL_ERROR "${name}: the ids of \"${found}\" do not rise, so the lanes are out of order")
+				endif()
+				set(previous ${id})
+			endforeach()
 		endforeach()
 		# Every other needle answers whether a string is present, which cannot say
 		# where it is relative to another string. CMake's REGEX MATCH does not span

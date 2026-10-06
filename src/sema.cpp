@@ -1813,14 +1813,14 @@ namespace {
 		}
 
 		const Id byteType = _types.scalar(ScalarKind::UChar);
+		const Id laneType = _types.scalar(ScalarKind::Bool);
 		std::vector<uint32_t> lanes;
 		for (uint32_t lane = 0; lane < width; ++lane) {
-			lanes.push_back(_builder.emitTyped(spirv::OpCompositeExtract, byteType, { bytes, lane }));
+			const Id byte = _builder.emitTyped(spirv::OpCompositeExtract, byteType, { bytes, lane });
+			lanes.push_back(convert(byte, byteType, laneType));
 		}
 
-		const Id byteVector = _types.vector(ScalarKind::UChar, width);
-		return convert(_builder.emitTyped(spirv::OpCompositeConstruct, byteVector, lanes),
-			byteVector, boolType);
+		return _builder.emitTyped(spirv::OpCompositeConstruct, boolType, lanes);
 	}
 
 	// A bool or bool vector as the byte or bytes a buffer holds: 1 for true, 0
@@ -1833,11 +1833,11 @@ namespace {
 			return convert(value, boolType, byteType);
 		}
 
-		const Id byteVector = _types.vector(ScalarKind::UChar, width);
-		const Id bytes = convert(value, boolType, byteVector);
+		const Id laneType = _types.scalar(ScalarKind::Bool);
 		std::vector<uint32_t> lanes;
 		for (uint32_t lane = 0; lane < width; ++lane) {
-			lanes.push_back(_builder.emitTyped(spirv::OpCompositeExtract, byteType, { bytes, lane }));
+			const Id flag = _builder.emitTyped(spirv::OpCompositeExtract, laneType, { value, lane });
+			lanes.push_back(convert(flag, laneType, byteType));
 		}
 
 		return _builder.emitTyped(spirv::OpCompositeConstruct,
