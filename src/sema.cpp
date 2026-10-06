@@ -2470,13 +2470,12 @@ namespace {
 
 		const bool isShift = op == BinaryOperator::ShiftLeft
 			|| op == BinaryOperator::ShiftRight;
-		const bool needsIntegers = isShift || op == BinaryOperator::Modulo
-			|| op == BinaryOperator::BitAnd || op == BinaryOperator::BitOr
-			|| op == BinaryOperator::BitXor;
+		// % on a float is rejected by arithmeticOpcode, which knows to name fmod.
+		const bool needsIntegers = isShift || op == BinaryOperator::BitAnd
+			|| op == BinaryOperator::BitOr || op == BinaryOperator::BitXor;
 		if (needsIntegers && (_types.isFloat(leftType) || _types.isFloat(rightType))) {
 			throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
-				+ " needs integer operands"
-				+ (op == BinaryOperator::Modulo ? "; use fmod for floating point" : ""));
+				+ " needs integer operands");
 		}
 
 		const uint32_t leftWidth = _types.vectorWidth(leftType);
@@ -2657,16 +2656,7 @@ namespace {
 			throw CompileError("operator " + spelled + " cannot take a vector on the right of a scalar");
 		}
 
-		// A shift takes its type from the promoted left operand alone, and the
-		// count keeps its own.
-		if (isShift) {
-			const Id promoted = _types.bitWidth(targetType) < 32 ? promotedTo(1) : targetType;
-			return emitBinaryOperation(op, convert(current, targetType, promoted), value);
-		}
-
-		const Id common = usualArithmeticConversion(targetType, valueType).type;
-		return emitBinaryOperation(op, convert(current, targetType, common),
-			convert(value, valueType, common));
+		return emitBinaryOperation(op, current, value);
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
