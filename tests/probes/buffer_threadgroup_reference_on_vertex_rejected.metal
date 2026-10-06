@@ -1,4 +1,4 @@
-// EXPECT: error parameter "p" needs a device or constant address space to be a buffer binding, not threadgroup
+// EXPECT: error threadgroup parameters are only supported on kernel functions
 //
 // A threadgroup pointer is a kernel argument; a vertex function takes none.
 struct Foo { float a; };

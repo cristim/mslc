@@ -4071,6 +4071,15 @@ namespace {
 		const AddressSpace space = parameter.type.addressSpace;
 		const bool threadgroupArgument = space == AddressSpace::Threadgroup
 			&& !parameter.attributes.bufferIndex && _entryPoint->stage == Stage::Kernel;
+		if (space == AddressSpace::Threadgroup && !parameter.attributes.bufferIndex
+			&& _entryPoint->stage != Stage::Kernel) {
+			throw CompileError("parameter \"" + parameter.name + "\" is a threadgroup parameter; "
+				"threadgroup parameters are only supported on kernel functions");
+		}
+		if (space == AddressSpace::None) {
+			throw CompileError("parameter \"" + parameter.name + "\": pointer parameter needs an "
+				"explicit address space (device or constant)");
+		}
 		if (space != AddressSpace::Device && space != AddressSpace::Constant && !threadgroupArgument) {
 			throw CompileError("parameter \"" + parameter.name + "\" needs a device or constant "
 				"address space to be a buffer binding, not " + std::string(addressSpaceName(space)));

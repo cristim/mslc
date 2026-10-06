@@ -154,7 +154,7 @@ namespace {
 	// Keywords that may appear before a type and are not address spaces.
 	bool isTypeQualifier(std::string_view text) {
 		return text == "const" || text == "static" || text == "constexpr"
-			|| text == "volatile" || text == "restrict" || text == "__restrict";
+			|| text == "volatile" || text == "__restrict";
 	}
 
 	// The texture and sampler type names. Only texture2d, texturecube and sampler are lowered;
@@ -209,7 +209,12 @@ namespace {
 	// A variable in a function lives in the thread address space, or in
 	// threadgroup, and is never static; Apple reports anything else. On a
 	// pointer the address space is the pointee's, which is free to be device.
-	void rejectLocalQualifiers(const Type& type) {
+	// A reference is valid MSL that mslc does not lower, so it gets its own diagnostic
+	// rather than an address-space one.
+	void rejectLocalQualifiers(const Type& type, bool isReference) {
+		if (isReference) {
+			throw CompileError("a reference in function scope is not lowered yet");
+		}
 		if (type.isStatic) {
 			throw CompileError("variables in function scope cannot be declared static");
 		}
@@ -959,8 +964,8 @@ bool Parser::parseQualifier(Type& type, bool afterPointer) {
 		// alternative spelling, and which one was meant decides which storage
 		// class a binding lands in, so it is reported rather than resolved.
 		if (type.addressSpace != AddressSpace::None && type.addressSpace != space) {
-			throw CompileError("a type has one address space, found \"" + std::string(text)
-				+ "\" after another");
+			throw CompileError("mslc does not support more than one address space on a type, found \""
+				+ std::string(text) + "\" after another (Apple accepts this)");
 		}
 
 		type.addressSpace = space;
@@ -1367,7 +1372,7 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			declaration.type = parseType(true);
-			rejectLocalQualifiers(declaration.type);
+			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
@@ -1619,7 +1624,7 @@ StatementPtr Parser::parseForStatement() {
 		if (looksLikeType) {
 			VariableDeclaration declaration;
 			declaration.type = parseType();
-			rejectLocalQualifiers(declaration.type);
+			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
