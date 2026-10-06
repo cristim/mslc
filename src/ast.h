@@ -360,17 +360,29 @@ struct FunctionDecl {
 	Type returnType;
 	std::string name;
 	std::vector<Parameter> parameters;
+	// Null for a prototype, which declares a helper function and defines nothing.
 	StatementPtr body;
 	size_t line = 0;
 
 	// How many of the unit's globals the source declares above this function: the
 	// ones its body can name.
 	size_t globalsBefore = 0;
+
+	// Where the declaration sits among the file's function declarations, entry
+	// points and helpers alike, since a function can only be called from below its
+	// first declaration.
+	size_t order = 0;
+
+	// A function that is not an entry point.
+	bool isHelper() const { return stage == Stage::None; }
 };
 
 struct TranslationUnit {
 	std::vector<StructDecl> structs;
 	std::vector<FunctionDecl> functions;
+
+	// The file's helper functions, prototypes and definitions, in source order.
+	std::vector<FunctionDecl> helpers;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.

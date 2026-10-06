@@ -135,6 +135,11 @@ private:
 	int64_t evaluateConstant(const Expression& expression, bool nested) const;
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
+	// A file-scope function that is not an entry point. False, with the position
+	// restored, when the tokens ahead are not a function's return type, name and
+	// opening parenthesis, so a file-scope constant still reaches its own parser.
+	bool tryParseHelperFunction();
+	size_t _functionOrder = 0;
 	VariableDeclaration parseGlobalDeclaration();
 
 	// Reads a bare identifier used as a name, such as a struct field's.
@@ -157,7 +162,9 @@ private:
 	std::optional<uint32_t> tryParseArrayLength();
 
 	// Parameters
-	Parameter parseParameter();
+	// helperName is set for a helper function's parameter, which has fewer forms
+	// than an entry point's: no attribute, no resource, no pointer or reference.
+	Parameter parseParameter(const std::string& helperName = std::string());
 	ParameterAttributes parseParameterAttributes();
 
 	// Struct fields
