@@ -206,6 +206,19 @@ namespace {
 		return std::nullopt;
 	}
 
+	// A variable in a function lives in the thread address space, or in
+	// threadgroup, and is never static; Apple reports anything else. On a
+	// pointer the address space is the pointee's, which is free to be device.
+	void rejectLocalQualifiers(const Type& type) {
+		if (type.isStatic) {
+			throw CompileError("variables in function scope cannot be declared static");
+		}
+		if (!type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+			throw CompileError(std::string("variables in function scope cannot be in the ")
+				+ addressSpaceName(type.addressSpace) + " address space");
+		}
+	}
+
 }
 
 bool isMSLBuiltinName(std::string_view name) {
@@ -1092,6 +1105,10 @@ Parameter Parser::parseParameter() {
 
 	param.type = parseType(true);
 
+	if (param.type.isStatic || param.type.isConstexpr) {
+		throw CompileError(std::string("a parameter cannot be ") + (param.type.isStatic ? "static" : "constexpr"));
+	}
+
 	// "constant BufferClearParams &params" and "constant BufferClearParams
 	// *params" name the same buffer and lower to the same descriptor, so a
 	// reference is consumed and nothing is recorded for it.
@@ -1109,10 +1126,11 @@ Parameter Parser::parseParameter() {
 	rejectShadowing(param.name);
 
 	if (param.type.resource != ResourceKind::None
-		&& (param.type.isPointer || param.type.arrayLength || param.type.addressSpace != AddressSpace::None)) {
+		&& (param.type.isPointer || param.type.arrayLength
+			|| (param.type.addressSpace != AddressSpace::None && param.type.addressSpace != AddressSpace::Thread))) {
 		throw CompileError("parameter \"" + param.name + "\" is a pointer to or an array of "
-			+ typeName(param.type) + " or has an address space, which is not lowered yet; mslc "
-			"takes a texture or sampler by value");
+			+ typeName(param.type) + " or has an address space other than thread, which is not lowered "
+			"yet; mslc takes a texture or sampler by value");
 	}
 
 	// "float values[4]" is an array suffix, "[[buffer(0)]]" is an attribute
@@ -1348,15 +1366,8 @@ StatementPtr Parser::parseStatement() {
 		if (looksLikeType) {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
-			const size_t typeStart = _position;
 			declaration.type = parseType(true);
-			if (declaration.type.resource != ResourceKind::None) {
-				for (size_t at = typeStart; at < _position; ++at) {
-					if (_tokens[at].text == "static") {
-						throw CompileError("variables in function scope cannot be declared static");
-					}
-				}
-			}
+			rejectLocalQualifiers(declaration.type);
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
@@ -1608,6 +1619,7 @@ StatementPtr Parser::parseForStatement() {
 		if (looksLikeType) {
 			VariableDeclaration declaration;
 			declaration.type = parseType();
+			rejectLocalQualifiers(declaration.type);
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
