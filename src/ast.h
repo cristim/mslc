@@ -225,6 +225,11 @@ struct Expression {
 
 	// Line the expression started on, for diagnostics.
 	size_t line = 0;
+
+	// Nodes on the longest path from here down to a leaf, this one included.
+	// The parser sets it on every node that has a child, and refuses a tree
+	// taller than it can walk without running out of stack.
+	uint32_t height = 1;
 };
 
 enum class StatementKind {

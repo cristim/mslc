@@ -83,6 +83,14 @@ foreach(probe IN LISTS probes)
 		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
 endforeach()
 
+# These spend about twenty seconds in spirv-val. They stay in the default run;
+# `ctest -LE slow` leaves them out.
+set_tests_properties(
+	probe/nesting_ifs_997_deep_valid
+	probe/logical_and_nested_999_deep_valid
+	probe/logical_or_nested_and_right_operand_500_deep_valid
+	PROPERTIES LABELS slow TIMEOUT 600)
+
 # A source that uses macros must compile to the same module as the source with them
 # expanded by hand: one test per tests/equivalence/<name>.macro.metal, against its
 # <name>.expanded.metal.

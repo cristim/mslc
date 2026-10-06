@@ -1551,9 +1551,10 @@ namespace {
 		// predecessor a value arrives from.
 		Id _currentBlock = InvalidId;
 
-		// How many short-circuit right operands enclose the one being emitted.
-		// Each is a selection construct, and spirv-val allows 1023 of them nested.
-		uint32_t _shortCircuitDepth = 0;
+		// How many selection and loop constructs enclose the point being emitted,
+		// counting the right operand of a scalar && or ||: spirv-val rejects a module
+		// nested 1023 deep, whatever the source nesting that produced it.
+		uint32_t _controlDepth = 0;
 
 		std::string _reflection;
 		// The next descriptor binding a texture or sampler takes, and the
@@ -2824,6 +2825,25 @@ namespace {
 		return { commonType, operandsSigned };
 	}
 
+	// Holds one level of structured control flow for as long as it lives.
+	class ControlDepthScope {
+	public:
+		explicit ControlDepthScope(uint32_t& depth): _depth(depth) {
+			constexpr uint32_t kMaxControlDepth = 1000;
+			if (_depth >= kMaxControlDepth) {
+				throw CompileError("control flow is nested more than "
+					+ std::to_string(kMaxControlDepth) + " deep");
+			}
+			++_depth;
+		}
+		~ControlDepthScope() { --_depth; }
+		ControlDepthScope(const ControlDepthScope&) = delete;
+		ControlDepthScope& operator=(const ControlDepthScope&) = delete;
+
+	private:
+		uint32_t& _depth;
+	};
+
 	// A scalar && or || evaluates its right operand only when the left does not
 	// decide the result, so a guard such as `i < n && buf[i] > 0` is one. A vector
 	// operand is componentwise and evaluates both, as in Metal.
@@ -2838,16 +2858,9 @@ namespace {
 		terminate(spirv::OpBranchConditional, { condition,
 			isAnd ? rightLabel : mergeLabel, isAnd ? mergeLabel : rightLabel });
 
-		constexpr uint32_t kMaxShortCircuitDepth = 512;
-		if (_shortCircuitDepth >= kMaxShortCircuitDepth) {
-			throw CompileError("&& and || are nested more than " + std::to_string(kMaxShortCircuitDepth)
-				+ " deep in their right operands");
-		}
-
 		beginBlock(rightLabel);
-		++_shortCircuitDepth;
+		const ControlDepthScope depth(_controlDepth);
 		const Id right = asCondition(emitExpression(rightExpression));
-		--_shortCircuitDepth;
 		const Id rightBlock = _currentBlock;
 		terminate(spirv::OpBranch, { mergeLabel });
 
@@ -5252,6 +5265,7 @@ namespace {
 				_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
 				terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
 
+				const ControlDepthScope depth(_controlDepth);
 				beginBlock(thenLabel);
 				emitStatement(*statement.thenBranch);
 				branchUnlessTerminated(mergeLabel);
@@ -5289,6 +5303,7 @@ namespace {
 
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
+				const ControlDepthScope depth(_controlDepth);
 
 				// A && or || in the condition splits it over several blocks, and
 				// OpLoopMerge has to end the header, so it goes in front of them.

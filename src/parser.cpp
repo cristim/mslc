@@ -1,5 +1,6 @@
 #include "parser.h"
 
+#include <algorithm>
 #include <climits>
 #include <unordered_map>
 
@@ -422,6 +423,7 @@ ExpressionPtr Parser::parseInitializer() {
 }
 
 ExpressionPtr Parser::parseInitializerList() {
+	const NestingScope scope(*this);
 	auto list = std::make_unique<Expression>();
 	list->kind = ExpressionKind::InitList;
 	list->line = line();
@@ -448,6 +450,7 @@ ExpressionPtr Parser::parseInitializerList() {
 	}
 
 	expect(TokenKind::RBrace, "to close a braced initialiser");
+	measure(*list);
 	return list;
 }
 
@@ -1293,7 +1296,47 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	return decl;
 }
 
+Parser::NestingScope::NestingScope(Parser& parser): _parser(parser) {
+	if (++_parser._nesting > kMaxNestingDepth) {
+		throw CompileError("statements and expressions are nested more than "
+			+ std::to_string(kMaxNestingDepth) + " deep");
+	}
+}
+
+void Parser::measure(Expression& expression) const {
+	uint32_t tallest = 0;
+	const auto consider = [&tallest](const ExpressionPtr& child) {
+		if (child) {
+			tallest = std::max(tallest, child->height);
+		}
+	};
+	consider(expression.left);
+	consider(expression.right);
+	for (const ExpressionPtr& argument: expression.arguments) {
+		consider(argument);
+	}
+	for (const InitializerElement& element: expression.elements) {
+		consider(element.value);
+	}
+
+	expression.height = tallest + 1;
+	if (expression.height > kMaxExpressionHeight) {
+		throw CompileError("an expression is more than " + std::to_string(kMaxExpressionHeight)
+			+ " operators deep");
+	}
+}
+
+StatementPtr Parser::parseBody() {
+	if (at(TokenKind::LBrace)) {
+		return parseCompoundStatement();
+	}
+
+	const NestingScope scope(*this);
+	return parseStatement();
+}
+
 StatementPtr Parser::parseCompoundStatement() {
+	const NestingScope scope(*this);
 	auto statement = std::make_unique<Statement>();
 	statement->kind = StatementKind::Compound;
 	statement->line = line();
@@ -1405,6 +1448,7 @@ StatementPtr Parser::parseStatement() {
 				construct->line = line();
 				construct->constructType = declaration.type;
 				construct->arguments = parseArgumentList("to close a constructor's argument list");
+				measure(*construct);
 				declaration.initializer = std::move(construct);
 			}
 
@@ -1598,10 +1642,10 @@ StatementPtr Parser::parseIfStatement() {
 	statement->expression = parseExpression();
 	expect(TokenKind::RParen, "after an if condition");
 
-	statement->thenBranch = parseStatement();
+	statement->thenBranch = parseBody();
 
 	if (matchIdentifier("else")) {
-		statement->elseBranch = parseStatement();
+		statement->elseBranch = parseBody();
 	}
 
 	return statement;
@@ -1651,7 +1695,7 @@ StatementPtr Parser::parseForStatement() {
 	}
 	expect(TokenKind::RParen, "after a for header");
 
-	statement->forBody = parseStatement();
+	statement->forBody = parseBody();
 
 	return statement;
 }
@@ -1666,7 +1710,7 @@ StatementPtr Parser::parseWhileStatement() {
 	statement->whileCondition = parseExpression();
 	expect(TokenKind::RParen, "after a while condition");
 
-	statement->whileBody = parseStatement();
+	statement->whileBody = parseBody();
 
 	return statement;
 }
@@ -1692,6 +1736,7 @@ ExpressionPtr Parser::parseExpression() {
 }
 
 ExpressionPtr Parser::parseAssignment() {
+	const NestingScope scope(*this);
 	auto left = parseLogicalOr();
 
 	static const std::pair<TokenKind, BinaryOperator> compounds[] = {
@@ -1722,6 +1767,7 @@ ExpressionPtr Parser::parseAssignment() {
 		expression->line = left->line;
 		expression->left = std::move(left);
 		expression->right = parseAssignment();
+		measure(*expression);
 		return expression;
 	}
 
@@ -1790,6 +1836,7 @@ ExpressionPtr Parser::parseUnary() {
 		dereference->line = line();
 		advance();
 
+		const NestingScope scope(*this);
 		auto operand = parseUnary();
 		if (operand->kind == ExpressionKind::Binary) {
 			throw CompileError("pointer arithmetic such as \"*(p + i)\" is not supported; "
@@ -1805,6 +1852,7 @@ ExpressionPtr Parser::parseUnary() {
 
 		dereference->left = std::move(operand);
 		dereference->arguments.push_back(std::move(zero));
+		measure(*dereference);
 		return dereference;
 	}
 
@@ -1828,7 +1876,9 @@ ExpressionPtr Parser::parseUnary() {
 		}
 
 		advance();
+		const NestingScope scope(*this);
 		expression->left = parseUnary();
+		measure(*expression);
 		return expression;
 	}
 
@@ -1847,6 +1897,7 @@ ExpressionPtr Parser::parsePostfix() {
 				? UnaryOperator::PostIncrement : UnaryOperator::PostDecrement;
 			advance();
 			step->left = std::move(expression);
+			measure(*step);
 			return step;
 		}
 
@@ -1858,6 +1909,7 @@ ExpressionPtr Parser::parsePostfix() {
 			index->left = std::move(expression);
 			index->arguments.push_back(parseExpression());
 			expect(TokenKind::RBracket, "to close an index");
+			measure(*index);
 			expression = std::move(index);
 			continue;
 		}
@@ -1874,6 +1926,7 @@ ExpressionPtr Parser::parsePostfix() {
 			member->line = expression->line;
 			member->left = std::move(expression);
 			member->memberName = std::string(advance().text);
+			measure(*member);
 			expression = std::move(member);
 			continue;
 		}
@@ -1885,6 +1938,7 @@ ExpressionPtr Parser::parsePostfix() {
 			call->line = expression->line;
 			call->left = std::move(expression);
 			call->arguments = parseArgumentList("to close an argument list");
+			measure(*call);
 			expression = std::move(call);
 			continue;
 		}
@@ -2027,6 +2081,7 @@ ExpressionPtr Parser::parsePrimary() {
 			expression->line = line();
 			expression->constructType = type;
 			expression->arguments = parseArgumentList("to close a constructor's argument list");
+			measure(*expression);
 			return expression;
 		}
 
@@ -2047,6 +2102,7 @@ ExpressionPtr Parser::parsePrimary() {
 			negated->line = expression->line;
 			negated->unaryOperator = UnaryOperator::Negate;
 			negated->left = std::move(expression);
+			measure(*negated);
 			return negated;
 		}
 
