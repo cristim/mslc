@@ -36,7 +36,13 @@ class Parser {
 	// type is reported as what it is.
 	std::map<std::string, Type> _typedefs;
 	std::map<std::string, std::string> _enumTypes; // name or typedef name -> tag
-	std::map<std::string, int64_t> _enumConstants;
+	struct EnumConstant {
+		int64_t value;
+		ScalarKind kind; // the underlying type of the enum it belongs to
+	};
+	std::map<std::string, EnumConstant> _enumConstants;
+	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type
+	ScalarKind _lastEnumUnderlying = ScalarKind::Int;
 
 	// Every file-scope name and what it names, so a typedef or an enum constant
 	// that collides with another declaration is reported, as it is in Apple's
