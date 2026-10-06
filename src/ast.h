@@ -172,6 +172,7 @@ enum class ExpressionKind {
 	Call,
 	Construct,
 	InitList,
+	Conditional,
 };
 
 enum class BinaryOperator {
@@ -210,6 +211,9 @@ struct Expression {
 
 	// InitList
 	std::vector<InitializerElement> elements;
+
+	// Conditional: left is the condition, arguments[0] the value when it holds and
+	// arguments[1] the value when it does not.
 
 	// Binary, Unary, Assign
 	BinaryOperator binaryOperator = BinaryOperator::Add;

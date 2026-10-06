@@ -4340,6 +4340,7 @@ namespace {
 			case ExpressionKind::Call: return emitCall(expression);
 			case ExpressionKind::Construct: return emitConstruct(expression);
 			case ExpressionKind::InitList:
+			case ExpressionKind::Conditional:
 			case ExpressionKind::Assign: break;
 		}
 
