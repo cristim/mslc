@@ -1596,6 +1596,7 @@ namespace {
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
 		Id emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression);
 		Id emitArithmetic(BinaryOperator op, Id left, Id right);
+		Id emitVectorComparison(BinaryOperator op, Id left, Id right);
 		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
 		struct ArithmeticConversion {
 			Id type;
@@ -2667,6 +2668,10 @@ namespace {
 			return _builder.emitTyped(opcode, _boolType, { asCondition(left), asCondition(right) });
 		}
 
+		if (isComparison && (_types.vectorWidth(leftType) > 1 || _types.vectorWidth(_builder.typeOf(right)) > 1)) {
+			return emitVectorComparison(op, left, right);
+		}
+
 		if (isComparison) {
 			const ArithmeticConversion common = usualArithmeticConversion(_builder.typeOf(left), _builder.typeOf(right));
 			const Id commonType = common.type;
@@ -2767,6 +2772,50 @@ namespace {
 
 		const Id common = usualArithmeticConversion(leftType, rightType).type;
 		return emit(common, convert(left, leftType, common), convert(right, rightType, common));
+	}
+
+	// A comparison with a vector operand is componentwise and yields a bool vector
+	// of the same width. The operand rules are those of the arithmetic operators: a
+	// scalar beside a vector is converted to its component type and broadcast, and
+	// two vectors have to be the same type.
+	Id Emitter::emitVectorComparison(BinaryOperator op, Id left, Id right) {
+		const Id leftType = _builder.typeOf(left);
+		const Id rightType = _builder.typeOf(right);
+
+		for (const Id type: { leftType, rightType }) {
+			if (_types.bitWidth(type) == 0 || _types.isBool(type)) {
+				throw CompileError("a comparison with a vector operand is lowered only for "
+					"numeric scalars and vectors; a bool operand is not lowered yet");
+			}
+		}
+
+		const uint32_t leftWidth = _types.vectorWidth(leftType);
+		const uint32_t rightWidth = _types.vectorWidth(rightType);
+		Id operandType = leftType;
+
+		if (leftWidth > 1 && rightWidth > 1) {
+			if (leftWidth != rightWidth) {
+				throw CompileError("the operands of an operator are vectors of different widths");
+			}
+			if (leftType != rightType) {
+				throw CompileError("an operator takes two vectors of the same type");
+			}
+		} else {
+			operandType = leftWidth > 1 ? leftType : rightType;
+			const Id scalarType = leftWidth > 1 ? rightType : leftType;
+			if (_types.isFloat(scalarType) && !_types.isFloat(operandType)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			if (leftWidth > 1) {
+				right = broadcast(right, operandType);
+			} else {
+				left = broadcast(left, operandType);
+			}
+		}
+
+		const Id resultType = _types.vector(ScalarKind::Bool, _types.vectorWidth(operandType));
+		return _builder.emitTyped(comparisonOpcode(op, _types.isFloat(operandType),
+			_types.isSignedInt(operandType)), resultType, { left, right });
 	}
 
 	// A product with a matrix on at least one side. SPIR-V has an opcode per
