@@ -538,6 +538,18 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 		}
 	}
 
+	// An unscoped enum without a fixed underlying type is stored as an int, and
+	// promotes to int in arithmetic, so it is an int here. Apple also refuses an
+	// int where an enum is expected; mslc does not track that distinction.
+	if (_enumTypes.count(std::string(text))) {
+		out.scalar = ScalarKind::Int;
+		out.vectorWidth = 0;
+		out.matrixColumns = 0;
+		out.isPacked = false;
+		out.namedType.clear();
+		return true;
+	}
+
 	const auto alias = _typedefs.find(std::string(text));
 	if (alias == _typedefs.end()) {
 		return false;
@@ -1019,11 +1031,12 @@ Type Parser::parseType(bool allowResource) {
 		parseResourceType(type);
 	} else if (kind() == TokenKind::Identifier && resolveTypeName(current().text, type)) {
 		advance();
-	} else if (kind() == TokenKind::Identifier && _enumTypes.count(std::string(current().text))) {
-		throw CompileError("the enum type \"" + std::string(current().text) + "\" is not supported as a "
-			"type; its enumerators are, as integer constants");
 	} else if (atKeyword("enum")) {
-		throw CompileError("an enum used as a type is not supported; its enumerators are, as integer constants");
+		advance();
+		if (kind() != TokenKind::Identifier || !_enumTypes.count(std::string(current().text))) {
+			throw CompileError("an elaborated enum type must name an enum declared earlier in the unit");
+		}
+		resolveTypeName(advance().text, type);
 	} else if (kind() == TokenKind::Identifier) {
 		type.namedType = std::string(advance().text);
 	} else {
@@ -1366,7 +1379,11 @@ StatementPtr Parser::parseStatement() {
 		return statement;
 	}
 
-	if (atKeyword("typedef") || atKeyword("enum")) {
+	// "enum Mode m;" declares a local of an enum declared earlier; anything else
+	// that starts with "enum" would declare a type.
+	const bool elaboratedEnumLocal = atKeyword("enum") && lookahead().kind == TokenKind::Identifier
+		&& _enumTypes.count(std::string(lookahead().text)) && lookahead(2).kind == TokenKind::Identifier;
+	if (atKeyword("typedef") || (atKeyword("enum") && !elaboratedEnumLocal)) {
 		throw CompileError("\"" + std::string(current().text) + "\" inside a function is not supported; "
 			"declare it at file scope");
 	}
@@ -1406,9 +1423,8 @@ StatementPtr Parser::parseStatement() {
 		const bool looksLikeType =
 			(kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
 				|| isTypeQualifier(current().text) || isResourceTypeName(current().text)
-				|| _enumTypes.count(std::string(current().text)) > 0
 				|| _unit.findStruct(std::string(current().text)) != nullptr))
-			|| atKeyword("device") || atKeyword("constant")
+			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 
 		if (looksLikeType) {
@@ -1662,8 +1678,7 @@ StatementPtr Parser::parseForStatement() {
 	{
 		Type probe;
 		const bool looksLikeType =
-			kind() == TokenKind::Identifier && (resolveTypeName(current().text, probe)
-				|| _enumTypes.count(std::string(current().text)) > 0);
+			kind() == TokenKind::Identifier && resolveTypeName(current().text, probe);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
