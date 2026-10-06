@@ -1,6 +1,11 @@
-// EXPECT: error [[stage_in]] on a vertex function is not lowered yet
+// EXPECT: valid
+// DISASM: OpDecorate %12 Location 0
+// DISASM: OpDecorate %14 Location 2
+// DISASM: %12 = OpVariable %_ptr_Input_v4float Input
+// DISASM: %14 = OpVariable %_ptr_Input_v4float Input
 //
-// The index of [[attribute(n)]] is an enumerator here. What this pins is that the attribute list parses and the source gets as far as the stage check; a vertex stage_in is not lowered yet, so that is the answer.
+// The index of [[attribute(n)]] is an enumerator here: Position is 0 and Color
+// is 2, so the Inputs sit at Locations 0 and 2 and nothing at 1.
 #include <metal_stdlib>
 using namespace metal;
 enum Attr { Position, Color = 2 };

@@ -1279,7 +1279,7 @@ namespace {
 		// What a return statement writes: one variable for a returned scalar or
 		// vector, or one per field of a returned struct. Empty for a void function.
 		std::vector<StageVariable> _outputs;
-		// The fragment function's [[stage_in]] parameter and one Input per field.
+		// The [[stage_in]] parameter and one Input per field.
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
 
@@ -1339,6 +1339,7 @@ namespace {
 			const std::string& what);
 		std::vector<StageVariable> declareStageStruct(const StructDecl& decl,
 			spirv::StorageClassValue storageClass);
+		std::vector<StageVariable> declareVertexAttributes(const StructDecl& decl);
 		void declareStageOutputs();
 		void loadStageInputs();
 		void emitReturn(const Statement& statement);
@@ -3192,16 +3193,19 @@ namespace {
 			}
 
 			if (parameter.attributes.stageIn) {
-				if (_entryPoint->stage != Stage::Fragment) {
-					throw CompileError("[[stage_in]] on a "
-						+ std::string(_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
-						+ " function is not lowered yet (parameter \"" + parameter.name
-						+ "\"); mslc lowers it on a fragment function only");
+				if (_entryPoint->stage == Stage::Kernel) {
+					throw CompileError("[[stage_in]] on a kernel function is not lowered (parameter \""
+						+ parameter.name + "\"); mslc lowers it on a vertex or a fragment function");
 				}
 
 				if (_stageIn) {
-					throw CompileError("a fragment function takes one [[stage_in]] parameter, and \""
+					throw CompileError("a function takes one [[stage_in]] parameter, and \""
 						+ _entryPoint->name + "\" has a second (\"" + parameter.name + "\")");
+				}
+
+				if (parameter.isReference) {
+					throw CompileError("[[stage_in]] parameter \"" + parameter.name + "\" is a "
+						"reference, which Apple's compiler does not allow; take the struct by value");
 				}
 
 				const StructDecl* decl = structValue(parameter.type);
@@ -3212,7 +3216,9 @@ namespace {
 				}
 
 				_stageIn = &parameter;
-				_stageInputs = declareStageStruct(*decl, spirv::StorageClass::Input);
+				_stageInputs = _entryPoint->stage == Stage::Vertex
+					? declareVertexAttributes(*decl)
+					: declareStageStruct(*decl, spirv::StorageClass::Input);
 				continue;
 			}
 
@@ -3911,6 +3917,66 @@ namespace {
 		if (!isInput && !hasPosition) {
 			throw CompileError("struct \"" + decl.name + "\" is returned by a vertex function and "
 				"has no [[position]] field");
+		}
+
+		return variables;
+	}
+
+	// A vertex function's [[stage_in]] struct: one Input per field, at the Location
+	// the field's [[attribute(n)]] names. Iridium decorates an air.vertex_input
+	// parameter with its air.location_index (indium src/iridium/air.cpp:652-660)
+	// and indium builds the pipeline's VkVertexInputAttributeDescription with
+	// location = the vertex descriptor's attribute index
+	// (src/indium/render-pipeline.cpp:114), so the Location is n, not the field's
+	// position in the struct. The reflection lists each so a consumer can see
+	// which attributes the function reads.
+	std::vector<StageVariable> Emitter::declareVertexAttributes(const StructDecl& decl) {
+		std::vector<StageVariable> variables;
+		std::set<uint32_t> used;
+
+		if (decl.fields.empty()) {
+			throw CompileError("[[stage_in]] struct \"" + decl.name + "\" of vertex function \""
+				+ _entryPoint->name + "\" has no fields");
+		}
+
+		for (const StructField& field: decl.fields) {
+			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
+			const Type& type = field.type;
+
+			if (field.attributes.position) {
+				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
+					"struct cannot carry");
+			}
+			if (!field.attributes.attributeIndex) {
+				throw CompileError(what + " has no [[attribute(n)]]; every field of a vertex "
+					"function's [[stage_in]] struct needs one");
+			}
+			const uint32_t index = *field.attributes.attributeIndex;
+			if (!used.insert(index).second) {
+				throw CompileError(what + " reuses [[attribute(" + std::to_string(index) + ")]]");
+			}
+
+			if (type.isPointer || !type.namedType.empty() || type.isMatrix() || type.isPacked) {
+				throw CompileError(what + " is a " + typeName(type) + ", which Apple's compiler does "
+					"not allow as a vertex attribute; use a scalar or a vector");
+			}
+			if (type.scalar != ScalarKind::Half && scalarBitWidth(type.scalar) != 32
+				&& type.scalar != ScalarKind::Bool) {
+				throw CompileError(what + " is a " + typeName(type) + ", which mslc does not lower as "
+					"a vertex attribute yet; use a 32-bit scalar or vector, or half");
+			}
+			if (type.scalar == ScalarKind::Bool) {
+				throw CompileError(what + " is a " + typeName(type) + ", which mslc does not lower as "
+					"a vertex attribute; use an int or a uint");
+			}
+
+			variables.push_back(declareStageVariable(type, spirv::StorageClass::Input,
+				"vertex attribute " + what));
+			_builder.emit(spirv::OpDecorate, { variables.back().variable,
+				static_cast<uint32_t>(spirv::Decoration::Location), index });
+			addReflectionEntry("{ \"kind\": \"VertexInput\", \"metal_index\": "
+				+ std::to_string(index) + ", \"location\": " + std::to_string(index)
+				+ ", \"name\": \"" + field.name + "\" }");
 		}
 
 		return variables;

@@ -1038,7 +1038,7 @@ Parameter Parser::parseParameter() {
 		throw CompileError("a reference to " + typeName(param.type) + " is not valid; a texture or "
 			"sampler parameter is taken by value");
 	}
-	match(TokenKind::Ampersand);
+	param.isReference = match(TokenKind::Ampersand);
 
 	if (kind() != TokenKind::Identifier) {
 		throw CompileError("expected a parameter name, found " + std::string(tokenKindName(kind())));
