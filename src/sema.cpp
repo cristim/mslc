@@ -1955,6 +1955,7 @@ namespace {
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
 		Id emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression);
 		Id emitConditional(const Expression& expression);
+		bool isSafeToEvaluateUnchosen(const Expression& expression) const;
 		Id conditionalType(Id trueType, Id falseType);
 		Id toConditionalType(Id value, Id type);
 		Id emitArithmetic(BinaryOperator op, Id left, Id right);
@@ -3256,10 +3257,12 @@ namespace {
 	}
 
 	// Whether evaluating an expression whether or not it is chosen is harmless: it
-	// reads no memory through an index or a call, divides nothing and branches
-	// nowhere, so it cannot trap or touch an address the condition guards.
-	static bool isSafeToEvaluateUnchosen(const Expression& expression) {
-		const auto safe = [](const ExpressionPtr& child) {
+	// reads no memory through an index, a pointer, a reference or a call, divides
+	// nothing and branches nowhere, so it cannot trap or touch an address the
+	// condition guards. A name bound to a buffer is such a pointer or reference,
+	// and so is every member reached through one.
+	bool Emitter::isSafeToEvaluateUnchosen(const Expression& expression) const {
+		const auto safe = [this](const ExpressionPtr& child) {
 			return !child || isSafeToEvaluateUnchosen(*child);
 		};
 
@@ -3267,8 +3270,12 @@ namespace {
 			case ExpressionKind::IntLiteral:
 			case ExpressionKind::FloatLiteral:
 			case ExpressionKind::BoolLiteral:
-			case ExpressionKind::Identifier:
 				return true;
+			case ExpressionKind::Identifier: {
+				const Binding* binding = findResourceBinding(expression.name);
+				return !binding || (binding->bufferPointeeType == InvalidId
+					&& binding->storageClass != spirv::StorageClass::PhysicalStorageBuffer);
+			}
 			case ExpressionKind::Member:
 				return safe(expression.left);
 			case ExpressionKind::Unary:
@@ -3384,8 +3391,6 @@ namespace {
 		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
 		terminate(spirv::OpBranchConditional, { condition, trueLabel, falseLabel });
 
-		const ControlDepthScope depth(_controlDepth);
-
 		// The common type is known only once the second value is emitted, and the
 		// first block must convert to it before it ends: emit the first, lift it
 		// out unfinished, emit the second, then put the first back ahead of it.
@@ -3404,7 +3409,6 @@ namespace {
 		std::vector<spirv::Instruction> falseBody = _builder.takeFunctionsFrom(mark);
 
 		_builder.appendFunctions(std::move(trueBody));
-		_currentBlock = trueEnd;
 		trueValue = toConditionalType(trueValue, type);
 		terminate(spirv::OpBranch, { mergeLabel });
 		_builder.appendFunctions(std::move(falseBody));
