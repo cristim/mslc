@@ -2515,11 +2515,11 @@ ExpressionPtr Parser::parseCast() {
 
 	const std::string head(first.text);
 	if (first.kind == TokenKind::Identifier) {
-		if (isTypeQualifier(head) || addressSpaceFor(head)) {
-			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
-		}
 		if (head == "unsigned" || head == "long" || head == "short" || head == "signed") {
 			throw CompileError("a cast to a multi-word type name is not supported yet");
+		}
+		if (isTypeQualifier(head) || addressSpaceFor(head)) {
+			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
 		}
 		if (head == "void") {
 			throw CompileError("a cast to void is not supported");
