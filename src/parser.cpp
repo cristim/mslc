@@ -797,6 +797,16 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested) cons
 		}
 		case ExpressionKind::Binary: {
 			const int64_t left = evaluateConstant(*expression.left, true);
+
+			// The right operand is evaluated only when the left does not decide
+			// the result, so `0 && 1 / 0` is a constant and not a division by zero.
+			if (expression.binaryOperator == BinaryOperator::LogicalAnd && left == 0) {
+				return 0;
+			}
+			if (expression.binaryOperator == BinaryOperator::LogicalOr && left != 0) {
+				return 1;
+			}
+
 			const int64_t right = evaluateConstant(*expression.right, true);
 			switch (expression.binaryOperator) {
 				case BinaryOperator::Add: return fit(left + right);
