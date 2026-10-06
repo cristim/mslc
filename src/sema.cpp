@@ -1651,6 +1651,7 @@ namespace {
 		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
 			const std::string& what);
 		void decorateInterpolation(Id variable, Interpolation interpolation);
+		std::vector<StageVariable> declareColorOutputs(const StructDecl& decl);
 		std::vector<StageVariable> declareStageStruct(const StructDecl& decl,
 			spirv::StorageClassValue storageClass);
 		std::vector<StageVariable> declareVertexAttributes(const StructDecl& decl);
@@ -4913,6 +4914,49 @@ namespace {
 		return variables;
 	}
 
+	// A fragment function's returned struct: one Output per field, at the Location
+	// its [[color(n)]] names. Apple takes every field as a colour attachment or
+	// none of them, allows gaps in the indices, and rejects a repeated index or one
+	// above 7 (xcrun metal: "invalid return type", "'color' attribute parameter
+	// is out of bounds").
+	std::vector<StageVariable> Emitter::declareColorOutputs(const StructDecl& decl) {
+		constexpr uint32_t maxColorAttachments = 8;
+		std::vector<StageVariable> variables;
+		std::set<uint32_t> used;
+
+		for (const StructField& field: decl.fields) {
+			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
+
+			if (field.attributes.interpolation != Interpolation::None) {
+				throw CompileError(what + " has an interpolation attribute, which is not valid on a "
+					"fragment output");
+			}
+			if (field.attributes.position || field.attributes.attributeIndex) {
+				throw CompileError(what + " has [[position]] or [[attribute(n)]], which is not valid on "
+					"a fragment output");
+			}
+			if (!field.attributes.colorIndex) {
+				throw CompileError(what + " has no [[color(n)]]; every field of a fragment function's "
+					"returned struct needs one");
+			}
+
+			const uint32_t index = *field.attributes.colorIndex;
+			if (index >= maxColorAttachments) {
+				throw CompileError(what + " is [[color(" + std::to_string(index) + ")]], and Apple's "
+					"compiler allows indices 0 to 7");
+			}
+			if (!used.insert(index).second) {
+				throw CompileError(what + " reuses [[color(" + std::to_string(index) + ")]]");
+			}
+
+			variables.push_back(declareStageVariable(field.type, spirv::StorageClass::Output, what));
+			_builder.emit(spirv::OpDecorate, { variables.back().variable,
+				static_cast<uint32_t>(spirv::Decoration::Location), index });
+		}
+
+		return variables;
+	}
+
 	// The variables a return statement writes. A vertex function returns a struct
 	// with a [[position]] field, and a fragment function one colour, at Location 0.
 	void Emitter::declareStageOutputs() {
@@ -4940,12 +4984,16 @@ namespace {
 			return;
 		}
 
+		const StructDecl* decl = structValue(type);
 		if (_entryPoint->stage == Stage::Fragment) {
-			throw CompileError("fragment function \"" + _entryPoint->name + "\" returns the struct "
-				+ spelled + ", and a struct of several colour attachments is not lowered yet");
+			if (!decl) {
+				throw CompileError("fragment function \"" + _entryPoint->name + "\" returns " + spelled
+					+ ", and mslc lowers a returned struct this source declares and nothing else");
+			}
+			_outputs = declareColorOutputs(*decl);
+			return;
 		}
 
-		const StructDecl* decl = structValue(type);
 		if (!decl) {
 			throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
 				+ ", and mslc lowers a returned struct this source declares and nothing else");
