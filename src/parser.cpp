@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <map>
 #include <unordered_map>
 
 namespace mslc {
@@ -169,6 +170,20 @@ namespace {
 			"depth2d_ms", "depth2d_ms_array", "depthcube", "depthcube_array",
 		};
 		return names.count(text) > 0;
+	}
+
+	std::optional<Interpolation> interpolationFromName(std::string_view name) {
+		static const std::map<std::string_view, Interpolation> table = {
+			{ "flat", Interpolation::Flat },
+			{ "center_perspective", Interpolation::CenterPerspective },
+			{ "center_no_perspective", Interpolation::CenterNoPerspective },
+			{ "centroid_perspective", Interpolation::CentroidPerspective },
+			{ "centroid_no_perspective", Interpolation::CentroidNoPerspective },
+			{ "sample_perspective", Interpolation::SamplePerspective },
+			{ "sample_no_perspective", Interpolation::SampleNoPerspective },
+		};
+		const auto found = table.find(name);
+		return found == table.end() ? std::nullopt : std::optional<Interpolation>(found->second);
 	}
 
 	// MSL builtin attributes the subset can map onto a SPIR-V BuiltIn. An
@@ -1222,6 +1237,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			attributes.samplerIndex = argument;
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
+		} else if (name == "color") {
+			throw CompileError("[[color(n)]] on a parameter is framebuffer fetch, which mslc does not "
+				"lower: Vulkan reads a previous colour attachment only through a subpass input "
+				"attachment, which needs a descriptor mslc does not assign");
 		} else if (auto builtin = builtinFromName(name)) {
 			attributes.builtin = builtin;
 		} else if (isMSLBuiltinName(name)) {
@@ -1247,9 +1266,21 @@ FieldAttributes Parser::parseFieldAttributes() {
 			}
 			checkAttributeIndex(name, *argument);
 			attributes.attributeIndex = argument;
+		} else if (name == "color") {
+			if (!argument) {
+				throw CompileError("[[color]] needs an index");
+			}
+			attributes.colorIndex = argument;
+		} else if (const auto interpolation = interpolationFromName(name)) {
+			if (attributes.interpolation != Interpolation::None) {
+				throw CompileError("a struct field has more than one interpolation attribute; "
+					"\"" + name + "\" follows another");
+			}
+			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]] and [[attribute(n)]] are");
+				"field; only [[position]], [[attribute(n)]], [[color(n)]] and the interpolation "
+				"attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
 		}
