@@ -1364,6 +1364,7 @@ namespace {
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
+		Id emitArithmetic(BinaryOperator op, Id left, Id right);
 		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
 		struct ArithmeticConversion {
 			Id type;
@@ -2354,8 +2355,6 @@ namespace {
 			return emitMatrixProduct(op, left, right);
 		}
 
-		const bool isFloat = _types.isFloat(leftType);
-		const bool isSigned = _types.isSignedInt(leftType);
 		const bool isLogical = op == BinaryOperator::LogicalAnd
 			|| op == BinaryOperator::LogicalOr;
 
@@ -2399,26 +2398,82 @@ namespace {
 				"convert the bool to an int first");
 		}
 
-		// OpUDiv and OpUMod need both operands of the result type, and a literal
-		// is always uint. A shift count is free to have its own type and width.
-		const bool isShift = op == BinaryOperator::ShiftLeft
-			|| op == BinaryOperator::ShiftRight;
+		return emitArithmetic(op, left, right);
+	}
 
-		// A scalar beside a vector is a broadcast, which is what "v * 2.0" means
-		// in MSL, so the two cases share one rule below. A shift count is spread
-		// too: the opcode takes a count with as many lanes as the value.
-		const uint32_t rightWidth = _types.vectorWidth(_builder.typeOf(right));
-		if (_types.vectorWidth(leftType) > 1 && rightWidth == 1
-			&& !isLogical && !isComparison) {
+	// The operators + - * / % & | ^ << >> on numeric scalars and vectors, with
+	// the operand rules of C and of Apple's compiler. Scalars undergo the integer
+	// promotions and then the usual arithmetic conversions, so "int + float" adds
+	// in float. A vector keeps its own type: a scalar beside it is converted to
+	// the vector's component type, and two vectors have to be the same type.
+	Id Emitter::emitArithmetic(BinaryOperator op, Id left, Id right) {
+		const Id leftType = _builder.typeOf(left);
+		const Id rightType = _builder.typeOf(right);
 
-			const Id splat = broadcast(right, leftType);
-			return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
-				leftType, { left, splat });
+		for (const Id type: { leftType, rightType }) {
+			if (_types.bitWidth(type) == 0) {
+				throw CompileError("an arithmetic or bitwise operator is lowered only for "
+					"numeric scalars, vectors and matrices");
+			}
 		}
 
-		const Id rightOperand = isShift ? right : convert(right, _builder.typeOf(right), leftType);
-		return _builder.emitTyped(arithmeticOpcode(op, isFloat, isSigned),
-			leftType, { left, rightOperand });
+		const bool isShift = op == BinaryOperator::ShiftLeft
+			|| op == BinaryOperator::ShiftRight;
+		const bool needsIntegers = isShift || op == BinaryOperator::Modulo
+			|| op == BinaryOperator::BitAnd || op == BinaryOperator::BitOr
+			|| op == BinaryOperator::BitXor;
+		if (needsIntegers && (_types.isFloat(leftType) || _types.isFloat(rightType))) {
+			throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
+				+ " needs integer operands"
+				+ (op == BinaryOperator::Modulo ? "; use fmod for floating point" : ""));
+		}
+
+		const uint32_t leftWidth = _types.vectorWidth(leftType);
+		const uint32_t rightWidth = _types.vectorWidth(rightType);
+		const auto emit = [&](Id type, Id leftOperand, Id rightOperand) {
+			return _builder.emitTyped(arithmeticOpcode(op, _types.isFloat(type),
+				_types.isSignedInt(type)), type, { leftOperand, rightOperand });
+		};
+
+		if (leftWidth > 1 && rightWidth > 1) {
+			if (leftWidth != rightWidth) {
+				throw CompileError("the operands of an operator are vectors of different widths");
+			}
+
+			// A shift count may be any integer type; every other operator wants the
+			// same vector type on both sides.
+			if (!isShift && leftType != rightType) {
+				throw CompileError("an operator takes two vectors of the same type");
+			}
+			return emit(leftType, left, right);
+		}
+
+		if (leftWidth > 1) {
+			if (_types.isFloat(rightType) && !_types.isFloat(leftType)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			return emit(leftType, left, broadcast(right, leftType));
+		}
+
+		if (rightWidth > 1) {
+			if (isShift) {
+				throw CompileError("a scalar cannot be shifted by a vector");
+			}
+			if (_types.isFloat(leftType) && !_types.isFloat(rightType)) {
+				throw CompileError("a floating-point scalar cannot be combined with an integer vector");
+			}
+			return emit(rightType, broadcast(left, rightType), right);
+		}
+
+		// A shift takes its type from the promoted left operand alone, and the
+		// count keeps its own.
+		if (isShift) {
+			const Id promoted = _types.bitWidth(leftType) < 32 ? promotedTo(1) : leftType;
+			return emit(promoted, convert(left, leftType, promoted), right);
+		}
+
+		const Id common = usualArithmeticConversion(leftType, rightType).type;
+		return emit(common, convert(left, leftType, common), convert(right, rightType, common));
 	}
 
 	// A product with a matrix on at least one side. SPIR-V has an opcode per
