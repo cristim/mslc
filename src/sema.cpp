@@ -43,6 +43,12 @@ namespace {
 		return { false, false, 0 };
 	}
 
+	// How many bytes a scalar takes in a buffer. A bool is one byte there, though
+	// SPIR-V gives OpTypeBool no size of its own.
+	uint32_t storageBytesOf(ScalarKind kind) {
+		return kind == ScalarKind::Bool ? 1u : mappingFor(kind).width / 8;
+	}
+
 	// Where a member sits in a Metal struct, and how far an array of the struct
 	// steps. Metal puts a float3 at the next multiple of 16 even though it holds
 	// 12, and steps 16 too, so a float after it starts at 16 rather than 12.
@@ -583,8 +589,24 @@ Id TypeTable::packedStorage(ScalarKind kind, uint32_t width) {
 	return id;
 }
 
+// How a bool or a bool vector is held in a buffer. OpTypeBool has no layout, so
+// the buffer holds bytes: one for a scalar, and an array of one byte per lane for
+// a vector, which is stored lane by lane because a bool3's fourth byte is padding
+// that Apple leaves alone. A load compares each byte with zero and a store writes
+// 0 or 1 (see Emitter::boolFromStorage and boolToStorage).
+spirv::Id TypeTable::boolStorage(spirv::Id boolType) {
+	if (!_storage8Declared) {
+		_builder.emit(spirv::OpCapability,
+			{ static_cast<uint32_t>(spirv::Capability::StorageBuffer8BitAccess) });
+		_storage8Declared = true;
+	}
+
+	const uint32_t width = vectorWidth(boolType);
+	return width > 1 ? packedStorage(ScalarKind::UChar, width) : scalar(ScalarKind::UChar);
+}
+
 // The types a struct's members have where the struct is laid out, which are the
-// value types except for the packed ones.
+// value types except for the packed and the bool ones.
 std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::vector<Id>& valueTypes) {
 	std::vector<Id> types = valueTypes;
 	const StructDecl* decl = _unit.findStruct(name);
@@ -592,6 +614,8 @@ std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::v
 		const Type& field = decl->fields[i].type;
 		if (field.isPacked) {
 			types[i] = packedStorage(field.scalar, field.vectorWidth);
+		} else if (field.scalar == ScalarKind::Bool && !field.isPointer && field.namedType.empty()) {
+			types[i] = boolStorage(types[i]);
 		}
 	}
 
@@ -633,6 +657,9 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 	uint32_t stride = 4;
 	if (const auto it = _widthOfScalar.find(elementType); it != _widthOfScalar.end()) {
 		stride = (it->second + 7) / 8;
+		if (isBool(elementType)) {
+			storedType = boolStorage(elementType);
+		}
 	} else if (const auto it = _widthOfVector.find(elementType); it != _widthOfVector.end()) {
 		// The component's own size, from the scalar the vector was built from, so
 		// a vector of half strides 8 and one of ulong strides 32 rather than both
@@ -643,6 +670,8 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 				scalarBytes = (scalarBitWidth(static_cast<ScalarKind>(key.first)) + 7) / 8;
 				if (packed) {
 					storedType = packedStorage(static_cast<ScalarKind>(key.first), it->second);
+				} else if (static_cast<ScalarKind>(key.first) == ScalarKind::Bool) {
+					storedType = boolStorage(elementType);
 				}
 			}
 		}
@@ -949,7 +978,7 @@ uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 		uint32_t alignment = 1;
 		for (const StructField& field: decl->fields) {
 			const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-			const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
+			const uint32_t scalarBytes = storageBytesOf(field.type.scalar);
 			const VectorLayout layout = field.type.isMatrix()
 				? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
 				: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
@@ -1092,7 +1121,7 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-		const uint32_t scalarBytes = mappingFor(field.type.scalar).width / 8;
+		const uint32_t scalarBytes = storageBytesOf(field.type.scalar);
 		const VectorLayout layout = field.type.isMatrix()
 			? matrixLayoutFor(scalarBytes, field.type.matrixColumns, components)
 			: field.type.isPacked ? packedVectorLayoutFor(scalarBytes, components)
@@ -1118,21 +1147,6 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	return true;
 }
 
-void TypeTable::rejectBoolMembers(const std::string& structName) const {
-	const StructDecl* decl = _unit.findStruct(structName);
-	if (!decl) {
-		return;
-	}
-
-	for (const StructField& field: decl->fields) {
-		if (field.type.scalar == ScalarKind::Bool) {
-			throw CompileError("struct \"" + decl->name + "\" has the bool member \"" + field.name
-				+ "\" and is used as a buffer's layout, which mslc does not lay out yet; "
-					"keep the flag in a uint");
-		}
-	}
-}
-
 // A struct as the element of an array of it: the same members with their
 // offsets, and no Block decoration. Vulkan requires a struct nested inside a
 // Block to be laid out, and rejects a Block-decorated struct inside an array, so
@@ -1142,8 +1156,6 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 	if (cached != _elementStructs.end()) {
 		return cached->second;
 	}
-
-	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -1194,8 +1206,6 @@ Id TypeTable::namedStruct(const std::string& name) {
 	if (cached != _structs.end()) {
 		return cached->second;
 	}
-
-	rejectBoolMembers(name);
 
 	std::vector<Id> fieldTypes;
 	std::vector<uint32_t> offsets;
@@ -1534,6 +1544,10 @@ namespace {
 		// vector as a float3's, so the address is what remembers that it is only as
 		// aligned as a component.
 		std::set<Id> _packedAddresses;
+		// Addresses of a bool or a bool vector in a buffer, each with the bool type
+		// the access reads and writes. The address points at bytes, so what the
+		// address itself says would be taken for a uchar.
+		std::map<Id, Id> _boolAddresses;
 
 		Id _uintType = InvalidId;
 		Id _intType = InvalidId;
@@ -1597,6 +1611,14 @@ namespace {
 		Id packedVectorAddress(Id storageAddress, Id vectorType);
 		Id loadFromBuffer(Id pointer, Id pointeeType);
 		void storeIntoBuffer(Id pointer, Id value);
+		// The address of a bool in a buffer, which holds bytes, recorded as one so
+		// that a load and a store through it convert.
+		Id boolAddress(Id storageAddress, Id boolType);
+		// What an address points at, as the source sees it: the bool type for a
+		// bool's bytes, the pointee otherwise.
+		Id valueTypeAt(Id address) const;
+		Id boolFromStorage(Id bytes, Id boolType);
+		Id boolToStorage(Id value);
 		// The Aligned memory operand a buffer access has to carry, at the
 		// alignment the buffer's own layout guarantees.
 		std::vector<uint32_t> alignedOperands(Id pointer, Id pointeeType) const;
@@ -1770,15 +1792,73 @@ namespace {
 		return address;
 	}
 
+	Id Emitter::boolAddress(Id storageAddress, Id boolType) {
+		_boolAddresses.emplace(storageAddress, boolType);
+		return storageAddress;
+	}
+
+	Id Emitter::valueTypeAt(Id address) const {
+		const auto bytes = _boolAddresses.find(address);
+		return bytes != _boolAddresses.end() ? bytes->second
+			: _types.pointeeOf(_builder.typeOf(address));
+	}
+
+	// A byte, or an array of bytes, as the bool or bool vector it holds: a lane is
+	// true when its byte is not zero. Apple leaves a byte other than 0 or 1
+	// undefined; a nonzero byte is true here.
+	Id Emitter::boolFromStorage(Id bytes, Id boolType) {
+		const uint32_t width = _types.vectorWidth(boolType);
+		if (width == 1) {
+			return convert(bytes, _builder.typeOf(bytes), boolType);
+		}
+
+		const Id byteType = _types.scalar(ScalarKind::UChar);
+		const Id laneType = _types.scalar(ScalarKind::Bool);
+		std::vector<uint32_t> lanes;
+		for (uint32_t lane = 0; lane < width; ++lane) {
+			const Id byte = _builder.emitTyped(spirv::OpCompositeExtract, byteType, { bytes, lane });
+			lanes.push_back(convert(byte, byteType, laneType));
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct, boolType, lanes);
+	}
+
+	// A bool or bool vector as the byte or bytes a buffer holds: 1 for true, 0
+	// for false, never the bool's own bits.
+	Id Emitter::boolToStorage(Id value) {
+		const Id boolType = _builder.typeOf(value);
+		const uint32_t width = _types.vectorWidth(boolType);
+		const Id byteType = _types.scalar(ScalarKind::UChar);
+		if (width == 1) {
+			return convert(value, boolType, byteType);
+		}
+
+		const Id laneType = _types.scalar(ScalarKind::Bool);
+		std::vector<uint32_t> lanes;
+		for (uint32_t lane = 0; lane < width; ++lane) {
+			const Id flag = _builder.emitTyped(spirv::OpCompositeExtract, laneType, { value, lane });
+			lanes.push_back(convert(flag, laneType, byteType));
+		}
+
+		return _builder.emitTyped(spirv::OpCompositeConstruct,
+			_types.boolStorage(boolType), lanes);
+	}
+
 	Id Emitter::loadFromBuffer(Id pointer, Id pointeeType) {
+		const auto bytes = _boolAddresses.find(pointer);
+		const Id loadedType = bytes == _boolAddresses.end()
+			? pointeeType : _types.pointeeOf(_builder.typeOf(pointer));
 		std::vector<uint32_t> operands = alignedOperands(pointer, pointeeType);
 		operands.insert(operands.begin(), pointer);
-		return _builder.emitTyped(spirv::OpLoad, pointeeType, operands);
-
+		const Id loaded = _builder.emitTyped(spirv::OpLoad, loadedType, operands);
+		return bytes == _boolAddresses.end() ? loaded : boolFromStorage(loaded, bytes->second);
 	}
 
 	void Emitter::storeIntoBuffer(Id pointer, Id value) {
-		const Id pointeeType = _types.pointeeOf(_builder.typeOf(pointer));
+		const Id pointeeType = valueTypeAt(pointer);
+		if (_boolAddresses.count(pointer) > 0) {
+			value = boolToStorage(value);
+		}
 
 		// Inserted one at a time: insert(pos, a, b) with two integers is the
 		// count-and-value overload, which would insert a copies of b.
@@ -1818,7 +1898,12 @@ namespace {
 			Id member = _builder.emitTyped(spirv::OpCompositeExtract, from.declared[i],
 				{ value, static_cast<uint32_t>(i) });
 
-			if (from.declared[i] != to.declared[i]) {
+			if (from.declared[i] != to.declared[i] && _types.isBool(from.value[i])) {
+				// A bool member is bytes in the laid-out form and a bool in the value
+				// form, whichever way the copy goes.
+				member = from.declared[i] == from.value[i]
+					? boolToStorage(member) : boolFromStorage(member, from.value[i]);
+			} else if (from.declared[i] != to.declared[i]) {
 				const Id vector = from.value[i];
 				const Id component = _types.componentOf(vector);
 				const uint32_t width = _types.vectorWidth(vector);
@@ -2106,8 +2191,10 @@ namespace {
 		if (binding.bufferPointeeType != InvalidId) {
 			const Id base = bufferBase(binding);
 			const bool packed = binding.pointeeMsl.isPacked;
+			const bool bytes = _types.isBool(binding.pointeeType);
 			const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
 				packed ? _types.packedStorage(binding.pointeeMsl.scalar, binding.pointeeMsl.vectorWidth)
+					: bytes ? _types.boolStorage(binding.pointeeType)
 					: binding.pointeeType);
 
 			// A buffer's pointee is { T runtime_array[] }, so an element is member
@@ -2119,6 +2206,8 @@ namespace {
 
 			if (packed) {
 				address = packedVectorAddress(address, binding.pointeeType);
+			} else if (bytes) {
+				address = boolAddress(address, binding.pointeeType);
 			}
 
 			return asAddress ? address : loadFromBuffer(address, binding.pointeeType);
@@ -2240,7 +2329,7 @@ namespace {
 		}
 
 		const Id address = emitPlaceAddress(base);
-		const Id vectorType = _types.pointeeOf(_builder.typeOf(address));
+		const Id vectorType = valueTypeAt(address);
 		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
 		if (vectorType == InvalidId || !storageClass) {
 			throw CompileError("assigning to an element of a value that is not a local, a struct "
@@ -2253,6 +2342,15 @@ namespace {
 		}
 
 		const ElementIndex index = elementIndex(*expression.arguments[0], _types.vectorWidth(vectorType));
+
+		// The lanes of a bool vector in a buffer are bytes of an array, so the lane is
+		// the byte's address, and a store through it still converts to a bool first.
+		if (_boolAddresses.count(address) > 0) {
+			return boolAddress(_builder.emitTyped(spirv::OpAccessChain,
+				_types.pointer(*storageClass, _types.scalar(ScalarKind::UChar)),
+				{ address, index.constant ? constantU32(*index.constant) : index.id }), component);
+		}
+
 		return _builder.emitTyped(spirv::OpAccessChain, _types.pointer(*storageClass, component),
 			{ address, index.constant ? constantU32(*index.constant) : index.id });
 	}
@@ -2553,11 +2651,14 @@ namespace {
 		// A packed member of a laid-out struct is stored as an array of its
 		// components, and is viewed as the vector once it has an address.
 		const bool packed = fromBuffer && current.isPacked;
+		const bool bytes = fromBuffer && _types.isBool(outFieldType);
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(storageClass, packed
-				? _types.packedStorage(current.scalar, current.vectorWidth) : outFieldType), operands);
+				? _types.packedStorage(current.scalar, current.vectorWidth)
+				: bytes ? _types.boolStorage(outFieldType) : outFieldType), operands);
 
-		return packed ? packedVectorAddress(address, outFieldType) : address;
+		return packed ? packedVectorAddress(address, outFieldType)
+			: bytes ? boolAddress(address, outFieldType) : address;
 	}
 
 	Id Emitter::broadcast(Id value, Id vectorType) {
@@ -4129,11 +4230,6 @@ namespace {
 			}
 
 			pointeeType = declaredTypeOf(parameter.type);
-			if (_types.isBool(pointeeType)) {
-				throw CompileError("parameter \"" + parameter.name + "\" is a buffer of "
-					+ typeName(parameter.type) + ", which mslc does not lay out yet; "
-						"keep the flags in a uint");
-			}
 		}
 
 		// A buffer parameter's address is a member of the binding-0 block rather
@@ -5052,7 +5148,7 @@ namespace {
 
 		const Id address = emitPlaceAddress(base);
 		const Id addressType = _builder.typeOf(address);
-		const Id vectorType = _types.pointeeOf(addressType);
+		const Id vectorType = valueTypeAt(address);
 		const auto storageClass = _types.storageClassOf(addressType);
 		if (!storageClass) {
 			throw CompileError("assigning to " + quoted + " of a value that is not a local, "
@@ -5195,7 +5291,7 @@ namespace {
 		// A store's value has the type the address points at, not the type of
 		// the address, so the pointee is what the value is converted to.
 		const Id addressType = _builder.typeOf(address);
-		const Id pointeeType = _types.pointeeOf(addressType);
+		const Id pointeeType = valueTypeAt(address);
 		if (pointeeType == spirv::InvalidId) {
 			throw CompileError("cannot determine what \""
 				+ left.name + "\" points at, so the store cannot be typed");

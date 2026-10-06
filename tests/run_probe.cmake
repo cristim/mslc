@@ -12,6 +12,11 @@
 #   // DISASM-ORDER: <text>      a later DISASM-ORDER line appears after this one
 #   // DISASM-MATCH: <regex>      spirv-dis output matches <regex>
 #   // DISASM-NO-MATCH: <regex>   spirv-dis output does not match <regex>
+#   // DISASM-ASCENDING: <text>   every instruction starting with <text> lists ids
+#                                 that rise left to right; says nothing about the
+#                                 literal indices of the extracts that feed it
+#   // DISASM-LANES: <text> <n>   the instructions "<text> %id <index>" come in
+#                                 groups of <n> with indices 0 to <n>-1 in order
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -71,13 +76,15 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" unwanted REGEX "^// DISASM-NOT: ")
 	file(STRINGS "${PROBE}" wantedPatterns REGEX "^// DISASM-MATCH: ")
 	file(STRINGS "${PROBE}" unwantedPatterns REGEX "^// DISASM-NO-MATCH: ")
+	file(STRINGS "${PROBE}" ascendingNeedles REGEX "^// DISASM-ASCENDING: ")
+	file(STRINGS "${PROBE}" laneNeedles REGEX "^// DISASM-LANES: ")
 	# Collected on whitespace after the prefix rather than one literal space, so a
 	# tab-separated needle is collected instead of silently skipped. A line whose
 	# prefix is not followed by whitespace is not a needle at all and is reported
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -121,6 +128,50 @@ if(expectation STREQUAL "valid")
 			if(NOT found STREQUAL "")
 				message(FATAL_ERROR "${name}: disassembly matches \"${needle}\":\n${disassembly}")
 			endif()
+		endforeach()
+		# A regex cannot compare two ids, so the id order of a construct is checked
+		# here, for every instruction that matches. Whether the extracts feeding it
+		# took lane 0, 1, 2 in turn is the DISASM-LANES check below.
+		foreach(line IN LISTS ascendingNeedles)
+			string(REGEX REPLACE "^// DISASM-ASCENDING: " "" needle "${line}")
+			string(REGEX MATCHALL "${needle}( %[0-9]+)+" instructions "${disassembly}")
+			if(instructions STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly lacks an instruction \"${needle}\" with ids:\n${disassembly}")
+			endif()
+			foreach(found IN LISTS instructions)
+				string(REGEX MATCHALL "%[0-9]+" ids "${found}")
+				set(previous -1)
+				foreach(token IN LISTS ids)
+					string(SUBSTRING "${token}" 1 -1 id)
+					if(NOT id GREATER previous)
+						message(FATAL_ERROR "${name}: the ids of \"${found}\" do not rise")
+					endif()
+					set(previous ${id})
+				endforeach()
+			endforeach()
+		endforeach()
+		foreach(line IN LISTS laneNeedles)
+			string(REGEX REPLACE "^// DISASM-LANES: " "" value "${line}")
+			if(NOT value MATCHES "^(.+) ([0-9]+)$" OR CMAKE_MATCH_2 LESS 2)
+				message(FATAL_ERROR "${name}: \"${line}\" is not \"// DISASM-LANES: <text> <n>\" with n of 2 or more")
+			endif()
+			set(needle "${CMAKE_MATCH_1}")
+			set(width ${CMAKE_MATCH_2})
+			string(REGEX MATCHALL "${needle} %[0-9]+ [0-9]+" instructions "${disassembly}")
+			list(LENGTH instructions total)
+			math(EXPR remainder "${total} % ${width}")
+			if(total EQUAL 0 OR NOT remainder EQUAL 0)
+				message(FATAL_ERROR "${name}: ${total} instructions \"${needle} <id> <index>\", not a whole number of groups of ${width}:\n${disassembly}")
+			endif()
+			set(position 0)
+			foreach(found IN LISTS instructions)
+				string(REGEX MATCH "[0-9]+$" index "${found}")
+				math(EXPR expected "${position} % ${width}")
+				if(NOT index EQUAL expected)
+					message(FATAL_ERROR "${name}: \"${found}\" takes lane ${index} where lane ${expected} is due")
+				endif()
+				math(EXPR position "${position} + 1")
+			endforeach()
 		endforeach()
 		# Every other needle answers whether a string is present, which cannot say
 		# where it is relative to another string. CMake's REGEX MATCH does not span

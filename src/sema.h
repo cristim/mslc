@@ -47,6 +47,7 @@ private:
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _packedStorage;
+	bool _storage8Declared = false;
 
 	spirv::Id _voidType = spirv::InvalidId;
 	std::map<ResourceKind, spirv::Id> _images;
@@ -83,6 +84,10 @@ public:
 	// How a packed vector of the given type is stored in a laid-out struct or
 	// buffer: an array of its components, strided by the component's size.
 	spirv::Id packedStorage(ScalarKind kind, uint32_t width);
+
+	// How a bool or a bool vector is held in a buffer: a byte, or an array of
+	// bytes, one per lane. Declares the 8-bit storage capability the first time.
+	spirv::Id boolStorage(spirv::Id boolType);
 
 	// The shape of a matrix, or null when the id is not a matrix this table
 	// created.
@@ -163,12 +168,6 @@ public:
 	// is not declared.
 	bool structMembersFor(const std::string& name, std::vector<spirv::Id>& outTypes,
 		std::vector<uint32_t>& outOffsets, uint32_t& outSize);
-
-	// Throws when the struct has a bool member. Metal gives a bool one byte and
-	// a bool vector its own size and alignment in a buffer, and mslc has no
-	// storage form for either: a bool member in a Block takes the offset of the
-	// member before it, and SPIR-V gives a bool in memory no layout of its own.
-	void rejectBoolMembers(const std::string& structName) const;
 
 	// The same struct as the element of an array of it: the members with their
 	// offsets, and no Block decoration, since Vulkan requires a struct nested in
