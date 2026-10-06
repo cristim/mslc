@@ -390,6 +390,17 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 				suffixValid = parseIntegerSuffix(source.substr(suffixStart, i - suffixStart), isUnsigned, longCount);
 			} else if (i < size) {
 				const char suffix = source[i];
+				const bool isHex = c == '0' && start + 1 < size && (source[start + 1] == 'x' || source[start + 1] == 'X');
+				// A float takes no u, and a hex literal has no f or h suffix: the
+				// f is one of its digits and an h makes no literal.
+				const bool isMisplaced = ((suffix == 'u' || suffix == 'U') && isFloat)
+					|| (isHex && (suffix == 'h' || suffix == 'H'));
+				if (isMisplaced) {
+					++i;
+					invalid(InvalidReason::MalformedNumber, start, start);
+					continue;
+				}
+
 				if (suffix == 'u' || suffix == 'U') {
 					isUnsigned = true;
 					isFloat = false;

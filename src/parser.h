@@ -94,7 +94,7 @@ private:
 	// A constant integer expression: literals, enum constants and the operators
 	// on them. Anything that is not a constant is a CompileError.
 	int64_t evaluateConstant(const Expression& expression, bool nested) const;
-	int64_t parseConstantIndex(const std::string& context);
+	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	VariableDeclaration parseGlobalDeclaration();
 
