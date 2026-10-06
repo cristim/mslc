@@ -1488,6 +1488,14 @@ namespace {
 		// emitted into it until the next label.
 		bool _terminated = false;
 
+		// The label of the block being emitted into, which an OpPhi names as the
+		// predecessor a value arrives from.
+		Id _currentBlock = InvalidId;
+
+		// How many short-circuit right operands enclose the one being emitted.
+		// Each is a selection construct, and spirv-val allows 1023 of them nested.
+		uint32_t _shortCircuitDepth = 0;
+
 		std::string _reflection;
 		// The next descriptor binding a texture or sampler takes, and the
 		// constexpr samplers declared so far in the entry point.
@@ -1586,6 +1594,7 @@ namespace {
 		Id emitExpression(const Expression& expression);
 		Id emitBinary(const Expression& expression);
 		Id emitBinaryOperation(BinaryOperator op, Id left, Id right);
+		Id emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression);
 		Id emitArithmetic(BinaryOperator op, Id left, Id right);
 		Id emitCompoundOperation(BinaryOperator op, Id current, Id value);
 		struct ArithmeticConversion {
@@ -2564,8 +2573,71 @@ namespace {
 		return { commonType, operandsSigned };
 	}
 
+	// A scalar && or || evaluates its right operand only when the left does not
+	// decide the result, so a guard such as `i < n && buf[i] > 0` is one. A vector
+	// operand is componentwise and evaluates both, as in Metal.
+	Id Emitter::emitShortCircuit(BinaryOperator op, Id left, const Expression& rightExpression) {
+		const bool isAnd = op == BinaryOperator::LogicalAnd;
+		const Id condition = asCondition(left);
+		const Id leftBlock = _currentBlock;
+		const Id rightLabel = _builder.nextId();
+		const Id mergeLabel = _builder.nextId();
+
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		terminate(spirv::OpBranchConditional, { condition,
+			isAnd ? rightLabel : mergeLabel, isAnd ? mergeLabel : rightLabel });
+
+		constexpr uint32_t kMaxShortCircuitDepth = 512;
+		if (_shortCircuitDepth >= kMaxShortCircuitDepth) {
+			throw CompileError("&& and || are nested more than " + std::to_string(kMaxShortCircuitDepth)
+				+ " deep in their right operands");
+		}
+
+		beginBlock(rightLabel);
+		++_shortCircuitDepth;
+		const Id right = asCondition(emitExpression(rightExpression));
+		--_shortCircuitDepth;
+		const Id rightBlock = _currentBlock;
+		terminate(spirv::OpBranch, { mergeLabel });
+
+		beginBlock(mergeLabel);
+		const Id decided = isAnd
+			? _builder.emitDeclTyped(spirv::OpConstantFalse, _boolType, { })
+			: _builder.emitDeclTyped(spirv::OpConstantTrue, _boolType, { });
+		return _builder.emitTyped(spirv::OpPhi, _boolType, { decided, leftBlock, right, rightBlock });
+	}
+
+	static bool containsLogicalOperator(const Expression& expression) {
+		if (expression.kind == ExpressionKind::Binary
+			&& (expression.binaryOperator == BinaryOperator::LogicalAnd
+				|| expression.binaryOperator == BinaryOperator::LogicalOr)) {
+			return true;
+		}
+
+		const auto contains = [](const ExpressionPtr& child) {
+			return child && containsLogicalOperator(*child);
+		};
+		if (contains(expression.left) || contains(expression.right)) {
+			return true;
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			if (contains(argument)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	Id Emitter::emitBinary(const Expression& expression) {
 		const Id left = emitExpression(*expression.left);
+
+		const bool isLogical = expression.binaryOperator == BinaryOperator::LogicalAnd
+			|| expression.binaryOperator == BinaryOperator::LogicalOr;
+		const Id leftType = _builder.typeOf(left);
+		if (isLogical && !_types.matrixInfo(leftType) && _types.vectorWidth(leftType) <= 1) {
+			return emitShortCircuit(expression.binaryOperator, left, *expression.right);
+		}
+
 		const Id right = emitExpression(*expression.right);
 		return emitBinaryOperation(expression.binaryOperator, left, right);
 	}
@@ -4566,6 +4638,7 @@ namespace {
 	// is why this emits the label with its own id instead of emitDecl's.
 	void Emitter::beginBlock(Id label) {
 		_builder.emit(spirv::OpLabel, { label });
+		_currentBlock = label;
 		_terminated = false;
 	}
 
@@ -4879,8 +4952,21 @@ namespace {
 
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
-				const Id conditionValue = condition ? asCondition(emitExpression(*condition)) : InvalidId;
+
+				// A && or || in the condition splits it over several blocks, and
+				// OpLoopMerge has to end the header, so it goes in front of them.
+				const bool splitsCondition = condition && containsLogicalOperator(*condition);
+				Id conditionValue = InvalidId;
+				if (condition && !splitsCondition) {
+					conditionValue = asCondition(emitExpression(*condition));
+				}
 				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
+				if (splitsCondition) {
+					const Id conditionLabel = _builder.nextId();
+					terminate(spirv::OpBranch, { conditionLabel });
+					beginBlock(conditionLabel);
+					conditionValue = asCondition(emitExpression(*condition));
+				}
 				if (condition) {
 					terminate(spirv::OpBranchConditional, { conditionValue, bodyLabel, mergeLabel });
 				} else {
