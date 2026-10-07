@@ -944,28 +944,19 @@ spirv::Id TypeTable::bufferPointer(Id pointee) {
 // that set is asked for.
 TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTypes,
 	uint32_t descriptorSet) {
-	// One block per set: every buffer parameter of an entry point is a member of
-	// the same one, which is what occupies binding 0, and a module with both a
-	// vertex and a fragment entry point needs one each because indium splits the
-	// sets by stage. A single cache would hand the fragment function the vertex
-	// function's set, and its buffers would never bind.
+	// One block per set and member list: every buffer parameter of an entry
+	// point is a member of the same one, which is what occupies binding 0, and a
+	// module with both a vertex and a fragment entry point needs one each because
+	// indium splits the sets by stage.
 	//
-	// Two entry points in the *same* stage share a set and therefore have to
-	// share the block, which only works if they declare the same buffers: the
-	// block's members are typed and its count is fixed when it is declared, and
-	// a second entry point indexing it with a different count or a different
-	// pointee type produces an access chain whose result type does not match the
-	// type the member holds. Both are hard errors rather than a silent reuse,
-	// because the module that comes out is a rejected one at best.
-	const auto cached = _addressBlocks.find(descriptorSet);
+	// Entry points that declare the same buffers share a block. Ones that declare
+	// different buffers get a block of their own at the same set and binding:
+	// indium creates a pipeline from one entry point, and Vulkan only requires
+	// (set, binding) to be unique among the variables that entry point uses, so
+	// the other entry point's variable is never part of that pipeline.
+	const auto key = std::make_pair(descriptorSet, pointeeTypes);
+	const auto cached = _addressBlocks.find(key);
 	if (cached != _addressBlocks.end()) {
-		if (cached->second.pointeeTypes != pointeeTypes) {
-			throw CompileError("two entry points sharing descriptor set "
-				+ std::to_string(descriptorSet) + " bind different buffers, and one "
-					"address block at binding 0 holds them; they have to agree in both "
-					"number and type");
-		}
-
 		return cached->second;
 	}
 
@@ -1004,7 +995,7 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 	_builder.emit(spirv::OpDecorate, { block.variable,
 		static_cast<uint32_t>(spirv::Decoration::Binding), 0u });
 
-	_addressBlocks.emplace(descriptorSet, block);
+	_addressBlocks.emplace(key, block);
 	return block;
 }
 

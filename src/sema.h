@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace mslc {
@@ -194,30 +195,19 @@ public:
 		spirv::Id blockType = spirv::InvalidId;
 		spirv::Id variable = spirv::InvalidId;
 		spirv::Id memberPointer = spirv::InvalidId;
-		// What its members point at, in order. A second entry point in the same
-		// set has to agree with this in both count and type: the members are
-		// typed and fixed when the block is built, so a mismatch produces an
-		// access chain whose result type is not the type the member holds.
+		// What its members point at, in order.
 		std::vector<spirv::Id> pointeeTypes;
 	};
-	// Builds the binding-0 address block for one descriptor set from the given
-	// pointee types on the first call for that set, and returns it unchanged
-	// afterwards. Keyed by set rather than cached singly, because indium splits
-	// the sets by stage, so a module with both a vertex and a fragment entry point
-	// has one block each, and a single cache would hand the fragment function the
-	// vertex function's set.
-	//
-	// Keyed by descriptor set alone, and the set is the whole of the constraint.
-	// indium writes one descriptor per set and one fill per function, so two entry
-	// points resolving to one set have to agree on the block, whether they are two
-	// vertex functions or a kernel and a vertex function, which both use set 0.
-	// Keying by stage as well would give a kernel and a vertex function a block
-	// each, and both would be decorated DescriptorSet 0 Binding 0: a module
-	// spirv-val accepts, holding two Uniform variables where indium binds one.
+	// Builds the binding-0 address block for one descriptor set and member list
+	// on the first call for that pair, and returns it unchanged afterwards. Keyed
+	// by set because indium splits the sets by stage, and by member list because
+	// two entry points of one stage with different buffers cannot share one typed
+	// block; each gets its own variable at the same set and binding, and only the
+	// entry point a pipeline is created from uses it.
 	AddressBlock addressBlock(const std::vector<spirv::Id>& pointeeTypes,
 		uint32_t descriptorSet);
 
-	std::map<uint32_t, AddressBlock> _addressBlocks;
+	std::map<std::pair<uint32_t, std::vector<spirv::Id>>, AddressBlock> _addressBlocks;
 
 	// The address a buffer's own storage class guarantees for one access, which
 	// is what the Aligned memory operand has to say. A buffer element sits at a
