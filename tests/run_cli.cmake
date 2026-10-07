@@ -71,10 +71,7 @@ run_expects(missing_reflect "usage: mslc")
 # An input that does not exist is a failure, not an empty module.
 run(absent_input nonzero "${WORK_DIR}/does-not-exist.metal")
 
-# A file-scope declaration on its own parses, so the failure is the missing entry
-# point rather than a parse error, and the message names the Vulkan limit that
-# decides it (a module needs an entry point; probes/no_entry_point.metal says
-# why that rules out the empty module Apple's compiler would build).
+# A file-scope declaration alone reaches the Vulkan shader entry-point check.
 set(bad "${WORK_DIR}/bad.metal")
 file(WRITE "${bad}" "constant float x = 1.0;\n")
 run(no_entry_point nonzero "-o;${WORK_DIR}/bad.spv;${bad}")
