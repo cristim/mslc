@@ -12,6 +12,7 @@ const char* tokenKindName(TokenKind kind) {
 		case TokenKind::Identifier: return "identifier";
 		case TokenKind::IntegerLiteral: return "integer literal";
 		case TokenKind::FloatLiteral: return "float literal";
+		case TokenKind::StringLiteral: return "string literal";
 		case TokenKind::LBrace: return "{";
 		case TokenKind::RBrace: return "}";
 		case TokenKind::LParen: return "(";
@@ -295,8 +296,8 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 			continue;
 		}
 
-		// string literal, kept as a single token; the subset has no use for it
-		// yet but swallowing it here stops the contents being lexed as code
+		// A string literal, kept as one token so its contents are not lexed as
+		// code. mslc lowers none, so the parser rejects wherever one appears.
 		if (c == '"') {
 			const size_t start = i;
 			++i;
@@ -338,7 +339,7 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 				continue;
 			}
 
-			makeToken(TokenKind::Identifier, start);
+			makeToken(TokenKind::StringLiteral, start);
 			continue;
 		}
 
