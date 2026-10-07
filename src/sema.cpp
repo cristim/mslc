@@ -1414,6 +1414,20 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 
 namespace {
 
+	// SPIR-V constant operands cannot contain arithmetic or runtime loads.
+	struct FoldedConstant {
+		bool isComposite = false;
+		Id type = InvalidId;
+		std::vector<Id> parts;
+
+		// Floats are rounded to their own width; integers are sign- or zero-extended
+		// after truncation, so casting a signed value to int64_t preserves its value.
+		ScalarKind scalar = ScalarKind::Void;
+		double number = 0.0;
+		uint64_t integer = 0;
+		bool boolean = false;
+	};
+
 	// A name bound in the function being emitted. The value's SPIR-V type is
 	// recorded in the builder, so this only tracks what a name refers to.
 	struct Binding {
@@ -1447,6 +1461,7 @@ namespace {
 		// True for a sampler declared with coord::pixel. Vulkan forbids an
 		// implicit-lod lookup through an unnormalized sampler.
 		bool unnormalizedSampler = false;
+		std::optional<FoldedConstant> folded;
 	};
 
 	// A constexpr sampler of the entry point being emitted. Samplers with equal
@@ -1476,28 +1491,6 @@ namespace {
 	struct ConstantBinding {
 		Id id = InvalidId;
 		const StructDecl* structType = nullptr;
-	};
-
-	// A file-scope "constant" folded to a value. SPIR-V takes only constants as a
-	// constant's operands, so an initialiser that refers to an earlier constant
-	// or does arithmetic has to be folded here rather than emitted as the
-	// expression it was written as.
-	struct FoldedConstant {
-		// A composite: the type it was declared as, and the constants making it
-		// up, which have already been emitted.
-		bool isComposite = false;
-		Id type = InvalidId;
-		std::vector<Id> parts;
-
-		// A scalar: the kind to declare it as, and its value. A float or half
-		// is a double that holds exactly what its own width does; an integer is
-		// its 64 bits, reduced to the kind's width and then sign-extended for a
-		// signed kind or zero-extended for an unsigned one, so that a signed
-		// value reads back through a cast to int64_t.
-		ScalarKind scalar = ScalarKind::Void;
-		double number = 0.0;
-		uint64_t integer = 0;
-		bool boolean = false;
 	};
 
 	// A scalar constant as the kind it is declared with. An integer wraps to the
@@ -1601,31 +1594,6 @@ namespace {
 		if ((negative && !toSigned) || (beyondLong && toSigned)
 			|| normalizeInteger(to, constant.integer) != constant.integer) {
 			throw narrowed();
-		}
-	}
-
-	// The scalar kind a type the table declared stands for, or nothing for a
-	// type that is no scalar. A switch asks this of its selector, which arrives
-	// as an emitted value whose AST type the emitter never resolved.
-	std::optional<ScalarKind> scalarKindOf(const TypeTable& types, Id type) {
-		if (types.isBool(type)) {
-			return ScalarKind::Bool;
-		}
-		const uint32_t bits = types.bitWidth(type);
-		if (bits == 0) {
-			return std::nullopt;
-		}
-		if (types.isFloat(type)) {
-			return bits == 16 ? ScalarKind::Half : bits == 64 ? ScalarKind::Double
-				: ScalarKind::Float;
-		}
-		const bool isSigned = types.isSignedInt(type);
-		switch (bits) {
-			case 8: return isSigned ? ScalarKind::Char : ScalarKind::UChar;
-			case 16: return isSigned ? ScalarKind::Short : ScalarKind::UShort;
-			case 32: return isSigned ? ScalarKind::Int : ScalarKind::UInt;
-			case 64: return isSigned ? ScalarKind::Long : ScalarKind::ULong;
-			default: return std::nullopt;
 		}
 	}
 
@@ -2082,7 +2050,7 @@ namespace {
 		void requireStorable(const Expression& target) const;
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
-		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
@@ -4652,10 +4620,11 @@ namespace {
 				const auto local = _bindings.find(expression.name);
 				if (local != _bindings.end()) {
 					const auto value = _localFolded.find(local->second.id);
-					if (value == _localFolded.end()) {
+					if (value != _localFolded.end()) { return value->second; }
+					if (!local->second.folded) {
 						throw CompileError("a local in this initializer is not a supported constant expression");
 					}
-					return value->second;
+					return *local->second.folded;
 				}
 				// Declaration order is what makes this resolvable, and the module's
 				// constants are declared in the order the source declares them.
@@ -6513,7 +6482,7 @@ namespace {
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
-	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
+	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
 			return;
@@ -6539,7 +6508,7 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
-		if (declaration.type.isConstexpr && declaration.initializer
+		if (!storageOnly && declaration.type.isConstexpr && declaration.initializer
 			&& declaration.initializer->kind == ExpressionKind::InitList) {
 			const auto validate = [&](const auto& self, const Expression& expression) -> void {
 				if (expression.kind == ExpressionKind::InitList) {
@@ -6552,22 +6521,24 @@ namespace {
 		}
 
 		Id initial = InvalidId;
-		if (declaration.initializer) {
+		if (!storageOnly && declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
 				? emitInitListValue(declaration.type, *declaration.initializer)
 				: emitExpression(*declaration.initializer);
 			initial = convertImplicit(initializer, typeId);
-		} else {
+		} else if (!storageOnly) {
 			initial = _types.zero(typeId);
 		}
 
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
 		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
-		_builder.emit(spirv::OpStore, { id, initial });
+		if (!storageOnly) {
+			_builder.emit(spirv::OpStore, { id, initial });
+		}
 
 		bindLocal(declaration.name, id, typeId, declaration.type);
-		if (declaration.initializer && !_types.isAggregate(typeId)
+		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
 			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
 			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
@@ -6591,6 +6562,15 @@ namespace {
 					const FoldedConstant converted = convertConstant(folded, to);
 					if (!isFloatKind(to) || std::isfinite(converted.number)) { _localFolded[id] = converted; }
 				}
+			}
+		}
+		if (!storageOnly && declaration.type.isConst && declaration.initializer
+			&& declaration.type.namedType.empty() && declaration.type.isScalar()
+			&& !isFloatKind(declaration.type.scalar)) {
+			try {
+				_bindings[declaration.name].folded = foldInitializer(declaration.type, *declaration.initializer);
+			} catch (const CompileError&) {
+				// A const local may have a runtime initializer without being a constant expression.
 			}
 		}
 	}
@@ -6884,19 +6864,19 @@ namespace {
 		// The selector arrives as a value, so its MSL type is recovered from the
 		// SPIR-V one. A bool is an integer type C++ accepts here; OpSwitch does
 		// not, so it switches on the bool's int value, 1 or 0.
-		const std::optional<ScalarKind> selectorKind = scalarKindOf(_types, emittedType);
-		if (!selectorKind || isFloatKind(*selectorKind) || _types.vectorWidth(emittedType) > 1) {
-			std::string name = selectorKind ? std::string(scalarKindName(*selectorKind)) : "void";
-			if (selectorKind && _types.vectorWidth(emittedType) > 1) {
+		const std::optional<ScalarKind> selectorKind = _types.scalarKindOf(emittedType);
+		if (!selectorKind || isFloatKind(*selectorKind)) {
+			const auto diagnosticKind = _types.scalarKindOf(_types.componentOf(emittedType));
+			std::string name = diagnosticKind ? std::string(scalarKindName(*diagnosticKind)) : "void";
+			if (diagnosticKind && _types.vectorWidth(emittedType) > 1) {
 				name += std::to_string(_types.vectorWidth(emittedType));
 			}
 			throw CompileError("statement requires expression of integer type ('" + name + "' invalid)");
 		}
 
-		ScalarKind kind = *selectorKind;
-		if (kind == ScalarKind::Bool) {
-			selector = convert(selector, emittedType, _types.scalar(ScalarKind::Int));
-			kind = ScalarKind::Int;
+		const ScalarKind kind = promotedKind(*selectorKind);
+		if (kind != *selectorKind) {
+			selector = convert(selector, emittedType, _intType);
 		}
 
 		const Id mergeLabel = _builder.nextId();
@@ -6904,47 +6884,76 @@ namespace {
 		std::vector<Id> labels(statement.switchCases.size());
 		std::vector<uint64_t> literals(statement.switchCases.size(), 0);
 
-		std::set<uint64_t> seen;
-		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
-			labels[i] = _builder.nextId();
-			const SwitchCase& kase = statement.switchCases[i];
-			if (!kase.value) {
-				if (defaultLabel != InvalidId) {
-					throw CompileError("multiple default labels in one switch");
-				}
-				defaultLabel = labels[i];
-				continue;
-			}
-
-			FoldedConstant folded;
-			try {
-				folded = foldExpression(*kase.value);
-			} catch (const CompileError&) {
-				throw CompileError("case value is not a constant expression");
-			}
-			if (folded.isComposite || isFloatKind(folded.scalar)) {
-				throw CompileError("case value is not an integer constant expression");
-			}
-			// A bool case value is its int value, as the selector is.
-			if (folded.scalar == ScalarKind::Bool) {
-				folded.scalar = ScalarKind::Int;
-				folded.integer = folded.boolean ? 1 : 0;
-			}
-
-			if (!fitsInKind(folded, kind)) {
-				throw CompileError("case value evaluates to " + integerText(folded)
-					+ ", which cannot be narrowed to type '" + scalarKindName(kind) + "'");
-			}
-
-			literals[i] = normalizeInteger(kind, folded.integer);
-			if (!seen.insert(literals[i]).second) {
-				FoldedConstant asSelector;
-				asSelector.scalar = kind;
-				asSelector.integer = literals[i];
-				throw CompileError("duplicate case value '" + integerText(asSelector) + "'");
-			}
+		for (Id& label: labels) {
+			label = _builder.nextId();
 		}
 
+		std::set<uint64_t> seen;
+		{
+			const BindingScope validationScope(_bindings);
+			for (const StatementPtr& child: statement.switchPreamble) {
+				if (child->kind == StatementKind::DeclarationStatement) {
+					const auto& declaration = *child->declaration;
+					if (!statement.switchCases.empty() && (declaration.initializer
+						|| declaration.type.resource == ResourceKind::Sampler)) {
+						throw CompileError("switch label bypasses variable initialization");
+					}
+					_bindings[declaration.name] = Binding{};
+				}
+			}
+			for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+				const SwitchCase& kase = statement.switchCases[i];
+				if (!kase.value) {
+					if (defaultLabel != InvalidId) {
+						throw CompileError("multiple default labels in one switch");
+					}
+					defaultLabel = labels[i];
+				} else {
+					FoldedConstant folded;
+					try {
+						folded = foldExpression(*kase.value);
+					} catch (const CompileError&) {
+						throw CompileError("case value is not a constant expression");
+					}
+					if (folded.isComposite || isFloatKind(folded.scalar)) {
+						throw CompileError("case value is not an integer constant expression");
+					}
+					// A bool case value is its int value, as the selector is.
+					if (folded.scalar == ScalarKind::Bool) {
+						folded.scalar = ScalarKind::Int;
+						folded.integer = folded.boolean ? 1 : 0;
+					}
+
+					if (!fitsInKind(folded, kind)) {
+						throw CompileError("case value evaluates to " + integerText(folded)
+							+ ", which cannot be narrowed to type '" + scalarKindName(kind) + "'");
+					}
+
+					literals[i] = normalizeInteger(kind, folded.integer);
+					if (!seen.insert(literals[i]).second) {
+						FoldedConstant asSelector;
+						asSelector.scalar = kind;
+						asSelector.integer = literals[i];
+						throw CompileError("duplicate case value '" + integerText(asSelector) + "'");
+					}
+				}
+				for (const StatementPtr& child: kase.body) {
+					if (child->kind == StatementKind::DeclarationStatement) {
+						const auto& declaration = *child->declaration;
+						if (i + 1 < statement.switchCases.size() && (declaration.initializer
+							|| declaration.type.resource == ResourceKind::Sampler)) {
+							throw CompileError("switch label bypasses variable initialization");
+						}
+						_bindings[declaration.name] = Binding{};
+					}
+				}
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			if (child->kind == StatementKind::DeclarationStatement) {
+				emitVariableDeclaration(*child->declaration, true);
+			}
+		}
 		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
 		std::vector<uint32_t> operands = {
 			selector, defaultLabel != InvalidId ? defaultLabel : mergeLabel };
@@ -6975,7 +6984,10 @@ namespace {
 			beginBlock(labels[i]);
 			for (const StatementPtr& child: statement.switchCases[i].body) {
 				if (_terminated) {
-					break;
+					if (child->kind == StatementKind::DeclarationStatement) {
+						emitVariableDeclaration(*child->declaration, true);
+					}
+					continue;
 				}
 				emitStatement(*child);
 			}
