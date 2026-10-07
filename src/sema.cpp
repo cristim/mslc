@@ -445,6 +445,15 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) collectIdentifiers(*nested, names);
 		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) collectIdentifiers(*kase.value, names);
+			for (const StatementPtr& child: kase.body) {
+				collectIdentifiers(*child, names);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectIdentifiers(*child, names);
+		}
 	}
 
 	// The identifiers a body names where no parameter or local of that name is in
@@ -467,7 +476,8 @@ namespace {
 		if (!statement) return;
 		// A compound statement and a for loop open a scope; a declaration belongs to
 		// the one around it.
-		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For;
+		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For
+			|| statement->kind == StatementKind::Switch;
 		if (opensScope) scopes.emplace_back();
 		collectUnshadowed(statement->expression.get(), scopes, names);
 		collectUnshadowed(statement->whileCondition.get(), scopes, names);
@@ -487,6 +497,15 @@ namespace {
 		for (const Statement* nested: { statement->thenBranch.get(), statement->elseBranch.get(),
 			statement->forBody.get(), statement->whileBody.get() }) {
 			collectUnshadowed(nested, scopes, names);
+		}
+		for (const SwitchCase& kase: statement->switchCases) {
+			collectUnshadowed(kase.value.get(), scopes, names);
+			for (const StatementPtr& child: kase.body) {
+				collectUnshadowed(child.get(), scopes, names);
+			}
+		}
+		for (const StatementPtr& child: statement->switchPreamble) {
+			collectUnshadowed(child.get(), scopes, names);
 		}
 		if (opensScope) scopes.pop_back();
 	}
@@ -1585,6 +1604,59 @@ namespace {
 		}
 	}
 
+	// The scalar kind a type the table declared stands for, or nothing for a
+	// type that is no scalar. A switch asks this of its selector, which arrives
+	// as an emitted value whose AST type the emitter never resolved.
+	std::optional<ScalarKind> scalarKindOf(const TypeTable& types, Id type) {
+		if (types.isBool(type)) {
+			return ScalarKind::Bool;
+		}
+		const uint32_t bits = types.bitWidth(type);
+		if (bits == 0) {
+			return std::nullopt;
+		}
+		if (types.isFloat(type)) {
+			return bits == 16 ? ScalarKind::Half : bits == 64 ? ScalarKind::Double
+				: ScalarKind::Float;
+		}
+		const bool isSigned = types.isSignedInt(type);
+		switch (bits) {
+			case 8: return isSigned ? ScalarKind::Char : ScalarKind::UChar;
+			case 16: return isSigned ? ScalarKind::Short : ScalarKind::UShort;
+			case 32: return isSigned ? ScalarKind::Int : ScalarKind::UInt;
+			case 64: return isSigned ? ScalarKind::Long : ScalarKind::ULong;
+			default: return std::nullopt;
+		}
+	}
+
+	// Whether an integer case value is one the selector's type holds, which C++
+	// asks of a case label where a braced initialiser asks it of a value.
+	bool fitsInKind(const FoldedConstant& constant, ScalarKind to) {
+		const uint32_t width = mappingFor(to).width;
+		if (isSignedInteger(constant.scalar)) {
+			const int64_t value = static_cast<int64_t>(constant.integer);
+			if (isSignedInteger(to)) {
+				if (width >= 64) {
+					return true;
+				}
+				const int64_t low = -(int64_t{ 1 } << (width - 1));
+				const int64_t high = (int64_t{ 1 } << (width - 1)) - 1;
+				return value >= low && value <= high;
+			}
+			if (value < 0) {
+				return false;
+			}
+			return width >= 64 || static_cast<uint64_t>(value) <= ((uint64_t{ 1 } << width) - 1);
+		}
+
+		const uint64_t value = constant.integer;
+		if (isSignedInteger(to)) {
+			return width >= 64 ? static_cast<int64_t>(value) >= 0
+				: value <= ((uint64_t{ 1 } << (width - 1)) - 1);
+		}
+		return width >= 64 || value <= ((uint64_t{ 1 } << width) - 1);
+	}
+
 	// An Input or Output variable carrying one value across a stage boundary: a
 	// returned value, or one field of a returned or [[stage_in]] struct. The
 	// variable's type can differ from the value's, because a half crosses as a
@@ -1642,6 +1714,17 @@ namespace {
 			if (*branch) {
 				collectCalls(**branch, out);
 			}
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) {
+				collectCalls(*kase.value, out);
+			}
+			for (const StatementPtr& child: kase.body) {
+				collectCalls(*child, out);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectCalls(*child, out);
 		}
 	}
 
@@ -1990,6 +2073,7 @@ namespace {
 		void checkStageInterfacesAgree() const;
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
+		void emitSwitch(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
@@ -6789,6 +6873,118 @@ namespace {
 		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
+	// A switch is a selection: OpSelectionMerge names the block after the body,
+	// and OpSwitch sends the selector to one case's block, each of which
+	// branches to the next for a fall-through or, through a break, to the merge.
+	// A switch with no default sends every unmatched value to the merge.
+	void Emitter::emitSwitch(const Statement& statement) {
+		Id selector = emitExpression(*statement.expression);
+		const Id emittedType = _builder.typeOf(selector);
+
+		// The selector arrives as a value, so its MSL type is recovered from the
+		// SPIR-V one. A bool is an integer type C++ accepts here; OpSwitch does
+		// not, so it switches on the bool's int value, 1 or 0.
+		const std::optional<ScalarKind> selectorKind = scalarKindOf(_types, emittedType);
+		if (!selectorKind || isFloatKind(*selectorKind) || _types.vectorWidth(emittedType) > 1) {
+			std::string name = selectorKind ? std::string(scalarKindName(*selectorKind)) : "void";
+			if (selectorKind && _types.vectorWidth(emittedType) > 1) {
+				name += std::to_string(_types.vectorWidth(emittedType));
+			}
+			throw CompileError("statement requires expression of integer type ('" + name + "' invalid)");
+		}
+
+		ScalarKind kind = *selectorKind;
+		if (kind == ScalarKind::Bool) {
+			selector = convert(selector, emittedType, _types.scalar(ScalarKind::Int));
+			kind = ScalarKind::Int;
+		}
+
+		const Id mergeLabel = _builder.nextId();
+		Id defaultLabel = InvalidId;
+		std::vector<Id> labels(statement.switchCases.size());
+		std::vector<uint64_t> literals(statement.switchCases.size(), 0);
+
+		std::set<uint64_t> seen;
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			labels[i] = _builder.nextId();
+			const SwitchCase& kase = statement.switchCases[i];
+			if (!kase.value) {
+				if (defaultLabel != InvalidId) {
+					throw CompileError("multiple default labels in one switch");
+				}
+				defaultLabel = labels[i];
+				continue;
+			}
+
+			FoldedConstant folded;
+			try {
+				folded = foldExpression(*kase.value);
+			} catch (const CompileError&) {
+				throw CompileError("case value is not a constant expression");
+			}
+			if (folded.isComposite || isFloatKind(folded.scalar)) {
+				throw CompileError("case value is not an integer constant expression");
+			}
+			// A bool case value is its int value, as the selector is.
+			if (folded.scalar == ScalarKind::Bool) {
+				folded.scalar = ScalarKind::Int;
+				folded.integer = folded.boolean ? 1 : 0;
+			}
+
+			if (!fitsInKind(folded, kind)) {
+				throw CompileError("case value evaluates to " + integerText(folded)
+					+ ", which cannot be narrowed to type '" + scalarKindName(kind) + "'");
+			}
+
+			literals[i] = normalizeInteger(kind, folded.integer);
+			if (!seen.insert(literals[i]).second) {
+				FoldedConstant asSelector;
+				asSelector.scalar = kind;
+				asSelector.integer = literals[i];
+				throw CompileError("duplicate case value '" + integerText(asSelector) + "'");
+			}
+		}
+
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		std::vector<uint32_t> operands = {
+			selector, defaultLabel != InvalidId ? defaultLabel : mergeLabel };
+		const uint32_t width = mappingFor(kind).width;
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			if (!statement.switchCases[i].value) {
+				continue;
+			}
+			// A literal is as wide as the selector: two words for a 64-bit one.
+			operands.push_back(static_cast<uint32_t>(literals[i]));
+			if (width > 32) {
+				operands.push_back(static_cast<uint32_t>(literals[i] >> 32));
+			}
+			operands.push_back(labels[i]);
+		}
+		terminate(spirv::OpSwitch, operands);
+
+		const ControlDepthScope depth(_controlDepth);
+		// A break leaves the switch; a continue belongs to the loop around it,
+		// which is what a target with no continue label tells the jump lowering.
+		_jumpTargets.push_back({ mergeLabel, InvalidId });
+		struct PopTarget {
+			std::vector<JumpTarget>& targets;
+			~PopTarget() { targets.pop_back(); }
+		} popTarget{ _jumpTargets };
+
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			beginBlock(labels[i]);
+			for (const StatementPtr& child: statement.switchCases[i].body) {
+				if (_terminated) {
+					break;
+				}
+				emitStatement(*child);
+			}
+			branchUnlessTerminated(i + 1 < labels.size() ? labels[i + 1] : mergeLabel);
+		}
+
+		beginBlock(mergeLabel);
+	}
+
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
 			case StatementKind::Compound: {
@@ -6949,8 +7145,13 @@ namespace {
 				}
 				terminate(spirv::OpKill, {});
 				return;
-			case StatementKind::Switch:
-				throw CompileError("a switch statement is parsed but not lowered yet");
+			case StatementKind::Switch: {
+				// A local declared under one label is visible under the ones after
+				// it, as C++ says, so the whole body shares one scope.
+				const BindingScope scope(_bindings);
+				emitSwitch(statement);
+				return;
+			}
 		}
 	}
 
