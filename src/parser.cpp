@@ -812,6 +812,7 @@ bool Parser::parseStructFunction(StructDecl& decl) {
 	const std::string unqualified = unqualifiedName(decl.name);
 	bool isFunction = !unqualified.empty() && lookahead(ahead).kind == TokenKind::Identifier
 		&& lookahead(ahead).text == unqualified && lookahead(ahead + 1).kind == TokenKind::LParen;
+	decl.hasConstructors = decl.hasConstructors || isFunction;
 	bool isStatic = false;
 	for (size_t i = 0; i < ahead; ++i) {
 		isStatic = isStatic || lookahead(i).text == "static";
