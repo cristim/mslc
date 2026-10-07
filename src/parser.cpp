@@ -289,6 +289,14 @@ const Token& Parser::lookahead(size_t offset) const {
 	return index < _tokens.size() ? _tokens[index] : _tokens.back();
 }
 
+// True at a "metal::discard_fragment" the parser is positioned on, which tells
+// the qualified form of the call from a call on an object called "metal".
+bool Parser::isDiscardFragment() const {
+	return lookahead().kind == TokenKind::ColonColon
+		&& lookahead(2).kind == TokenKind::Identifier
+		&& lookahead(2).text == "discard_fragment";
+}
+
 const Token& Parser::advance() {
 	const Token& token = _tokens[_position];
 	if (_position + 1 < _tokens.size()) {
@@ -2444,11 +2452,25 @@ StatementPtr Parser::parseStatement() {
 		return parseReturnStatement();
 	}
 
-	if (atKeyword("break") || atKeyword("continue") || atKeyword("discard_fragment")) {
+	// discard_fragment() is declared in <metal_stdlib> as a function, so it
+	// reaches here as a call expression and is recognised by its name rather
+	// than by the keyword position break and continue are read at. The empty
+	// parentheses are part of the call.
+	if (atKeyword("discard_fragment") || (atKeyword("metal") && isDiscardFragment())) {
+		statement->kind = StatementKind::Discard;
+		advance();
+		if (match(TokenKind::ColonColon)) {
+			expect(TokenKind::Identifier, "after \"metal::\"");
+		}
+		expect(TokenKind::LParen, "to open the call \"discard_fragment()\"");
+		expect(TokenKind::RParen, "to close the call \"discard_fragment()\", which takes no arguments");
+		expect(TokenKind::Semicolon, "after \"discard_fragment()\"");
+		return statement;
+	}
+
+	if (atKeyword("break") || atKeyword("continue")) {
 		const std::string keyword(advance().text);
-		statement->kind = keyword == "break" ? StatementKind::Break
-			: keyword == "continue" ? StatementKind::Continue
-			: StatementKind::Discard;
+		statement->kind = keyword == "break" ? StatementKind::Break : StatementKind::Continue;
 		expect(TokenKind::Semicolon, "after a jump statement");
 		return statement;
 	}

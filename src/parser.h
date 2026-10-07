@@ -110,6 +110,9 @@ private:
 
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
+
+	// True at a "metal::discard_fragment" the parser is positioned on.
+	bool isDiscardFragment() const;
 	TokenKind kind() const { return current().kind; }
 
 	bool at(TokenKind expected) const { return kind() == expected; }
