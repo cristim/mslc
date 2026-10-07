@@ -71,12 +71,11 @@ run_expects(missing_reflect "usage: mslc")
 # An input that does not exist is a failure, not an empty module.
 run(absent_input nonzero "${WORK_DIR}/does-not-exist.metal")
 
-# A file-scope declaration on its own parses, so the failure is the missing entry
-# point rather than a parse error, and the message names what it looked for.
+# A file-scope declaration alone reaches the Vulkan shader entry-point check.
 set(bad "${WORK_DIR}/bad.metal")
 file(WRITE "${bad}" "constant float x = 1.0;\n")
 run(no_entry_point nonzero "-o;${WORK_DIR}/bad.spv;${bad}")
-run_expects(no_entry_point "declares no kernel, vertex or fragment entry point")
+run_expects(no_entry_point "declares no function, and mslc emits one SPIR-V module per library")
 
 # -V runs the validator, and a valid module passes it. That is the success side
 # of the case run_validate_failure.cmake checks the failure of.
