@@ -113,6 +113,10 @@ private:
 
 	// True at a "metal::discard_fragment" the parser is positioned on.
 	bool isDiscardFragment() const;
+
+	// True at a bare "discard_fragment(" that names the <metal_stdlib> builtin
+	// rather than a local or a function the source declared itself.
+	bool isBareDiscardFragment() const;
 	TokenKind kind() const { return current().kind; }
 
 	bool at(TokenKind expected) const { return kind() == expected; }

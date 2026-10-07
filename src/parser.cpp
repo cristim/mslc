@@ -297,6 +297,19 @@ bool Parser::isDiscardFragment() const {
 		&& lookahead(2).text == "discard_fragment";
 }
 
+// True at a bare "discard_fragment(" that names the <metal_stdlib> builtin:
+// the parenthesis makes it a call, and mslc does not declare the stdlib
+// functions, so a local of that name or a function the source declared itself
+// is the source's own, and a statement starting with it is not a discard.
+bool Parser::isBareDiscardFragment() const {
+	if (lookahead().kind != TokenKind::LParen || isLocal("discard_fragment")) {
+		return false;
+	}
+	QualifiedName name;
+	name.parts = { "discard_fragment" };
+	return !_declared.count(resolveName(name));
+}
+
 const Token& Parser::advance() {
 	const Token& token = _tokens[_position];
 	if (_position + 1 < _tokens.size()) {
@@ -2455,8 +2468,11 @@ StatementPtr Parser::parseStatement() {
 	// discard_fragment() is declared in <metal_stdlib> as a function, so it
 	// reaches here as a call expression and is recognised by its name rather
 	// than by the keyword position break and continue are read at. The empty
-	// parentheses are part of the call.
-	if (atKeyword("discard_fragment") || (atKeyword("metal") && isDiscardFragment())) {
+	// parentheses are part of the call. The bare spelling is a discard only
+	// when it names the builtin; anything the source itself declared under
+	// that name falls through to ordinary statement parsing.
+	if ((atKeyword("discard_fragment") && isBareDiscardFragment())
+		|| (atKeyword("metal") && isDiscardFragment())) {
 		statement->kind = StatementKind::Discard;
 		advance();
 		if (match(TokenKind::ColonColon)) {
