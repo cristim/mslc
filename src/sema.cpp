@@ -1332,14 +1332,7 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 	}
 
 	if (requested == Stage::None) {
-		// Apple's compiler accepts a source with no entry point and builds a
-		// library of helper functions from it (both Xcode Metal templates are
-		// such a file). A Vulkan module cannot be that: spirv-val rejects a
-		// module with no OpEntryPoint unless it declares the Linkage (or
-		// GraphARM) capability, which Vulkan does not allow, so there is no
-		// empty module to emit and indium would have nothing to bind. Say so,
-		// rather than leaving a message that reads as a claim about the source.
-		// A prototype and its definition are one function; count by name.
+		// Vulkan shader modules require an entry point; count helpers by name.
 		std::set<std::string> names;
 		for (const FunctionDecl& helper: unit.helpers) {
 			names.insert(helper.name);
