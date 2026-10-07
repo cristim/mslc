@@ -1332,7 +1332,22 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 	}
 
 	if (requested == Stage::None) {
-		throw CompileError("source declares no kernel, vertex or fragment entry point");
+		// Apple's compiler accepts a source with no entry point and builds a
+		// library of helper functions from it (both Xcode Metal templates are
+		// such a file). A Vulkan module cannot be that: spirv-val rejects a
+		// module with no OpEntryPoint unless it declares the Linkage capability,
+		// which Vulkan does not allow, so there is no empty module to emit and
+		// indium would have nothing to bind. Say so, rather than leaving a
+		// message that reads as a claim about the source.
+		const size_t helpers = unit.helpers.size();
+		throw CompileError(helpers == 0
+			? std::string("this source declares no function, and mslc emits one SPIR-V module per "
+				"library: Vulkan requires an entry point, so a file with no kernel, vertex or "
+				"fragment function cannot be compiled")
+			: "this source declares " + std::to_string(helpers) + (helpers == 1 ? " helper function" : " helper functions")
+				+ " and no kernel, vertex or fragment entry point. Apple's compiler builds a "
+				"library of the helpers, but a Vulkan module needs an entry point, so mslc "
+				"cannot compile a file whose functions are all helpers");
 	}
 
 	throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"

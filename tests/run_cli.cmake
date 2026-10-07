@@ -72,11 +72,13 @@ run_expects(missing_reflect "usage: mslc")
 run(absent_input nonzero "${WORK_DIR}/does-not-exist.metal")
 
 # A file-scope declaration on its own parses, so the failure is the missing entry
-# point rather than a parse error, and the message names what it looked for.
+# point rather than a parse error, and the message names the Vulkan limit that
+# decides it (a module needs an entry point; probes/no_entry_point.metal says
+# why that rules out the empty module Apple's compiler would build).
 set(bad "${WORK_DIR}/bad.metal")
 file(WRITE "${bad}" "constant float x = 1.0;\n")
 run(no_entry_point nonzero "-o;${WORK_DIR}/bad.spv;${bad}")
-run_expects(no_entry_point "declares no kernel, vertex or fragment entry point")
+run_expects(no_entry_point "declares no function, and mslc emits one SPIR-V module per library")
 
 # -V runs the validator, and a valid module passes it. That is the success side
 # of the case run_validate_failure.cmake checks the failure of.
