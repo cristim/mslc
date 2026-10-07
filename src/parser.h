@@ -111,12 +111,6 @@ private:
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
 
-	// True at a "metal::discard_fragment" the parser is positioned on.
-	bool isDiscardFragment() const;
-
-	// True at a bare "discard_fragment(" that names the <metal_stdlib> builtin
-	// rather than a local or a function the source declared itself.
-	bool isBareDiscardFragment() const;
 	TokenKind kind() const { return current().kind; }
 
 	bool at(TokenKind expected) const { return kind() == expected; }
@@ -191,6 +185,7 @@ private:
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
+	bool isDiscardFragment(QualifiedName& name) const;
 
 	// The file-scope name a spelling refers to from here: its qualified name, or the
 	// spelling itself when it names no declaration (a builtin). A qualified spelling

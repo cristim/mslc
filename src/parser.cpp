@@ -289,25 +289,14 @@ const Token& Parser::lookahead(size_t offset) const {
 	return index < _tokens.size() ? _tokens[index] : _tokens.back();
 }
 
-// True at a "metal::discard_fragment" the parser is positioned on, which tells
-// the qualified form of the call from a call on an object called "metal".
-bool Parser::isDiscardFragment() const {
-	return lookahead().kind == TokenKind::ColonColon
-		&& lookahead(2).kind == TokenKind::Identifier
-		&& lookahead(2).text == "discard_fragment";
-}
-
-// True at a bare "discard_fragment(" that names the <metal_stdlib> builtin:
-// the parenthesis makes it a call, and mslc does not declare the stdlib
-// functions, so a local of that name or a function the source declared itself
-// is the source's own, and a statement starting with it is not a discard.
-bool Parser::isBareDiscardFragment() const {
-	if (lookahead().kind != TokenKind::LParen || isLocal("discard_fragment")) {
+bool Parser::isDiscardFragment(QualifiedName& name) const {
+	if (!peekQualifiedName(name) || name.parts.back() != "discard_fragment"
+		|| lookahead(name.tokens).kind != TokenKind::LParen
+		|| lookahead(name.tokens + 1).kind != TokenKind::RParen
+		|| (!name.global && name.parts.size() == 1 && isLocal("discard_fragment"))) {
 		return false;
 	}
-	QualifiedName name;
-	name.parts = { "discard_fragment" };
-	return !_declared.count(resolveName(name));
+	return resolveName(name) == "metal::discard_fragment";
 }
 
 const Token& Parser::advance() {
@@ -537,7 +526,7 @@ void Parser::parseUsing() {
 	}
 	expect(TokenKind::Semicolon, "after a using declaration");
 	const std::string resolved = resolveName(name);
-	if (!_declared.count(resolved)) {
+	if (!_declared.count(resolved) && resolved != "metal::discard_fragment") {
 		return; // a name of the standard library, which is visible already
 	}
 	_scopes[scope].declarations[name.parts.back()] = resolved;
@@ -1269,6 +1258,9 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 }
 
 void Parser::collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const {
+	if (scope == kStdlibNamespace && name == "discard_fragment") {
+		found.insert("metal::discard_fragment");
+	}
 	const std::string key = scope.empty() ? name : scope + "::" + name;
 	if (_declared.count(key)) {
 		found.insert(key);
@@ -1412,7 +1404,9 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	// "metal::sin" is the standard library's "sin", with or without a using
 	// directive, unless the file extends the namespace with a name of that spelling.
 	if (parts.front() == kStdlibNamespace && parts.size() > 1) {
-		return joinParts(parts, 1, parts.size());
+		if (parts.size() != 2 || last != "discard_fragment") {
+			return joinParts(parts, 1, parts.size());
+		}
 	}
 
 	if (parts.size() == 1) {
@@ -1427,6 +1421,9 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		if (_unit.findStruct(structName)) {
 			return structName + "::" + last;
 		}
+	}
+	if (!found && parts.size() == 2 && parts.front() == kStdlibNamespace && last == "discard_fragment") {
+		return "metal::discard_fragment";
 	}
 	if (!found) {
 		throw CompileError("\"" + joinParts(parts, 0, parts.size() - 1) + "\" in \"" + spelled
@@ -2465,18 +2462,11 @@ StatementPtr Parser::parseStatement() {
 		return parseReturnStatement();
 	}
 
-	// discard_fragment() is declared in <metal_stdlib> as a function, so it
-	// reaches here as a call expression and is recognised by its name rather
-	// than by the keyword position break and continue are read at. The empty
-	// parentheses are part of the call. The bare spelling is a discard only
-	// when it names the builtin; anything the source itself declared under
-	// that name falls through to ordinary statement parsing.
-	if ((atKeyword("discard_fragment") && isBareDiscardFragment())
-		|| (atKeyword("metal") && isDiscardFragment())) {
+	QualifiedName discardName;
+	if (isDiscardFragment(discardName)) {
 		statement->kind = StatementKind::Discard;
-		advance();
-		if (match(TokenKind::ColonColon)) {
-			expect(TokenKind::Identifier, "after \"metal::\"");
+		for (size_t i = 0; i < discardName.tokens; ++i) {
+			advance();
 		}
 		expect(TokenKind::LParen, "to open the call \"discard_fragment()\"");
 		expect(TokenKind::RParen, "to close the call \"discard_fragment()\", which takes no arguments");
