@@ -413,7 +413,10 @@ namespace {
 			names.insert(expression.name);
 		}
 		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
-			if (child) collectIdentifiers(*child, names);
+			if (child && !(expression.kind == ExpressionKind::Call && child == expression.left.get()
+				&& child->kind == ExpressionKind::Identifier)) {
+				collectIdentifiers(*child, names);
+			}
 		}
 		for (const ExpressionPtr& argument: expression.arguments) {
 			collectIdentifiers(*argument, names);
@@ -1779,6 +1782,8 @@ namespace {
 		// emitted names, which are looked up after its own parameters and locals.
 		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
 		std::map<std::string, Binding> _fileScopeSamplerBindings;
+		// The entry point whose sampler a helper that names a file-scope one holds.
+		std::map<std::string, const FunctionDecl*> _samplerHelperOwner;
 		// What each constant folded to, so a later constant referring to this one
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
@@ -1837,11 +1842,10 @@ namespace {
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
 
-		// A helper function of the unit, as one module holds it: emitted once, on
-		// the first call from an entry point or from another helper that is emitted.
+		// A helper's body is emitted once per stage that reaches it.
 		struct HelperFunction {
 			const FunctionDecl* definition = nullptr;
-			Id id = InvalidId;
+			std::map<Stage, Id> ids;
 			Id returnType = InvalidId;
 			std::vector<Id> parameterTypes;
 			Id type = InvalidId;
@@ -1916,6 +1920,7 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
+		void rejectMemberFileScopeSamplers(const FunctionDecl& member) const;
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -1994,6 +1999,10 @@ namespace {
 		Id emitCall(const Expression& expression);
 		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
+		Id helperParameterType(const Type& type);
+		Id resourceArgument(const Expression& argument, const Parameter& parameter,
+			const std::string& function);
+		Id resourcePointee(const Type& type);
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
 		bool returnsVoid(const FunctionDecl& function) const;
@@ -3849,6 +3858,7 @@ namespace {
 					+ " arguments, and it takes " + std::to_string(parameters.size() - 1));
 			}
 
+			rejectMemberFileScopeSamplers(*found->second.definition);
 			receiver = member.left.get();
 			return &found->second;
 		}
@@ -3865,6 +3875,51 @@ namespace {
 		return function.returnType.scalar == ScalarKind::Void && function.returnType.namedType.empty();
 	}
 
+	// A texture or sampler parameter is a pointer to the UniformConstant variable
+	// the caller's own parameter or sampler is, because Vulkan SPIR-V passes an
+	// opaque object by reference. Any other parameter is the value it names.
+	Id Emitter::helperParameterType(const Type& type) {
+		if (type.resource == ResourceKind::None) {
+			return declaredTypeOf(type);
+		}
+
+		return _types.pointer(spirv::StorageClass::UniformConstant, resourcePointee(type));
+	}
+
+	Id Emitter::resourcePointee(const Type& type) {
+		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
+	}
+
+	// The variable behind a texture or sampler argument: it has to be a name for a
+	// texture or sampler of the same kind as the parameter, since there is no
+	// other way to hold one, and Apple finds no function for any other call.
+	Id Emitter::resourceArgument(const Expression& argument, const Parameter& parameter,
+		const std::string& function) {
+		const std::string what = "the argument for parameter \"" + parameter.name + "\" of \"" + function + "\"";
+		if (argument.kind != ExpressionKind::Identifier) {
+			throw CompileError(what + " has to name a texture or sampler parameter, a sampler declared "
+				"in the shader, or a texture or sampler parameter of the calling helper");
+		}
+
+		const Binding* binding = findResourceBinding(argument.name);
+		const Type& wanted = parameter.type;
+		const bool matches = binding && binding->pointeeMsl.resource == wanted.resource
+			&& (!wanted.isTexture() || binding->pointeeMsl.scalar == wanted.scalar);
+		if (!matches) {
+			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
+				+ typeName(wanted));
+		}
+
+		// The helper samples with an implicit lod, which Vulkan refuses through an
+		// unnormalized sampler, and the helper is one function whatever it is given.
+		if (binding->unnormalizedSampler) {
+			throw CompileError(what + " is a coord::pixel sampler, which a helper function does not take: "
+				"Vulkan forbids an implicit-lod lookup through it");
+		}
+
+		return binding->id;
+	}
+
 	// The arguments are evaluated left to right and converted to the parameter
 	// types as an initialiser would be; Apple does the same and refuses a vector of
 	// another width. A helper has no side effects an argument could expose, since
@@ -3873,11 +3928,11 @@ namespace {
 	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver) {
 		const FunctionDecl& definition = *helper.definition;
 
-		if (helper.id == InvalidId) {
+		if (helper.type == InvalidId) {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
 			for (const Parameter& parameter: definition.parameters) {
-				helper.parameterTypes.push_back(declaredTypeOf(parameter.type));
+				helper.parameterTypes.push_back(helperParameterType(parameter.type));
 				signature.push_back(helper.parameterTypes.back());
 			}
 
@@ -3888,11 +3943,15 @@ namespace {
 			}
 
 			helper.type = slot.first->second;
-			helper.id = _builder.nextId();
+		}
+
+		const auto slot = helper.ids.emplace(_entryPoint->stage, InvalidId);
+		if (slot.second) {
+			slot.first->second = _builder.nextId();
 			_helperQueue.push_back(&helper);
 		}
 
-		std::vector<uint32_t> operands { helper.id };
+		std::vector<uint32_t> operands { slot.first->second };
 		const size_t first = receiver ? 1 : 0;
 		if (first) {
 			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
@@ -3900,6 +3959,12 @@ namespace {
 			operands.push_back(convertImplicit(object, helper.parameterTypes[0]));
 		}
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			const Parameter& parameter = definition.parameters[first + i];
+			if (parameter.type.resource != ResourceKind::None) {
+				operands.push_back(resourceArgument(*call.arguments[i], parameter, definition.name));
+				continue;
+			}
+
 			const Id value = emitExpression(*call.arguments[i]);
 			try {
 				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
@@ -3925,7 +3990,7 @@ namespace {
 		_controlDepth = 0;
 
 		_builder.setSection(spirv::Section::Functions);
-		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.id,
+		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.ids.at(_entryPoint->stage),
 			{ kFunctionControlNone, helper.type });
 
 		std::vector<Id> values;
@@ -3937,6 +4002,17 @@ namespace {
 		for (size_t i = 0; i < values.size(); ++i) {
 			const Parameter& parameter = definition.parameters[i];
 			if (parameter.name.empty()) {
+				continue;
+			}
+
+			if (parameter.type.resource != ResourceKind::None) {
+				Binding bound;
+				bound.id = values[i];
+				bound.isPointer = true;
+				bound.pointeeType = resourcePointee(parameter.type);
+				bound.storageClass = spirv::StorageClass::UniformConstant;
+				bound.pointeeMsl = parameter.type;
+				_bindings[parameter.name] = bound;
 				continue;
 			}
 
@@ -5122,23 +5198,101 @@ namespace {
 			+ ", \"name\": \"" + declaration.name + "\" }");
 	}
 
+	void Emitter::rejectMemberFileScopeSamplers(const FunctionDecl& member) const {
+		std::set<const FunctionDecl*> seen { &member };
+		std::vector<const FunctionDecl*> pending { &member };
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+			ScopeStack scopes(1);
+			for (const Parameter& parameter: function->parameters) {
+				scopes.back().insert(parameter.name);
+			}
+			std::set<std::string> names;
+			collectUnshadowed(function->body.get(), scopes, names);
+			for (const VariableDeclaration& global: _unit.globals) {
+				if (global.sampler && names.count(global.name)) {
+					throw CompileError("member helper \"" + member.name + "\" names a file-scope sampler, "
+						"pass the sampler to it as an argument");
+				}
+			}
+			std::vector<const Expression*> calls;
+			collectCalls(*function->body, calls);
+			for (const Expression* call: calls) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+				const auto helper = _helpers.find(call->left->name);
+				if (helper != _helpers.end() && seen.insert(helper->second.definition).second) {
+					pending.push_back(helper->second.definition);
+				}
+			}
+		}
+	}
+
 	// A file-scope sampler is reserved, once the entry point's own are, if the body
 	// names it where no parameter or local of that name hides it. They go in the
 	// order the file declares them. Which embedded samplers an entry point lists is
 	// per entry point, so a sampler two of them name is listed by each.
 	void Emitter::reserveFileScopeSamplers() {
-		ScopeStack scopes(1);
-		for (const Parameter& parameter: _entryPoint->parameters) {
-			scopes.back().insert(parameter.name);
-		}
-		std::set<std::string> names;
-		collectUnshadowed(_entryPoint->body.get(), scopes, names);
+		std::set<const VariableDeclaration*> named;
+		const auto scan = [&](const FunctionDecl& function) {
+			ScopeStack scopes(1);
+			for (const Parameter& parameter: function.parameters) {
+				scopes.back().insert(parameter.name);
+			}
+			std::set<std::string> names;
+			collectUnshadowed(function.body.get(), scopes, names);
 
-		const auto declaredAbove = _unit.globals.begin() + _entryPoint->globalsBefore;
-		for (auto global = _unit.globals.begin(); global != declaredAbove; ++global) {
-			if (global->sampler && names.count(global->name)) {
-				reserveSampler(*global);
-				_fileScopeSamplerBindings[global->name] = embeddedSamplerBinding(*global);
+			const auto declaredAbove = _unit.globals.begin() + function.globalsBefore;
+			bool any = false;
+			for (auto global = _unit.globals.begin(); global != declaredAbove; ++global) {
+				if (global->sampler && names.count(global->name)) {
+					named.insert(&*global);
+					any = true;
+				}
+			}
+			return any;
+		};
+
+		scan(*_entryPoint);
+
+		// A helper naming a file-scope sampler is owned by one entry point.
+		std::set<const FunctionDecl*> seen { _entryPoint };
+		std::vector<const FunctionDecl*> pending { _entryPoint };
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+
+			std::vector<const Expression*> calls;
+			collectCalls(*function->body, calls);
+			for (const Expression* call: calls) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+				const auto helper = _helpers.find(call->left->name);
+				if (helper == _helpers.end() || !seen.insert(helper->second.definition).second) {
+					continue;
+				}
+
+				pending.push_back(helper->second.definition);
+				if (scan(*helper->second.definition)) {
+					const auto owner = _samplerHelperOwner.emplace(helper->first, _entryPoint);
+					if (owner.first->second != _entryPoint) {
+						throw CompileError("helper function \"" + helper->first + "\" names a file-scope "
+							"sampler, and entry points \"" + owner.first->second->name + "\" and \""
+							+ _entryPoint->name + "\" both reach it; helper file-scope samplers are "
+							"owned by one entry point, so pass the sampler to it as an argument");
+					}
+				}
+			}
+		}
+
+		// They go in the order the file declares them.
+		for (const VariableDeclaration& global: _unit.globals) {
+			if (named.count(&global)) {
+				reserveSampler(global);
+				_fileScopeSamplerBindings[global.name] = embeddedSamplerBinding(global);
 			}
 		}
 	}
@@ -6529,6 +6683,7 @@ namespace {
 			_interface.clear();
 			_reflection.clear();
 			_embeddedSamplers.clear();
+			_fileScopeSamplerBindings.clear();
 			_nextBinding = 0;
 			// The address block is per entry point too, and clearing it with the
 			// rest is what keeps a later change to when it is read from inheriting
