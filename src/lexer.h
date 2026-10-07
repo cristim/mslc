@@ -13,6 +13,7 @@ enum class TokenKind {
 	Identifier,
 	IntegerLiteral,
 	FloatLiteral,
+	StringLiteral,
 
 	// punctuation and operators
 	LBrace, RBrace,

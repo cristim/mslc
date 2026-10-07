@@ -292,15 +292,12 @@ typedef float4x4 simd_float4x4;
 		return false;
 	}
 
-	// The lexer reports a string literal as an Identifier token, so a token of
-	// that kind is a name only if it starts like one.
 	bool isName(const Token& token) {
-		return token.kind == TokenKind::Identifier && !token.text.empty()
-			&& (std::isalpha(static_cast<unsigned char>(token.text[0])) || token.text[0] == '_');
+		return token.kind == TokenKind::Identifier;
 	}
 
 	bool isStringLiteral(const Token& token) {
-		return token.kind == TokenKind::Identifier && !token.text.empty() && token.text[0] == '"';
+		return token.kind == TokenKind::StringLiteral;
 	}
 
 	// "1L", "0b101" and "1e+5" are each one preprocessing number in C, though the

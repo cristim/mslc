@@ -3312,6 +3312,13 @@ static ScalarKind integerLiteralKind(const Token& literal) {
 }
 
 ExpressionPtr Parser::parsePrimary() {
+	// mslc lowers no string type, so a string in expression position is a
+	// rejection. Naming it as one is the whole point: read as a name, it
+	// reported a failed lookup for an identifier spelled with quotes.
+	if (at(TokenKind::StringLiteral)) {
+		throw CompileError("a string literal is not lowered; mslc has no string type");
+	}
+
 	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
 		if (atKeyword("static_cast")) {
 			return parseNamedCast();
