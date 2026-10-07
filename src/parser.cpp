@@ -3137,6 +3137,9 @@ ExpressionPtr Parser::parseNamedCast() {
 		expression->arguments.push_back(parseExpression());
 	}
 	expect(TokenKind::RParen, "to close a static_cast");
+	if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
+		return call;
+	}
 	expression->constructType = type;
 	measure(*expression);
 	return expression;
