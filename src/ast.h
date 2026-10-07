@@ -246,6 +246,7 @@ enum class StatementKind {
 	If,
 	For,
 	While,
+	Switch,
 	Return,
 	Break,
 	Continue,
@@ -254,6 +255,15 @@ enum class StatementKind {
 
 struct Statement;
 using StatementPtr = std::unique_ptr<Statement>;
+
+// One label of a switch and the statements under it, up to the next label or
+// the end of the body. A default label has no value; the value of a case label
+// is the constant expression the selector is compared with.
+struct SwitchCase {
+	ExpressionPtr value;
+	std::vector<StatementPtr> body;
+	size_t line = 0;
+};
 
 enum class SamplerAddress { ClampToZero, ClampToEdge, Repeat, MirroredRepeat };
 enum class SamplerFilter { Nearest, Linear };
@@ -316,6 +326,11 @@ struct Statement {
 	// While
 	ExpressionPtr whileCondition;
 	StatementPtr whileBody;
+
+	// Switch: the selector is `expression`. Statements before the first label
+	// are unreachable, as C++ says, and the preamble is where they are kept.
+	std::vector<SwitchCase> switchCases;
+	std::vector<StatementPtr> switchPreamble;
 
 	size_t line = 0;
 };

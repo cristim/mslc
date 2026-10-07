@@ -6949,6 +6949,8 @@ namespace {
 				}
 				terminate(spirv::OpKill, {});
 				return;
+			case StatementKind::Switch:
+				throw CompileError("a switch statement is parsed but not lowered yet");
 		}
 	}
 

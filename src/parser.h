@@ -265,6 +265,7 @@ private:
 	StatementPtr parseIfStatement();
 	StatementPtr parseForStatement();
 	StatementPtr parseWhileStatement();
+	StatementPtr parseSwitchStatement();
 	StatementPtr parseReturnStatement();
 
 	// Expressions, by precedence level.
