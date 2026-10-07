@@ -605,6 +605,7 @@ bool Parser::tryParseHelperFunction() {
 
 	advance();
 	decl.order = _functionOrder++;
+	decl.globalsBefore = _unit.globals.size();
 
 	const std::string quoted = "helper function \"" + decl.name + "\"";
 	rejectUnloweredReturn(decl.returnType, quoted);
@@ -2136,9 +2137,6 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 	if (helper) {
 		const std::string what = "parameter \"" + param.name + "\" of helper function \"" + helperName + "\" ";
-		if (param.type.resource != ResourceKind::None) {
-			throw CompileError(what + "is a texture or sampler, which a helper function does not take yet");
-		}
 		if (param.type.isPointer) {
 			throw CompileError(what + "is a pointer, which a helper function does not take yet; "
 				"it takes scalar, vector, matrix and struct values");
