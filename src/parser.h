@@ -277,6 +277,9 @@ private:
 	ExpressionPtr parseAssignment();
 	ExpressionPtr parseConditional();
 	ExpressionPtr parseCast();
+	ExpressionPtr parseNamedCast();
+
+	std::optional<Type> peekCastTargetName(size_t& nameTokens);
 	ExpressionPtr parseLogicalOr();
 	ExpressionPtr parseLogicalAnd();
 	ExpressionPtr parseBitwiseOr();

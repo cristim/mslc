@@ -3018,6 +3018,35 @@ ExpressionPtr Parser::parseUnary() {
 	return parsePostfix();
 }
 
+// A nonconsuming null result lets a speculative C-style cast backtrack.
+std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
+	const std::string head(current().text);
+	if (kind() == TokenKind::Identifier) {
+		if (isTypeQualifier(head) || addressSpaceFor(head)) {
+			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
+		}
+		if (head == "void") {
+			throw CompileError("a cast to void is not supported");
+		}
+	}
+
+	QualifiedName spelled;
+	if (!peekQualifiedName(spelled)) {
+		return std::nullopt;
+	}
+	const std::string name = peekResolved(nameTokens);
+
+	Type type;
+	if (!resolveTypeName(name, type)) {
+		if (!_unit.findStruct(name)) {
+			return std::nullopt;
+		}
+		type.namedType = name;
+	}
+
+	return type;
+}
+
 // `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
 // enum or a struct, is the functional cast T(operand). A type name cannot begin a
 // parenthesised expression, so "(" followed by one is always a cast. Returns null
@@ -3055,40 +3084,20 @@ ExpressionPtr Parser::parseCast() {
 		}
 	}
 
-	const std::string head(first.text);
-	if (first.kind == TokenKind::Identifier) {
-		if (isTypeQualifier(head) || addressSpaceFor(head)) {
-			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
-		}
-		if (head == "void") {
-			throw CompileError("a cast to void is not supported");
-		}
-	}
-
 	// Read the name, which may be namespace-qualified, from just past the '('.
 	const size_t open = _position;
 	++_position;
-	QualifiedName spelled;
-	if (!peekQualifiedName(spelled)) {
-		_position = open;
-		return nullptr;
-	}
 	size_t nameTokens = 0;
-	std::string name;
+	std::optional<Type> type;
 	try {
-		name = peekResolved(nameTokens);
+		type = peekCastTargetName(nameTokens);
 	} catch (...) {
 		_position = open;
 		throw;
 	}
 	_position = open;
-
-	Type type;
-	if (!resolveTypeName(name, type)) {
-		if (!_unit.findStruct(name)) {
-			return nullptr;
-		}
-		type.namedType = name;
+	if (!type) {
+		return nullptr;
 	}
 
 	const Token& after = lookahead(1 + nameTokens);
@@ -3102,7 +3111,7 @@ ExpressionPtr Parser::parseCast() {
 	auto expression = std::make_unique<Expression>();
 	expression->kind = ExpressionKind::Construct;
 	expression->line = line();
-	expression->constructType = type;
+	expression->constructType = *type;
 	advance();
 	for (size_t i = 0; i < nameTokens; ++i) {
 		advance();
@@ -3110,6 +3119,56 @@ ExpressionPtr Parser::parseCast() {
 	advance();
 	const NestingScope scope(*this);
 	expression->arguments.push_back(parseUnary());
+	measure(*expression);
+	return expression;
+}
+
+// Unlike a C-style cast, a named cast cannot backtrack into an expression.
+ExpressionPtr Parser::parseNamedCast() {
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::Construct;
+	expression->line = line();
+
+	advance();
+	advance();
+
+	Type type;
+	while (kind() == TokenKind::Identifier
+		&& (current().text == "const" || current().text == "volatile")) {
+		advance();
+	}
+	if (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) {
+		parseSpecifierRun(type);
+	} else {
+		size_t nameTokens = 0;
+		auto target = peekCastTargetName(nameTokens);
+		if (!target) {
+			if (nameTokens > 0 && lookahead(nameTokens).kind == TokenKind::Less) {
+				throw CompileError("a cast to a pointer, reference or template type is not supported");
+			}
+			throw CompileError("expected a type name in \"static_cast<\", found \""
+				+ std::string(current().text) + "\"");
+		}
+		type = *target;
+		for (size_t i = 0; i < nameTokens; ++i) {
+			advance();
+		}
+	}
+
+	if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
+		throw CompileError("a cast to a pointer, reference or template type is not supported");
+	}
+	expect(TokenKind::Greater, "to close the type of a static_cast");
+	expect(TokenKind::LParen, "for the operand of a static_cast");
+	{
+		const NestingScope scope(*this);
+		expression->arguments.push_back(parseExpression());
+	}
+	expect(TokenKind::RParen, "to close a static_cast");
+	if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
+		return call;
+	}
+	expression->constructType = type;
 	measure(*expression);
 	return expression;
 }
@@ -3253,6 +3312,16 @@ static ScalarKind integerLiteralKind(const Token& literal) {
 }
 
 ExpressionPtr Parser::parsePrimary() {
+	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
+		if (atKeyword("static_cast")) {
+			return parseNamedCast();
+		}
+		if (atKeyword("reinterpret_cast") || atKeyword("const_cast")) {
+			throw CompileError(std::string(current().text) + " is not supported; "
+				"use static_cast or a functional cast for a value conversion");
+		}
+	}
+
 	if (at(TokenKind::IntegerLiteral)) {
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::IntLiteral;
