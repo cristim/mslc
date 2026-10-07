@@ -957,6 +957,7 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 	const std::string quoted = std::string(isConstructor ? "constructor \"" : "member function \"") + fn.name + "\"";
 	rejectUnloweredReturn(fn.returnType, quoted);
 	fn.order = _functionOrder++;
+	fn.globalsBefore = _unit.globals.size();
 	declareName(fn.name, "function");
 
 	const LocalScope parameters(*this);

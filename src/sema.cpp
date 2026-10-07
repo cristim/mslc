@@ -413,7 +413,10 @@ namespace {
 			names.insert(expression.name);
 		}
 		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
-			if (child) collectIdentifiers(*child, names);
+			if (child && !(expression.kind == ExpressionKind::Call && child == expression.left.get()
+				&& child->kind == ExpressionKind::Identifier)) {
+				collectIdentifiers(*child, names);
+			}
 		}
 		for (const ExpressionPtr& argument: expression.arguments) {
 			collectIdentifiers(*argument, names);
@@ -1904,6 +1907,7 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
+		void rejectMemberFileScopeSamplers(const FunctionDecl& member) const;
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
@@ -3841,6 +3845,7 @@ namespace {
 					+ " arguments, and it takes " + std::to_string(parameters.size() - 1));
 			}
 
+			rejectMemberFileScopeSamplers(*found->second.definition);
 			receiver = member.left.get();
 			return &found->second;
 		}
@@ -5178,6 +5183,38 @@ namespace {
 		addReflectionEntry("{ \"kind\": \"Sampler\", \"descriptor\": " + descriptorJson(binding)
 			+ ", \"embedded_sampler\": " + std::to_string(_embeddedSamplers.size() - 1)
 			+ ", \"name\": \"" + declaration.name + "\" }");
+	}
+
+	void Emitter::rejectMemberFileScopeSamplers(const FunctionDecl& member) const {
+		std::set<const FunctionDecl*> seen { &member };
+		std::vector<const FunctionDecl*> pending { &member };
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+			ScopeStack scopes(1);
+			for (const Parameter& parameter: function->parameters) {
+				scopes.back().insert(parameter.name);
+			}
+			std::set<std::string> names;
+			collectUnshadowed(function->body.get(), scopes, names);
+			for (const VariableDeclaration& global: _unit.globals) {
+				if (global.sampler && names.count(global.name)) {
+					throw CompileError("member helper \"" + member.name + "\" names a file-scope sampler, "
+						"pass the sampler to it as an argument");
+				}
+			}
+			std::vector<const Expression*> calls;
+			collectCalls(*function->body, calls);
+			for (const Expression* call: calls) {
+				if (call->left->kind != ExpressionKind::Identifier) {
+					continue;
+				}
+				const auto helper = _helpers.find(call->left->name);
+				if (helper != _helpers.end() && seen.insert(helper->second.definition).second) {
+					pending.push_back(helper->second.definition);
+				}
+			}
+		}
 	}
 
 	// A file-scope sampler is reserved, once the entry point's own are, if the body
