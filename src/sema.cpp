@@ -1826,11 +1826,10 @@ namespace {
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
 
-		// A helper function of the unit, as one module holds it: emitted once, on
-		// the first call from an entry point or from another helper that is emitted.
+		// A helper's body is emitted once per stage that reaches it.
 		struct HelperFunction {
 			const FunctionDecl* definition = nullptr;
-			Id id = InvalidId;
+			std::map<Stage, Id> ids;
 			Id returnType = InvalidId;
 			std::vector<Id> parameterTypes;
 			Id type = InvalidId;
@@ -3911,7 +3910,7 @@ namespace {
 	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver) {
 		const FunctionDecl& definition = *helper.definition;
 
-		if (helper.id == InvalidId) {
+		if (helper.type == InvalidId) {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
 			for (const Parameter& parameter: definition.parameters) {
@@ -3926,11 +3925,15 @@ namespace {
 			}
 
 			helper.type = slot.first->second;
-			helper.id = _builder.nextId();
+		}
+
+		const auto slot = helper.ids.emplace(_entryPoint->stage, InvalidId);
+		if (slot.second) {
+			slot.first->second = _builder.nextId();
 			_helperQueue.push_back(&helper);
 		}
 
-		std::vector<uint32_t> operands { helper.id };
+		std::vector<uint32_t> operands { slot.first->second };
 		const size_t first = receiver ? 1 : 0;
 		if (first) {
 			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
@@ -3969,7 +3972,7 @@ namespace {
 		_controlDepth = 0;
 
 		_builder.setSection(spirv::Section::Functions);
-		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.id,
+		_builder.emitDeclTypedAt(spirv::OpFunction, helper.returnType, helper.ids.at(_entryPoint->stage),
 			{ kFunctionControlNone, helper.type });
 
 		std::vector<Id> values;
@@ -5204,10 +5207,7 @@ namespace {
 
 		scan(*_entryPoint);
 
-		// A helper the entry point reaches names it too. The helper is emitted once
-		// for the module, with the variable of the entry point that reached it
-		// first, so a second entry point reaching a helper that names a file-scope
-		// sampler has no variable to give it.
+		// A helper naming a file-scope sampler is owned by one entry point.
 		std::set<const FunctionDecl*> seen { _entryPoint };
 		std::vector<const FunctionDecl*> pending { _entryPoint };
 		while (!pending.empty()) {
@@ -5231,8 +5231,8 @@ namespace {
 					if (owner.first->second != _entryPoint) {
 						throw CompileError("helper function \"" + helper->first + "\" names a file-scope "
 							"sampler, and entry points \"" + owner.first->second->name + "\" and \""
-							+ _entryPoint->name + "\" both reach it; the helper is one function whose "
-							"sampler is one entry point's, so pass the sampler to it as an argument");
+							+ _entryPoint->name + "\" both reach it; helper file-scope samplers are "
+							"owned by one entry point, so pass the sampler to it as an argument");
 					}
 				}
 			}
