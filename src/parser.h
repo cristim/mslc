@@ -110,6 +110,7 @@ private:
 
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
+
 	TokenKind kind() const { return current().kind; }
 
 	bool at(TokenKind expected) const { return kind() == expected; }
@@ -184,6 +185,7 @@ private:
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
+	bool isDiscardFragment(QualifiedName& name) const;
 
 	// The file-scope name a spelling refers to from here: its qualified name, or the
 	// spelling itself when it names no declaration (a builtin). A qualified spelling

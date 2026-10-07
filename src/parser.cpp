@@ -289,6 +289,16 @@ const Token& Parser::lookahead(size_t offset) const {
 	return index < _tokens.size() ? _tokens[index] : _tokens.back();
 }
 
+bool Parser::isDiscardFragment(QualifiedName& name) const {
+	if (!peekQualifiedName(name) || name.parts.back() != "discard_fragment"
+		|| lookahead(name.tokens).kind != TokenKind::LParen
+		|| lookahead(name.tokens + 1).kind != TokenKind::RParen
+		|| (!name.global && name.parts.size() == 1 && isLocal("discard_fragment"))) {
+		return false;
+	}
+	return resolveName(name) == "metal::discard_fragment";
+}
+
 const Token& Parser::advance() {
 	const Token& token = _tokens[_position];
 	if (_position + 1 < _tokens.size()) {
@@ -516,7 +526,7 @@ void Parser::parseUsing() {
 	}
 	expect(TokenKind::Semicolon, "after a using declaration");
 	const std::string resolved = resolveName(name);
-	if (!_declared.count(resolved)) {
+	if (!_declared.count(resolved) && resolved != "metal::discard_fragment") {
 		return; // a name of the standard library, which is visible already
 	}
 	_scopes[scope].declarations[name.parts.back()] = resolved;
@@ -1248,6 +1258,9 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 }
 
 void Parser::collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const {
+	if (scope == kStdlibNamespace && name == "discard_fragment") {
+		found.insert("metal::discard_fragment");
+	}
 	const std::string key = scope.empty() ? name : scope + "::" + name;
 	if (_declared.count(key)) {
 		found.insert(key);
@@ -1391,7 +1404,9 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	// "metal::sin" is the standard library's "sin", with or without a using
 	// directive, unless the file extends the namespace with a name of that spelling.
 	if (parts.front() == kStdlibNamespace && parts.size() > 1) {
-		return joinParts(parts, 1, parts.size());
+		if (parts.size() != 2 || last != "discard_fragment") {
+			return joinParts(parts, 1, parts.size());
+		}
 	}
 
 	if (parts.size() == 1) {
@@ -1406,6 +1421,9 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		if (_unit.findStruct(structName)) {
 			return structName + "::" + last;
 		}
+	}
+	if (!found && parts.size() == 2 && parts.front() == kStdlibNamespace && last == "discard_fragment") {
+		return "metal::discard_fragment";
 	}
 	if (!found) {
 		throw CompileError("\"" + joinParts(parts, 0, parts.size() - 1) + "\" in \"" + spelled
@@ -2444,11 +2462,21 @@ StatementPtr Parser::parseStatement() {
 		return parseReturnStatement();
 	}
 
-	if (atKeyword("break") || atKeyword("continue") || atKeyword("discard_fragment")) {
+	QualifiedName discardName;
+	if (isDiscardFragment(discardName)) {
+		statement->kind = StatementKind::Discard;
+		for (size_t i = 0; i < discardName.tokens; ++i) {
+			advance();
+		}
+		expect(TokenKind::LParen, "to open the call \"discard_fragment()\"");
+		expect(TokenKind::RParen, "to close the call \"discard_fragment()\", which takes no arguments");
+		expect(TokenKind::Semicolon, "after \"discard_fragment()\"");
+		return statement;
+	}
+
+	if (atKeyword("break") || atKeyword("continue")) {
 		const std::string keyword(advance().text);
-		statement->kind = keyword == "break" ? StatementKind::Break
-			: keyword == "continue" ? StatementKind::Continue
-			: StatementKind::Discard;
+		statement->kind = keyword == "break" ? StatementKind::Break : StatementKind::Continue;
 		expect(TokenKind::Semicolon, "after a jump statement");
 		return statement;
 	}

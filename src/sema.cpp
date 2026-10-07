@@ -6333,9 +6333,26 @@ namespace {
 
 			case StatementKind::Break:
 			case StatementKind::Continue:
-			case StatementKind::Discard:
-				throw CompileError("break, continue and discard_fragment inside a loop are "
+				throw CompileError("break and continue inside a loop are "
 					"recognised but not lowered yet");
+
+			// OpKill ends the block for good, so what follows in the same source
+			// block is unreachable, as after a return.
+			case StatementKind::Discard:
+				// A helper is not a stage, and a helper that returns a value cannot
+				// drop the fragment that called it without changing the ABI mslc
+				// has fixed. Apple accepts the helper; mslc reports it.
+				if (_helper) {
+					throw CompileError("discard_fragment() in a helper function is not lowered yet; "
+						"mslc drops the fragment in a fragment function only");
+				}
+				if (_entryPoint->stage != Stage::Fragment) {
+					throw CompileError(std::string("discard_fragment() is not allowed within a ")
+						+ (_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
+						+ " function: it drops the fragment, and this function has none");
+				}
+				terminate(spirv::OpKill, {});
+				return;
 		}
 	}
 
