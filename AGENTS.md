@@ -101,6 +101,25 @@ so plainly: "1 of 7 before, 1 of 7 after; `test/cube` now parses in full and sto
 at the multi-entry-point check instead of at the attribute list." That is a real
 result. Overclaiming it as progress on the corpus is not.
 
+## Review and merge evidence
+
+Use a capable independent reviewer; no fixed model is required. For code changes,
+exercise the actual path and data shape with realistic fixtures, mocks, recorded
+data or local integration. Show a failure before the fix and a pass after it where
+applicable, run a fresh build and relevant suite, and state coverage gaps. A live
+cloud account or purchase is not a gate. These methods complement the corpus counts
+and produced-value read-backs; they do not replace them.
+
+The standing owner waiver permits normal merge when CodeRabbit is demonstrably
+throttled or out of quota and the remaining gates pass. Record
+`CR waived: quota, adversarial review + local verification + green CI` on the PR.
+A green "Review rate limited" status is not a review. Resolve every available finding,
+obtain independent review and local proof, then check fresh CI for the exact live
+head and live mergeability immediately before a normal merge. Preserve branch
+protections. Retain one tracked retrospective full-review retry, with its owner
+and quota-reset time, and verify there is no duplicate. Address later actionable
+findings in a focused follow-up PR.
+
 ## Tests and manifests
 
 One probe per behaviour, in `tests/probes/`, each carrying its own expectation in a
