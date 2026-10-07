@@ -2981,16 +2981,6 @@ ExpressionPtr Parser::parseUnary() {
 		return expression;
 	}
 
-	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
-		if (atKeyword("static_cast")) {
-			return parseNamedCast();
-		}
-		if (atKeyword("reinterpret_cast") || atKeyword("const_cast")) {
-			throw CompileError(std::string(current().text) + " is not supported; "
-				"use static_cast or a functional cast for a value conversion");
-		}
-	}
-
 	if (at(TokenKind::LParen)) {
 		if (auto cast = parseCast()) {
 			return cast;
@@ -3000,13 +2990,7 @@ ExpressionPtr Parser::parseUnary() {
 	return parsePostfix();
 }
 
-// The name at the current position as the target type of an explicit cast: a
-// scalar, vector, matrix, typedef or enum through resolveTypeName, else a
-// struct by name. Nothing is consumed; nameTokens says how far the spelled
-// name reaches. Callers consume any leading const/volatile themselves. Throws
-// for the heads that can only be a botched cast (a qualifier, an address
-// space, void); returns null when the tokens are not a type at all, leaving
-// the caller to decide whether that is an error.
+// A nonconsuming null result lets a speculative C-style cast backtrack.
 std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 	const std::string head(current().text);
 	if (kind() == TokenKind::Identifier) {
@@ -3111,12 +3095,7 @@ ExpressionPtr Parser::parseCast() {
 	return expression;
 }
 
-// `static_cast<T>(x)` is the functional cast T(x) under an explicit spelling, so
-// it lowers to the same Construct parseCast produces for `(T)x`. Unlike
-// parseCast nothing here is speculative: the caller entered only on
-// `static_cast` followed by `<`, so a malformed cast is an error, never a
-// backtrack. reinterpret_cast and const_cast never reach here: parseUnary
-// rejects them where it accepts static_cast.
+// Unlike a C-style cast, a named cast cannot backtrack into an expression.
 ExpressionPtr Parser::parseNamedCast() {
 	auto expression = std::make_unique<Expression>();
 	expression->kind = ExpressionKind::Construct;
@@ -3302,6 +3281,16 @@ static ScalarKind integerLiteralKind(const Token& literal) {
 }
 
 ExpressionPtr Parser::parsePrimary() {
+	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
+		if (atKeyword("static_cast")) {
+			return parseNamedCast();
+		}
+		if (atKeyword("reinterpret_cast") || atKeyword("const_cast")) {
+			throw CompileError(std::string(current().text) + " is not supported; "
+				"use static_cast or a functional cast for a value conversion");
+		}
+	}
+
 	if (at(TokenKind::IntegerLiteral)) {
 		auto expression = std::make_unique<Expression>();
 		expression->kind = ExpressionKind::IntLiteral;
