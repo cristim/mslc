@@ -275,6 +275,12 @@ private:
 	ExpressionPtr parseAssignment();
 	ExpressionPtr parseConditional();
 	ExpressionPtr parseCast();
+	ExpressionPtr parseNamedCast();
+
+	// The name at the current position as an explicit cast's target type, or
+	// nothing when it spells no type. Nothing is consumed; nameTokens says how
+	// far the spelled name reaches. Shared by parseCast and parseNamedCast.
+	std::optional<Type> peekCastTargetName(size_t& nameTokens);
 	ExpressionPtr parseLogicalOr();
 	ExpressionPtr parseLogicalAnd();
 	ExpressionPtr parseBitwiseOr();
