@@ -2522,7 +2522,9 @@ StatementPtr Parser::parseStatement() {
 			}
 
 			if (match(TokenKind::Assign)) {
-				declaration.initializer = parseExpression();
+				declaration.initializer = parseInitializer();
+			} else if (at(TokenKind::LBrace)) {
+				declaration.initializer = parseInitializerList();
 			} else if (at(TokenKind::LParen)) {
 				// Direct initialisation, float3 specularTerm(0); . The name comes
 				// first here, so the list after it constructs the variable's own
@@ -2759,9 +2761,11 @@ StatementPtr Parser::parseForStatement() {
 	{
 		Type probe;
 		size_t nameTokens = 0;
+		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
+			? peekResolved(nameTokens) : std::string();
 		const bool looksLikeType = (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& resolveTypeName(peekResolved(nameTokens), probe));
+				&& (resolveTypeName(name, probe) || _unit.findStruct(name) != nullptr));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -2773,7 +2777,9 @@ StatementPtr Parser::parseForStatement() {
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
 			if (match(TokenKind::Assign)) {
-				declaration.initializer = parseExpression();
+				declaration.initializer = parseInitializer();
+			} else if (at(TokenKind::LBrace)) {
+				declaration.initializer = parseInitializerList();
 			}
 			statement->forInitializer = std::move(declaration);
 		} else {
