@@ -53,6 +53,8 @@ enum class ResourceKind {
 	Sampler,
 };
 
+enum class TextureAccess { Sample, Write };
+
 struct Type {
 	// Scalar base. For a named type, a pointer, or an array, the base is the
 	// element type and the wrappers below describe the rest.
@@ -89,6 +91,7 @@ struct Type {
 	std::optional<uint32_t> arrayLength;
 
 	ResourceKind resource = ResourceKind::None;
+	TextureAccess textureAccess = TextureAccess::Sample;
 
 	bool isScalar() const { return vectorWidth == 0; }
 	bool isVector() const { return vectorWidth > 1; }
