@@ -54,6 +54,7 @@ private:
 	std::map<ResourceKind, spirv::Id> _images;
 	std::map<ResourceKind, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
+	spirv::Id _uintWriteImage = spirv::InvalidId;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -80,6 +81,7 @@ public:
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
 	spirv::Id image(ResourceKind kind);
+	spirv::Id uintWriteImage();
 	spirv::Id samplerType();
 	spirv::Id sampledImage(ResourceKind kind);
 
