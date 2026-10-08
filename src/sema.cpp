@@ -1859,6 +1859,15 @@ namespace {
 		// nested 1023 deep, whatever the source nesting that produced it.
 		uint32_t _controlDepth = 0;
 
+		// Where break and continue go from the point being emitted, innermost
+		// last. A target with no continue label is one a switch could push: break
+		// reaches it, continue looks past it to the loop around.
+		struct JumpTarget {
+			Id breakLabel;
+			Id continueLabel;
+		};
+		std::vector<JumpTarget> _jumpTargets;
+
 		std::string _reflection;
 		// The next descriptor binding a texture or sampler takes, and the
 		// constexpr samplers declared so far in the entry point.
@@ -6798,6 +6807,13 @@ namespace {
 				terminate(spirv::OpBranch, { headerLabel });
 				beginBlock(headerLabel);
 				const ControlDepthScope depth(_controlDepth);
+				// The condition is outside the loop body, but nothing in it can
+				// be a statement, so the targets may be pushed before it.
+				_jumpTargets.push_back({ mergeLabel, continueLabel });
+				struct PopTarget {
+					std::vector<JumpTarget>& targets;
+					~PopTarget() { targets.pop_back(); }
+				} popTarget{ _jumpTargets };
 
 				// A &&, || or ?: in the condition splits it over several blocks, and
 				// OpLoopMerge has to end the header, so it goes in front of them.
@@ -6833,10 +6849,27 @@ namespace {
 				return;
 			}
 
-			case StatementKind::Break:
-			case StatementKind::Continue:
-				throw CompileError("break and continue inside a loop are "
-					"recognised but not lowered yet");
+			// Both leave the current block for good, so what follows in the same
+			// source block is dropped, as after a return. Inside an if the
+			// branch leaves the selection for the loop's own blocks, which
+			// structured control flow allows.
+			case StatementKind::Break: {
+				if (_jumpTargets.empty()) {
+					throw CompileError("'break' statement not in loop or switch statement");
+				}
+				terminate(spirv::OpBranch, { _jumpTargets.back().breakLabel });
+				return;
+			}
+
+			case StatementKind::Continue: {
+				for (auto target = _jumpTargets.rbegin(); target != _jumpTargets.rend(); ++target) {
+					if (target->continueLabel != InvalidId) {
+						terminate(spirv::OpBranch, { target->continueLabel });
+						return;
+					}
+				}
+				throw CompileError("'continue' statement not in loop statement");
+			}
 
 			// OpKill ends the block for good, so what follows in the same source
 			// block is unreachable, as after a return.

@@ -26,6 +26,13 @@
 #                              arm blocks were not swapped. It does not say what
 #                              either block computes, and it fails when no such
 #                              branch exists.
+#   // DISASM-LOOP-MERGE-REACHED: yes
+#                              the merge block named by every OpLoopMerge is the
+#                              target of some branch. A loop with no condition
+#                              can only reach it through a break, so this is what
+#                              says a break goes to the merge block and not, say,
+#                              the continue block. It does not say which loop the
+#                              break leaves.
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -88,13 +95,14 @@ if(expectation STREQUAL "valid")
 	file(STRINGS "${PROBE}" ascendingNeedles REGEX "^// DISASM-ASCENDING: ")
 	file(STRINGS "${PROBE}" laneNeedles REGEX "^// DISASM-LANES: ")
 	file(STRINGS "${PROBE}" fallthroughNeedles REGEX "^// DISASM-BRANCH-FALLTHROUGH: ")
+	file(STRINGS "${PROBE}" loopMergeNeedles REGEX "^// DISASM-LOOP-MERGE-REACHED: ")
 	# Collected on whitespace after the prefix rather than one literal space, so a
 	# tab-separated needle is collected instead of silently skipped. A line whose
 	# prefix is not followed by whitespace is not a needle at all and is reported
 	# below, since the REGEX above cannot see it.
 	file(STRINGS "${PROBE}" orderNeedles REGEX "^// DISASM-ORDER:[ \t]")
 	file(STRINGS "${PROBE}" malformedOrder REGEX "^// *DISASM-ORDER")
-	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR orderNeedles OR malformedOrder)
+	if(wanted OR unwanted OR wantedPatterns OR unwantedPatterns OR ascendingNeedles OR laneNeedles OR fallthroughNeedles OR loopMergeNeedles OR orderNeedles OR malformedOrder)
 		if(NOT SPIRV_DIS)
 			message(FATAL_ERROR "${name}: spirv-dis not found; install SPIRV-Tools and re-run cmake")
 		endif()
@@ -181,6 +189,19 @@ if(expectation STREQUAL "valid")
 					message(FATAL_ERROR "${name}: \"${found}\" takes lane ${index} where lane ${expected} is due")
 				endif()
 				math(EXPR position "${position} + 1")
+			endforeach()
+		endforeach()
+		foreach(line IN LISTS loopMergeNeedles)
+			string(REGEX MATCHALL "OpLoopMerge %[0-9]+ %[0-9]+" loops "${disassembly}")
+			if(loops STREQUAL "")
+				message(FATAL_ERROR "${name}: disassembly has no OpLoopMerge:\n${disassembly}")
+			endif()
+			foreach(loop IN LISTS loops)
+				string(REGEX MATCH "OpLoopMerge %([0-9]+)" ignored "${loop}")
+				set(mergeLabel "${CMAKE_MATCH_1}")
+				if(NOT disassembly MATCHES "OpBranch[A-Za-z]* [^\n]*%${mergeLabel}([^0-9]|$)")
+					message(FATAL_ERROR "${name}: no branch targets the loop merge block %${mergeLabel} (a break does not leave the loop):\n${disassembly}")
+				endif()
 			endforeach()
 		endforeach()
 		foreach(line IN LISTS fallthroughNeedles)
