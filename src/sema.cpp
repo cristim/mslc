@@ -6333,6 +6333,18 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
+		if (declaration.type.isConstexpr && declaration.initializer
+			&& declaration.initializer->kind == ExpressionKind::InitList) {
+			const auto validate = [&](const auto& self, const Expression& expression) -> void {
+				if (expression.kind == ExpressionKind::InitList) {
+					for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
+				} else if (!canFoldExpression(expression, declaration.name)) {
+					throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
+				}
+			};
+			validate(validate, *declaration.initializer);
+		}
+
 		Id initial = InvalidId;
 		if (declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
