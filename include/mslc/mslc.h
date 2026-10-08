@@ -91,6 +91,18 @@ void mslc_default_options(MslcOptions* options);
 int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* options,
 	uint8_t** outSpirv, size_t* outSpirvSize, char** outReflection, char** outError);
 
+/* Compiles a genuinely empty active translation unit to a Universal SPIR-V 1.5
+ * Linkage library, with no entry points or functions. Only comments, preprocessing,
+ * semicolons and using namespace metal; are supported. This is not a Vulkan
+ * executable. stage must be UNKNOWN; local size and image set policy are unused.
+ * Source path and include options have the same meaning as in mslc_translate.
+ * Returns 0 on success, 1 for unsupported input, 2 for internal/allocation failure.
+ * Provided outputs are reset before processing. Successful bytes use mslc_free;
+ * a requested diagnostic also uses mslc_free, but may be NULL on allocation failure.
+ * No C++ exception escapes this function. */
+int mslc_compile_library(const char* source, size_t sourceLength, const MslcOptions* options,
+	uint8_t** outSpirv, size_t* outSpirvSize, char** outError);
+
 /* Validates a module with SPIRV-Tools if mslc was built with that support.
  * Returns 0 when the module is structurally valid. */
 int mslc_validate(const uint8_t* spirv, size_t spirvSize, char** outError);

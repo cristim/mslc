@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(mslc CXX)
+project(mslc C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,6 +43,16 @@ enable_testing()
 add_executable(mslc-api-test tests/preprocess_api.cpp)
 target_link_libraries(mslc-api-test PRIVATE mslc)
 add_test(NAME api/preprocess COMMAND mslc-api-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/include)
+
+add_executable(mslc-library-api-test tests/library_api.c)
+target_link_libraries(mslc-library-api-test PRIVATE mslc)
+add_test(NAME api/library COMMAND mslc-library-api-test)
+
+add_executable(mslc-library-allocation-test tests/library_allocation.cpp src/mslc.cpp)
+target_include_directories(mslc-library-allocation-test PRIVATE include src)
+target_compile_definitions(mslc-library-allocation-test PRIVATE MSLC_LIBRARY_ALLOCATION_TEST)
+target_link_libraries(mslc-library-allocation-test PRIVATE mslc)
+add_test(NAME api/library-allocation COMMAND mslc-library-allocation-test)
 
 # Tests that validate SPIR-V fail, never skip, when this is not found.
 find_program(SPIRV_VAL spirv-val)
