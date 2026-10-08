@@ -498,14 +498,14 @@ namespace {
 			statement->forBody.get(), statement->whileBody.get() }) {
 			collectUnshadowed(nested, scopes, names);
 		}
+		for (const StatementPtr& child: statement->switchPreamble) {
+			collectUnshadowed(child.get(), scopes, names);
+		}
 		for (const SwitchCase& kase: statement->switchCases) {
 			collectUnshadowed(kase.value.get(), scopes, names);
 			for (const StatementPtr& child: kase.body) {
 				collectUnshadowed(child.get(), scopes, names);
 			}
-		}
-		for (const StatementPtr& child: statement->switchPreamble) {
-			collectUnshadowed(child.get(), scopes, names);
 		}
 		if (opensScope) scopes.pop_back();
 	}
@@ -5505,6 +5505,11 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
 				reserveLocalSamplers(*nested, used);
+			}
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				reserveLocalSamplers(*child, used);
 			}
 		}
 	}
