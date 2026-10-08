@@ -110,6 +110,7 @@ private:
 
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
+
 	TokenKind kind() const { return current().kind; }
 
 	bool at(TokenKind expected) const { return kind() == expected; }
@@ -184,6 +185,7 @@ private:
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
+	bool isDiscardFragment(QualifiedName& name) const;
 
 	// The file-scope name a spelling refers to from here: its qualified name, or the
 	// spelling itself when it names no declaration (a builtin). A qualified spelling
@@ -234,6 +236,7 @@ private:
 	// allowResource is true where a texture or sampler type may be spelled: an
 	// entry point parameter, and a local declaration, which only a sampler may be.
 	Type parseType(bool allowResource = false);
+	size_t parseSpecifierRun(Type& type);
 	void parseResourceType(Type& type);
 	bool parseQualifier(Type& type, bool afterPointer);
 	void parseSamplerLocal(VariableDeclaration& declaration);
@@ -274,6 +277,9 @@ private:
 	ExpressionPtr parseAssignment();
 	ExpressionPtr parseConditional();
 	ExpressionPtr parseCast();
+	ExpressionPtr parseNamedCast();
+
+	std::optional<Type> peekCastTargetName(size_t& nameTokens);
 	ExpressionPtr parseLogicalOr();
 	ExpressionPtr parseLogicalAnd();
 	ExpressionPtr parseBitwiseOr();

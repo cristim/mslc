@@ -359,6 +359,7 @@ struct StructField {
 };
 
 struct StructDecl {
+	bool hasConstructors = false;
 	std::string name;
 	std::vector<StructField> fields;
 };

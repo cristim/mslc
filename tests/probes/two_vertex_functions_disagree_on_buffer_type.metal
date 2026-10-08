@@ -1,20 +1,9 @@
-// EXPECT: error two entry points sharing descriptor set 0 bind different buffers
-// The same count, different types. This is the case that comparing only the
-// number of buffers would miss: the block has as many members as the first
-// function builds it, so the second finds member 0 present and indexes it, and
-// what it reads is a pointer to an int where the source says a pointer to a
-// float.
-//
-// spirv-val catches the mismatch in the access chain's result type, so this
-// would be a rejected module rather than a wrong one. That is the better of the
-// two outcomes, but it is a rejection, and a rejection of a source xcrun metal
-// accepts is mslc being stricter than the reference for a shape it can express.
-// Comparing the pointee types turns the rejection into a diagnostic that names
-// the reason.
-//
-// Vertex functions for the reason in two_vertex_functions_disagree_on_buffers:
-// two kernels in one source is refused earlier, for the workgroup-size spec
-// constants.
+// EXPECT: valid
+// DISASM-MATCH: DescriptorSet 0.*DescriptorSet 0
+// Two entry points of one stage with the same number of buffers at different
+// pointee types (float and int). Sharing one block would give an access chain
+// whose result type is not the member's type; each entry point gets its own
+// block at set 0, binding 0 instead. See two_vertex_functions_disagree_on_buffers.
 vertex void vertex_float_buffer(device float *p [[buffer(0)]],
                                   uint index [[vertex_id]])
 {
