@@ -3479,6 +3479,13 @@ namespace {
 			return emitMatrixProduct(op, left, right);
 		}
 
+		if ((op == BinaryOperator::Equal || op == BinaryOperator::NotEqual)
+			&& leftType == _boolType && _builder.typeOf(right) == _boolType) {
+			const uint16_t opcode = op == BinaryOperator::Equal
+				? spirv::OpLogicalEqual : spirv::OpLogicalNotEqual;
+			return _builder.emitTyped(opcode, _boolType, { left, right });
+		}
+
 		const bool isLogical = op == BinaryOperator::LogicalAnd
 			|| op == BinaryOperator::LogicalOr;
 
