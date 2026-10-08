@@ -2077,11 +2077,12 @@ void Parser::parseResourceType(Type& type) {
 	} else {
 		advance();
 	}
-	if (component != "float" && component != "half") {
+	if (component != "float" && component != "half" && component != "uint") {
 		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
 			"sampled types float and half");
 	}
 
+	std::string access = "sample";
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
 			advance();
@@ -2095,8 +2096,8 @@ void Parser::parseResourceType(Type& type) {
 		if (kind() != TokenKind::Identifier) {
 			throw CompileError("expected an access qualifier name after \"access::\"");
 		}
-		const std::string access(advance().text);
-		if (access != "sample") {
+		access = std::string(advance().text);
+		if (access != "sample" && !(name == "texture2d" && component == "uint" && access == "write")) {
 			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
 				"access::sample, which is the default");
 		}
@@ -2104,7 +2105,12 @@ void Parser::parseResourceType(Type& type) {
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
 	type.resource = name == "texturecube" ? ResourceKind::TextureCube : ResourceKind::Texture2D;
-	type.scalar = component == "half" ? ScalarKind::Half : ScalarKind::Float;
+	if (component == "uint" && !(name == "texture2d" && access == "write")) {
+		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::write");
+	}
+	type.textureAccess = access == "write" ? TextureAccess::Write : TextureAccess::Sample;
+	type.scalar = component == "uint" ? ScalarKind::UInt
+		: component == "half" ? ScalarKind::Half : ScalarKind::Float;
 }
 
 Parameter Parser::parseParameter(const std::string& helperName) {

@@ -1112,6 +1112,17 @@ Id TypeTable::image(ResourceKind kind) {
 	return cached;
 }
 
+Id TypeTable::uintWriteImage() {
+	if (_uintWriteImage == InvalidId) {
+		_builder.emit(spirv::OpCapability, {
+			static_cast<uint32_t>(spirv::Capability::StorageImageWriteWithoutFormat) });
+		_uintWriteImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
+			spirv::Dim::Dim2D, 0u, 0u, 0u, 2u,
+			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
+	}
+	return _uintWriteImage;
+}
+
 Id TypeTable::samplerType() {
 	if (_samplerType == InvalidId) {
 		_samplerType = _builder.emitDecl(spirv::OpTypeSampler);
@@ -1643,7 +1654,8 @@ namespace {
 			const Type& x = a.parameters[i].type;
 			const Type& y = b.parameters[i].type;
 			if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
-				|| x.isPacked != y.isPacked || x.namedType != y.namedType) {
+				|| x.isPacked != y.isPacked || x.namedType != y.namedType
+				|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
 				return false;
 			}
 		}
@@ -1956,6 +1968,8 @@ namespace {
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void addReflectionEntry(const std::string& entry);
 		std::string descriptorJson(uint32_t binding) const;
+		const Binding& textureReceiver(const Expression& call);
+		void emitTextureWrite(const Expression& call, const Binding& texture);
 		Id emitTextureCall(const Expression& call);
 		Id emitTextureSample(const Expression& call, const Binding& texture);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
@@ -4124,6 +4138,7 @@ namespace {
 	}
 
 	Id Emitter::resourcePointee(const Type& type) {
+		if (type.textureAccess == TextureAccess::Write) return _types.uintWriteImage();
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
 	}
 
@@ -4141,7 +4156,8 @@ namespace {
 		const Binding* binding = findResourceBinding(argument.name);
 		const Type& wanted = parameter.type;
 		const bool matches = binding && binding->pointeeMsl.resource == wanted.resource
-			&& (!wanted.isTexture() || binding->pointeeMsl.scalar == wanted.scalar);
+			&& (!wanted.isTexture() || (binding->pointeeMsl.scalar == wanted.scalar
+				&& binding->pointeeMsl.textureAccess == wanted.textureAccess));
 		if (!matches) {
 			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
 				+ typeName(wanted));
@@ -4157,11 +4173,8 @@ namespace {
 		return binding->id;
 	}
 
-	// The arguments are evaluated left to right and converted to the parameter
-	// types as an initialiser would be; Apple does the same and refuses a vector of
-	// another width. A helper has no side effects an argument could expose, since
-	// it takes values only and an assignment is not an expression here, so the
-	// order is not observable.
+	// Arguments are evaluated left to right and converted to the parameter types.
+	// Resource arguments retain their caller's identity, including writes.
 	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver) {
 		const FunctionDecl& definition = *helper.definition;
 
@@ -5376,8 +5389,11 @@ namespace {
 
 		for (const Entry& entry: textures) {
 			const uint32_t binding = _nextBinding++;
-			const Id imageType = _types.image(entry.parameter->type.resource);
+			const Id imageType = resourcePointee(entry.parameter->type);
 			const Id variable = declareDescriptorVariable(imageType, binding);
+			if (entry.parameter->type.textureAccess == TextureAccess::Write) {
+				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonReadable) });
+			}
 
 			Binding bound;
 			bound.id = variable;
@@ -5390,7 +5406,8 @@ namespace {
 			addReflectionEntry("{ \"kind\": \"Texture\", \"metal_index\": "
 				+ std::to_string(entry.metalIndex)
 				+ ", \"descriptor\": " + descriptorJson(binding)
-				+ ", \"texture_access\": \"Sample\""
+				+ ", \"texture_access\": \""
+				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write" : "Sample") + "\""
 				+ ", \"param_index\": " + std::to_string(entry.index)
 				+ ", \"name\": \"" + entry.parameter->name + "\" }");
 		}
@@ -5588,7 +5605,7 @@ namespace {
 		return convert(sampled, _builder.typeOf(sampled), _types.vector(ScalarKind::Half, 4));
 	}
 
-	Id Emitter::emitTextureCall(const Expression& call) {
+	const Binding& Emitter::textureReceiver(const Expression& call) {
 		const Expression& member = *call.left;
 		if (member.left->kind != ExpressionKind::Identifier) {
 			throw CompileError("the receiver of \"." + member.memberName + "\" has to be a texture parameter");
@@ -5600,19 +5617,51 @@ namespace {
 				"\"." + member.memberName + "\" is not a call mslc lowers");
 		}
 
-		const std::string& method = member.memberName;
-		if (method == "sample") {
-			return emitTextureSample(call, it->second);
+		return it->second;
+	}
+
+	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
+		if (texture.pointeeMsl.textureAccess != TextureAccess::Write) {
+			throw CompileError("the texture method \"write\" is not lowered yet on sampled textures");
 		}
-		if (it->second.pointeeMsl.resource == ResourceKind::TextureCube) {
+		if (call.arguments.size() != 2) {
+			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
+		}
+		const Id value = emitExpression(*call.arguments[0]);
+		const Id coordinate = emitExpression(*call.arguments[1]);
+		if (_builder.typeOf(value) != _uintType
+			|| _builder.typeOf(coordinate) != _types.vector(ScalarKind::UInt, 2)) {
+			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
+		}
+		const Id texel = broadcast(value, _types.vector(ScalarKind::UInt, 4));
+		const Id image = loadFrom(texture.id, texture.pointeeType);
+		_builder.emit(spirv::OpImageWrite, { image, coordinate, texel });
+	}
+
+	Id Emitter::emitTextureCall(const Expression& call) {
+		const Binding& texture = textureReceiver(call);
+		const std::string& method = call.left->memberName;
+		if (method == "write") {
+			throw CompileError("texture write returns void and has no value");
+		}
+		if (texture.pointeeMsl.textureAccess == TextureAccess::Write) {
+			if (method != "get_width" || !call.arguments.empty()) {
+				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
+			}
+			return emitTextureSize(call, texture, true);
+		}
+		if (method == "sample") {
+			return emitTextureSample(call, texture);
+		}
+		if (texture.pointeeMsl.resource == ResourceKind::TextureCube) {
 			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
 				"lowers sample on a texturecube");
 		}
 		if (method == "read") {
-			return emitTextureRead(call, it->second);
+			return emitTextureRead(call, texture);
 		}
 		if (method == "get_width" || method == "get_height") {
-			return emitTextureSize(call, it->second, method == "get_width");
+			return emitTextureSize(call, texture, method == "get_width");
 		}
 
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
@@ -5744,7 +5793,9 @@ namespace {
 				+ std::to_string(call.arguments.size()));
 		}
 
-		const Id lod = call.arguments.empty() ? constantU32(0) : emitLod(*call.arguments[0], name);
+		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Write;
+		const Id lod = storage ? InvalidId
+			: call.arguments.empty() ? constantU32(0) : emitLod(*call.arguments[0], name);
 
 		if (!_imageQueryDeclared) {
 			_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::ImageQuery) });
@@ -5752,8 +5803,9 @@ namespace {
 		}
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
-		const Id size = _builder.emitTyped(spirv::OpImageQuerySizeLod,
-			_types.vector(ScalarKind::UInt, 2), { image, lod });
+		const Id size = _builder.emitTyped(storage ? spirv::OpImageQuerySize : spirv::OpImageQuerySizeLod,
+			_types.vector(ScalarKind::UInt, 2),
+			storage ? std::vector<uint32_t>{ image } : std::vector<uint32_t>{ image, lod });
 		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, width ? 0u : 1u });
 	}
 
@@ -6580,6 +6632,10 @@ namespace {
 			const Expression* receiver = nullptr;
 			if (HelperFunction* helper = findHelper(expression, receiver)) {
 				emitHelperCall(expression, *helper, receiver);
+				return;
+			}
+			if (expression.left->kind == ExpressionKind::Member && expression.left->memberName == "write") {
+				emitTextureWrite(expression, textureReceiver(expression));
 				return;
 			}
 		}
