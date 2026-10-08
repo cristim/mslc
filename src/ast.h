@@ -334,6 +334,8 @@ enum class Interpolation {
 	SampleNoPerspective,
 };
 
+enum class DepthMode { Any, Less, Greater };
+
 struct FieldAttributes {
 	// [[position]]: the field is the stage's own position. On a vertex output
 	// that is the BuiltIn Position; on a fragment input it is the FragCoord.
@@ -349,6 +351,7 @@ struct FieldAttributes {
 
 	// [[color(n)]]: the field is colour attachment n of a fragment output.
 	std::optional<uint32_t> colorIndex;
+	std::optional<DepthMode> depthMode;
 
 	// [[user(name)]]: the name Apple pairs a vertex output with a fragment input
 	// by, in place of the field's own name.

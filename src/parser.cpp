@@ -2212,6 +2212,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 				throw CompileError("[[sampler]] needs an index");
 			}
 			attributes.samplerIndex = argument;
+		} else if (name == "depth") {
+			throw CompileError("[[depth]] is not valid on an input parameter");
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
 		} else if (name == "color") {
@@ -2236,7 +2238,20 @@ FieldAttributes Parser::parseFieldAttributes() {
 
 	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument,
 		const std::string& identifier) {
-		if (name == "user") {
+		if (name == "depth") {
+			if (attributes.depthMode) {
+				throw CompileError("a struct field has more than one [[depth]] attribute");
+			}
+			if (identifier == "any") {
+				attributes.depthMode = DepthMode::Any;
+			} else if (identifier == "less") {
+				attributes.depthMode = DepthMode::Less;
+			} else if (identifier == "greater") {
+				attributes.depthMode = DepthMode::Greater;
+			} else {
+				throw CompileError("[[depth]] needs one of any, less or greater");
+			}
+		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
 			}
@@ -2265,7 +2280,7 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[user(name)]] and the "
+				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
@@ -2296,10 +2311,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		std::string identifier;
 		if (at(TokenKind::LParen)) {
 			advance();
-			if (name == "user") {
-				// [[user(name)]] takes an identifier, not an integer.
+			if (name == "user" || name == "depth") {
 				if (kind() != TokenKind::Identifier) {
-					throw CompileError("attribute \"user\" needs an identifier, found "
+					throw CompileError("attribute \"" + name + "\" needs an identifier, found "
 						+ std::string(tokenKindName(kind())));
 				}
 				identifier = std::string(advance().text);
