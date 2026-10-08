@@ -241,6 +241,15 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 	if (!hasEntryPoint()) {
 		return false;
 	}
+	serialize(out);
+	return true;
+}
+
+void Builder::finalizeLibrary(std::vector<uint8_t>& out) const {
+	serialize(out);
+}
+
+void Builder::serialize(std::vector<uint8_t>& out) const {
 
 	// Build the word stream first, since the header needs the total count.
 	std::vector<uint32_t> words;
@@ -298,7 +307,6 @@ bool Builder::finalize(std::vector<uint8_t>& out) const {
 	out.resize(words.size() * sizeof(uint32_t));
 	std::memcpy(out.data(), words.data(), out.size());
 
-	return true;
 }
 
 }

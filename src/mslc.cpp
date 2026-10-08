@@ -40,9 +40,146 @@ namespace {
 		return buffer;
 	}
 
+	enum class ArtifactKind { VulkanExecutable, EmptyLibrary };
+
+	void compile(const char* source, size_t sourceLength, const MslcOptions& effective,
+		ArtifactKind kind, std::vector<uint8_t>& module, std::string& reflection) {
+		mslc::PreprocessOptions preprocessOptions;
+		if (effective.sourcePath) {
+			preprocessOptions.sourcePath = effective.sourcePath;
+		}
+		if (effective.includeDirCount > 0 && !effective.includeDirs) {
+			throw mslc::CompileError("includeDirCount is nonzero but includeDirs is NULL");
+		}
+		for (size_t i = 0; i < effective.includeDirCount; ++i) {
+			if (!effective.includeDirs[i]) {
+				throw mslc::CompileError("includeDirs has a NULL entry");
+			}
+			preprocessOptions.includeDirs.emplace_back(effective.includeDirs[i]);
+		}
+
+		const mslc::PreprocessedSource preprocessed = mslc::preprocess(
+			std::string_view(source, sourceLength), preprocessOptions);
+		mslc::Parser parser(preprocessed.tokens);
+		const mslc::TranslationUnit unit = [&]() {
+			try {
+				return parser.parse();
+			} catch (const mslc::CompileError& error) {
+				throw mslc::CompileError(mslc::describeOrigin(preprocessed, parser.position()) + ": "
+					+ error.what());
+			}
+		}();
+
+		mslc::spirv::Builder builder;
+		if (kind == ArtifactKind::EmptyLibrary) {
+			if (effective.stage != MSLC_STAGE_UNKNOWN) {
+				throw mslc::CompileError("library compilation requires stage UNKNOWN");
+			}
+			const auto& tokens = preprocessed.tokens;
+			for (size_t i = 0; i < tokens.size();) {
+				if (tokens[i].kind == mslc::TokenKind::EndOfFile
+					|| tokens[i].kind == mslc::TokenKind::Semicolon) {
+					++i;
+					continue;
+				}
+				if (tokens.size() - i >= 4
+					&& tokens[i].kind == mslc::TokenKind::Identifier && tokens[i].text == "using"
+					&& tokens[i + 1].kind == mslc::TokenKind::Identifier && tokens[i + 1].text == "namespace"
+					&& tokens[i + 2].kind == mslc::TokenKind::Identifier && tokens[i + 2].text == "metal"
+					&& tokens[i + 3].kind == mslc::TokenKind::Semicolon) {
+					i += 4;
+					continue;
+				}
+				throw mslc::CompileError(mslc::describeOrigin(preprocessed, i)
+					+ ": library compilation supports only empty translation units");
+			}
+			using namespace mslc::spirv;
+			builder.emit(OpCapability, {static_cast<uint32_t>(Capability::Shader)});
+			builder.emit(OpCapability, {static_cast<uint32_t>(Capability::Linkage)});
+			builder.emit(OpCapability, {static_cast<uint32_t>(Capability::PhysicalStorageBufferAddresses)});
+			builder.setSection(Section::MemoryModel);
+			builder.emit(OpMemoryModel, {static_cast<uint32_t>(AddressingModel::PhysicalStorageBuffer64),
+				static_cast<uint32_t>(MemoryModel::GLSL450)});
+			builder.finalizeLibrary(module);
+			return;
+		}
+
+		const auto entryPoints = mslc::selectEntryPoints(unit, stageFromApi(effective.stage));
+		mslc::ModuleOptions moduleOptions;
+		moduleOptions.localSizeX = effective.localSizeX ? effective.localSizeX : 1;
+		moduleOptions.localSizeY = effective.localSizeY ? effective.localSizeY : 1;
+		moduleOptions.localSizeZ = effective.localSizeZ ? effective.localSizeZ : 1;
+		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
+		reflection = mslc::emitModule(builder, unit, entryPoints, moduleOptions);
+		if (!builder.finalize(module)) {
+			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
+		}
+	}
+
+#ifdef MSLC_LIBRARY_ALLOCATION_TEST
+	thread_local int libraryFailAllocation = 0;
+#endif
+	void* libraryAllocate(size_t size, int site) noexcept {
+#ifdef MSLC_LIBRARY_ALLOCATION_TEST
+		if (libraryFailAllocation == site) {
+			return nullptr;
+		}
+#else
+		(void)site;
+#endif
+		return std::malloc(size);
+	}
+
+	int libraryError(const char* text, int status, char** outError) noexcept {
+		if (outError) {
+			const size_t size = std::strlen(text) + 1;
+			*outError = static_cast<char*>(libraryAllocate(size, 2));
+			if (!*outError) {
+				return 2;
+			}
+			std::memcpy(*outError, text, size);
+		}
+		return status;
+	}
+
 }
 
 extern "C" {
+
+#ifdef MSLC_LIBRARY_ALLOCATION_TEST
+void mslc_test_library_fail_allocation(int site) {
+	libraryFailAllocation = site;
+}
+#endif
+
+int mslc_compile_library(const char* source, size_t sourceLength, const MslcOptions* options,
+	uint8_t** outSpirv, size_t* outSpirvSize, char** outError) {
+	if (outSpirv) *outSpirv = nullptr;
+	if (outSpirvSize) *outSpirvSize = 0;
+	if (outError) *outError = nullptr;
+	try {
+		if (!source) return libraryError("no source given", 1, outError);
+		MslcOptions effective;
+		mslc_default_options(&effective);
+		if (options) effective = *options;
+		std::vector<uint8_t> module;
+		std::string reflection;
+		compile(source, sourceLength, effective, ArtifactKind::EmptyLibrary, module, reflection);
+		auto* buffer = static_cast<uint8_t*>(libraryAllocate(module.size(), 1));
+		if (!buffer) return libraryError("internal error: allocation failure", 2, outError);
+		std::memcpy(buffer, module.data(), module.size());
+		if (outSpirv) *outSpirv = buffer;
+		else std::free(buffer);
+		if (outSpirvSize) *outSpirvSize = module.size();
+		return 0;
+	} catch (const mslc::CompileError& error) {
+		return libraryError(error.what(), 1, outError);
+	} catch (const std::exception& error) {
+		return libraryError(error.what(), 2, outError);
+	} catch (...) {
+		return libraryError("internal error: unknown exception", 2, outError);
+	}
+}
 
 void mslc_default_options(MslcOptions* options) {
 	if (!options) {
@@ -89,53 +226,9 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 	}
 
 	try {
-		const std::string_view view(source, sourceLength);
-
-		mslc::PreprocessOptions preprocessOptions;
-		if (effective.sourcePath) {
-			preprocessOptions.sourcePath = effective.sourcePath;
-		}
-		if (effective.includeDirCount > 0 && !effective.includeDirs) {
-			throw mslc::CompileError("includeDirCount is nonzero but includeDirs is NULL");
-		}
-		for (size_t i = 0; i < effective.includeDirCount; ++i) {
-			if (!effective.includeDirs[i]) {
-				throw mslc::CompileError("includeDirs has a NULL entry");
-			}
-			preprocessOptions.includeDirs.emplace_back(effective.includeDirs[i]);
-		}
-
-		// Holds the text the tokens point into, so it outlives the parse.
-		const mslc::PreprocessedSource preprocessed = mslc::preprocess(view, preprocessOptions);
-
-		mslc::Parser parser(preprocessed.tokens);
-		// A parse error is about the token the parser stopped at, which the
-		// preprocessor can place in the file it was written in.
-		const mslc::TranslationUnit unit = [&]() {
-			try {
-				return parser.parse();
-			} catch (const mslc::CompileError& error) {
-				throw mslc::CompileError(mslc::describeOrigin(preprocessed, parser.position()) + ": "
-					+ error.what());
-			}
-		}();
-
-		const std::vector<const mslc::FunctionDecl*> entryPoints = mslc::selectEntryPoints(unit,
-			stageFromApi(effective.stage));
-
-		mslc::ModuleOptions moduleOptions;
-		moduleOptions.localSizeX = effective.localSizeX ? effective.localSizeX : 1;
-		moduleOptions.localSizeY = effective.localSizeY ? effective.localSizeY : 1;
-		moduleOptions.localSizeZ = effective.localSizeZ ? effective.localSizeZ : 1;
-		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
-
-		mslc::spirv::Builder builder;
-		std::string reflection = mslc::emitModule(builder, unit, entryPoints, moduleOptions);
-
 		std::vector<uint8_t> module;
-		if (!builder.finalize(module)) {
-			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
-		}
+		std::string reflection;
+		compile(source, sourceLength, effective, ArtifactKind::VulkanExecutable, module, reflection);
 
 		// The reflection is a complete document already: the emitter built it
 		// around the entry points it emitted, and there is more than one of them

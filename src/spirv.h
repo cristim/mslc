@@ -70,6 +70,7 @@ class Builder {
 	Id _currentFunction = InvalidId;
 
 	Section _currentSection = Section::TypesGlobals;
+	void serialize(std::vector<uint8_t>& out) const;
 
 public:
 	Id nextId() { return _nextId++; }
@@ -141,6 +142,7 @@ public:
 	// Serialises to a SPIR-V module. Returns false when no entry point was
 	// emitted, since such a module is not loadable.
 	bool finalize(std::vector<uint8_t>& out) const;
+	void finalizeLibrary(std::vector<uint8_t>& out) const;
 
 	bool hasEntryPoint() const { return !_sections.at(Section::EntryPoints).empty(); }
 };
