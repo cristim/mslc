@@ -5998,6 +5998,11 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.sampleMask) {
+				throw CompileError(isInput
+					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
+					: what + " has [[sample_mask]], which is not valid on a vertex output");
+			}
 			if (field.attributes.attributeIndex) {
 				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
 					"on a struct crossing from the vertex to the fragment stage");
@@ -6087,6 +6092,9 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.sampleMask) {
+				throw CompileError(what + " has [[sample_mask]], which is not valid on a vertex input");
+			}
 			if (field.attributes.position) {
 				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
 					"struct cannot carry");
@@ -6136,12 +6144,14 @@ namespace {
 		std::vector<StageVariable> variables;
 		std::set<uint32_t> used;
 		bool hasDepth = false;
+		bool hasSampleMask = false;
 
 		for (const StructField& field: decl.fields) {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
 			if (field.attributes.depthMode) {
-				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex) {
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex
+					|| field.attributes.sampleMask) {
 					throw CompileError(what + " has an incompatible depth attribute combination");
 				}
 				if (field.attributes.userName || field.attributes.interpolation != Interpolation::None) {
@@ -6162,6 +6172,33 @@ namespace {
 					static_cast<uint32_t>(spirv::BuiltIn::FragDepth) });
 				continue;
 			}
+			if (field.attributes.sampleMask) {
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex) {
+					throw CompileError(what + " has an incompatible sample_mask attribute combination");
+				}
+				if (field.attributes.userName || field.attributes.interpolation != Interpolation::None) {
+					throw CompileError(what + " combines sample_mask with user or interpolation, which mslc does not lower");
+				}
+				if (hasSampleMask) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[sample_mask]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::UInt || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[sample_mask]], which has to be a scalar uint");
+				}
+				hasSampleMask = true;
+				const Id array = _types.packedStorage(ScalarKind::UInt, 1);
+				const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+					_types.pointer(spirv::StorageClass::Output, array),
+					{ static_cast<uint32_t>(spirv::StorageClass::Output) });
+				_interface.push_back(variable);
+				variables.push_back({ variable, array, _types.scalar(ScalarKind::UInt) });
+				_builder.emit(spirv::OpDecorate, { variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::SampleMask) });
+				continue;
+			}
 			if (field.attributes.interpolation != Interpolation::None) {
 				throw CompileError(what + " has an interpolation attribute, which is not valid on a "
 					"fragment output");
@@ -6171,7 +6208,7 @@ namespace {
 					"a fragment output");
 			}
 			if (!field.attributes.colorIndex) {
-				throw CompileError(what + " has no [[color(n)]] or [[depth(mode)]]; every field of a "
+				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
 					"fragment function's returned struct needs one");
 			}
 
@@ -6302,8 +6339,10 @@ namespace {
 				const StageVariable& output = _outputs[i];
 				const Id field = _builder.emitTyped(spirv::OpCompositeExtract, output.valueType,
 					{ copy, static_cast<uint32_t>(i) });
-				_builder.emit(spirv::OpStore, { output.variable,
-					convert(field, output.valueType, output.interfaceType) });
+				const Id stored = structValue(_entryPoint->returnType)->fields[i].attributes.sampleMask
+					? _builder.emitTyped(spirv::OpCompositeConstruct, output.interfaceType, { field })
+					: convert(field, output.valueType, output.interfaceType);
+				_builder.emit(spirv::OpStore, { output.variable, stored });
 			}
 		} else {
 			const StageVariable& output = _outputs.front();
