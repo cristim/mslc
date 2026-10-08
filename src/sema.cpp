@@ -576,6 +576,15 @@ Id TypeTable::scalar(ScalarKind kind) {
 	return id;
 }
 
+std::optional<ScalarKind> TypeTable::scalarKindOf(Id type) const {
+	for (const auto& [kind, id]: _scalars) {
+		if (id == type) {
+			return static_cast<ScalarKind>(kind);
+		}
+	}
+	return std::nullopt;
+}
+
 Id TypeTable::vector(ScalarKind kind, uint32_t width) {
 	if (width < 2) {
 		return scalar(kind);
@@ -1219,25 +1228,36 @@ Id TypeTable::arrayElementStruct(const std::string& name) {
 Id TypeTable::valueStruct(const std::string& name) {
 	const auto cached = _valueStructs.find(name);
 	if (cached != _valueStructs.end()) {
+		if (cached->second == InvalidId) {
+			throw CompileError("recursive value struct \"" + name + "\" is not supported");
+		}
 		return cached->second;
 	}
-
-	std::vector<Id> fieldTypes;
-	std::vector<uint32_t> offsets;
-	uint32_t size = 0;
-	if (!structMembersFor(name, fieldTypes, offsets, size)) {
+	const StructDecl* decl = _unit.findStruct(name);
+	if (!decl) {
 		return InvalidId;
 	}
+	_valueStructs.emplace(name, InvalidId);
+	std::vector<Id> fieldTypes;
+	for (const StructField& field: decl->fields) {
+		if (field.type.isPointer || field.type.arrayLength) {
+			throw CompileError(std::string(field.type.isPointer ? "a pointer" : "an array")
+				+ " field in value struct \"" + name + "\" is not lowered yet");
+		}
+		const Id fieldType = !field.type.namedType.empty() ? valueStruct(field.type.namedType)
+			: field.type.isMatrix() ? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
+			: field.type.vectorWidth > 1 ? vector(field.type.scalar, field.type.vectorWidth)
+			: scalar(field.type.scalar);
+		if (fieldType == InvalidId) {
+			throw CompileError("undeclared type \"" + field.type.namedType + "\"");
+		}
+		fieldTypes.push_back(fieldType);
+	}
 
-	// Members only. The count is implied by the instruction's word count, and
-	// writing it as an operand would be read as one extra member.
 	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
 
-	// No Block and no member offsets: that is the layout of a buffer, and a
-	// struct used as a value is laid out by whatever holds it. A Block-decorated
-	// struct is only valid in the storage classes a descriptor is allowed in, so
-	// using this one as a constant's type would be rejected.
-	_valueStructs.emplace(name, id);
+	// Value structs need no buffer layout decorations.
+	_valueStructs[name] = id;
 	return id;
 }
 
@@ -1789,6 +1809,7 @@ namespace {
 		// What each constant folded to, so a later constant referring to this one
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
+		std::map<Id, FoldedConstant> _localFolded;
 		std::map<spirv::Id, const StructDecl*> _structByValue;
 		// The pointee of every buffer parameter, in declaration order, which is
 		// what the binding-0 block is built from once the loop is done.
@@ -2011,6 +2032,10 @@ namespace {
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
+		Id emitInitListValue(const Type& target, const Expression& list);
+		Id emitListScalarValue(const Type& target, const Expression& expression);
+		Id convertListScalar(Id value, const Type& target, const Expression& expression);
+		bool canFoldExpression(const Expression& expression, const std::string& excluded = {});
 		const StructDecl* structOf(const Expression& expression);
 		Id emitSwizzle(const Expression& expression);
 		Id emitIdentifier(const Expression& expression);
@@ -2740,10 +2765,7 @@ namespace {
 		outSteps.assign(reversed.rbegin(), reversed.rend());
 	}
 
-	// The struct an expression's value is, or null when it is not one. A '.' on
-	// anything else is a swizzle, which is why this is asked before any code for
-	// the left side is emitted. A member is never a struct: a struct field of
-	// struct type is rejected where the struct is declared.
+	// Distinguish struct members from vector swizzles before emitting the left side.
 	const StructDecl* Emitter::structOf(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: {
@@ -2754,6 +2776,17 @@ namespace {
 				}
 				const auto constant = _constants.find(expression.name);
 				return constant == _constants.end() ? nullptr : constant->second.structType;
+			}
+
+			case ExpressionKind::Member: {
+				const StructDecl* parent = structOf(*expression.left);
+				if (!parent) {
+					return nullptr;
+				}
+				std::string name;
+				const size_t field = fieldIndexOf(*parent, expression.memberName, name);
+				return field == parent->fields.size() ? nullptr
+					: _unit.findStruct(parent->fields[field].type.namedType);
 			}
 
 			// An element of a buffer has the buffer's own type.
@@ -3099,6 +3132,192 @@ namespace {
 				+ " components needs " + std::to_string(width));
 		}
 
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, pieces);
+	}
+
+	bool Emitter::canFoldExpression(const Expression& expression, const std::string& excluded) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::BoolLiteral: return true;
+			case ExpressionKind::FloatLiteral: return std::isfinite(foldExpression(expression).number);
+			case ExpressionKind::Identifier: {
+				if (expression.name == excluded) { return false; }
+				const auto local = _bindings.find(expression.name);
+				if (local != _bindings.end()) { return _localFolded.count(local->second.id) != 0; }
+				const auto value = _folded.find(expression.name);
+				if (value == _folded.end() || value->second.isComposite
+					|| (isFloatKind(value->second.scalar) && !std::isfinite(value->second.number))) { return false; }
+				for (const VariableDeclaration& global: _unit.globals) {
+					if (global.name != expression.name || !global.initializer) { continue; }
+					const Expression* initializer = global.initializer.get();
+					while (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1) {
+						initializer = initializer->elements.front().value.get();
+					}
+					const Expression* literal = initializer;
+					while (literal->kind == ExpressionKind::Unary) { literal = literal->left.get(); }
+					return (literal->kind == ExpressionKind::IntLiteral || literal->kind == ExpressionKind::FloatLiteral
+						|| literal->kind == ExpressionKind::BoolLiteral) && canFoldExpression(*initializer);
+				}
+				return false;
+			}
+			case ExpressionKind::Unary: {
+				const UnaryOperator op = expression.unaryOperator;
+				if ((op != UnaryOperator::Plus && op != UnaryOperator::Negate
+					&& op != UnaryOperator::BitNot && op != UnaryOperator::Not)
+					|| !canFoldExpression(*expression.left, excluded)) { return false; }
+				const FoldedConstant operand = foldExpression(*expression.left);
+				if ((operand.scalar == ScalarKind::Bool && op != UnaryOperator::Not)
+					|| (isFloatKind(operand.scalar) && op == UnaryOperator::BitNot)) { return false; }
+				if (op == UnaryOperator::Negate && isSignedInteger(operand.scalar)) {
+					const ScalarKind promoted = promotedKind(operand.scalar);
+					const uint64_t minimum = normalizeInteger(promoted, uint64_t{ 1 } << (mappingFor(promoted).width - 1));
+					if (operand.integer == minimum) { return false; }
+				}
+				return true;
+			}
+			default: return false;
+		}
+	}
+
+	Id Emitter::convertListScalar(Id value, const Type& target, const Expression& expression) {
+		const auto from = _types.scalarKindOf(_builder.typeOf(value));
+		if (!from) { throw CompileError("a scalar initializer list needs a scalar value"); }
+		const ScalarKind to = target.scalar;
+		const bool integerWidening = !isFloatKind(*from) && !isFloatKind(to)
+			&& (isSignedInteger(*from) == isSignedInteger(to)
+				? mappingFor(*from).width <= mappingFor(to).width
+				: !isSignedInteger(*from) && mappingFor(*from).width < mappingFor(to).width);
+		if (*from != to && !(*from == ScalarKind::Half && to == ScalarKind::Float) && !integerWidening) {
+			if (isFloatKind(*from) && !isFloatKind(to)) {
+				throw CompileError("a floating value cannot be narrowed to an integer or bool in an initializer list");
+			}
+			if (!canFoldExpression(expression)) {
+				throw CompileError("a narrowing initializer list conversion requires a supported constant expression; this form is not lowered yet");
+			}
+			FoldedConstant folded = foldExpression(expression);
+			if (folded.scalar == ScalarKind::Bool) { folded.integer = folded.boolean ? 1 : 0; }
+			requireNotNarrowing(folded, to);
+		}
+		return convertImplicit(value, _types.scalar(to));
+	}
+
+	Id Emitter::emitListScalarValue(const Type& target, const Expression& expression) {
+		if (expression.kind != ExpressionKind::InitList) {
+			return convertListScalar(emitExpression(expression), target, expression);
+		}
+		if (expression.elements.empty()) { return _types.zero(declaredTypeOf(target)); }
+		if (expression.elements.size() != 1) {
+			throw CompileError("nested scalar initialization with excess elements is not lowered yet");
+		}
+		if (!expression.elements.front().fieldName.empty()) {
+			throw CompileError("a field designator requires a struct initializer");
+		}
+		return emitListScalarValue(target, *expression.elements.front().value);
+	}
+
+	Id Emitter::emitInitListValue(const Type& target, const Expression& list) {
+		if (target.addressSpace != AddressSpace::None) {
+			throw CompileError("a local in the " + std::string(addressSpaceName(target.addressSpace))
+				+ " address space is not lowered yet; every local mslc declares is thread-private");
+		}
+		const Id toType = declaredTypeOf(target);
+		const std::string spelled = typeName(target);
+		if (!target.namedType.empty()) {
+			const StructDecl& decl = *_unit.findStruct(target.namedType);
+			if (decl.hasConstructors) {
+				throw CompileError("brace initialization of " + spelled + " with declared constructors is not lowered yet");
+			}
+			std::optional<Id> singleValue;
+			if (list.elements.size() == 1 && list.elements.front().fieldName.empty()
+				&& list.elements.front().value->kind != ExpressionKind::InitList) {
+				singleValue = emitExpression(*list.elements.front().value);
+				const std::string* sourceName = _types.structNameOf(_builder.typeOf(*singleValue), nullptr);
+				if (sourceName && *sourceName == target.namedType) {
+					return convertImplicit(*singleValue, toType);
+				}
+			}
+			Expression empty;
+			empty.kind = ExpressionKind::InitList;
+			std::vector<uint32_t> fields;
+			for (const InitializerElement& element: list.elements) {
+				if (!element.fieldName.empty()) {
+					size_t named = fields.size();
+					while (named < decl.fields.size() && decl.fields[named].name != element.fieldName) {
+						++named;
+					}
+					if (named == decl.fields.size()) {
+						throw CompileError("field " + element.fieldName + " is unknown or out of order in " + spelled + " initializer");
+					}
+					while (fields.size() < named) {
+						fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+					}
+				}
+				if (fields.size() == decl.fields.size()) {
+					throw CompileError("excess elements in " + spelled + " initializer");
+				}
+				const Type& field = decl.fields[fields.size()].type;
+				if (element.value->kind == ExpressionKind::InitList) {
+					fields.push_back(emitInitListValue(field, *element.value));
+				} else {
+					const Id value = singleValue ? *singleValue : emitExpression(*element.value);
+					fields.push_back(field.namedType.empty() && field.isScalar()
+						? convertListScalar(value, field, *element.value)
+						: convertImplicit(value, declaredTypeOf(field)));
+				}
+			}
+			while (fields.size() < decl.fields.size()) {
+				fields.push_back(emitInitListValue(decl.fields[fields.size()].type, empty));
+			}
+			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, fields);
+		}
+		if (list.elements.empty()) { return _types.zero(toType); }
+		for (const InitializerElement& element: list.elements) {
+			if (!element.fieldName.empty()) { throw CompileError("a field designator requires a struct initializer"); }
+		}
+		if (target.isMatrix()) {
+			if (list.elements.size() != target.matrixColumns) {
+				throw CompileError("a matrix initializer needs one vector per column");
+			}
+			Type columnType;
+			columnType.scalar = target.scalar;
+			columnType.vectorWidth = target.vectorWidth;
+			std::vector<uint32_t> columns;
+			for (const InitializerElement& element: list.elements) {
+				if (element.value->kind == ExpressionKind::InitList && element.value->elements.empty()) {
+					throw CompileError("an empty matrix column initializer is not lowered yet");
+				}
+				const Id column = element.value->kind == ExpressionKind::InitList
+					? emitInitListValue(columnType, *element.value) : emitExpression(*element.value);
+				if (_builder.typeOf(column) != declaredTypeOf(columnType)) {
+					throw CompileError("a matrix initializer column has to have its column type already");
+				}
+				columns.push_back(column);
+			}
+			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
+		}
+		Type component;
+		component.scalar = target.scalar;
+		if (target.isScalar()) {
+			if (list.elements.size() != 1) { throw CompileError("excess elements in a scalar initializer list"); }
+			return emitListScalarValue(component, *list.elements.front().value);
+		}
+		std::vector<uint32_t> pieces;
+		uint32_t width = 0;
+		for (const InitializerElement& element: list.elements) {
+			Id value = element.value->kind == ExpressionKind::InitList
+				? emitListScalarValue(component, *element.value) : emitExpression(*element.value);
+			const Id valueType = _builder.typeOf(value);
+			if (_types.scalarKindOf(valueType)) {
+				if (element.value->kind != ExpressionKind::InitList) { value = convertListScalar(value, component, *element.value); }
+				++width;
+			} else {
+				if (list.elements.size() == 1 && valueType == toType) { return value; }
+				throw CompileError("a vector initializer list needs scalar elements or one value of its exact vector type");
+			}
+			pieces.push_back(value);
+		}
+		if (width > target.vectorWidth) { throw CompileError("a vector initializer list has too many components"); }
+		while (pieces.size() < target.vectorWidth) { pieces.push_back(_types.zero(_types.scalar(component.scalar))); }
 		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, pieces);
 	}
 
@@ -4324,6 +4543,14 @@ namespace {
 				return folded;
 
 			case ExpressionKind::Identifier: {
+				const auto local = _bindings.find(expression.name);
+				if (local != _bindings.end()) {
+					const auto value = _localFolded.find(local->second.id);
+					if (value == _localFolded.end()) {
+						throw CompileError("a local in this initializer is not a supported constant expression");
+					}
+					return value->second;
+				}
 				// Declaration order is what makes this resolvable, and the module's
 				// constants are declared in the order the source declares them.
 				const auto found = _folded.find(expression.name);
@@ -6106,9 +6333,23 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
+		if (declaration.type.isConstexpr && declaration.initializer
+			&& declaration.initializer->kind == ExpressionKind::InitList) {
+			const auto validate = [&](const auto& self, const Expression& expression) -> void {
+				if (expression.kind == ExpressionKind::InitList) {
+					for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
+				} else if (!canFoldExpression(expression, declaration.name)) {
+					throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
+				}
+			};
+			validate(validate, *declaration.initializer);
+		}
+
 		Id initial = InvalidId;
 		if (declaration.initializer) {
-			const Id initializer = emitExpression(*declaration.initializer);
+			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
+				? emitInitListValue(declaration.type, *declaration.initializer)
+				: emitExpression(*declaration.initializer);
 			initial = convertImplicit(initializer, typeId);
 		} else {
 			initial = _types.zero(typeId);
@@ -6120,6 +6361,32 @@ namespace {
 		_builder.emit(spirv::OpStore, { id, initial });
 
 		bindLocal(declaration.name, id, typeId, declaration.type);
+		if (declaration.initializer && !_types.isAggregate(typeId)
+			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
+			const Expression* expression = declaration.initializer.get();
+			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
+				expression = expression->elements.front().value.get();
+			}
+			FoldedConstant folded;
+			folded.scalar = declaration.type.scalar;
+			const bool empty = expression->kind == ExpressionKind::InitList && expression->elements.empty();
+			if (empty || canFoldExpression(*expression, declaration.name)) {
+				if (!empty) { folded = foldExpression(*expression); }
+				const ScalarKind to = declaration.type.scalar;
+				if (to == ScalarKind::Bool) {
+					folded.boolean = folded.scalar == ScalarKind::Bool ? folded.boolean
+						: isFloatKind(folded.scalar) ? folded.number != 0 : folded.integer != 0;
+					folded.scalar = to;
+				} else if (folded.scalar == ScalarKind::Bool) {
+					folded.integer = folded.boolean ? 1 : 0;
+					folded.scalar = ScalarKind::Int;
+				}
+				if (!isFloatKind(folded.scalar) || isFloatKind(to)) {
+					const FoldedConstant converted = convertConstant(folded, to);
+					if (!isFloatKind(to) || std::isfinite(converted.number)) { _localFolded[id] = converted; }
+				}
+			}
+		}
 	}
 
 	// pointeeMsl is what a member access on the local resolves its fields against.

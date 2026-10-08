@@ -69,6 +69,7 @@ public:
 
 	spirv::Id voidType();
 	spirv::Id scalar(ScalarKind kind);
+	std::optional<ScalarKind> scalarKindOf(spirv::Id type) const;
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
