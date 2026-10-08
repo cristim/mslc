@@ -6221,7 +6221,14 @@ namespace {
 				throw CompileError(what + " reuses [[color(" + std::to_string(index) + ")]]");
 			}
 
-			variables.push_back(declareStageVariable(field.type, spirv::StorageClass::Output, what));
+			Type carried = field.type;
+			if ((carried.scalar == ScalarKind::Short || carried.scalar == ScalarKind::UShort)
+				&& carried.vectorWidth <= 4 && !carried.isPointer && !carried.arrayLength && !carried.isPacked) {
+				carried.scalar = carried.scalar == ScalarKind::Short ? ScalarKind::Int : ScalarKind::UInt;
+			}
+			StageVariable variable = declareStageVariable(carried, spirv::StorageClass::Output, what);
+			variable.valueType = declaredTypeOf(field.type);
+			variables.push_back(variable);
 			_builder.emit(spirv::OpDecorate, { variables.back().variable,
 				static_cast<uint32_t>(spirv::Decoration::Location), index });
 		}
