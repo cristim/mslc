@@ -1980,7 +1980,7 @@ namespace {
 		StageVariable declareStageVariable(const Type& type, spirv::StorageClassValue storageClass,
 			const std::string& what);
 		void decorateInterpolation(Id variable, Interpolation interpolation);
-		std::vector<StageVariable> declareColorOutputs(const StructDecl& decl);
+		std::vector<StageVariable> declareFragmentOutputs(const StructDecl& decl);
 		std::vector<StageVariable> declareStageStruct(const StructDecl& decl,
 			spirv::StorageClassValue storageClass);
 		std::vector<StageVariable> declareVertexAttributes(const StructDecl& decl);
@@ -5995,6 +5995,9 @@ namespace {
 			const StructField& field = decl.fields[index];
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.depthMode) {
+				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
+			}
 			if (field.attributes.attributeIndex) {
 				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
 					"on a struct crossing from the vertex to the fragment stage");
@@ -6081,6 +6084,9 @@ namespace {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 			const Type& type = field.type;
 
+			if (field.attributes.depthMode) {
+				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
+			}
 			if (field.attributes.position) {
 				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
 					"struct cannot carry");
@@ -6125,19 +6131,37 @@ namespace {
 		return variables;
 	}
 
-	// A fragment function's returned struct: one Output per field, at the Location
-	// its [[color(n)]] names. Apple takes every field as a colour attachment or
-	// none of them, allows gaps in the indices, and rejects a repeated index or one
-	// above 7 (xcrun metal: "invalid return type", "'color' attribute parameter
-	// is out of bounds").
-	std::vector<StageVariable> Emitter::declareColorOutputs(const StructDecl& decl) {
+	std::vector<StageVariable> Emitter::declareFragmentOutputs(const StructDecl& decl) {
 		constexpr uint32_t maxColorAttachments = 8;
 		std::vector<StageVariable> variables;
 		std::set<uint32_t> used;
+		bool hasDepth = false;
 
 		for (const StructField& field: decl.fields) {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.depthMode) {
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.attributeIndex) {
+					throw CompileError(what + " has an incompatible depth attribute combination");
+				}
+				if (field.attributes.userName || field.attributes.interpolation != Interpolation::None) {
+					throw CompileError(what + " combines depth with user or interpolation, which mslc does not lower");
+				}
+				if (hasDepth) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[depth]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::Float || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[depth]], which has to be a scalar float");
+				}
+				hasDepth = true;
+				variables.push_back(declareStageVariable(type, spirv::StorageClass::Output, what));
+				_builder.emit(spirv::OpDecorate, { variables.back().variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::FragDepth) });
+				continue;
+			}
 			if (field.attributes.interpolation != Interpolation::None) {
 				throw CompileError(what + " has an interpolation attribute, which is not valid on a "
 					"fragment output");
@@ -6147,8 +6171,8 @@ namespace {
 					"a fragment output");
 			}
 			if (!field.attributes.colorIndex) {
-				throw CompileError(what + " has no [[color(n)]]; every field of a fragment function's "
-					"returned struct needs one");
+				throw CompileError(what + " has no [[color(n)]] or [[depth(mode)]]; every field of a "
+					"fragment function's returned struct needs one");
 			}
 
 			const uint32_t index = *field.attributes.colorIndex;
@@ -6168,8 +6192,6 @@ namespace {
 		return variables;
 	}
 
-	// The variables a return statement writes. A vertex function returns a struct
-	// with a [[position]] field, and a fragment function one colour, at Location 0.
 	void Emitter::declareStageOutputs() {
 		const Type& type = _entryPoint->returnType;
 		if (type.namedType.empty() && !type.isPointer && type.scalar == ScalarKind::Void) {
@@ -6201,7 +6223,7 @@ namespace {
 				throw CompileError("fragment function \"" + _entryPoint->name + "\" returns " + spelled
 					+ ", and mslc lowers a returned struct this source declares and nothing else");
 			}
-			_outputs = declareColorOutputs(*decl);
+			_outputs = declareFragmentOutputs(*decl);
 			return;
 		}
 
@@ -6971,6 +6993,20 @@ namespace {
 			_builder.setSection(spirv::Section::ExecutionModes);
 			_builder.emit(spirv::OpExecutionMode, { _entryPointId,
 				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
+			if (const StructDecl* decl = structValue(_entryPoint->returnType)) {
+				for (const StructField& field: decl->fields) {
+					if (!field.attributes.depthMode) {
+						continue;
+					}
+					_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+						static_cast<uint32_t>(spirv::ExecutionMode::DepthReplacing) });
+					if (*field.attributes.depthMode != DepthMode::Any) {
+						_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+							static_cast<uint32_t>(*field.attributes.depthMode == DepthMode::Less
+								? spirv::ExecutionMode::DepthLess : spirv::ExecutionMode::DepthGreater) });
+					}
+				}
+			}
 		}
 
 		_builder.setSection(spirv::Section::Functions);
