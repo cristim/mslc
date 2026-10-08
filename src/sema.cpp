@@ -327,6 +327,7 @@ namespace {
 		VectorToScalar,
 		// As VectorToScalar, but a core opcode rather than GLSL.std.450.
 		Dot,
+		Fwidth,
 		// Two vectors of one type and a scalar eta.
 		Refract,
 		// Two three-component vectors.
@@ -383,6 +384,7 @@ namespace {
 		{ "reflect", 2, MathShape::Vector, 71, kNoInstruction, kNoInstruction },
 		{ "refract", 3, MathShape::Refract, 72, kNoInstruction, kNoInstruction },
 		{ "dot", 2, MathShape::Dot, kNoInstruction, kNoInstruction, kNoInstruction },
+		{ "fwidth", 1, MathShape::Fwidth, kNoInstruction, kNoInstruction, kNoInstruction },
 	};
 
 	const MathBuiltin* findMathBuiltin(const std::string& name) {
@@ -4069,6 +4071,10 @@ namespace {
 				+ std::to_string(arguments.size()));
 		}
 
+		if (builtin.shape == MathShape::Fwidth && _entryPoint->stage != Stage::Fragment) {
+			throw CompileError("fwidth is only available in fragment functions");
+		}
+
 		std::vector<Id> values;
 		for (const ExpressionPtr& argument: arguments) {
 			const Id value = emitExpression(*argument);
@@ -4081,6 +4087,14 @@ namespace {
 				throw CompileError(name + " takes numeric scalars or vectors");
 			}
 			values.push_back(value);
+		}
+
+		if (builtin.shape == MathShape::Fwidth) {
+			const Id type = _builder.typeOf(values[0]);
+			if (!_types.isFloat(type) || _types.bitWidth(type) != 32) {
+				throw CompileError("fwidth takes float scalars or vectors, half is not supported yet");
+			}
+			return _builder.emitTyped(spirv::OpFwidth, type, { values[0] });
 		}
 
 		// refract's eta is a scalar of its own, so only the first two of its
