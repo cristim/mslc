@@ -2214,6 +2214,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			attributes.samplerIndex = argument;
 		} else if (name == "depth") {
 			throw CompileError("[[depth]] is not valid on an input parameter");
+		} else if (name == "sample_mask") {
+			throw CompileError("[[sample_mask]] on an input parameter is not lowered yet");
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
 		} else if (name == "color") {
@@ -2251,6 +2253,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 			} else {
 				throw CompileError("[[depth]] needs one of any, less or greater");
 			}
+		} else if (name == "sample_mask") {
+			if (attributes.sampleMask) {
+				throw CompileError("a struct field has more than one [[sample_mask]] attribute");
+			}
+			attributes.sampleMask = true;
 		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
@@ -2280,7 +2287,7 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[user(name)]] and the "
+				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
@@ -2310,6 +2317,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		std::optional<uint32_t> argument;
 		std::string identifier;
 		if (at(TokenKind::LParen)) {
+			if (name == "sample_mask") {
+				throw CompileError("[[sample_mask]] takes no argument");
+			}
 			advance();
 			if (name == "user" || name == "depth") {
 				if (kind() != TokenKind::Identifier) {
