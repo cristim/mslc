@@ -6866,7 +6866,8 @@ namespace {
 		// not, so it switches on the bool's int value, 1 or 0.
 		const std::optional<ScalarKind> selectorKind = _types.scalarKindOf(emittedType);
 		if (!selectorKind || isFloatKind(*selectorKind)) {
-			const auto diagnosticKind = _types.scalarKindOf(_types.componentOf(emittedType));
+			const auto diagnosticKind = selectorKind ? selectorKind
+				: _types.scalarKindOf(_types.componentOf(emittedType));
 			std::string name = diagnosticKind ? std::string(scalarKindName(*diagnosticKind)) : "void";
 			if (diagnosticKind && _types.vectorWidth(emittedType) > 1) {
 				name += std::to_string(_types.vectorWidth(emittedType));
