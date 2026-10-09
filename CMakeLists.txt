@@ -8,15 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # The library is C++ but exposes a C ABI, so it has no C++ types in its public
 # surface and can be built as a shared object for the Darling guest or used
 # directly by the CLI.
-add_library(mslc
-	src/lexer.cpp
-	src/preprocessor.cpp
-	src/ast.cpp
-	src/parser.cpp
-	src/sema.cpp
-	src/spirv.cpp
-	src/mslc.cpp
-)
+include(${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake)
+add_library(mslc ${MSLC_LIBRARY_SOURCES})
 target_include_directories(mslc
 	PUBLIC include
 	PRIVATE src
