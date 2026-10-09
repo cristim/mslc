@@ -54,6 +54,11 @@ target_compile_definitions(mslc-library-allocation-test PRIVATE MSLC_LIBRARY_ALL
 target_link_libraries(mslc-library-allocation-test PRIVATE mslc)
 add_test(NAME api/library-allocation COMMAND mslc-library-allocation-test)
 
+add_executable(mslc-builder-test tests/spirv_builder.cpp)
+target_include_directories(mslc-builder-test PRIVATE src)
+target_link_libraries(mslc-builder-test PRIVATE mslc)
+add_test(NAME api/spirv-builder COMMAND mslc-builder-test)
+
 # Tests that validate SPIR-V fail, never skip, when this is not found.
 find_program(SPIRV_VAL spirv-val)
 if(NOT SPIRV_VAL)

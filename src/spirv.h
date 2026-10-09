@@ -144,7 +144,10 @@ public:
 	bool finalize(std::vector<uint8_t>& out) const;
 	void finalizeLibrary(std::vector<uint8_t>& out) const;
 
-	bool hasEntryPoint() const { return !_sections.at(Section::EntryPoints).empty(); }
+	bool hasEntryPoint() const {
+		const auto entryPoints = _sections.find(Section::EntryPoints);
+		return entryPoints != _sections.end() && !entryPoints->second.empty();
+	}
 };
 
 // SPIR-V serial version emitted.
