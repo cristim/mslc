@@ -1112,15 +1112,21 @@ Id TypeTable::image(ResourceKind kind) {
 	return cached;
 }
 
-Id TypeTable::uintWriteImage() {
-	if (_uintWriteImage == InvalidId) {
-		_builder.emit(spirv::OpCapability, {
-			static_cast<uint32_t>(spirv::Capability::StorageImageWriteWithoutFormat) });
-		_uintWriteImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
+Id TypeTable::uintStorageImage(TextureAccess access) {
+	const bool read = access == TextureAccess::Read;
+	bool& declared = read ? _storageReadDeclared : _storageWriteDeclared;
+	if (!declared) {
+		declared = true;
+		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(read
+			? spirv::Capability::StorageImageReadWithoutFormat
+			: spirv::Capability::StorageImageWriteWithoutFormat) });
+	}
+	if (_uintStorageImage == InvalidId) {
+		_uintStorageImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
 			spirv::Dim::Dim2D, 0u, 0u, 0u, 2u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
-	return _uintWriteImage;
+	return _uintStorageImage;
 }
 
 Id TypeTable::samplerType() {
@@ -4138,7 +4144,7 @@ namespace {
 	}
 
 	Id Emitter::resourcePointee(const Type& type) {
-		if (type.textureAccess == TextureAccess::Write) return _types.uintWriteImage();
+		if (type.textureAccess != TextureAccess::Sample) return _types.uintStorageImage(type.textureAccess);
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
 	}
 
@@ -5393,6 +5399,8 @@ namespace {
 			const Id variable = declareDescriptorVariable(imageType, binding);
 			if (entry.parameter->type.textureAccess == TextureAccess::Write) {
 				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonReadable) });
+			} else if (entry.parameter->type.textureAccess == TextureAccess::Read) {
+				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonWritable) });
 			}
 
 			Binding bound;
@@ -5407,7 +5415,8 @@ namespace {
 				+ std::to_string(entry.metalIndex)
 				+ ", \"descriptor\": " + descriptorJson(binding)
 				+ ", \"texture_access\": \""
-				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write" : "Sample") + "\""
+				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write"
+					: entry.parameter->type.textureAccess == TextureAccess::Read ? "Read" : "Sample") + "\""
 				+ ", \"param_index\": " + std::to_string(entry.index)
 				+ ", \"name\": \"" + entry.parameter->name + "\" }");
 		}
@@ -5622,7 +5631,7 @@ namespace {
 
 	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
 		if (texture.pointeeMsl.textureAccess != TextureAccess::Write) {
-			throw CompileError("the texture method \"write\" is not lowered yet on sampled textures");
+			throw CompileError("the texture method \"write\" is not lowered yet on textures that are not access::write");
 		}
 		if (call.arguments.size() != 2) {
 			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
@@ -5649,6 +5658,14 @@ namespace {
 				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
 			}
 			return emitTextureSize(call, texture, true);
+		}
+		if (texture.pointeeMsl.textureAccess == TextureAccess::Read) {
+			if (method == "read") return emitTextureRead(call, texture);
+			if (method == "get_width" || method == "get_height") {
+				return emitTextureSize(call, texture, method == "get_width");
+			}
+			throw CompileError("access::read textures lower only read(), get_width() and get_height(); \""
+				+ method + "\" is not lowered yet");
 		}
 		if (method == "sample") {
 			return emitTextureSample(call, texture);
@@ -5759,9 +5776,13 @@ namespace {
 	}
 
 	// read(uint2 coordinate [, lod]): a texel by integer coordinate, with no
-	// sampler. Metal takes uint2 and ushort2 and rejects int2 and float2.
+	// sampler. access::read storage images take no lod. Metal takes uint2 and ushort2 and rejects int2 and float2.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
+		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Read;
+		if (storage && arguments.size() == 2) {
+			throw CompileError("mip arguments are unsupported on access::read textures; read takes only a coordinate");
+		}
 		if (arguments.empty() || arguments.size() > 2) {
 			throw CompileError("read takes a coordinate and optionally a lod; this call passes "
 				+ std::to_string(arguments.size()));
@@ -5777,6 +5798,12 @@ namespace {
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
 
+		if (storage) {
+			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
+			return _builder.emitTyped(spirv::OpImageRead,
+				_types.vector(ScalarKind::UInt, 4), { storageImage, coordinate });
+		}
+
 		Id lod = arguments.size() == 2 ? emitLod(*arguments[1], "read") : constantU32(0);
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
@@ -5788,12 +5815,16 @@ namespace {
 	// get_width() and get_height(), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, bool width) {
 		const std::string name = width ? "get_width" : "get_height";
+		const bool readOnly = texture.pointeeMsl.textureAccess == TextureAccess::Read;
+		if (readOnly && !call.arguments.empty()) {
+			throw CompileError("mip arguments are unsupported on access::read textures; " + name + " takes no arguments");
+		}
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "
 				+ std::to_string(call.arguments.size()));
 		}
 
-		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Write;
+		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
 		const Id lod = storage ? InvalidId
 			: call.arguments.empty() ? constantU32(0) : emitLod(*call.arguments[0], name);
 

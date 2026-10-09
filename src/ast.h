@@ -53,7 +53,7 @@ enum class ResourceKind {
 	Sampler,
 };
 
-enum class TextureAccess { Sample, Write };
+enum class TextureAccess { Sample, Write, Read };
 
 struct Type {
 	// Scalar base. For a named type, a pointer, or an array, the base is the

@@ -28,7 +28,8 @@ std::string typeName(const Type& type) {
 	}
 	if (type.resource == ResourceKind::Texture2D) {
 		return std::string("texture2d<") + scalarKindName(type.scalar)
-			+ (type.textureAccess == TextureAccess::Write ? ", access::write>" : ">");
+			+ (type.textureAccess == TextureAccess::Write ? ", access::write>"
+				: type.textureAccess == TextureAccess::Read ? ", access::read>" : ">");
 	}
 	if (type.resource == ResourceKind::TextureCube) {
 		return std::string("texturecube<") + scalarKindName(type.scalar) + ">";
