@@ -6292,10 +6292,8 @@ namespace {
 					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
 					: what + " has [[sample_mask]], which is not valid on a vertex output");
 			}
-			if (field.attributes.attributeIndex) {
-				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
-					"on a struct crossing from the vertex to the fragment stage");
-			}
+			// [[attribute(n)]] names a vertex-fetch slot and says nothing about a field
+			// crossing to the fragment stage, which takes its Location from stageLocations.
 
 			if (field.attributes.colorIndex) {
 				throw CompileError(isInput
