@@ -1473,6 +1473,9 @@ namespace {
 		// True when id is the address of an element or a member rather than a
 		// variable, as for a reference local bound to one.
 		bool isAddress = false;
+		// True for a const local of integral type whose initialiser is a constant
+		// expression: C++ lets it stand in a constant expression.
+		bool constantValue = false;
 		// True for a sampler declared with coord::pixel. Vulkan forbids an
 		// implicit-lod lookup through an unnormalized sampler.
 		bool unnormalizedSampler = false;
@@ -2097,7 +2100,8 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		void rejectBoolReference(const std::string& name, const Binding& binding) const;
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
-		void validateConstexprBraces(const VariableDeclaration& declaration);
+		void validateConstexprInitializer(const VariableDeclaration& declaration);
+		bool readsRuntimeValue(const Expression& expression) const;
 		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
@@ -6748,11 +6752,69 @@ namespace {
 		}
 	}
 
+	// True when the expression reads something only known when the shader runs: a
+	// parameter, a local that is not a constant, an element of a buffer, or a
+	// store. Used to refuse such an initialiser on a constexpr; a form that is
+	// not recognised as runtime is left to the lowering, which folds what it can.
+	bool Emitter::readsRuntimeValue(const Expression& expression) const {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+				return false;
+			case ExpressionKind::Assign:
+				return true;
+			case ExpressionKind::Unary:
+				if (expression.unaryOperator == UnaryOperator::PreIncrement
+					|| expression.unaryOperator == UnaryOperator::PreDecrement
+					|| expression.unaryOperator == UnaryOperator::PostIncrement
+					|| expression.unaryOperator == UnaryOperator::PostDecrement) {
+					return true;
+				}
+				break;
+			case ExpressionKind::Identifier: {
+				const auto local = _bindings.find(expression.name);
+				if (local == _bindings.end()) {
+					return false;
+				}
+				return _localFolded.count(local->second.id) == 0 && !local->second.pointeeMsl.isConstexpr
+					&& !local->second.constantValue;
+			}
+			default:
+				break;
+		}
+
+		if (expression.left && readsRuntimeValue(*expression.left)) {
+			return true;
+		}
+		if (expression.right && readsRuntimeValue(*expression.right)) {
+			return true;
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			if (readsRuntimeValue(*argument)) {
+				return true;
+			}
+		}
+		for (const InitializerElement& element: expression.elements) {
+			if (readsRuntimeValue(*element.value)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// A constexpr brace initializer has to be made of constants. This is checked
 	// for a declaration that is never reached too, which is invalid all the same.
-	void Emitter::validateConstexprBraces(const VariableDeclaration& declaration) {
-		if (!declaration.type.isConstexpr || !declaration.initializer
-			|| declaration.initializer->kind != ExpressionKind::InitList) {
+	void Emitter::validateConstexprInitializer(const VariableDeclaration& declaration) {
+		if (!declaration.type.isConstexpr || !declaration.initializer) {
+			return;
+		}
+
+		if (declaration.initializer->kind != ExpressionKind::InitList) {
+			if (readsRuntimeValue(*declaration.initializer)) {
+				throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
+					"constant expression");
+			}
 			return;
 		}
 
@@ -6798,7 +6860,7 @@ namespace {
 		const Id typeId = declaredTypeOf(declaration.type);
 
 		if (!storageOnly) {
-			validateConstexprBraces(declaration);
+			validateConstexprInitializer(declaration);
 		}
 
 		Id initial = InvalidId;
@@ -6819,6 +6881,13 @@ namespace {
 		}
 
 		bindLocal(declaration.name, id, typeId, declaration.type);
+		const Type& declared = declaration.type;
+		if (declaration.initializer && declared.isConst && !declared.isConstexpr && !declared.isPointer
+			&& !declared.isVector() && !declared.isMatrix() && declared.namedType.empty()
+			&& !declared.arrayLength && !isFloatKind(declared.scalar)
+			&& !readsRuntimeValue(*declaration.initializer)) {
+			_bindings[declaration.name].constantValue = true;
+		}
 		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
 			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
@@ -7282,7 +7351,7 @@ namespace {
 			for (const StatementPtr& child: statement.switchCases[i].body) {
 				if (_terminated) {
 					if (child->kind == StatementKind::DeclarationStatement) {
-						validateConstexprBraces(*child->declaration);
+						validateConstexprInitializer(*child->declaration);
 						emitVariableDeclaration(*child->declaration, true);
 						if (child->declaration->type.isConstexpr) {
 							_localFolded[_bindings[child->declaration->name].id]
@@ -7308,7 +7377,7 @@ namespace {
 				for (const StatementPtr& child: statement.children) {
 					if (_terminated) {
 						if (child->kind == StatementKind::DeclarationStatement) {
-							validateConstexprBraces(*child->declaration);
+							validateConstexprInitializer(*child->declaration);
 							// Its name still counts as a constant for the declarations after it.
 							if (child->declaration->type.isConstexpr) {
 								Binding dead;
