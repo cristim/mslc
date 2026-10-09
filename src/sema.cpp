@@ -1894,6 +1894,10 @@ namespace {
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
 		std::map<Id, FoldedConstant> _localFolded;
+		// Set when a fold meets an operation a constant expression may not contain:
+		// a signed overflow, a division by zero, a shift by a bad count, a NaN. The
+		// value is still computed, since only a constexpr needs it to be an error.
+		bool _foldDomainError = false;
 		std::map<spirv::Id, const StructDecl*> _structByValue;
 		// The pointee of every buffer parameter, in declaration order, which is
 		// what the binding-0 block is built from once the loop is done.
@@ -4866,6 +4870,10 @@ namespace {
 		// result wraps in its own width like the instruction the lowering emits.
 		operand.scalar = promotedKind(operand.scalar);
 		if (op == UnaryOperator::Negate) {
+			if (isSignedInteger(operand.scalar)
+				&& operand.integer == normalizeInteger(operand.scalar, uint64_t{ 1 } << (mappingFor(operand.scalar).width - 1))) {
+				_foldDomainError = true;
+			}
 			operand.integer = normalizeInteger(operand.scalar, uint64_t{ 0 } - operand.integer);
 		} else if (op == UnaryOperator::BitNot) {
 			operand.integer = normalizeInteger(operand.scalar, ~operand.integer);
@@ -4875,6 +4883,26 @@ namespace {
 	}
 
 	FoldedConstant Emitter::foldBinary(const Expression& expression) {
+		// && and || do not evaluate the right operand once the left decides the
+		// result, so an operation in it that no constant expression holds is not
+		// reached either.
+		if (expression.binaryOperator == BinaryOperator::LogicalAnd
+			|| expression.binaryOperator == BinaryOperator::LogicalOr) {
+			const auto truth = [](const FoldedConstant& value) {
+				if (value.isComposite) {
+					throw CompileError("a composite constant cannot be an operand of a binary operator");
+				}
+				return value.scalar == ScalarKind::Bool ? value.boolean
+					: isFloatKind(value.scalar) ? value.number != 0.0 : value.integer != 0;
+			};
+			const bool isAnd = expression.binaryOperator == BinaryOperator::LogicalAnd;
+			const bool decided = truth(foldExpression(*expression.left)) != isAnd;
+			FoldedConstant folded;
+			folded.scalar = ScalarKind::Bool;
+			folded.boolean = decided ? !isAnd : truth(foldExpression(*expression.right));
+			return folded;
+		}
+
 		const FoldedConstant left = foldExpression(*expression.left);
 		const FoldedConstant right = foldExpression(*expression.right);
 
@@ -4907,11 +4935,15 @@ namespace {
 				case BinaryOperator::Multiply: folded.number = l * r; break;
 				// A float division by zero is infinity, which is what the language
 				// says, so it is not treated as a mistake here.
-				case BinaryOperator::Divide: folded.number = l / r; break;
+				case BinaryOperator::Divide:
+					if (r == 0.0) { _foldDomainError = true; }
+					folded.number = l / r;
+					break;
 				default:
 					throw CompileError("this operator is recognised but not folded yet");
 			}
 
+			if (std::isnan(folded.number)) { _foldDomainError = true; }
 			folded.number = roundedToKind(folded.scalar, folded.number);
 			return folded;
 		}
@@ -4926,6 +4958,7 @@ namespace {
 			const uint32_t width = mappingFor(folded.scalar).width;
 			const bool negative = isSignedInteger(right.scalar) && static_cast<int64_t>(right.integer) < 0;
 			if (negative || right.integer >= width) {
+				_foldDomainError = true;
 				throw CompileError("a shift of a constant is by a count outside 0 to "
 					+ std::to_string(width - 1));
 			}
@@ -4949,6 +4982,23 @@ namespace {
 		const bool isSigned = isSignedInteger(folded.scalar);
 
 		uint64_t value = 0;
+		if (isSigned && (op == BinaryOperator::Add || op == BinaryOperator::Subtract
+			|| op == BinaryOperator::Multiply)) {
+			// The exact result has to lie in the type; a signed overflow is undefined
+			// in C++ and so no constant expression.
+			const auto sl = static_cast<int64_t>(l);
+			const auto sr = static_cast<int64_t>(r);
+			int64_t exact = 0;
+			bool overflow = op == BinaryOperator::Add ? __builtin_add_overflow(sl, sr, &exact)
+				: op == BinaryOperator::Subtract ? __builtin_sub_overflow(sl, sr, &exact)
+				: __builtin_mul_overflow(sl, sr, &exact);
+			const uint32_t width = mappingFor(folded.scalar).width;
+			if (!overflow && width < 64) {
+				const int64_t most = (int64_t{ 1 } << (width - 1)) - 1;
+				overflow = exact > most || exact < -most - 1;
+			}
+			if (overflow) { _foldDomainError = true; }
+		}
 		switch (op) {
 			case BinaryOperator::Add: value = l + r; break;
 			case BinaryOperator::Subtract: value = l - r; break;
@@ -4956,6 +5006,7 @@ namespace {
 			case BinaryOperator::Modulo:
 			case BinaryOperator::Divide:
 				if (r == 0) {
+					_foldDomainError = true;
 					throw CompileError("an integer constant divides by zero");
 				}
 
@@ -4967,6 +5018,7 @@ namespace {
 					const uint64_t most = normalizeInteger(folded.scalar,
 						uint64_t{ 1 } << (mappingFor(folded.scalar).width - 1));
 					const bool overflows = sr == -1 && l == most;
+					if (overflows) { _foldDomainError = true; }
 					value = overflows ? (op == BinaryOperator::Divide ? l : 0)
 						: static_cast<uint64_t>(op == BinaryOperator::Divide ? sl / sr : sl % sr);
 				} else {
@@ -5076,7 +5128,13 @@ namespace {
 	// folded and the result declared as one of the module's constants, with no
 	// binding of its own.
 	Id Emitter::declareGlobalConstant(const VariableDeclaration& declaration) {
+		_foldDomainError = false;
 		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
+		if (_foldDomainError && declaration.type.isConstexpr) {
+			throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
+				"constant expression");
+		}
+		_foldDomainError = false;
 		const Id id = emitConstant(folded);
 
 		ConstantBinding binding;
@@ -6811,9 +6869,27 @@ namespace {
 		}
 
 		if (declaration.initializer->kind != ExpressionKind::InitList) {
+			const std::string notConstant = "constexpr variable \"" + declaration.name
+				+ "\" must be initialized by a constant expression";
 			if (readsRuntimeValue(*declaration.initializer)) {
-				throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
-					"constant expression");
+				throw CompileError(notConstant);
+			}
+
+			// What can be folded is checked for the operations no constant expression
+			// holds, such as a signed overflow or a division by zero. What cannot be
+			// folded is left to the lowering.
+			if (declaration.type.isScalar() && declaration.type.namedType.empty()) {
+				_foldDomainError = false;
+				try {
+					foldInitializer(declaration.type, *declaration.initializer);
+				} catch (const CompileError&) {
+					// not a form the folder knows
+				}
+				const bool outside = _foldDomainError;
+				_foldDomainError = false;
+				if (outside) {
+					throw CompileError(notConstant);
+				}
 			}
 			return;
 		}
