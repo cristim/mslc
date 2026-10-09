@@ -1,4 +1,7 @@
-// EXPECT: error field "texCoord" of "Vertex" has [[attribute(n)]]
+// EXPECT: valid
+// DISASM: OpImageSampleImplicitLod
+// REFLECT: { "kind": "Texture", "metal_index": 0, "descriptor": { "set": 1, "binding": 0 }, "texture_access": "Sample"
+// REFLECT: { "kind": "Sampler", "descriptor": { "set": 1, "binding": 1 }, "embedded_sampler": 0, "name": "s" }
 using namespace metal;
 struct Vertex {
   float4 position [[position]];
