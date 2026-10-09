@@ -147,8 +147,15 @@ struct Parameter {
 	Type type;
 	std::string name;
 	ParameterAttributes attributes;
-	// Declared with "&". Only a [[stage_in]] parameter reads it.
+	// Declared with "&". On an entry point only a [[stage_in]] parameter reads
+	// it; a helper's non-const reference is the caller's variable.
 	bool isReference = false;
+
+	// A helper parameter that names the caller's variable, as opposed to a copy
+	// of it. A reference to const cannot change it, so it is passed as a copy.
+	bool isMutableReference() const {
+		return isReference && !type.isConst && type.resource == ResourceKind::None;
+	}
 };
 
 struct Expression;
