@@ -793,6 +793,12 @@ spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 		}
 	}
 
+	for (const auto& [pointee, id]: _bufferPointers) {
+		if (id == pointerType) {
+			return pointee;
+		}
+	}
+
 	return spirv::InvalidId;
 }
 
@@ -800,6 +806,12 @@ std::optional<spirv::StorageClassValue> TypeTable::storageClassOf(Id pointerType
 	for (const auto& [key, id]: _pointers) {
 		if (id == pointerType) {
 			return key.first;
+		}
+	}
+
+	for (const auto& [pointee, id]: _bufferPointers) {
+		if (id == pointerType) {
+			return spirv::StorageClass::PhysicalStorageBuffer;
 		}
 	}
 
@@ -2077,6 +2089,7 @@ namespace {
 		ArithmeticConversion usualArithmeticConversion(Id leftType, Id rightType);
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
+		void rejectBoolReference(const std::string& name, const Binding& binding) const;
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
 		Id emitElementAccess(const Expression& expression, bool asAddress);
@@ -2484,6 +2497,15 @@ namespace {
 		return convert(value, type, _boolType);
 	}
 
+	// A bool is stored as a byte, which an indexed buffer maps through boolAddress;
+	// the base of a reference parameter has no such mapping yet.
+	void Emitter::rejectBoolReference(const std::string& name, const Binding& binding) const {
+		if (_types.isBool(binding.pointeeType)) {
+			throw CompileError("\"" + name + "\" is a bool reference parameter, which is not lowered "
+				"yet; pass a pointer to it, or put it in a struct");
+		}
+	}
+
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		// The entry point's own names first, then the module's: a constant declared
 		// at file scope is not a parameter of the entry point that reads it.
@@ -2517,8 +2539,17 @@ namespace {
 		// A buffer is reached through the address block, so the binding has no id
 		// of its own to load, and loading it wrote an OpLoad of id 0.
 		if (binding.bufferPointeeType != InvalidId) {
-			throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
-				"which is not lowered yet");
+			if (binding.isBuffer) {
+				throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
+					"which is not lowered yet");
+			}
+
+			// A reference parameter names the one value its buffer holds, so its
+			// use as a value reads the whole of it.
+			rejectBoolReference(expression.name, binding);
+			const Id loaded = loadFromBuffer(bufferBase(binding), binding.pointeeType);
+			const Id declared = declaredTypeOf(binding.pointeeMsl);
+			return _builder.typeOf(loaded) == declared ? loaded : convertImplicit(loaded, declared);
 		}
 
 		if (!binding.isPointer) {
@@ -6639,6 +6670,11 @@ namespace {
 			if (it != _bindings.end() && it->second.isPointer
 				&& it->second.storageClass == spirv::StorageClass::Function) {
 				address = it->second.id;
+			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
+				&& !it->second.isBuffer) {
+				// A reference parameter is the one value its buffer holds.
+				rejectBoolReference(left.name, it->second);
+				address = bufferBase(it->second);
 			} else {
 				address = emitExpression(left);
 			}
