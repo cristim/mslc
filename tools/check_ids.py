@@ -39,33 +39,46 @@ def load_grammar(path):
     return grammar, kinds
 
 
-def operand_id_positions(instruction, kinds):
-    """Indices of operands that are ids, as offsets into the operand list."""
+def string_words(operands, start):
+    """Words a NUL-terminated literal string takes, counted from start."""
+    count = 0
+    for word in operands[start:]:
+        count += 1
+        if any((word >> shift) & 0xFF == 0 for shift in (0, 8, 16, 24)):
+            return count
+    return count
+
+
+def operand_id_positions(instruction, kinds, operands):
+    """Indices of operands that are ids, as offsets into the operand words.
+
+    A literal string spans as many words as its text needs, so the positions
+    after one are found by reading the words rather than counting operands.
+    """
     positions = []
     index = 0
 
     for operand in instruction.get("operands", []):
         kind = operand["kind"]
-        info = kinds.get(kind, {})
+        quantity = operand.get("quantifier", "")
 
-        if kind == "IdResultType":
-            positions.append(index)
-        elif kind == "IdResult":
-            positions.append(index)
-        elif kind in ID_KINDS:
-            positions.append(index)
-        elif kind == "LiteralContextDependentNumber":
+        if index >= len(operands):
+            break
+
+        if kind == "LiteralContextDependentNumber":
             # variable width, so nothing can be assumed after it
             break
 
-        quantity = operand.get("quantifier", "")
         if quantity == "*":
             # A trailing variadic operand: everything left is that kind
             if kind in ID_KINDS:
-                positions.extend(range(index, index))
+                positions.extend(range(index, len(operands)))
             break
 
-        index += 1
+        if kind in ID_KINDS:
+            positions.append(index)
+
+        index += string_words(operands, index) if kind == "LiteralString" else 1
 
     return positions
 
@@ -107,7 +120,7 @@ def main():
             problems.append((index, "unknown opcode %d" % opcode))
         else:
             name = instruction["opname"]
-            positions = operand_id_positions(instruction, kinds)
+            positions = operand_id_positions(instruction, kinds, operands)
 
             for position in positions:
                 if position >= len(operands):

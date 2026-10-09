@@ -59,6 +59,13 @@ target_include_directories(mslc-builder-test PRIVATE src)
 target_link_libraries(mslc-builder-test PRIVATE mslc)
 add_test(NAME api/spirv-builder COMMAND mslc-builder-test)
 
+find_program(PYTHON3 python3)
+add_test(NAME tools/check-ids-multiword-entry-name
+	COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_test.py $<TARGET_FILE:mslc-cli>
+		${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ids.py
+		${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv.core.grammar.json
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_entry_name.metal)
+
 # Tests that validate SPIR-V fail, never skip, when this is not found.
 find_program(SPIRV_VAL spirv-val)
 if(NOT SPIRV_VAL)
