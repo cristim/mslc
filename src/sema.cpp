@@ -1470,6 +1470,9 @@ namespace {
 		// True for a const local and for a buffer in constant memory or declared
 		// const: Metal rejects a store through it.
 		bool readOnly = false;
+		// True when id is the address of an element or a member rather than a
+		// variable, as for a reference local bound to one.
+		bool isAddress = false;
 		// True for a sampler declared with coord::pixel. Vulkan forbids an
 		// implicit-lod lookup through an unnormalized sampler.
 		bool unnormalizedSampler = false;
@@ -1716,6 +1719,9 @@ namespace {
 		for (size_t i = 0; i < a.parameters.size(); ++i) {
 			const Type& x = a.parameters[i].type;
 			const Type& y = b.parameters[i].type;
+			if (a.parameters[i].isMutableReference() != b.parameters[i].isMutableReference()) {
+				return false;
+			}
 			if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
 				|| x.isPacked != y.isPacked || x.namedType != y.namedType
 				|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
@@ -2113,6 +2119,10 @@ namespace {
 		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
 		Id helperParameterType(const Type& type);
+		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
+			size_t first) const;
+		Id referenceArgument(const Expression& argument, const Parameter& parameter,
+			const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts);
 		Id resourceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function);
 		Id resourcePointee(const Type& type);
@@ -4277,7 +4287,9 @@ namespace {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
 			for (const Parameter& parameter: definition.parameters) {
-				helper.parameterTypes.push_back(helperParameterType(parameter.type));
+				helper.parameterTypes.push_back(parameter.isMutableReference()
+					? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
+					: helperParameterType(parameter.type));
 				signature.push_back(helper.parameterTypes.back());
 			}
 
@@ -4297,7 +4309,9 @@ namespace {
 		}
 
 		std::vector<uint32_t> operands { slot.first->second };
+		std::vector<std::pair<Id, Id>> copyOuts;
 		const size_t first = receiver ? 1 : 0;
+		rejectAliasedReferenceArguments(call, definition, first);
 		if (first) {
 			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
 			_pendingObject = InvalidId;
@@ -4307,6 +4321,11 @@ namespace {
 			const Parameter& parameter = definition.parameters[first + i];
 			if (parameter.type.resource != ResourceKind::None) {
 				operands.push_back(resourceArgument(*call.arguments[i], parameter, definition.name));
+				continue;
+			}
+
+			if (parameter.isMutableReference()) {
+				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
 				continue;
 			}
 
@@ -4320,7 +4339,108 @@ namespace {
 			}
 		}
 
-		return _builder.emitTyped(spirv::OpFunctionCall, helper.returnType, operands);
+		const Id result = _builder.emitTyped(spirv::OpFunctionCall, helper.returnType, operands);
+		for (const auto& [place, temporary]: copyOuts) {
+			const Id type = valueTypeAt(place);
+			_builder.emit(spirv::OpStore, { place, loadFrom(temporary, type) });
+		}
+		return result;
+	}
+
+	// An element, a member, or a reference local bound to one is passed through a
+	// temporary copied back after the call, so a second reference argument naming
+	// the same storage would have its write overwritten by the stale copy. Two
+	// bare variables are the same pointer and alias as C++ does.
+	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
+		size_t first) const {
+		struct Passed { std::string root; bool temporary; };
+		std::vector<Passed> passed;
+		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			if (!definition.parameters[first + i].isMutableReference()) {
+				continue;
+			}
+			const Expression& argument = *call.arguments[i];
+			if (argument.kind != ExpressionKind::Identifier && argument.kind != ExpressionKind::Index
+				&& argument.kind != ExpressionKind::Member) {
+				continue;
+			}
+			const Expression& root = storeRoot(argument);
+			if (root.kind != ExpressionKind::Identifier) {
+				continue;
+			}
+			const auto bound = _bindings.find(root.name);
+			passed.push_back({ root.name, argument.kind != ExpressionKind::Identifier
+				|| (bound != _bindings.end() && bound->second.isAddress) });
+		}
+
+		for (size_t i = 0; i < passed.size(); ++i) {
+			for (size_t j = i + 1; j < passed.size(); ++j) {
+				const bool sameRoot = passed[i].root == passed[j].root;
+				const bool viaAddress = (passed[i].temporary || passed[j].temporary)
+					&& (_bindings.count(passed[i].root) && _bindings.at(passed[i].root).isAddress
+						|| _bindings.count(passed[j].root) && _bindings.at(passed[j].root).isAddress);
+				if ((sameRoot && (passed[i].temporary || passed[j].temporary)) || viaAddress) {
+					throw CompileError("the call to \"" + definition.name + "\" passes the same variable "
+						"through two reference parameters, one of them as a member or element; that is "
+						"not lowered yet");
+				}
+			}
+		}
+	}
+
+	// The variable a non-const reference parameter names: the caller's own, so a
+	// store in the helper is a store to it. Only a place in the thread's own
+	// storage can be passed, since the parameter is a pointer into it.
+	Id Emitter::referenceArgument(const Expression& argument, const Parameter& parameter,
+		const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts) {
+		const std::string what = "argument " + std::to_string(position) + " of the call to \"" + function + "\"";
+		if (argument.kind != ExpressionKind::Identifier && argument.kind != ExpressionKind::Index
+			&& argument.kind != ExpressionKind::Member) {
+			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
+				+ parameter.name + "\" is a reference to it");
+		}
+		if (argument.kind == ExpressionKind::Member && !structOf(*argument.left)) {
+			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
+				"name yet");
+		}
+
+		const Expression& root = storeRoot(argument);
+		if (root.kind == ExpressionKind::Identifier) {
+			const auto binding = _bindings.find(root.name);
+			if (binding != _bindings.end() && binding->second.readOnly) {
+				throw CompileError(what + " is const or in constant memory, and parameter \""
+					+ parameter.name + "\" is a reference that can change it");
+			}
+		}
+
+		const Id address = emitPlaceAddress(argument);
+		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
+		if (!storageClass || *storageClass != spirv::StorageClass::Function) {
+			throw CompileError(what + " is not a variable of this function; a reference parameter takes "
+				"a local, a member of one, or a reference parameter of the caller");
+		}
+		if (valueTypeAt(address) != declaredTypeOf(parameter.type)) {
+			throw CompileError(what + " is not the type of parameter \"" + parameter.name + "\", "
+				+ typeName(parameter.type) + "; a conversion would make a temporary");
+		}
+
+		// A function parameter has to be a pointer to a variable, which an element
+		// or a member of one is not, so those go through a temporary copied back
+		// after the call.
+		if (argument.kind == ExpressionKind::Identifier) {
+			const auto named = _bindings.find(argument.name);
+			if (named != _bindings.end() && !named->second.isAddress) {
+				return address;
+			}
+		}
+
+		const Id type = declaredTypeOf(parameter.type);
+		const Id temporary = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Function, type),
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		_builder.emit(spirv::OpStore, { temporary, loadFrom(address, type) });
+		copyOuts.emplace_back(address, temporary);
+		return temporary;
 	}
 
 	// A parameter is a value the body may assign to, as in C++, and the caller's
@@ -4358,6 +4478,11 @@ namespace {
 				bound.storageClass = spirv::StorageClass::UniformConstant;
 				bound.pointeeMsl = parameter.type;
 				_bindings[parameter.name] = bound;
+				continue;
+			}
+
+			if (parameter.isMutableReference()) {
+				bindLocal(parameter.name, values[i], declaredTypeOf(parameter.type), parameter.type);
 				continue;
 			}
 
@@ -6601,6 +6726,7 @@ namespace {
 		binding.structType = declaration.type.namedType.empty()
 			? nullptr : _unit.findStruct(declaration.type.namedType);
 		binding.readOnly = constReference || rootReadOnly;
+		binding.isAddress = true;
 		_bindings[declaration.name] = binding;
 	}
 

@@ -2156,14 +2156,13 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 			throw CompileError(what + "is a pointer, which a helper function does not take yet; "
 				"it takes scalar, vector, matrix and struct values");
 		}
-		if (param.isReference) {
-			throw CompileError(what + "is a reference, which a helper function does not take yet; "
-				"it takes scalar, vector, matrix and struct values");
-		}
 		if (param.type.arrayLength || (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket)) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
 		}
-		if (param.type.addressSpace != AddressSpace::None) {
+		// A reference to a thread variable may spell its space out; any other
+		// parameter has none to name.
+		if (param.type.addressSpace != AddressSpace::None
+			&& !(param.isReference && param.type.addressSpace == AddressSpace::Thread)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}
