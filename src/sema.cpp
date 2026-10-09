@@ -2090,6 +2090,8 @@ namespace {
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		void rejectBoolReference(const std::string& name, const Binding& binding) const;
+		void emitReferenceDeclaration(const VariableDeclaration& declaration);
+		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
 		Id emitElementAccess(const Expression& expression, bool asAddress);
@@ -2560,6 +2562,12 @@ namespace {
 		// is what the pointer addresses, so load it. Index and member
 		// expressions ask for the address itself, and go through the address
 		// path instead.
+		if (binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
+			const Id inBuffer = loadFromBuffer(binding.id, binding.pointeeType);
+			const Id declared = declaredTypeOf(binding.pointeeMsl);
+			return _builder.typeOf(inBuffer) == declared ? inBuffer : convertImplicit(inBuffer, declared);
+		}
+
 		const Id loaded = loadFrom(binding.id, binding.pointeeType);
 
 		// A builtin whose MSL type is a scalar but whose SPIR-V form is a
@@ -2994,7 +3002,8 @@ namespace {
 		// the address form does the work and this loads. A buffer's load carries the
 		// Aligned operand the same rule as any other access through its pointer.
 		const auto it = _bindings.find(rootName);
-		return it != _bindings.end() && it->second.bufferPointeeType != InvalidId
+		return it != _bindings.end() && (it->second.bufferPointeeType != InvalidId
+				|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)
 			? loadFromBuffer(address, fieldType)
 			: loadFrom(address, fieldType);
 	}
@@ -3090,8 +3099,11 @@ namespace {
 
 		// A packed member of a laid-out struct is stored as an array of its
 		// components, and is viewed as the vector once it has an address.
-		const bool packed = fromBuffer && current.isPacked;
-		const bool bytes = fromBuffer && _types.isBool(outFieldType);
+		// A reference local bound to a buffer element holds that element's address
+		// and has no buffer of its own, but its fields are laid out the same way.
+		const bool inBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
+		const bool packed = inBuffer && current.isPacked;
+		const bool bytes = inBuffer && _types.isBool(outFieldType);
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(storageClass, packed
 				? _types.packedStorage(current.scalar, current.vectorWidth)
@@ -6528,9 +6540,95 @@ namespace {
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
+	// T& r = place; names the place the initialiser denotes, so a use of r loads
+	// from it and a store through r writes to it. A local variable is aliased by
+	// copying its binding; an element or a member, or a reference parameter, is a
+	// place reached by address, which the binding then holds.
+	void Emitter::emitReferenceDeclaration(const VariableDeclaration& declaration) {
+		const Expression& place = *declaration.initializer;
+		if (place.kind != ExpressionKind::Identifier && place.kind != ExpressionKind::Index
+			&& place.kind != ExpressionKind::Member) {
+			throw CompileError("the reference \"" + declaration.name + "\" has to be bound to a variable, "
+				"an element or a member; binding it to a value is not lowered yet");
+		}
+
+		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a component of a "
+				"vector, which is not lowered yet");
+		}
+
+		const Expression& root = storeRoot(place);
+		if (root.kind != ExpressionKind::Identifier) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a place mslc "
+				"cannot name");
+		}
+		const auto rootBinding = _bindings.find(root.name);
+		const bool rootReadOnly = rootBinding != _bindings.end() && rootBinding->second.readOnly;
+		const bool constReference = declaration.type.isConst
+			|| declaration.type.addressSpace == AddressSpace::Constant;
+		if (rootReadOnly && !constReference) {
+			throw CompileError("the reference \"" + declaration.name + "\" is not const but is bound to "
+				"constant memory or a const variable");
+		}
+
+		if (place.kind == ExpressionKind::Identifier && rootBinding != _bindings.end()
+			&& rootBinding->second.bufferPointeeType == InvalidId && rootBinding->second.isPointer
+			&& rootBinding->second.storageClass == spirv::StorageClass::Function) {
+			Binding alias = rootBinding->second;
+			alias.readOnly = alias.readOnly || constReference;
+			requireSameReferent(declaration, alias.pointeeType);
+			_bindings[declaration.name] = alias;
+			return;
+		}
+
+		if (place.kind == ExpressionKind::Identifier && rootBinding != _bindings.end()) {
+			rejectBoolReference(root.name, rootBinding->second);
+		}
+		const Id address = emitPlaceAddress(place);
+		const Id pointee = valueTypeAt(address);
+		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
+		if (pointee == InvalidId || !storageClass) {
+			throw CompileError("cannot determine what the reference \"" + declaration.name + "\" names");
+		}
+		requireSameReferent(declaration, pointee);
+
+		Binding binding;
+		binding.id = address;
+		binding.isPointer = true;
+		binding.pointeeType = pointee;
+		binding.storageClass = *storageClass;
+		binding.pointeeMsl = declaration.type;
+		binding.structType = declaration.type.namedType.empty()
+			? nullptr : _unit.findStruct(declaration.type.namedType);
+		binding.readOnly = constReference || rootReadOnly;
+		_bindings[declaration.name] = binding;
+	}
+
+	// A reference binds without a conversion: a different type would be a
+	// temporary, which is a value and not the place.
+	void Emitter::requireSameReferent(const VariableDeclaration& declaration, Id referent) {
+		if (!declaration.type.namedType.empty()) {
+			TypeTable::StructForm have;
+			if (!_types.structForm(referent, have) || have.name != declaration.type.namedType) {
+				throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
+					"it is bound to");
+			}
+			return;
+		}
+		if (referent != declaredTypeOf(declaration.type)) {
+			throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
+				"it is bound to; a conversion would make a temporary");
+		}
+	}
+
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
+			return;
+		}
+
+		if (declaration.isReference) {
+			emitReferenceDeclaration(declaration);
 			return;
 		}
 
@@ -6668,7 +6766,9 @@ namespace {
 			// plain value is loaded, so only this case takes the binding.
 			const auto it = _bindings.find(left.name);
 			if (it != _bindings.end() && it->second.isPointer
-				&& it->second.storageClass == spirv::StorageClass::Function) {
+				&& it->second.bufferPointeeType == InvalidId
+				&& (it->second.storageClass == spirv::StorageClass::Function
+					|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)) {
 				address = it->second.id;
 			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
 				&& !it->second.isBuffer) {

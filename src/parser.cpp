@@ -245,14 +245,16 @@ namespace {
 	// pointer the address space is the pointee's, which is free to be device.
 	// A reference is valid MSL that mslc does not lower, so it gets its own diagnostic
 	// rather than an address-space one.
-	void rejectLocalQualifiers(const Type& type, bool isReference) {
-		if (isReference) {
+	void rejectLocalQualifiers(const Type& type, bool isReference, bool referenceAllowed = false) {
+		if (isReference && !referenceAllowed) {
 			throw CompileError("a reference in function scope is not lowered yet");
 		}
 		if (type.isStatic) {
 			throw CompileError("variables in function scope cannot be declared static");
 		}
-		if (!type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+		// A reference names a place that is already in its own address space, so
+		// "const device S &r = buffer[i];" is the one way to spell it.
+		if (!isReference && !type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
 			throw CompileError(std::string("variables in function scope cannot be in the ")
 				+ addressSpaceName(type.addressSpace) + " address space");
 		}
@@ -2558,13 +2560,31 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			declaration.type = parseType(true);
-			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
+			declaration.isReference = at(TokenKind::Ampersand);
+			rejectLocalQualifiers(declaration.type, declaration.isReference, true);
+			if (declaration.isReference) {
+				advance();
+				if (declaration.type.isPointer || declaration.type.arrayLength
+					|| declaration.type.resource != ResourceKind::None) {
+					throw CompileError("a reference to a pointer, an array or a resource is not lowered yet");
+				}
+			}
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+
+			if (declaration.isReference) {
+				if (!match(TokenKind::Assign)) {
+					throw CompileError("the reference \"" + declaration.name + "\" needs an initialiser");
+				}
+				declaration.initializer = parseExpression();
+				statement->declaration = std::move(declaration);
+				expect(TokenKind::Semicolon, "after a reference declaration");
+				return statement;
+			}
 
 			if (declaration.type.resource != ResourceKind::None) {
 				parseSamplerLocal(declaration);

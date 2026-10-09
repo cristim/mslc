@@ -297,6 +297,9 @@ struct VariableDeclaration {
 	std::string name;
 	ExpressionPtr initializer;
 
+	// T& name = lvalue; : a name for the place the initialiser denotes.
+	bool isReference = false;
+
 	// A sampler local: the state its options spell.
 	std::optional<SamplerState> sampler;
 };
