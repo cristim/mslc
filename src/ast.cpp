@@ -22,16 +22,25 @@ const char* scalarKindName(ScalarKind kind) {
 	return "unknown";
 }
 
+const char* resourceKindName(ResourceKind kind) {
+	switch (kind) {
+		case ResourceKind::None: return "none";
+		case ResourceKind::Texture2D: return "texture2d";
+		case ResourceKind::TextureCube: return "texturecube";
+		case ResourceKind::Texture3D: return "texture3d";
+		case ResourceKind::Sampler: return "sampler";
+	}
+
+	return "unknown";
+}
+
 std::string typeName(const Type& type) {
 	if (type.resource == ResourceKind::Sampler) {
 		return "sampler";
 	}
-	if (type.resource == ResourceKind::Texture2D) {
-		return std::string("texture2d<") + scalarKindName(type.scalar)
+	if (type.isTexture()) {
+		return std::string(resourceKindName(type.resource)) + "<" + scalarKindName(type.scalar)
 			+ (type.textureAccess == TextureAccess::Write ? ", access::write>" : ">");
-	}
-	if (type.resource == ResourceKind::TextureCube) {
-		return std::string("texturecube<") + scalarKindName(type.scalar) + ">";
 	}
 
 	std::string name = type.namedType.empty()
