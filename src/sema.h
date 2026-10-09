@@ -75,9 +75,9 @@ public:
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
 
-	// The image a texture2d or texturecube of float or half is declared as: a
-	// float sampled type, sampled by a sampler (Sampled 1), format Unknown and
-	// depth unspecified, in Dim 2D or Cube, which is what Iridium declares (indium
+	// The image a texture2d, texturecube or texture3d of float or half is declared
+	// as: a float sampled type, sampled by a sampler (Sampled 1), format Unknown and
+	// depth unspecified, in Dim 2D, Cube or 3D, which is what Iridium declares (indium
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
 	spirv::Id image(ResourceKind kind);
