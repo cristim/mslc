@@ -1136,8 +1136,9 @@ Id TypeTable::image(ResourceKind kind) {
 	if (cached == InvalidId) {
 		const uint32_t dimension = kind == ResourceKind::TextureCube ? spirv::Dim::Cube
 			: kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D : spirv::Dim::Dim2D;
+		const uint32_t arrayed = kind == ResourceKind::Texture2DArray ? 1u : 0u;
 		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
-			dimension, 2u, 0u, 0u, 1u,
+			dimension, 2u, arrayed, 0u, 1u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
 
@@ -2051,6 +2052,8 @@ namespace {
 		Id emitTextureSample(const Expression& call, const Binding& texture);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
 		Id emitTextureSize(const Expression& call, const Binding& texture, uint32_t component);
+		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
+			const std::string& callName);
 		Id texturePixels(const Binding& texture, Id sampled);
 		Id emitLod(const Expression& expression, const std::string& callName);
 		const StructDecl* structValue(const Type& type) const;
@@ -5956,16 +5959,26 @@ namespace {
 		if (method == "get_depth" && texture.pointeeMsl.resource == ResourceKind::Texture3D) {
 			return emitTextureSize(call, texture, 2);
 		}
+		if (method == "get_array_size" && texture.pointeeMsl.resource == ResourceKind::Texture2DArray) {
+			if (!call.arguments.empty()) {
+				throw CompileError("get_array_size takes no arguments; the layer count has no mip level");
+			}
+			return emitTextureSize(call, texture, 2);
+		}
 
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
-			"sample, read, get_width, get_height and, on a texture3d, get_depth");
+			"sample, read, get_width, get_height, get_depth on a texture3d and get_array_size on a "
+			"texture2d_array");
 	}
 
-	// The components of a coordinate that addresses a texel of an image of this
-	// kind. A cube's coordinate is a direction, three wide, but its size is two.
+	// The components of the coordinate argument of sample and read on an image of
+	// this kind. A texture2d_array takes its layer as a separate argument, so its
+	// coordinate is two wide and its size three; a cube's coordinate is a
+	// direction, three wide, and its size two.
 	static uint32_t textureCoordinateWidth(ResourceKind kind) {
 		switch (kind) {
 			case ResourceKind::Texture2D: return 2;
+			case ResourceKind::Texture2DArray: return 2;
 			case ResourceKind::TextureCube: return 3;
 			case ResourceKind::Texture3D: return 3;
 			case ResourceKind::None:
@@ -5975,19 +5988,42 @@ namespace {
 	}
 
 	static uint32_t textureSizeWidth(ResourceKind kind) {
-		return kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
+		return kind == ResourceKind::Texture2DArray ? 3
+			: kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
 	}
 
-	// sample(sampler, float2 coordinate [, level(lod)]), or a float3 coordinate on a
-	// texturecube or texture3d. A fragment function takes
+	// A texture2d_array coordinate of `component` with its layer appended as the
+	// last component, which is where an arrayed image instruction takes it. The
+	// layer is a uint in Metal, so an int wraps to uint before a sample sees it.
+	Id Emitter::appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
+		const std::string& callName) {
+		const Id value = emitExpression(layer);
+		const Id valueType = _builder.typeOf(value);
+		if (_types.vectorWidth(valueType) != 1 || _types.isFloat(valueType) || _types.bitWidth(valueType) < 8) {
+			throw CompileError("the array index of " + callName + " has to be an integer");
+		}
+
+		const Id index = convert(value, valueType, _uintType);
+		return _builder.emitTyped(spirv::OpCompositeConstruct,
+			_types.vector(component, _types.vectorWidth(_builder.typeOf(coordinate)) + 1),
+			{ coordinate, convert(index, _uintType, _types.scalar(component)) });
+	}
+
+	// sample(sampler, float2 coordinate [, level(lod)]), a float3 coordinate on a
+	// texturecube or texture3d, or a float2 coordinate and a uint layer on a
+	// texture2d_array. A fragment function takes
 	// the level from the derivatives, which is OpImageSampleImplicitLod; a vertex
 	// or kernel function has none, so it samples level 0 with an explicit lod,
 	// and so does a sampler with pixel coordinates, which Vulkan does not allow
 	// an implicit lod on.
 	Id Emitter::emitTextureSample(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
-		if (arguments.size() < 2 || arguments.size() > 3) {
-			throw CompileError("sample takes a sampler, a coordinate and optionally level(lod); "
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		const bool arrayed = kind == ResourceKind::Texture2DArray;
+		const size_t fixed = arrayed ? 3 : 2;
+		if (arguments.size() < fixed || arguments.size() > fixed + 1) {
+			throw CompileError(std::string("sample takes a sampler, a coordinate")
+				+ (arrayed ? ", an array index" : "") + " and optionally level(lod); "
 				"this call passes " + std::to_string(arguments.size()));
 		}
 
@@ -6001,11 +6037,10 @@ namespace {
 		}
 		const Binding& sampler = *samplerBinding;
 
-		const ResourceKind kind = texture.pointeeMsl.resource;
 		if (kind != ResourceKind::Texture2D && sampler.unnormalizedSampler) {
 			throw CompileError(std::string("a ") + resourceKindName(kind) + " cannot be sampled with a "
-				"coord::pixel sampler: Vulkan allows unnormalized coordinates on 1D and 2D image views "
-				"only. A sampler parameter is not checked, since its state is the host's");
+				"coord::pixel sampler: Vulkan allows unnormalized coordinates on non-arrayed 1D and 2D "
+				"image views only. A sampler parameter is not checked, since its state is the host's");
 		}
 		const uint32_t width = textureCoordinateWidth(kind);
 		const Id coordinateVector = _types.vector(ScalarKind::Float, width);
@@ -6018,10 +6053,13 @@ namespace {
 			}
 			coordinate = broadcast(coordinate, coordinateVector);
 		}
+		if (arrayed) {
+			coordinate = appendArrayLayer(coordinate, ScalarKind::Float, *arguments[2], "sample");
+		}
 
 		Id lod = InvalidId;
-		if (arguments.size() == 3) {
-			const Expression& option = *arguments[2];
+		if (arguments.size() == fixed + 1) {
+			const Expression& option = *arguments[fixed];
 			const bool isCall = option.kind == ExpressionKind::Call
 				&& option.left->kind == ExpressionKind::Identifier;
 			if (isCall && option.left->name == "level") {
@@ -6039,8 +6077,9 @@ namespace {
 				throw CompileError("the sample option " + option.left->name + "(...) is not lowered "
 					"yet; mslc lowers level(lod)");
 			} else {
-				throw CompileError("the third argument of sample has to be level(lod); an offset "
-					"and the other options are not lowered yet");
+				throw CompileError(std::string("the ") + (arrayed ? "fourth" : "third")
+					+ " argument of sample has to be level(lod); an offset and the other options "
+					"are not lowered yet");
 			}
 		}
 
@@ -6069,13 +6108,17 @@ namespace {
 		return texturePixels(texture, sampled);
 	}
 
-	// read(uint2 coordinate [, lod]), or a uint3 coordinate on a texture3d: a texel
-	// by integer coordinate, with no sampler. Metal takes uint and ushort vectors
-	// and rejects int and float ones.
+	// read(uint2 coordinate [, lod]), a uint3 coordinate on a texture3d, or a uint2
+	// coordinate and a uint layer on a texture2d_array: a texel by integer
+	// coordinate, with no sampler. Metal takes uint and ushort vectors and rejects
+	// int and float ones.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
-		if (arguments.empty() || arguments.size() > 2) {
-			throw CompileError("read takes a coordinate and optionally a lod; this call passes "
+		const bool arrayed = texture.pointeeMsl.resource == ResourceKind::Texture2DArray;
+		const size_t fixed = arrayed ? 2 : 1;
+		if (arguments.size() < fixed || arguments.size() > fixed + 1) {
+			throw CompileError(std::string("read takes a coordinate")
+				+ (arrayed ? ", an array index" : "") + " and optionally a lod; this call passes "
 				+ std::to_string(arguments.size()));
 		}
 
@@ -6090,8 +6133,11 @@ namespace {
 				+ " or a ushort" + std::to_string(width));
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
+		if (arrayed) {
+			coordinate = appendArrayLayer(coordinate, ScalarKind::UInt, *arguments[1], "read");
+		}
 
-		Id lod = arguments.size() == 2 ? emitLod(*arguments[1], "read") : constantU32(0);
+		Id lod = arguments.size() == fixed + 1 ? emitLod(*arguments[fixed], "read") : constantU32(0);
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id fetched = _builder.emitTyped(spirv::OpImageFetch,
@@ -6099,8 +6145,8 @@ namespace {
 		return texturePixels(texture, fetched);
 	}
 
-	// get_width(), get_height() and get_depth() (component 0, 1 and 2 of the
-	// size), of level 0 or of the lod given.
+	// get_width(), get_height() and get_depth() or get_array_size() (component 0,
+	// 1 and 2 of the size), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, uint32_t component) {
 		const std::string& name = call.left->memberName;
 		if (call.arguments.size() > 1) {

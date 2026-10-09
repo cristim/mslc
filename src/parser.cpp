@@ -177,9 +177,9 @@ namespace {
 			|| text == "volatile" || text == "__restrict";
 	}
 
-	// The texture and sampler type names. Only texture2d, texturecube, texture3d
-	// and sampler are lowered; the rest are recognised so they are reported by
-	// name rather than read as a struct type and failing later.
+	// The texture and sampler type names. Only texture2d, texturecube, texture3d,
+	// texture2d_array and sampler are lowered; the rest are recognised so they are
+	// reported by name rather than read as a struct type and failing later.
 	bool isResourceTypeName(std::string_view text) {
 		static const std::set<std::string_view> names = {
 			"sampler", "texture1d", "texture1d_array", "texture2d", "texture2d_array",
@@ -2064,11 +2064,12 @@ void Parser::parseResourceType(Type& type) {
 		{ "texture2d", ResourceKind::Texture2D },
 		{ "texturecube", ResourceKind::TextureCube },
 		{ "texture3d", ResourceKind::Texture3D },
+		{ "texture2d_array", ResourceKind::Texture2DArray },
 	};
 	const auto lowered = textures.find(name);
 	if (lowered == textures.end()) {
-		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d, texturecube "
-			"and texture3d of float or half, and sampler");
+		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d, texturecube, "
+			"texture3d and texture2d_array of float or half, and sampler");
 	}
 
 	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());
