@@ -6301,8 +6301,18 @@ namespace {
 
 		if (type.namedType.empty()) {
 			if (_entryPoint->stage == Stage::Vertex) {
-				throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
-					+ " rather than a struct, which is not lowered yet");
+				// A bare float4 return is the vertex position (MSL 5.2.3).
+				const std::string what = "the value vertex function \"" + _entryPoint->name + "\" returns";
+				if (type.isPointer || type.isMatrix() || type.vectorWidth != 4 || type.scalar != ScalarKind::Float) {
+					throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
+						+ ", and a vertex function returns a struct with a [[position]] field or a float4 "
+						"position");
+				}
+				_outputs.push_back(declareStageVariable(type, spirv::StorageClass::Output, what));
+				_builder.emit(spirv::OpDecorate, { _outputs.back().variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::Position) });
+				return;
 			}
 
 			_outputs.push_back(declareStageVariable(type, spirv::StorageClass::Output,
