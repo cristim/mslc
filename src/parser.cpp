@@ -2432,13 +2432,72 @@ void Parser::measure(Expression& expression) const {
 	}
 }
 
+// The initialiser a local may have after its name: "= value", a braced list,
+// or constructor arguments. A const local has to have one.
+void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
+	if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
+		&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
+		throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
+	}
+
+	if (match(TokenKind::Assign)) {
+		declaration.initializer = parseInitializer();
+	} else if (at(TokenKind::LBrace)) {
+		declaration.initializer = parseInitializerList();
+	} else if (at(TokenKind::LParen)) {
+		// Direct initialisation, float3 specularTerm(0); . The name comes
+		// first here, so the list after it constructs the variable's own
+		// type rather than calling it, and the two spellings are the same
+		// value. Metal has no other form: "float3(0) specularTerm;" is a
+		// parse error there, which xcrun metal confirms.
+		advance();
+		const size_t atLine = line();
+		std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
+		declaration.initializer = constructWithConstructor(declaration.type, arguments, atLine);
+		if (!declaration.initializer) {
+			auto construct = std::make_unique<Expression>();
+			construct->kind = ExpressionKind::Construct;
+			construct->line = atLine;
+			construct->constructType = declaration.type;
+			construct->arguments = std::move(arguments);
+			measure(*construct);
+			declaration.initializer = std::move(construct);
+		}
+	} else {
+		std::vector<ExpressionPtr> none;
+		declaration.initializer = constructWithConstructor(declaration.type, none, line());
+	}
+}
+
+void Parser::appendStatement(std::vector<StatementPtr>& out) {
+	out.push_back(parseStatement());
+	for (StatementPtr& tail: _declaratorTail) {
+		out.push_back(std::move(tail));
+	}
+	_declaratorTail.clear();
+}
+
 StatementPtr Parser::parseBody() {
 	if (at(TokenKind::LBrace)) {
 		return parseCompoundStatement();
 	}
 
 	const NestingScope scope(*this);
-	return parseStatement();
+	StatementPtr body = parseStatement();
+	if (_declaratorTail.empty()) {
+		return body;
+	}
+
+	// "if (c) int a, b;" is one declaration in a scope of its own.
+	auto block = std::make_unique<Statement>();
+	block->kind = StatementKind::Compound;
+	block->line = body->line;
+	block->children.push_back(std::move(body));
+	for (StatementPtr& tail: _declaratorTail) {
+		block->children.push_back(std::move(tail));
+	}
+	_declaratorTail.clear();
+	return block;
 }
 
 StatementPtr Parser::parseCompoundStatement() {
@@ -2451,7 +2510,7 @@ StatementPtr Parser::parseCompoundStatement() {
 	expect(TokenKind::LBrace, "to open a block");
 
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
-		statement->children.push_back(parseStatement());
+		appendStatement(statement->children);
 	}
 
 	expect(TokenKind::RBrace, "to close a block");
@@ -2591,37 +2650,29 @@ StatementPtr Parser::parseStatement() {
 				return statement;
 			}
 
-			if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
-				&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
-				throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
-			}
+			parseLocalInitializer(declaration);
 
-			if (match(TokenKind::Assign)) {
-				declaration.initializer = parseInitializer();
-			} else if (at(TokenKind::LBrace)) {
-				declaration.initializer = parseInitializerList();
-			} else if (at(TokenKind::LParen)) {
-				// Direct initialisation, float3 specularTerm(0); . The name comes
-				// first here, so the list after it constructs the variable's own
-				// type rather than calling it, and the two spellings are the same
-				// value. Metal has no other form: "float3(0) specularTerm;" is a
-				// parse error there, which xcrun metal confirms.
-				advance();
-				const size_t atLine = line();
-				std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
-				declaration.initializer = constructWithConstructor(declaration.type, arguments, atLine);
-				if (!declaration.initializer) {
-					auto construct = std::make_unique<Expression>();
-					construct->kind = ExpressionKind::Construct;
-					construct->line = atLine;
-					construct->constructType = declaration.type;
-					construct->arguments = std::move(arguments);
-					measure(*construct);
-					declaration.initializer = std::move(construct);
+			// "T a, b = 1, c;" declares each name with the type the first one has.
+			// A star binds to the name it precedes, so a pointer would need its own
+			// rule, and locals of pointer type are not lowered anyway.
+			while (at(TokenKind::Comma)) {
+				if (declaration.type.isPointer || declaration.type.arrayLength) {
+					throw CompileError("several declarators after a pointer or an array are not lowered yet");
 				}
-			} else {
-				std::vector<ExpressionPtr> none;
-				declaration.initializer = constructWithConstructor(declaration.type, none, line());
+				advance();
+				auto next = std::make_unique<Statement>();
+				next->kind = StatementKind::DeclarationStatement;
+				next->line = line();
+				VariableDeclaration another;
+				another.type = declaration.type;
+				if (kind() != TokenKind::Identifier) {
+					throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+				}
+				another.name = std::string(advance().text);
+				declareLocal(another.name);
+				parseLocalInitializer(another);
+				next->declaration = std::move(another);
+				_declaratorTail.push_back(std::move(next));
 			}
 
 			expect(TokenKind::Semicolon, "after a declaration");
@@ -2938,12 +2989,7 @@ StatementPtr Parser::parseSwitchStatement() {
 			continue;
 		}
 
-		StatementPtr child = parseStatement();
-		if (kase) {
-			kase->body.push_back(std::move(child));
-		} else {
-			statement->switchPreamble.push_back(std::move(child));
-		}
+		appendStatement(kase ? kase->body : statement->switchPreamble);
 	}
 
 	expect(TokenKind::RBrace, "to close a switch body");
