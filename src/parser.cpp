@@ -2308,6 +2308,7 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 	expect(TokenKind::LBracket, "to open an attribute list");
 	expect(TokenKind::LBracket, "to open an attribute");
 
+	std::set<std::string> seen;
 	while (!at(TokenKind::EndOfFile)) {
 		if (match(TokenKind::RBracket)) {
 			break;
@@ -2319,6 +2320,13 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		}
 
 		const std::string name(advance().text);
+
+		// [[user]], [[depth]], [[sample_mask]] and the interpolation attributes say
+		// more than once in their own words, where the field is parsed.
+		if (!seen.insert(name).second && name != "user" && name != "depth" && name != "sample_mask"
+			&& !interpolationFromName(name)) {
+			throw CompileError("attribute \"" + name + "\" cannot appear more than once on a declaration");
+		}
 
 		std::optional<uint32_t> argument;
 		std::string identifier;
