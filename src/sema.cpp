@@ -1159,7 +1159,8 @@ Id TypeTable::one(Id type) {
 Id TypeTable::image(ResourceKind kind) {
 	Id& cached = _images[kind];
 	if (cached == InvalidId) {
-		const uint32_t dimension = kind == ResourceKind::TextureCube ? spirv::Dim::Cube : spirv::Dim::Dim2D;
+		const uint32_t dimension = kind == ResourceKind::TextureCube ? spirv::Dim::Cube
+			: kind == ResourceKind::Texture3D ? spirv::Dim::Dim3D : spirv::Dim::Dim2D;
 		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::Float),
 			dimension, 2u, 0u, 0u, 1u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
@@ -2088,7 +2089,7 @@ namespace {
 		Id emitTextureCall(const Expression& call);
 		Id emitTextureSample(const Expression& call, const Binding& texture);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
-		Id emitTextureSize(const Expression& call, const Binding& texture, bool width);
+		Id emitTextureSize(const Expression& call, const Binding& texture, uint32_t component);
 		Id texturePixels(const Binding& texture, Id sampled);
 		Id emitLod(const Expression& expression, const std::string& callName);
 		const StructDecl* structValue(const Type& type) const;
@@ -6089,12 +6090,12 @@ namespace {
 			if (method != "get_width" || !call.arguments.empty()) {
 				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
 			}
-			return emitTextureSize(call, texture, true);
+			return emitTextureSize(call, texture, 0);
 		}
 		if (texture.pointeeMsl.textureAccess == TextureAccess::Read) {
 			if (method == "read") return emitTextureRead(call, texture);
 			if (method == "get_width" || method == "get_height") {
-				return emitTextureSize(call, texture, method == "get_width");
+				return emitTextureSize(call, texture, method == "get_width" ? 0 : 1);
 			}
 			throw CompileError("access::read textures lower only read(), get_width() and get_height(); \""
 				+ method + "\" is not lowered yet");
@@ -6110,15 +6111,35 @@ namespace {
 			return emitTextureRead(call, texture);
 		}
 		if (method == "get_width" || method == "get_height") {
-			return emitTextureSize(call, texture, method == "get_width");
+			return emitTextureSize(call, texture, method == "get_width" ? 0 : 1);
+		}
+		if (method == "get_depth" && texture.pointeeMsl.resource == ResourceKind::Texture3D) {
+			return emitTextureSize(call, texture, 2);
 		}
 
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
-			"sample, read, get_width and get_height");
+			"sample, read, get_width, get_height and, on a texture3d, get_depth");
+	}
+
+	// The components of a coordinate that addresses a texel of an image of this
+	// kind. A cube's coordinate is a direction, three wide, but its size is two.
+	static uint32_t textureCoordinateWidth(ResourceKind kind) {
+		switch (kind) {
+			case ResourceKind::Texture2D: return 2;
+			case ResourceKind::TextureCube: return 3;
+			case ResourceKind::Texture3D: return 3;
+			case ResourceKind::None:
+			case ResourceKind::Sampler: break;
+		}
+		throw CompileError(std::string("\"") + resourceKindName(kind) + "\" has no texel coordinate");
+	}
+
+	static uint32_t textureSizeWidth(ResourceKind kind) {
+		return kind == ResourceKind::TextureCube ? 2 : textureCoordinateWidth(kind);
 	}
 
 	// sample(sampler, float2 coordinate [, level(lod)]), or a float3 coordinate on a
-	// texturecube. A fragment function takes
+	// texturecube or texture3d. A fragment function takes
 	// the level from the derivatives, which is OpImageSampleImplicitLod; a vertex
 	// or kernel function has none, so it samples level 0 with an explicit lod,
 	// and so does a sampler with pixel coordinates, which Vulkan does not allow
@@ -6140,19 +6161,20 @@ namespace {
 		}
 		const Binding& sampler = *samplerBinding;
 
-		const bool cube = texture.pointeeMsl.resource == ResourceKind::TextureCube;
-		if (cube && sampler.unnormalizedSampler) {
-			throw CompileError("a texturecube cannot be sampled with a coord::pixel sampler: Vulkan allows "
-				"unnormalized coordinates on 1D and 2D image views only. A sampler parameter is not "
-				"checked, since its state is the host's");
+		const ResourceKind kind = texture.pointeeMsl.resource;
+		if (kind != ResourceKind::Texture2D && sampler.unnormalizedSampler) {
+			throw CompileError(std::string("a ") + resourceKindName(kind) + " cannot be sampled with a "
+				"coord::pixel sampler: Vulkan allows unnormalized coordinates on 1D and 2D image views "
+				"only. A sampler parameter is not checked, since its state is the host's");
 		}
-		const Id coordinateVector = _types.vector(ScalarKind::Float, cube ? 3 : 2);
+		const uint32_t width = textureCoordinateWidth(kind);
+		const Id coordinateVector = _types.vector(ScalarKind::Float, width);
 		Id coordinate = emitExpression(*arguments[1]);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		if (coordinateType != coordinateVector) {
 			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
-				throw CompileError(std::string("the coordinate of sample has to be a ")
-					+ (cube ? "float3" : "float2") + " or a number");
+				throw CompileError("the coordinate of sample has to be a float" + std::to_string(width)
+					+ " or a number");
 			}
 			coordinate = broadcast(coordinate, coordinateVector);
 		}
@@ -6207,8 +6229,10 @@ namespace {
 		return texturePixels(texture, sampled);
 	}
 
-	// read(uint2 coordinate [, lod]): a texel by integer coordinate, with no
-	// sampler. access::read storage images take no lod. Metal takes uint2 and ushort2 and rejects int2 and float2.
+	// read(uint2 coordinate [, lod]), or a uint3 coordinate on a texture3d: a texel
+	// by integer coordinate, with no sampler. access::read storage images take no lod.
+	// Metal takes uint and ushort vectors
+	// and rejects int and float ones.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
 		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Read;
@@ -6220,15 +6244,17 @@ namespace {
 				+ std::to_string(arguments.size()));
 		}
 
+		const uint32_t width = textureCoordinateWidth(texture.pointeeMsl.resource);
 		Id coordinate = emitExpression(*arguments[0]);
 		const Id coordinateType = _builder.typeOf(coordinate);
-		const bool unsignedPair = _types.vectorWidth(coordinateType) == 2
+		const bool unsignedVector = _types.vectorWidth(coordinateType) == width
 			&& !_types.isFloat(coordinateType) && !_types.isSignedInt(coordinateType)
 			&& (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
-		if (!unsignedPair) {
-			throw CompileError("the coordinate of read has to be a uint2 or a ushort2");
+		if (!unsignedVector) {
+			throw CompileError("the coordinate of read has to be a uint" + std::to_string(width)
+				+ " or a ushort" + std::to_string(width));
 		}
-		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
+		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
 
 		if (storage) {
 			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
@@ -6244,9 +6270,10 @@ namespace {
 		return texturePixels(texture, fetched);
 	}
 
-	// get_width() and get_height(), of level 0 or of the lod given.
-	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, bool width) {
-		const std::string name = width ? "get_width" : "get_height";
+	// get_width(), get_height() and get_depth() (component 0, 1 and 2 of the
+	// size), of level 0 or of the lod given.
+	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, uint32_t component) {
+		const std::string& name = call.left->memberName;
 		const bool readOnly = texture.pointeeMsl.textureAccess == TextureAccess::Read;
 		if (readOnly && !call.arguments.empty()) {
 			throw CompileError("mip arguments are unsupported on access::read textures; " + name + " takes no arguments");
@@ -6267,9 +6294,9 @@ namespace {
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		const Id size = _builder.emitTyped(storage ? spirv::OpImageQuerySize : spirv::OpImageQuerySizeLod,
-			_types.vector(ScalarKind::UInt, 2),
+			_types.vector(ScalarKind::UInt, textureSizeWidth(texture.pointeeMsl.resource)),
 			storage ? std::vector<uint32_t>{ image } : std::vector<uint32_t>{ image, lod });
-		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, width ? 0u : 1u });
+		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, component });
 	}
 
 	// A mip level argument: any number, converted to the uint the instruction takes.
