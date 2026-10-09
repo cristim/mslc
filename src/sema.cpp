@@ -6195,6 +6195,8 @@ namespace {
 			} else if (const auto named = field.attributes.userName
 				? locnLocation(*field.attributes.userName) : std::nullopt) {
 				locations.emplace_back(*named);
+			} else if (field.attributes.pointSize) {
+				locations.emplace_back(std::nullopt);
 			} else {
 				while (claimed.count(next) != 0) {
 					++next;
@@ -6217,6 +6219,7 @@ namespace {
 		std::vector<StageVariable> variables;
 		const std::vector<std::optional<uint32_t>> locations = stageLocations(decl);
 		bool hasPosition = false;
+		bool hasPointSize = false;
 
 		for (size_t index = 0; index < decl.fields.size(); ++index) {
 			const StructField& field = decl.fields[index];
@@ -6247,6 +6250,26 @@ namespace {
 			if (field.attributes.position && interpolation != Interpolation::None) {
 				throw CompileError(what + " is [[position]], which cannot also have an interpolation attribute");
 			}
+			if (field.attributes.pointSize) {
+				if (isInput) {
+					throw CompileError(what + " has [[point_size]] on a fragment input, which mslc does not lower yet");
+				}
+				if (field.attributes.position) {
+					throw CompileError(what + " has an incompatible point_size attribute combination");
+				}
+				if (field.attributes.userName || interpolation != Interpolation::None) {
+					throw CompileError(what + " combines point_size with user or interpolation, which mslc does not lower");
+				}
+				if (hasPointSize) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[point_size]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::Float || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[point_size]], which has to be a scalar float");
+				}
+				hasPointSize = true;
+			}
 
 			const StageVariable variable = declareStageVariable(field.type, storageClass, what);
 			const bool integral = !_types.isFloat(variable.interfaceType);
@@ -6263,6 +6286,10 @@ namespace {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
 					static_cast<uint32_t>(isInput ? spirv::BuiltIn::FragCoord : spirv::BuiltIn::Position) });
+			} else if (field.attributes.pointSize) {
+				_builder.emit(spirv::OpDecorate, { variable.variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::PointSize) });
 			} else {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::Location), *locations[index] });
@@ -6324,6 +6351,10 @@ namespace {
 			}
 			if (field.attributes.position) {
 				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
+					"struct cannot carry");
+			}
+			if (field.attributes.pointSize) {
+				throw CompileError(what + " has [[point_size]], which a vertex function's [[stage_in]] "
 					"struct cannot carry");
 			}
 			if (field.attributes.interpolation != Interpolation::None || field.attributes.colorIndex) {
@@ -6433,6 +6464,9 @@ namespace {
 			if (field.attributes.position || field.attributes.attributeIndex) {
 				throw CompileError(what + " has [[position]] or [[attribute(n)]], which is not valid on "
 					"a fragment output");
+			}
+			if (field.attributes.pointSize) {
+				throw CompileError(what + " has [[point_size]], which is only valid on a vertex output");
 			}
 			if (!field.attributes.colorIndex) {
 				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
@@ -6613,7 +6647,7 @@ namespace {
 				const auto locations = stageLocations(*decl);
 				for (size_t index = 0; index < decl->fields.size(); ++index) {
 					const StructField& field = decl->fields[index];
-					if (!field.attributes.position) {
+					if (!field.attributes.position && !field.attributes.pointSize) {
 						fields.push_back({ field.attributes.userName.value_or(field.name),
 							typeName(field.type), *locations[index] });
 					}

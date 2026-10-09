@@ -2264,6 +2264,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("a struct field has more than one [[sample_mask]] attribute");
 			}
 			attributes.sampleMask = true;
+		} else if (name == "point_size") {
+			if (attributes.pointSize) {
+				throw CompileError("a struct field has more than one [[point_size]] attribute");
+			}
+			attributes.pointSize = true;
 		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
@@ -2293,7 +2298,7 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[user(name)]] and the "
+				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
@@ -2321,10 +2326,10 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 
 		const std::string name(advance().text);
 
-		// [[user]], [[depth]], [[sample_mask]] and the interpolation attributes say
-		// more than once in their own words, where the field is parsed.
+		// [[user]], [[depth]], [[sample_mask]], [[point_size]] and the interpolation
+		// attributes say more than once in their own words, where the field is parsed.
 		if (!seen.insert(name).second && name != "user" && name != "depth" && name != "sample_mask"
-			&& !interpolationFromName(name)) {
+			&& name != "point_size" && !interpolationFromName(name)) {
 			throw CompileError("attribute \"" + name + "\" cannot appear more than once on a declaration");
 		}
 
@@ -2333,6 +2338,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		if (at(TokenKind::LParen)) {
 			if (name == "sample_mask") {
 				throw CompileError("[[sample_mask]] takes no argument");
+			}
+			if (name == "point_size") {
+				throw CompileError("[[point_size]] takes no argument");
 			}
 			advance();
 			if (name == "user" || name == "depth") {

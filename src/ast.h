@@ -379,6 +379,9 @@ struct FieldAttributes {
 	std::optional<DepthMode> depthMode;
 	bool sampleMask = false;
 
+	// [[point_size]]: the field is the vertex output's BuiltIn PointSize.
+	bool pointSize = false;
+
 	// [[user(name)]]: the name Apple pairs a vertex output with a fragment input
 	// by, in place of the field's own name.
 	std::optional<std::string> userName;
