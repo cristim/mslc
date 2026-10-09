@@ -2493,6 +2493,10 @@ StatementPtr Parser::parseStatement() {
 		return parseWhileStatement();
 	}
 
+	if (atKeyword("switch")) {
+		return parseSwitchStatement();
+	}
+
 	if (atKeyword("return")) {
 		return parseReturnStatement();
 	}
@@ -2513,6 +2517,22 @@ StatementPtr Parser::parseStatement() {
 		const std::string keyword(advance().text);
 		statement->kind = keyword == "break" ? StatementKind::Break : StatementKind::Continue;
 		expect(TokenKind::Semicolon, "after a jump statement");
+		return statement;
+	}
+
+	// The one attribute a statement carries is the fall-through marker, which
+	// lowers to nothing: a case's block already branches to the next, and the
+	// attribute only tells the reader the fall-through is meant.
+	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
+		&& lookahead(2).kind == TokenKind::Identifier && lookahead(2).text == "fallthrough"
+		&& lookahead(3).kind == TokenKind::RBracket && lookahead(4).kind == TokenKind::RBracket) {
+		advance();
+		advance();
+		advance();
+		advance();
+		advance();
+		expect(TokenKind::Semicolon, "after a [[fallthrough]] attribute");
+		statement->kind = StatementKind::ExpressionStatement;
 		return statement;
 	}
 
@@ -2851,6 +2871,63 @@ StatementPtr Parser::parseWhileStatement() {
 	expect(TokenKind::RParen, "after a while condition");
 
 	statement->whileBody = parseBody();
+
+	return statement;
+}
+
+// A switch parses into a flat list of labels, each holding the statements up
+// to the next label: the block structure the lowering wants is one block per
+// label, branching to the next for a fall-through. Statements before the first
+// label are reachable from nowhere, as C++ says, and are kept in the preamble.
+StatementPtr Parser::parseSwitchStatement() {
+	auto statement = std::make_unique<Statement>();
+	statement->kind = StatementKind::Switch;
+	statement->line = line();
+	const LocalScope locals(*this);
+
+	expectKeyword("switch", "at the start of a switch");
+	expect(TokenKind::LParen, "after 'switch'");
+	statement->expression = parseExpression();
+	expect(TokenKind::RParen, "after a switch selector");
+
+	// C++ takes any statement for a body, but a case label can only live inside
+	// a block, so the block is the only body that holds a switch's meaning.
+	if (!at(TokenKind::LBrace)) {
+		throw CompileError("a switch body needs braces around its case labels");
+	}
+	advance();
+
+	SwitchCase* kase = nullptr;
+	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		if (atKeyword("case")) {
+			advance();
+			SwitchCase next;
+			next.line = line();
+			next.value = parseAssignment();
+			expect(TokenKind::Colon, "after a case value");
+			statement->switchCases.push_back(std::move(next));
+			kase = &statement->switchCases.back();
+			continue;
+		}
+		if (atKeyword("default")) {
+			advance();
+			SwitchCase next;
+			next.line = line();
+			expect(TokenKind::Colon, "after 'default'");
+			statement->switchCases.push_back(std::move(next));
+			kase = &statement->switchCases.back();
+			continue;
+		}
+
+		StatementPtr child = parseStatement();
+		if (kase) {
+			kase->body.push_back(std::move(child));
+		} else {
+			statement->switchPreamble.push_back(std::move(child));
+		}
+	}
+
+	expect(TokenKind::RBrace, "to close a switch body");
 
 	return statement;
 }

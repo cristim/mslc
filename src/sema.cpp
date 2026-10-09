@@ -445,6 +445,15 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) collectIdentifiers(*nested, names);
 		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) collectIdentifiers(*kase.value, names);
+			for (const StatementPtr& child: kase.body) {
+				collectIdentifiers(*child, names);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectIdentifiers(*child, names);
+		}
 	}
 
 	// The identifiers a body names where no parameter or local of that name is in
@@ -467,7 +476,8 @@ namespace {
 		if (!statement) return;
 		// A compound statement and a for loop open a scope; a declaration belongs to
 		// the one around it.
-		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For;
+		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For
+			|| statement->kind == StatementKind::Switch;
 		if (opensScope) scopes.emplace_back();
 		collectUnshadowed(statement->expression.get(), scopes, names);
 		collectUnshadowed(statement->whileCondition.get(), scopes, names);
@@ -487,6 +497,15 @@ namespace {
 		for (const Statement* nested: { statement->thenBranch.get(), statement->elseBranch.get(),
 			statement->forBody.get(), statement->whileBody.get() }) {
 			collectUnshadowed(nested, scopes, names);
+		}
+		for (const StatementPtr& child: statement->switchPreamble) {
+			collectUnshadowed(child.get(), scopes, names);
+		}
+		for (const SwitchCase& kase: statement->switchCases) {
+			collectUnshadowed(kase.value.get(), scopes, names);
+			for (const StatementPtr& child: kase.body) {
+				collectUnshadowed(child.get(), scopes, names);
+			}
 		}
 		if (opensScope) scopes.pop_back();
 	}
@@ -1395,6 +1414,20 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 
 namespace {
 
+	// SPIR-V constant operands cannot contain arithmetic or runtime loads.
+	struct FoldedConstant {
+		bool isComposite = false;
+		Id type = InvalidId;
+		std::vector<Id> parts;
+
+		// Floats are rounded to their own width; integers are sign- or zero-extended
+		// after truncation, so casting a signed value to int64_t preserves its value.
+		ScalarKind scalar = ScalarKind::Void;
+		double number = 0.0;
+		uint64_t integer = 0;
+		bool boolean = false;
+	};
+
 	// A name bound in the function being emitted. The value's SPIR-V type is
 	// recorded in the builder, so this only tracks what a name refers to.
 	struct Binding {
@@ -1428,6 +1461,7 @@ namespace {
 		// True for a sampler declared with coord::pixel. Vulkan forbids an
 		// implicit-lod lookup through an unnormalized sampler.
 		bool unnormalizedSampler = false;
+		std::optional<FoldedConstant> folded;
 	};
 
 	// A constexpr sampler of the entry point being emitted. Samplers with equal
@@ -1457,28 +1491,6 @@ namespace {
 	struct ConstantBinding {
 		Id id = InvalidId;
 		const StructDecl* structType = nullptr;
-	};
-
-	// A file-scope "constant" folded to a value. SPIR-V takes only constants as a
-	// constant's operands, so an initialiser that refers to an earlier constant
-	// or does arithmetic has to be folded here rather than emitted as the
-	// expression it was written as.
-	struct FoldedConstant {
-		// A composite: the type it was declared as, and the constants making it
-		// up, which have already been emitted.
-		bool isComposite = false;
-		Id type = InvalidId;
-		std::vector<Id> parts;
-
-		// A scalar: the kind to declare it as, and its value. A float or half
-		// is a double that holds exactly what its own width does; an integer is
-		// its 64 bits, reduced to the kind's width and then sign-extended for a
-		// signed kind or zero-extended for an unsigned one, so that a signed
-		// value reads back through a cast to int64_t.
-		ScalarKind scalar = ScalarKind::Void;
-		double number = 0.0;
-		uint64_t integer = 0;
-		bool boolean = false;
 	};
 
 	// A scalar constant as the kind it is declared with. An integer wraps to the
@@ -1585,6 +1597,34 @@ namespace {
 		}
 	}
 
+	// Whether an integer case value is one the selector's type holds, which C++
+	// asks of a case label where a braced initialiser asks it of a value.
+	bool fitsInKind(const FoldedConstant& constant, ScalarKind to) {
+		const uint32_t width = mappingFor(to).width;
+		if (isSignedInteger(constant.scalar)) {
+			const int64_t value = static_cast<int64_t>(constant.integer);
+			if (isSignedInteger(to)) {
+				if (width >= 64) {
+					return true;
+				}
+				const int64_t low = -(int64_t{ 1 } << (width - 1));
+				const int64_t high = (int64_t{ 1 } << (width - 1)) - 1;
+				return value >= low && value <= high;
+			}
+			if (value < 0) {
+				return false;
+			}
+			return width >= 64 || static_cast<uint64_t>(value) <= ((uint64_t{ 1 } << width) - 1);
+		}
+
+		const uint64_t value = constant.integer;
+		if (isSignedInteger(to)) {
+			return width >= 64 ? static_cast<int64_t>(value) >= 0
+				: value <= ((uint64_t{ 1 } << (width - 1)) - 1);
+		}
+		return width >= 64 || value <= ((uint64_t{ 1 } << width) - 1);
+	}
+
 	// An Input or Output variable carrying one value across a stage boundary: a
 	// returned value, or one field of a returned or [[stage_in]] struct. The
 	// variable's type can differ from the value's, because a half crosses as a
@@ -1642,6 +1682,17 @@ namespace {
 			if (*branch) {
 				collectCalls(**branch, out);
 			}
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) {
+				collectCalls(*kase.value, out);
+			}
+			for (const StatementPtr& child: kase.body) {
+				collectCalls(*child, out);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectCalls(*child, out);
 		}
 	}
 
@@ -1990,6 +2041,7 @@ namespace {
 		void checkStageInterfacesAgree() const;
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
+		void emitSwitch(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
@@ -1998,7 +2050,7 @@ namespace {
 		void requireStorable(const Expression& target) const;
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
-		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
@@ -4568,10 +4620,11 @@ namespace {
 				const auto local = _bindings.find(expression.name);
 				if (local != _bindings.end()) {
 					const auto value = _localFolded.find(local->second.id);
-					if (value == _localFolded.end()) {
+					if (value != _localFolded.end()) { return value->second; }
+					if (!local->second.folded) {
 						throw CompileError("a local in this initializer is not a supported constant expression");
 					}
-					return value->second;
+					return *local->second.folded;
 				}
 				// Declaration order is what makes this resolvable, and the module's
 				// constants are declared in the order the source declares them.
@@ -5452,6 +5505,11 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
 				reserveLocalSamplers(*nested, used);
+			}
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				reserveLocalSamplers(*child, used);
 			}
 		}
 	}
@@ -6429,7 +6487,7 @@ namespace {
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
-	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
+	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
 			return;
@@ -6455,7 +6513,7 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
-		if (declaration.type.isConstexpr && declaration.initializer
+		if (!storageOnly && declaration.type.isConstexpr && declaration.initializer
 			&& declaration.initializer->kind == ExpressionKind::InitList) {
 			const auto validate = [&](const auto& self, const Expression& expression) -> void {
 				if (expression.kind == ExpressionKind::InitList) {
@@ -6468,22 +6526,24 @@ namespace {
 		}
 
 		Id initial = InvalidId;
-		if (declaration.initializer) {
+		if (!storageOnly && declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
 				? emitInitListValue(declaration.type, *declaration.initializer)
 				: emitExpression(*declaration.initializer);
 			initial = convertImplicit(initializer, typeId);
-		} else {
+		} else if (!storageOnly) {
 			initial = _types.zero(typeId);
 		}
 
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
 		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
-		_builder.emit(spirv::OpStore, { id, initial });
+		if (!storageOnly) {
+			_builder.emit(spirv::OpStore, { id, initial });
+		}
 
 		bindLocal(declaration.name, id, typeId, declaration.type);
-		if (declaration.initializer && !_types.isAggregate(typeId)
+		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
 			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
 			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
@@ -6507,6 +6567,15 @@ namespace {
 					const FoldedConstant converted = convertConstant(folded, to);
 					if (!isFloatKind(to) || std::isfinite(converted.number)) { _localFolded[id] = converted; }
 				}
+			}
+		}
+		if (!storageOnly && declaration.type.isConst && declaration.initializer
+			&& declaration.type.namedType.empty() && declaration.type.isScalar()
+			&& !isFloatKind(declaration.type.scalar)) {
+			try {
+				_bindings[declaration.name].folded = foldInitializer(declaration.type, *declaration.initializer);
+			} catch (const CompileError&) {
+				// A const local may have a runtime initializer without being a constant expression.
 			}
 		}
 	}
@@ -6789,6 +6858,151 @@ namespace {
 		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
+	// A switch is a selection: OpSelectionMerge names the block after the body,
+	// and OpSwitch sends the selector to one case's block, each of which
+	// branches to the next for a fall-through or, through a break, to the merge.
+	// A switch with no default sends every unmatched value to the merge.
+	void Emitter::emitSwitch(const Statement& statement) {
+		Id selector = emitExpression(*statement.expression);
+		const Id emittedType = _builder.typeOf(selector);
+
+		// The selector arrives as a value, so its MSL type is recovered from the
+		// SPIR-V one. A bool is an integer type C++ accepts here; OpSwitch does
+		// not, so it switches on the bool's int value, 1 or 0.
+		const std::optional<ScalarKind> selectorKind = _types.scalarKindOf(emittedType);
+		if (!selectorKind || isFloatKind(*selectorKind)) {
+			const auto diagnosticKind = selectorKind ? selectorKind
+				: _types.scalarKindOf(_types.componentOf(emittedType));
+			std::string name = diagnosticKind ? std::string(scalarKindName(*diagnosticKind)) : "void";
+			if (diagnosticKind && _types.vectorWidth(emittedType) > 1) {
+				name += std::to_string(_types.vectorWidth(emittedType));
+			}
+			throw CompileError("statement requires expression of integer type ('" + name + "' invalid)");
+		}
+
+		const ScalarKind kind = promotedKind(*selectorKind);
+		if (kind != *selectorKind) {
+			selector = convert(selector, emittedType, _intType);
+		}
+
+		const Id mergeLabel = _builder.nextId();
+		Id defaultLabel = InvalidId;
+		std::vector<Id> labels(statement.switchCases.size());
+		std::vector<uint64_t> literals(statement.switchCases.size(), 0);
+
+		for (Id& label: labels) {
+			label = _builder.nextId();
+		}
+
+		std::set<uint64_t> seen;
+		{
+			const BindingScope validationScope(_bindings);
+			for (const StatementPtr& child: statement.switchPreamble) {
+				if (child->kind == StatementKind::DeclarationStatement) {
+					const auto& declaration = *child->declaration;
+					if (!statement.switchCases.empty() && (declaration.initializer
+						|| declaration.type.resource == ResourceKind::Sampler)) {
+						throw CompileError("switch label bypasses variable initialization");
+					}
+					_bindings[declaration.name] = Binding{};
+				}
+			}
+			for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+				const SwitchCase& kase = statement.switchCases[i];
+				if (!kase.value) {
+					if (defaultLabel != InvalidId) {
+						throw CompileError("multiple default labels in one switch");
+					}
+					defaultLabel = labels[i];
+				} else {
+					FoldedConstant folded;
+					try {
+						folded = foldExpression(*kase.value);
+					} catch (const CompileError&) {
+						throw CompileError("case value is not a constant expression");
+					}
+					if (folded.isComposite || isFloatKind(folded.scalar)) {
+						throw CompileError("case value is not an integer constant expression");
+					}
+					// A bool case value is its int value, as the selector is.
+					if (folded.scalar == ScalarKind::Bool) {
+						folded.scalar = ScalarKind::Int;
+						folded.integer = folded.boolean ? 1 : 0;
+					}
+
+					if (!fitsInKind(folded, kind)) {
+						throw CompileError("case value evaluates to " + integerText(folded)
+							+ ", which cannot be narrowed to type '" + scalarKindName(kind) + "'");
+					}
+
+					literals[i] = normalizeInteger(kind, folded.integer);
+					if (!seen.insert(literals[i]).second) {
+						FoldedConstant asSelector;
+						asSelector.scalar = kind;
+						asSelector.integer = literals[i];
+						throw CompileError("duplicate case value '" + integerText(asSelector) + "'");
+					}
+				}
+				for (const StatementPtr& child: kase.body) {
+					if (child->kind == StatementKind::DeclarationStatement) {
+						const auto& declaration = *child->declaration;
+						if (i + 1 < statement.switchCases.size() && (declaration.initializer
+							|| declaration.type.resource == ResourceKind::Sampler)) {
+							throw CompileError("switch label bypasses variable initialization");
+						}
+						_bindings[declaration.name] = Binding{};
+					}
+				}
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			if (child->kind == StatementKind::DeclarationStatement) {
+				emitVariableDeclaration(*child->declaration, true);
+			}
+		}
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		std::vector<uint32_t> operands = {
+			selector, defaultLabel != InvalidId ? defaultLabel : mergeLabel };
+		const uint32_t width = mappingFor(kind).width;
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			if (!statement.switchCases[i].value) {
+				continue;
+			}
+			// A literal is as wide as the selector: two words for a 64-bit one.
+			operands.push_back(static_cast<uint32_t>(literals[i]));
+			if (width > 32) {
+				operands.push_back(static_cast<uint32_t>(literals[i] >> 32));
+			}
+			operands.push_back(labels[i]);
+		}
+		terminate(spirv::OpSwitch, operands);
+
+		const ControlDepthScope depth(_controlDepth);
+		// A break leaves the switch; a continue belongs to the loop around it,
+		// which is what a target with no continue label tells the jump lowering.
+		_jumpTargets.push_back({ mergeLabel, InvalidId });
+		struct PopTarget {
+			std::vector<JumpTarget>& targets;
+			~PopTarget() { targets.pop_back(); }
+		} popTarget{ _jumpTargets };
+
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			beginBlock(labels[i]);
+			for (const StatementPtr& child: statement.switchCases[i].body) {
+				if (_terminated) {
+					if (child->kind == StatementKind::DeclarationStatement) {
+						emitVariableDeclaration(*child->declaration, true);
+					}
+					continue;
+				}
+				emitStatement(*child);
+			}
+			branchUnlessTerminated(i + 1 < labels.size() ? labels[i + 1] : mergeLabel);
+		}
+
+		beginBlock(mergeLabel);
+	}
+
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
 			case StatementKind::Compound: {
@@ -6949,6 +7163,13 @@ namespace {
 				}
 				terminate(spirv::OpKill, {});
 				return;
+			case StatementKind::Switch: {
+				// A local declared under one label is visible under the ones after
+				// it, as C++ says, so the whole body shares one scope.
+				const BindingScope scope(_bindings);
+				emitSwitch(statement);
+				return;
+			}
 		}
 	}
 
