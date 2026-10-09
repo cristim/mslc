@@ -2076,6 +2076,11 @@ void Parser::parseResourceType(Type& type) {
 		component = typeName(channel);
 	} else {
 		advance();
+		Type alias;
+		if (!_enumTypes.count(component) && resolveTypeName(component, alias) && !alias.isVector() && !alias.isMatrix() && alias.namedType.empty()) {
+			alias.isConst = false;
+			component = typeName(alias);
+		}
 	}
 	if (component != "float" && component != "half" && component != "uint") {
 		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
