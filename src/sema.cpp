@@ -2097,6 +2097,7 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		void rejectBoolReference(const std::string& name, const Binding& binding) const;
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
+		void validateConstexprBraces(const VariableDeclaration& declaration);
 		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
@@ -6747,6 +6748,24 @@ namespace {
 		}
 	}
 
+	// A constexpr brace initializer has to be made of constants. This is checked
+	// for a declaration that is never reached too, which is invalid all the same.
+	void Emitter::validateConstexprBraces(const VariableDeclaration& declaration) {
+		if (!declaration.type.isConstexpr || !declaration.initializer
+			|| declaration.initializer->kind != ExpressionKind::InitList) {
+			return;
+		}
+
+		const auto validate = [&](const auto& self, const Expression& expression) -> void {
+			if (expression.kind == ExpressionKind::InitList) {
+				for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
+			} else if (!canFoldExpression(expression, declaration.name)) {
+				throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
+			}
+		};
+		validate(validate, *declaration.initializer);
+	}
+
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
@@ -6778,16 +6797,8 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
-		if (!storageOnly && declaration.type.isConstexpr && declaration.initializer
-			&& declaration.initializer->kind == ExpressionKind::InitList) {
-			const auto validate = [&](const auto& self, const Expression& expression) -> void {
-				if (expression.kind == ExpressionKind::InitList) {
-					for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
-				} else if (!canFoldExpression(expression, declaration.name)) {
-					throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
-				}
-			};
-			validate(validate, *declaration.initializer);
+		if (!storageOnly) {
+			validateConstexprBraces(declaration);
 		}
 
 		Id initial = InvalidId;
@@ -7130,6 +7141,14 @@ namespace {
 		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
+	// What stands for the value of a constexpr that is never reached: only that it
+	// is a constant matters to the declarations after it, not what it holds.
+	static FoldedConstant placeholderConstant(const Type& type) {
+		FoldedConstant constant;
+		constant.scalar = type.scalar;
+		return constant;
+	}
+
 	// A switch is a selection: OpSelectionMerge names the block after the body,
 	// and OpSwitch sends the selector to one case's block, each of which
 	// branches to the next for a fall-through or, through a break, to the merge.
@@ -7263,7 +7282,12 @@ namespace {
 			for (const StatementPtr& child: statement.switchCases[i].body) {
 				if (_terminated) {
 					if (child->kind == StatementKind::DeclarationStatement) {
+						validateConstexprBraces(*child->declaration);
 						emitVariableDeclaration(*child->declaration, true);
+						if (child->declaration->type.isConstexpr) {
+							_localFolded[_bindings[child->declaration->name].id]
+								= placeholderConstant(child->declaration->type);
+						}
 					}
 					continue;
 				}
@@ -7283,7 +7307,17 @@ namespace {
 				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
 					if (_terminated) {
-						break;
+						if (child->kind == StatementKind::DeclarationStatement) {
+							validateConstexprBraces(*child->declaration);
+							// Its name still counts as a constant for the declarations after it.
+							if (child->declaration->type.isConstexpr) {
+								Binding dead;
+								dead.id = _builder.nextId();
+								_localFolded[dead.id] = placeholderConstant(child->declaration->type);
+								_bindings[child->declaration->name] = dead;
+							}
+						}
+						continue;
 					}
 					emitStatement(*child);
 				}
