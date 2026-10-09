@@ -1867,6 +1867,10 @@ namespace {
 		}
 	}
 
+	// Which component of an image size a get_* call reads. An enum class, not a
+	// number or bool, so a call written against another signature fails to compile.
+	enum class SizeComponent : uint32_t { Width = 0, Height = 1, Depth = 2, ArraySize = 2 };
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -2051,7 +2055,7 @@ namespace {
 		Id emitTextureCall(const Expression& call);
 		Id emitTextureSample(const Expression& call, const Binding& texture);
 		Id emitTextureRead(const Expression& call, const Binding& texture);
-		Id emitTextureSize(const Expression& call, const Binding& texture, uint32_t component);
+		Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
 		Id appendArrayLayer(Id coordinate, ScalarKind component, const Expression& layer,
 			const std::string& callName);
 		Id texturePixels(const Binding& texture, Id sampled);
@@ -5941,7 +5945,7 @@ namespace {
 			if (method != "get_width" || !call.arguments.empty()) {
 				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
 			}
-			return emitTextureSize(call, texture, 0);
+			return emitTextureSize(call, texture, SizeComponent::Width);
 		}
 		if (method == "sample") {
 			return emitTextureSample(call, texture);
@@ -5954,16 +5958,17 @@ namespace {
 			return emitTextureRead(call, texture);
 		}
 		if (method == "get_width" || method == "get_height") {
-			return emitTextureSize(call, texture, method == "get_width" ? 0 : 1);
+			return emitTextureSize(call, texture,
+				method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
 		}
 		if (method == "get_depth" && texture.pointeeMsl.resource == ResourceKind::Texture3D) {
-			return emitTextureSize(call, texture, 2);
+			return emitTextureSize(call, texture, SizeComponent::Depth);
 		}
 		if (method == "get_array_size" && texture.pointeeMsl.resource == ResourceKind::Texture2DArray) {
 			if (!call.arguments.empty()) {
 				throw CompileError("get_array_size takes no arguments; the layer count has no mip level");
 			}
-			return emitTextureSize(call, texture, 2);
+			return emitTextureSize(call, texture, SizeComponent::ArraySize);
 		}
 
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
@@ -5975,6 +5980,7 @@ namespace {
 	// this kind. A texture2d_array takes its layer as a separate argument, so its
 	// coordinate is two wide and its size three; a cube's coordinate is a
 	// direction, three wide, and its size two.
+	// Only texture kinds reach here: textureReceiver has already rejected the rest.
 	static uint32_t textureCoordinateWidth(ResourceKind kind) {
 		switch (kind) {
 			case ResourceKind::Texture2D: return 2;
@@ -6147,7 +6153,7 @@ namespace {
 
 	// get_width(), get_height() and get_depth() or get_array_size() (component 0,
 	// 1 and 2 of the size), of level 0 or of the lod given.
-	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, uint32_t component) {
+	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component) {
 		const std::string& name = call.left->memberName;
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "
@@ -6167,7 +6173,7 @@ namespace {
 		const Id size = _builder.emitTyped(storage ? spirv::OpImageQuerySize : spirv::OpImageQuerySizeLod,
 			_types.vector(ScalarKind::UInt, textureSizeWidth(texture.pointeeMsl.resource)),
 			storage ? std::vector<uint32_t>{ image } : std::vector<uint32_t>{ image, lod });
-		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, component });
+		return _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, static_cast<uint32_t>(component) });
 	}
 
 	// A mip level argument: any number, converted to the uint the instruction takes.
