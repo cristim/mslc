@@ -1221,8 +1221,8 @@ void Parser::declareLocal(const std::string& name) {
 			"that name, which mslc does not support");
 	}
 
-	if (!_locals.empty()) {
-		_locals.back().insert(name);
+	if (!_locals.empty() && !_locals.back().insert(name).second) {
+		throw CompileError("redefinition of \"" + name + "\" in the same scope");
 	}
 }
 
@@ -2483,12 +2483,14 @@ StatementPtr Parser::parseBody() {
 	}
 
 	const NestingScope scope(*this);
+	const LocalScope locals(*this);
 	StatementPtr body = parseStatement();
-	if (_declaratorTail.empty()) {
+	if (_declaratorTail.empty() && body->kind != StatementKind::DeclarationStatement) {
 		return body;
 	}
 
-	// "if (c) int a, b;" is one declaration in a scope of its own.
+	// "if (c) int a, b;" is one declaration in a scope of its own, and so is a
+	// lone one: without a block its name would replace the enclosing one.
 	auto block = std::make_unique<Statement>();
 	block->kind = StatementKind::Compound;
 	block->line = body->line;
