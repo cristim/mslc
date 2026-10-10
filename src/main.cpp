@@ -76,6 +76,9 @@ namespace {
 			"  -I <dir>              also search <dir> for a quoted #include (repeatable)\n"
 			"  -E                    print the preprocessed source and exit\n"
 			"      --dump-tokens   print the token stream and exit\n"
+			"      --compile-library\n"
+			"                       compile an empty translation unit to a Universal\n"
+			"                       SPIR-V 1.5 Linkage library, not a Vulkan executable\n"
 			"      --version         print the library version\n");
 	}
 
@@ -107,6 +110,12 @@ int main(int argc, char** argv) {
 	bool validate = false;
 	bool dumpTokens = false;
 	bool preprocessOnly = false;
+	bool compileLibrary = false;
+	// Recorded separately from the options themselves, because an empty library
+	// has to be refused whichever order the arguments arrive in: deciding from
+	// the value would not tell "--stage kernel" from the default.
+	bool stageGiven = false;
+	bool localSizeGiven = false;
 	std::vector<std::string> includeDirs;
 
 	for (int i = 1; i < argc; ++i) {
@@ -126,11 +135,15 @@ int main(int argc, char** argv) {
 				std::fprintf(stderr, "mslc: unknown stage \"%s\"\n", argv[i]);
 				return 2;
 			}
+			stageGiven = true;
 		} else if (argument == "--local-size") {
 			if (i + 3 >= argc) { usage(); return 2; }
 			options.localSizeX = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 			options.localSizeY = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 			options.localSizeZ = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+			localSizeGiven = true;
+		} else if (argument == "--compile-library") {
+			compileLibrary = true;
 		} else if (argument == "-V" || argument == "--validate") {
 			validate = true;
 		} else if (argument == "-I") {
@@ -160,6 +173,42 @@ int main(int argc, char** argv) {
 	if (!input) {
 		usage();
 		return 2;
+	}
+
+	// Checked after the whole command line is read, so the refusal does not
+	// depend on which of --compile-library and the flag came first.
+	if (compileLibrary) {
+		// An empty library carries no entry point, so a stage, a workgroup size
+		// and a reflection document all describe something it does not have.
+		// --stage is also refused where its value is the inferred default, since
+		// "no stage" and "asked for no stage" are the same request here.
+		if (stageGiven) {
+			std::fprintf(stderr, "mslc: --compile-library does not take --stage; an empty "
+				"library has no entry point\n");
+			return 2;
+		}
+		if (localSizeGiven) {
+			std::fprintf(stderr, "mslc: --compile-library does not take --local-size; an "
+				"empty library has no workgroup\n");
+			return 2;
+		}
+		if (!reflectionPath.empty()) {
+			std::fprintf(stderr, "mslc: --compile-library does not take --reflect; an empty "
+				"library has no entry point to describe\n");
+			return 2;
+		}
+		// Both of these print something other than the module, so they would
+		// write no library at all.
+		if (preprocessOnly) {
+			std::fprintf(stderr, "mslc: --compile-library does not take -E, which prints the "
+				"preprocessed source instead of a module\n");
+			return 2;
+		}
+		if (dumpTokens) {
+			std::fprintf(stderr, "mslc: --compile-library does not take --dump-tokens, which "
+				"prints the token stream instead of a module\n");
+			return 2;
+		}
 	}
 
 	std::string source;
@@ -216,8 +265,13 @@ int main(int argc, char** argv) {
 	char* reflection = nullptr;
 	char* error = nullptr;
 
-	const int result = mslc_translate(source.data(), source.size(), &options,
-		&spirv, &spirvSize, reflectionPath.empty() ? nullptr : &reflection, &error);
+	// An empty library is not a Vulkan executable, so it goes through the other
+	// entry point. The API decides what an eligible empty translation unit is;
+	// nothing here re-implements that check.
+	const int result = compileLibrary
+		? mslc_compile_library(source.data(), source.size(), &options, &spirv, &spirvSize, &error)
+		: mslc_translate(source.data(), source.size(), &options,
+			&spirv, &spirvSize, reflectionPath.empty() ? nullptr : &reflection, &error);
 
 	if (result != 0) {
 		reportError(input, error ? error : "unknown error");
@@ -243,7 +297,13 @@ int main(int argc, char** argv) {
 		// Run spirv-val as a separate step rather than linking SPIRV-Tools
 		// into the library, so a build without it still works. Spawned without
 		// a shell so the output path needs no quoting.
-		const char* arguments[] = { "spirv-val", "--target-env", "vulkan1.3", output.c_str(), nullptr };
+		//
+		// An empty library is a Linkage object with no Vulkan interface, so it is
+		// validated against Universal SPIR-V 1.5. Validating it as vulkan1.3
+		// would reject an artifact that is correct for what it is, and would
+		// make -V say FAIL about a file the compiler was asked to produce.
+		const char* target = compileLibrary ? "spv1.5" : "vulkan1.3";
+		const char* arguments[] = { "spirv-val", "--target-env", target, output.c_str(), nullptr };
 		pid_t child = 0;
 		int status = 0;
 		const bool ran = posix_spawnp(&child, "spirv-val", nullptr, nullptr,
