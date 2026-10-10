@@ -2104,7 +2104,7 @@ void Parser::parseResourceType(Type& type) {
 			throw CompileError("expected an access qualifier name after \"access::\"");
 		}
 		access = std::string(advance().text);
-		if (access != "sample" && !(name == "texture2d" && component == "uint" && access == "write")) {
+		if (access != "sample" && !(name == "texture2d" && component == "uint" && (access == "write" || access == "read"))) {
 			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
 				"access::sample, which is the default");
 		}
@@ -2112,10 +2112,11 @@ void Parser::parseResourceType(Type& type) {
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
 	type.resource = name == "texturecube" ? ResourceKind::TextureCube : ResourceKind::Texture2D;
-	if (component == "uint" && !(name == "texture2d" && access == "write")) {
-		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::write");
+	if (component == "uint" && !(name == "texture2d" && (access == "write" || access == "read"))) {
+		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::read or access::write");
 	}
-	type.textureAccess = access == "write" ? TextureAccess::Write : TextureAccess::Sample;
+	type.textureAccess = access == "write" ? TextureAccess::Write
+		: access == "read" ? TextureAccess::Read : TextureAccess::Sample;
 	type.scalar = component == "uint" ? ScalarKind::UInt
 		: component == "half" ? ScalarKind::Half : ScalarKind::Float;
 }
