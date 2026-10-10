@@ -85,9 +85,17 @@ if(NOT EXISTS "${lib}")
 	message(FATAL_ERROR "--compile-library reported success but wrote no ${lib}:\n${output}")
 endif()
 
-# 2. It is a Universal SPIR-V 1.5 Linkage object.
+# 2. It is a Universal SPIR-V 1.5 Linkage object, and it is not a Vulkan
+#    executable.
+#
+#    The Vulkan half is deliberately NOT asserted as "vulkan1.3 rejects it".
+#    That is a property of the installed SPIRV-Tools, not of the artifact:
+#    SPIRV-Tools 2026.4 refuses it with "Capability Linkage is not allowed by
+#    Vulkan 1.3", and older releases accept it, so the assertion fails on CI
+#    for a reason that has nothing to do with this compiler. What makes the
+#    module a library rather than an executable is the Linkage capability and
+#    the absence of an entry point, both checked from the disassembly below.
 validate_file("${lib}" spv1.5 TRUE "--compile-library on the empty translation unit")
-validate_file("${lib}" vulkan1.3 FALSE "--compile-library on the empty translation unit")
 
 execute_process(
 	COMMAND "${SPIRV_DIS}" "${lib}"
@@ -104,7 +112,9 @@ foreach(needle IN ITEMS "OpCapability Linkage" "OpMemoryModel PhysicalStorageBuf
 		message(FATAL_ERROR "the library disassembly lacks \"${needle}\":\n${disassembly}")
 	endif()
 endforeach()
-# No entry point: that is what makes it a library rather than a shader.
+# No entry point: that is what makes it a library rather than a shader. The
+# Linkage capability above is the other half of that statement, and together
+# they are what the removed vulkan1.3 rejection was standing in for.
 string(FIND "${disassembly}" "OpEntryPoint" at)
 if(NOT at EQUAL -1)
 	message(FATAL_ERROR "an empty library must declare no entry point:\n${disassembly}")
