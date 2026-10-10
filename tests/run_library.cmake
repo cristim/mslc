@@ -211,26 +211,110 @@ endif()
 # 8. A library links with a compiler-produced shader, and the result is a valid
 #    Vulkan executable. This is the property the capability exists for.
 find_program(SPIRV_LINK spirv-link)
-if(SPIRV_LINK)
-	set(linked "${OUT_DIR}/linked.spv")
-	file(REMOVE "${linked}")
+set(linked "${OUT_DIR}/linked.spv")
+file(REMOVE "${linked}")
+execute_process(
+	COMMAND "${SPIRV_LINK}" "${lib}" "${shader}" -o "${linked}"
+	RESULT_VARIABLE status
+	OUTPUT_VARIABLE output
+	ERROR_VARIABLE output
+)
+if(NOT status EQUAL 0)
+	message(FATAL_ERROR "spirv-link could not link the library with the shader:\n${output}")
+endif()
+validate_file("${linked}" vulkan1.3 TRUE "the linked library and shader")
+execute_process(COMMAND "${SPIRV_DIS}" "${linked}" OUTPUT_VARIABLE disassembly ERROR_VARIABLE disassembly)
+	string(FIND "${disassembly}" "\"addone\"" at)
+	if(at EQUAL -1)
+		message(FATAL_ERROR "the linked module lost the shader's entry point:\n${disassembly}")
+	endif()
+# spirv-link ships in the same SPIRV-Tools package as spirv-val and spirv-dis,
+# which are already required above. A missing spirv-link therefore means a broken
+# toolchain rather than an environment without it, and skipping here would let
+# the summary below claim a link that was never attempted.
+if(NOT SPIRV_LINK)
+	message(FATAL_ERROR "run_library.cmake: spirv-link not found; the library-links-with-a-shader "
+		"check is the point of this mode and cannot be skipped")
+endif()
+
+set(linked "${OUT_DIR}/linked.spv")
+file(REMOVE "${linked}")
+execute_process(
+	COMMAND "${SPIRV_LINK}" "${lib}" "${shader}" -o "${linked}"
+	RESULT_VARIABLE status
+	OUTPUT_VARIABLE output
+	ERROR_VARIABLE output
+)
+if(NOT status EQUAL 0)
+	message(FATAL_ERROR "spirv-link could not link the library with the shader:\n${output}")
+endif()
+validate_file("${linked}" vulkan1.3 TRUE "the linked library and shader")
+execute_process(COMMAND "${SPIRV_DIS}" "${linked}" OUTPUT_VARIABLE disassembly ERROR_VARIABLE disassembly)
+string(FIND "${disassembly}" "\"addone\"" at)
+if(at EQUAL -1)
+	message(FATAL_ERROR "the linked module lost the shader's entry point:\n${disassembly}")
+endif()
+
+# 9. Each mode passes the target environment it claims.
+#
+#    Comparing validator outcomes cannot do this. For a module mslc produces,
+#    spv1.5 and vulkan1.3 accept exactly the same executables: every mslc module
+#    needs SPIR-V 1.5 (PhysicalStorageBufferAddresses) and carries nothing that
+#    only Vulkan allows, so a module accepted by one is accepted by the other.
+#    Forcing the executable branch to spv1.5 therefore passes every outcome
+#    check in this file, which is why it was pinned by observing the arguments
+#    instead.
+#
+#    A recording shim earlier on PATH captures the --target-env the CLI chose.
+#    The shim always succeeds, so this asserts what was requested rather than
+#    what any validator thinks; the real checks above use the real spirv-val.
+set(shim_dir "${OUT_DIR}/shim")
+file(MAKE_DIRECTORY "${shim_dir}")
+file(WRITE "${shim_dir}/spirv-val"
+"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${shim_dir}/argv.txt\"\nexit 0\n")
+execute_process(COMMAND chmod +x "${shim_dir}/spirv-val")
+
+function(record_target_env expected_mode)
+	file(REMOVE "${shim_dir}/argv.txt")
+	# PATH is prepended so the shim is the spirv-val the CLI spawns.
+	set(env "PATH=${shim_dir}:$ENV{PATH}")
+	if(expected_mode STREQUAL "library")
+		# A library only accepts an empty translation unit, so the two modes are
+		# driven by different inputs as well as different flags.
+		set(args --compile-library)
+		set(input "${empty}")
+	else()
+		set(args "")
+		set(input "${OUT_DIR}/library_kernel.metal")
+	endif()
 	execute_process(
-		COMMAND "${SPIRV_LINK}" "${lib}" "${shader}" -o "${linked}"
+		COMMAND "${CMAKE_COMMAND}" -E env "${env}" "${MSLC}" ${args} -V
+			-o "${OUT_DIR}/shim_out.spv" "${input}"
 		RESULT_VARIABLE status
 		OUTPUT_VARIABLE output
 		ERROR_VARIABLE output
 	)
 	if(NOT status EQUAL 0)
-		message(FATAL_ERROR "spirv-link could not link the library with the shader:\n${output}")
+		message(FATAL_ERROR "the shimmed -V run failed for ${expected_mode} mode:\n${output}")
 	endif()
-	validate_file("${linked}" vulkan1.3 TRUE "the linked library and shader")
-	execute_process(COMMAND "${SPIRV_DIS}" "${linked}" OUTPUT_VARIABLE disassembly ERROR_VARIABLE disassembly)
-	string(FIND "${disassembly}" "\"addone\"" at)
+	if(NOT EXISTS "${shim_dir}/argv.txt")
+		message(FATAL_ERROR "the shimmed -V run never invoked spirv-val:\n${output}")
+	endif()
+	file(READ "${shim_dir}/argv.txt" recorded)
+	string(STRIP "${recorded}" recorded)
+	if(expected_mode STREQUAL "library")
+		set(want "spv1.5")
+	else()
+		set(want "vulkan1.3")
+	endif()
+	string(FIND "${recorded}" "--target-env ${want}" at)
 	if(at EQUAL -1)
-		message(FATAL_ERROR "the linked module lost the shader's entry point:\n${disassembly}")
+		message(FATAL_ERROR "expected --target-env ${want} for ${expected_mode} mode, the CLI asked for: ${recorded}")
 	endif()
-else()
-	message(STATUS "spirv-link not found; skipping the library-links-with-a-shader check")
-endif()
+endfunction()
+
+record_target_env("executable")
+record_target_env("library")
 
 message(STATUS "library: empty translation unit compiles, validates as Universal SPIR-V 1.5, links with a shader")
+message(STATUS "library: each mode validates under its own target environment")
