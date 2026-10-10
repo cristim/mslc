@@ -786,6 +786,22 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 	return structure;
 }
 
+spirv::Id TypeTable::matrixReferenceStruct(spirv::Id matrixType) {
+	const auto cached = _matrixReferenceStructs.find(matrixType);
+	if (cached != _matrixReferenceStructs.end()) {
+		return cached->second;
+	}
+
+	const Id structure = _builder.emitDecl(spirv::OpTypeStruct, { matrixType });
+	_builder.emit(spirv::OpDecorate, { structure, static_cast<uint32_t>(spirv::Decoration::Block) });
+	_builder.emit(spirv::OpMemberDecorate, { structure, 0,
+		static_cast<uint32_t>(spirv::Decoration::Offset), 0u });
+	decorateMatrixMember(structure, 0, matrixType);
+
+	_matrixReferenceStructs.emplace(matrixType, structure);
+	return structure;
+}
+
 spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 	for (const auto& [key, id]: _pointers) {
 		if (id == pointerType) {
@@ -1910,6 +1926,8 @@ namespace {
 		std::vector<Id> _bufferMembers;
 		// The bool or bool vector type of a member that holds one by reference.
 		std::map<uint32_t, Id> _bufferBoolTypes;
+		// The matrix type of a member that holds one by reference, wrapped in a struct.
+		std::map<uint32_t, Id> _bufferMatrixTypes;
 		// The binding-0 block, and the loaded buffer pointer for each member.
 		TypeTable::AddressBlock _addressBlock;
 		std::map<uint32_t, Id> _bufferBases;
@@ -2650,6 +2668,18 @@ namespace {
 		// an access chain has to match its base.
 		if (binding.bufferPointeeType != InvalidId) {
 			const Id base = bufferBase(binding);
+
+			// A matrix reference holds the address of the matrix itself, so an index
+			// names one of its columns.
+			if (!binding.isBuffer) {
+				if (const auto* matrix = _types.matrixInfo(binding.pointeeType)) {
+					const Id column = _builder.emitTyped(spirv::OpAccessChain,
+						_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, matrix->column),
+						{ base, index });
+					return asAddress ? column : loadFromBuffer(column, matrix->column);
+				}
+			}
+
 			const bool packed = binding.pointeeMsl.isPacked;
 			const bool bytes = _types.isBool(binding.pointeeType);
 			const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
@@ -2679,6 +2709,12 @@ namespace {
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(binding.storageClass, elementType),
 			{ binding.id, index });
+
+		// A reference local bound to a place in a buffer holds that place's address,
+		// so a load through it carries the buffer's Aligned operand.
+		if (binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
+			return asAddress ? address : loadFromBuffer(address, elementType);
+		}
 
 		return asAddress ? address : loadFrom(address, elementType);
 	}
@@ -5528,12 +5564,6 @@ namespace {
 		} else {
 			// A matrix's layout is a MatrixStride, which SPIR-V only allows on a
 			// struct member, and a buffer reached directly is not wrapped in one.
-			if (parameter.type.isMatrix() && !parameter.type.isPointer) {
-				throw CompileError("parameter \"" + parameter.name + "\" is a " + typeName(parameter.type)
-					+ " reached by reference, which is not lowered yet; pass a pointer to it, "
-						"or put it in a struct");
-			}
-
 			pointeeType = declaredTypeOf(parameter.type);
 		}
 
@@ -5546,6 +5576,11 @@ namespace {
 		Id bufferPointee = pointeeType;
 		// A bool is a byte in a buffer, so the reference's own memory is that byte (or
 		// the bytes of a bool vector), mapped back to a bool where it is used.
+		const bool matrixReference = !parameter.type.isPointer && parameter.type.isMatrix();
+		if (matrixReference) {
+			// { matrix m; }: the matrix is member 0, which carries its layout.
+			bufferPointee = _types.matrixReferenceStruct(pointeeType);
+		}
 		const bool boolReference = !parameter.type.isPointer && _types.isBool(pointeeType);
 		if (boolReference) {
 			bufferPointee = _types.boolStorage(pointeeType);
@@ -5564,6 +5599,9 @@ namespace {
 		_bufferMembers.push_back(bufferPointee);
 		if (boolReference) {
 			_bufferBoolTypes[memberIndex] = pointeeType;
+		}
+		if (matrixReference) {
+			_bufferMatrixTypes[memberIndex] = pointeeType;
 		}
 
 		// The block is emitted after the loop, once every member is known.
@@ -6174,7 +6212,14 @@ namespace {
 			const Id memberAddress = _builder.emitTyped(spirv::OpAccessChain,
 				_types.pointer(spirv::StorageClass::Uniform, memberType),
 				{ _addressBlock.variable, constantU32(static_cast<uint32_t>(k)) });
-			const Id base = _builder.emitTyped(spirv::OpLoad, memberType, { memberAddress });
+			Id base = _builder.emitTyped(spirv::OpLoad, memberType, { memberAddress });
+			const auto matrixType = _bufferMatrixTypes.find(static_cast<uint32_t>(k));
+			if (matrixType != _bufferMatrixTypes.end()) {
+				// The base of the reference is the matrix inside its wrapper struct.
+				base = _builder.emitTyped(spirv::OpAccessChain,
+					_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, matrixType->second),
+					{ base, constantU32(0) });
+			}
 			_bufferBases.emplace(static_cast<uint32_t>(k), base);
 			const auto boolType = _bufferBoolTypes.find(static_cast<uint32_t>(k));
 			if (boolType != _bufferBoolTypes.end()) {
@@ -7909,6 +7954,7 @@ namespace {
 			_bindings.clear();
 			_bufferMembers.clear();
 			_bufferBoolTypes.clear();
+			_bufferMatrixTypes.clear();
 			_bufferBases.clear();
 			_interface.clear();
 			_reflection.clear();
