@@ -1,5 +1,10 @@
 // EXPECT: valid
-// DISASM: %67 = OpLoad %v4float %58
+// %52 is the variable this module declares for v, and the shuffle must take the
+// value's lanes as the second operand and the old value as the first. The ids
+// are pinned to the ones this module declares, because the claim is which
+// variable the load names, not what number the id has.
+// DISASM: %52 = OpVariable %_ptr_Function_v4float Function
+// DISASM: %67 = OpLoad %v4float %52
 // DISASM: %68 = OpVectorShuffle %v4float %67 %66 4 5 2 3
 //
 // A store to .xy takes the value's two lanes (second operand) and keeps the old
