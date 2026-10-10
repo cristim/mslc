@@ -332,6 +332,12 @@ namespace {
 		Refract,
 		// Two three-component vectors.
 		Cross,
+		// Round to nearest with halves away from zero, which GLSL.std.450's Round
+		// leaves to the implementation, so it is built from Trunc, FAbs and FSign.
+		RoundHalfAway,
+		// -1, 0 or 1 with the zeros keeping their sign and a NaN giving 0, where
+		// GLSL.std.450's FSign leaves both open.
+		SignExact,
 	};
 
 	// GLSL.std.450 numbers its instructions from 1, so 0 marks a builtin with no
@@ -355,6 +361,9 @@ namespace {
 		{ "floor", 1, MathShape::Componentwise, 8, kNoInstruction, kNoInstruction },
 		{ "ceil", 1, MathShape::Componentwise, 9, kNoInstruction, kNoInstruction },
 		{ "fract", 1, MathShape::Componentwise, 10, kNoInstruction, kNoInstruction },
+		{ "round", 1, MathShape::RoundHalfAway, 3, kNoInstruction, kNoInstruction },
+		{ "rint", 1, MathShape::Componentwise, 2, kNoInstruction, kNoInstruction },
+		{ "sign", 1, MathShape::SignExact, 6, kNoInstruction, kNoInstruction },
 		{ "sin", 1, MathShape::Componentwise, 13, kNoInstruction, kNoInstruction },
 		{ "cos", 1, MathShape::Componentwise, 14, kNoInstruction, kNoInstruction },
 		{ "tan", 1, MathShape::Componentwise, 15, kNoInstruction, kNoInstruction },
@@ -2167,6 +2176,8 @@ namespace {
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
 		bool returnsVoid(const FunctionDecl& function) const;
+		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
+		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
@@ -4639,7 +4650,8 @@ namespace {
 		const uint32_t bits = _types.bitWidth(type);
 
 		const bool takesScalars = builtin.shape == MathShape::Componentwise
-			|| builtin.shape == MathShape::Saturate;
+			|| builtin.shape == MathShape::Saturate || builtin.shape == MathShape::RoundHalfAway
+			|| builtin.shape == MathShape::SignExact;
 		// Metal has no double, and GLSL.std.450's transcendentals take only 16 and
 		// 32 bits.
 		if (isFloat ? bits > 32 : !takesIntegers) {
@@ -4702,6 +4714,13 @@ namespace {
 			values.push_back(one);
 		}
 
+		if (builtin.shape == MathShape::RoundHalfAway) {
+			return emitRoundHalfAway(values[0], type, bits);
+		}
+		if (builtin.shape == MathShape::SignExact) {
+			return emitSignExact(values[0], type, bits);
+		}
+
 		const uint32_t instruction = isFloat ? builtin.floatInstruction
 			: isSigned ? builtin.signedInstruction : builtin.unsignedInstruction;
 		if (instruction == kNoInstruction) {
@@ -4719,6 +4738,67 @@ namespace {
 		std::vector<uint32_t> operands { _glslSet, instruction };
 		operands.insert(operands.end(), values.begin(), values.end());
 		return _builder.emitTyped(spirv::OpExtInst, result, operands);
+	}
+
+	// round(x): the whole number nearest x, a half going away from zero. Trunc
+	// gives the whole part; when the fraction is at least a half the result is one
+	// further along the sign of x. Infinity and NaN come out as themselves, since
+	// their fraction is NaN and so is never at least a half.
+	Id Emitter::emitRoundHalfAway(Id value, Id type, uint32_t bits) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+
+		const auto extended = [&](uint32_t instruction, Id operand) {
+			return _builder.emitTyped(spirv::OpExtInst, type, { _glslSet, instruction, operand });
+		};
+		constexpr uint32_t kTrunc = 3;
+		constexpr uint32_t kFAbs = 4;
+		constexpr uint32_t kFSign = 6;
+
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = width > 1 ? _types.componentOf(type) : type;
+		Id half = _builder.emitDeclTyped(spirv::OpConstant, component, { bits == 16 ? 0x3800u : 0x3F000000u });
+		if (width > 1) {
+			half = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+				std::vector<uint32_t>(width, half));
+		}
+
+		const Id whole = extended(kTrunc, value);
+		const Id fraction = _builder.emitTyped(spirv::OpFSub, type, { value, whole });
+		const Id magnitude = extended(kFAbs, fraction);
+		const Id boolType = width > 1 ? _types.vector(ScalarKind::Bool, width) : _boolType;
+		const Id atLeastHalf = _builder.emitTyped(spirv::OpFOrdGreaterThanEqual, boolType, { magnitude, half });
+		const Id further = _builder.emitTyped(spirv::OpFAdd, type, { whole, extended(kFSign, value) });
+		return _builder.emitTyped(spirv::OpSelect, type, { atLeastHalf, further, whole });
+	}
+
+	// sign(x): FSign, except that a zero keeps its own sign and a NaN gives 0.
+	Id Emitter::emitSignExact(Id value, Id type, uint32_t bits) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = width > 1 ? _types.componentOf(type) : type;
+		Id zero = _builder.emitDeclTyped(spirv::OpConstant, component, { 0u });
+		if (width > 1) {
+			zero = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+				std::vector<uint32_t>(width, zero));
+		}
+		static_cast<void>(bits);
+
+		constexpr uint32_t kFSign = 6;
+		const Id boolType = width > 1 ? _types.vector(ScalarKind::Bool, width) : _boolType;
+		const Id sign = _builder.emitTyped(spirv::OpExtInst, type, { _glslSet, kFSign, value });
+		const Id isZero = _builder.emitTyped(spirv::OpFOrdEqual, boolType, { value, zero });
+		const Id isNaN = _builder.emitTyped(spirv::OpIsNan, boolType, { value });
+		const Id keptZero = _builder.emitTyped(spirv::OpSelect, type, { isZero, value, sign });
+		return _builder.emitTyped(spirv::OpSelect, type, { isNaN, zero, keptZero });
 	}
 
 	// The constant a folded value becomes: a scalar as an OpConstant of its kind,
