@@ -6480,11 +6480,6 @@ namespace {
 					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
 					: what + " has [[sample_mask]], which is not valid on a vertex output");
 			}
-			if (field.attributes.attributeIndex) {
-				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
-					"on a struct crossing from the vertex to the fragment stage");
-			}
-
 			if (field.attributes.colorIndex) {
 				throw CompileError(isInput
 					? what + " is [[color(n)]] on a fragment input, which is framebuffer fetch: mslc does "
