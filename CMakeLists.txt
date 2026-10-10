@@ -263,3 +263,15 @@ add_test(NAME cli/arguments COMMAND ${CMAKE_COMMAND}
 	-DMSLC=$<TARGET_FILE:mslc-cli>
 	-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli
 	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cli.cmake)
+
+# --compile-library: an empty translation unit as a Universal SPIR-V 1.5 Linkage
+# object rather than a Vulkan executable. Kept apart from cli/arguments because
+# it validates the artifact under a different target environment, and it links
+# the result with a real shader, which is the property the mode exists for.
+add_test(NAME library/empty COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DTEST_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DSPIRV_DIS=${SPIRV_DIS}
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/library
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_library.cmake)
