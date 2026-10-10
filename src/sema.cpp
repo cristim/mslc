@@ -1908,6 +1908,8 @@ namespace {
 		// The pointee of every buffer parameter, in declaration order, which is
 		// what the binding-0 block is built from once the loop is done.
 		std::vector<Id> _bufferMembers;
+		// The bool or bool vector type of a member that holds one by reference.
+		std::map<uint32_t, Id> _bufferBoolTypes;
 		// The binding-0 block, and the loaded buffer pointer for each member.
 		TypeTable::AddressBlock _addressBlock;
 		std::map<uint32_t, Id> _bufferBases;
@@ -2112,7 +2114,6 @@ namespace {
 		ArithmeticConversion usualArithmeticConversion(Id leftType, Id rightType);
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
-		void rejectBoolReference(const std::string& name, const Binding& binding) const;
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
 		bool readsRuntimeValue(const Expression& expression) const;
@@ -2528,15 +2529,6 @@ namespace {
 		return convert(value, type, _boolType);
 	}
 
-	// A bool is stored as a byte, which an indexed buffer maps through boolAddress;
-	// the base of a reference parameter has no such mapping yet.
-	void Emitter::rejectBoolReference(const std::string& name, const Binding& binding) const {
-		if (_types.isBool(binding.pointeeType)) {
-			throw CompileError("\"" + name + "\" is a bool reference parameter, which is not lowered "
-				"yet; pass a pointer to it, or put it in a struct");
-		}
-	}
-
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		// The entry point's own names first, then the module's: a constant declared
 		// at file scope is not a parameter of the entry point that reads it.
@@ -2577,7 +2569,6 @@ namespace {
 
 			// A reference parameter names the one value its buffer holds, so its
 			// use as a value reads the whole of it.
-			rejectBoolReference(expression.name, binding);
 			const Id loaded = loadFromBuffer(bufferBase(binding), binding.pointeeType);
 			const Id declared = declaredTypeOf(binding.pointeeMsl);
 			return _builder.typeOf(loaded) == declared ? loaded : convertImplicit(loaded, declared);
@@ -5553,6 +5544,12 @@ namespace {
 		// wrapped in { T runtime_array[] } and the parameter indexes through
 		// that -- for a struct element as much as for a scalar one.
 		Id bufferPointee = pointeeType;
+		// A bool is a byte in a buffer, so the reference's own memory is that byte (or
+		// the bytes of a bool vector), mapped back to a bool where it is used.
+		const bool boolReference = !parameter.type.isPointer && _types.isBool(pointeeType);
+		if (boolReference) {
+			bufferPointee = _types.boolStorage(pointeeType);
+		}
 		bool isBuffer = false;
 		if (parameter.type.isPointer) {
 			bufferPointee = _types.blockStructFor(pointeeType, parameter.type.isPacked);
@@ -5565,6 +5562,9 @@ namespace {
 		// goes in the reflection.
 		const auto memberIndex = static_cast<uint32_t>(_bufferMembers.size());
 		_bufferMembers.push_back(bufferPointee);
+		if (boolReference) {
+			_bufferBoolTypes[memberIndex] = pointeeType;
+		}
 
 		// The block is emitted after the loop, once every member is known.
 		Binding binding;
@@ -6174,8 +6174,12 @@ namespace {
 			const Id memberAddress = _builder.emitTyped(spirv::OpAccessChain,
 				_types.pointer(spirv::StorageClass::Uniform, memberType),
 				{ _addressBlock.variable, constantU32(static_cast<uint32_t>(k)) });
-			_bufferBases.emplace(static_cast<uint32_t>(k),
-				_builder.emitTyped(spirv::OpLoad, memberType, { memberAddress }));
+			const Id base = _builder.emitTyped(spirv::OpLoad, memberType, { memberAddress });
+			_bufferBases.emplace(static_cast<uint32_t>(k), base);
+			const auto boolType = _bufferBoolTypes.find(static_cast<uint32_t>(k));
+			if (boolType != _bufferBoolTypes.end()) {
+				boolAddress(base, boolType->second);
+			}
 		}
 	}
 
@@ -6874,9 +6878,6 @@ namespace {
 			return;
 		}
 
-		if (place.kind == ExpressionKind::Identifier && rootBinding != _bindings.end()) {
-			rejectBoolReference(root.name, rootBinding->second);
-		}
 		const Id address = emitPlaceAddress(place);
 		const Id pointee = valueTypeAt(address);
 		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
@@ -7160,7 +7161,6 @@ namespace {
 			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
 				&& !it->second.isBuffer) {
 				// A reference parameter is the one value its buffer holds.
-				rejectBoolReference(left.name, it->second);
 				address = bufferBase(it->second);
 			} else {
 				address = emitExpression(left);
@@ -7908,6 +7908,7 @@ namespace {
 			// point's own, and the interface is the list this OpEntryPoint names.
 			_bindings.clear();
 			_bufferMembers.clear();
+			_bufferBoolTypes.clear();
 			_bufferBases.clear();
 			_interface.clear();
 			_reflection.clear();
