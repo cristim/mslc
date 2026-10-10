@@ -45,6 +45,7 @@ private:
 	// array of that struct steps by.
 	std::map<spirv::Id, uint32_t> _structSizes;
 	std::map<std::pair<spirv::Id, bool>, spirv::Id> _blockStructs;
+	std::map<spirv::Id, spirv::Id> _matrixReferenceStructs;
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
 	std::map<std::pair<uint32_t, uint32_t>, spirv::Id> _packedStorage;
@@ -187,6 +188,9 @@ public:
 	// element type and layout. A packed vector element steps by its components'
 	// total size, and an unpacked one by Metal's rule, which rounds a 3-vector up.
 	spirv::Id blockStructFor(spirv::Id elementType, bool packed);
+	// { matrix m; } as a Block: a matrix reached by reference, since its layout
+	// decorations belong to a struct member.
+	spirv::Id matrixReferenceStruct(spirv::Id matrixType);
 
 	// A pointer to a pointee in a buffer's own address space, which is what the
 	// binding-0 address block hands the shader. Idempotent per pointee.
