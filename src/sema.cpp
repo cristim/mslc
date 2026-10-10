@@ -7165,6 +7165,18 @@ namespace {
 			validateConstexprInitializer(declaration);
 		}
 
+		// The name is in scope in its own initializer, so the binding is installed
+		// before the initializer is looked up rather than after. "int value = value;"
+		// resolves the int being declared, whose slot is still uninitialized, which
+		// is what Apple accepts with only an uninitialized warning. Binding after
+		// the initializer resolved the outer name instead: a file-scope float4 named
+		// value made the initializer a scalar and the conversion was rejected with
+		// "a scalar cannot be converted to a vector".
+		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
+		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		bindLocal(declaration.name, id, typeId, declaration.type);
+
 		Id initial = InvalidId;
 		if (!storageOnly && declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
@@ -7175,14 +7187,10 @@ namespace {
 			initial = _types.zero(typeId);
 		}
 
-		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
-		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
-			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
 		if (!storageOnly) {
 			_builder.emit(spirv::OpStore, { id, initial });
 		}
 
-		bindLocal(declaration.name, id, typeId, declaration.type);
 		const Type& declared = declaration.type;
 		if (declaration.initializer && declared.isConst && !declared.isConstexpr && !declared.isPointer
 			&& !declared.isVector() && !declared.isMatrix() && declared.namedType.empty()
