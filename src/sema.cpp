@@ -6102,7 +6102,8 @@ namespace {
 		if (texture.pointeeMsl.textureAccess == TextureAccess::Read) {
 			if (method == "read") return emitTextureRead(call, texture);
 			if (method == "get_width" || method == "get_height") {
-				return emitTextureSize(call, texture, method == "get_width" ? 0 : 1);
+				return emitTextureSize(call, texture,
+					method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
 			}
 			throw CompileError("access::read textures lower only read(), get_width() and get_height(); \""
 				+ method + "\" is not lowered yet");
