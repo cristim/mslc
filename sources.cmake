@@ -13,7 +13,11 @@
 # embedder that include()s at the top level of its own CMakeLists.txt reads them
 # directly. PARENT_SCOPE would be wrong here, since there is no parent at top
 # level.
-include_guard(GLOBAL)
+#
+# include_guard() is the directory-scoped form rather than GLOBAL. GLOBAL would
+# let the first of two sibling directories that include this file take the lists
+# and leave the second with none, since the guard is not per directory.
+include_guard()
 set(MSLC_LIBRARY_SOURCES
 	${CMAKE_CURRENT_LIST_DIR}/src/lexer.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor.cpp
