@@ -1967,6 +1967,10 @@ namespace {
 		// The [[stage_in]] parameter and one Input per field.
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
+		// At most one BuiltIn FragCoord Input variable per fragment entry point,
+		// whether it comes from a stage-struct [[position]] field or a direct
+		// [[position]]/[[frag_coord]] parameter.
+		bool _hasFragCoordInput = false;
 
 		// A helper's body is emitted once per stage that reaches it.
 		struct HelperFunction {
@@ -5378,6 +5382,7 @@ namespace {
 						case ParameterAttributes::Builtin::InstanceID:
 							return spirv::BuiltIn::InstanceIndex;
 						case ParameterAttributes::Builtin::FragCoord:
+						case ParameterAttributes::Builtin::Position:
 							return spirv::BuiltIn::FragCoord;
 						case ParameterAttributes::Builtin::FrontFacing:
 							return spirv::BuiltIn::FrontFacing;
@@ -5422,6 +5427,26 @@ namespace {
 						+ (_entryPoint->stage == Stage::Kernel ? "kernel"
 							: _entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
 						+ " function (parameter \"" + parameter.name + "\")");
+				}
+
+				// A direct FragCoord-mapped parameter (either MSL spelling) has to
+				// declare a float4: nothing else reinterprets the builtin's fixed
+				// Vulkan type, so a narrower or wider declaration would silently
+				// alias or misread it. At most one FragCoord source (this
+				// parameter, another parameter, or a stage-struct [[position]]
+				// field) may exist per fragment entry point, since Vulkan forbids
+				// two Input variables decorated with the same BuiltIn.
+				if (spvBuiltin == spirv::BuiltIn::FragCoord) {
+					if (declaredTypeOf(parameter.type) != _types.vector(ScalarKind::Float, 4)) {
+						throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+							builtinName(*parameter.attributes.builtin) + "]], which has to be a float4");
+					}
+					if (_hasFragCoordInput) {
+						throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+							builtinName(*parameter.attributes.builtin) + "]], which collides with this "
+							"function's other fragment position input");
+					}
+					_hasFragCoordInput = true;
 				}
 
 				_builder.setSection(spirv::Section::Annotations);
@@ -6373,6 +6398,14 @@ namespace {
 				}
 				if (variable.valueType != _types.vector(ScalarKind::Float, 4)) {
 					throw CompileError(what + " is [[position]], which has to be a float4");
+				}
+
+				if (isInput) {
+					if (_hasFragCoordInput) {
+						throw CompileError(what + " is [[position]], which collides with this "
+							"function's other fragment position input");
+					}
+					_hasFragCoordInput = true;
 				}
 
 				hasPosition = true;
@@ -7889,6 +7922,7 @@ namespace {
 			_outputs.clear();
 			_stageIn = nullptr;
 			_stageInputs.clear();
+			_hasFragCoordInput = false;
 			_terminated = false;
 
 			emitEntryPoint(functionType);
