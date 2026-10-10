@@ -53,7 +53,7 @@ enum class ResourceKind {
 	Sampler,
 };
 
-enum class TextureAccess { Sample, Write };
+enum class TextureAccess { Sample, Write, Read };
 
 struct Type {
 	// Scalar base. For a named type, a pointer, or an array, the base is the
@@ -147,8 +147,15 @@ struct Parameter {
 	Type type;
 	std::string name;
 	ParameterAttributes attributes;
-	// Declared with "&". Only a [[stage_in]] parameter reads it.
+	// Declared with "&". On an entry point only a [[stage_in]] parameter reads
+	// it; a helper's non-const reference is the caller's variable.
 	bool isReference = false;
+
+	// A helper parameter that names the caller's variable, as opposed to a copy
+	// of it. A reference to const cannot change it, so it is passed as a copy.
+	bool isMutableReference() const {
+		return isReference && !type.isConst && type.resource == ResourceKind::None;
+	}
 };
 
 struct Expression;
@@ -246,6 +253,7 @@ enum class StatementKind {
 	If,
 	For,
 	While,
+	Switch,
 	Return,
 	Break,
 	Continue,
@@ -254,6 +262,15 @@ enum class StatementKind {
 
 struct Statement;
 using StatementPtr = std::unique_ptr<Statement>;
+
+// One label of a switch and the statements under it, up to the next label or
+// the end of the body. A default label has no value; the value of a case label
+// is the constant expression the selector is compared with.
+struct SwitchCase {
+	ExpressionPtr value;
+	std::vector<StatementPtr> body;
+	size_t line = 0;
+};
 
 enum class SamplerAddress { ClampToZero, ClampToEdge, Repeat, MirroredRepeat };
 enum class SamplerFilter { Nearest, Linear };
@@ -287,6 +304,9 @@ struct VariableDeclaration {
 	std::string name;
 	ExpressionPtr initializer;
 
+	// T& name = lvalue; : a name for the place the initialiser denotes.
+	bool isReference = false;
+
 	// A sampler local: the state its options spell.
 	std::optional<SamplerState> sampler;
 };
@@ -316,6 +336,11 @@ struct Statement {
 	// While
 	ExpressionPtr whileCondition;
 	StatementPtr whileBody;
+
+	// Switch: the selector is `expression`. Statements before the first label
+	// are unreachable, as C++ says, and the preamble is where they are kept.
+	std::vector<SwitchCase> switchCases;
+	std::vector<StatementPtr> switchPreamble;
 
 	size_t line = 0;
 };
@@ -353,6 +378,9 @@ struct FieldAttributes {
 	std::optional<uint32_t> colorIndex;
 	std::optional<DepthMode> depthMode;
 	bool sampleMask = false;
+
+	// [[point_size]]: the field is the vertex output's BuiltIn PointSize.
+	bool pointSize = false;
 
 	// [[user(name)]]: the name Apple pairs a vertex output with a fragment input
 	// by, in place of the field's own name.

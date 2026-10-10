@@ -245,14 +245,16 @@ namespace {
 	// pointer the address space is the pointee's, which is free to be device.
 	// A reference is valid MSL that mslc does not lower, so it gets its own diagnostic
 	// rather than an address-space one.
-	void rejectLocalQualifiers(const Type& type, bool isReference) {
-		if (isReference) {
+	void rejectLocalQualifiers(const Type& type, bool isReference, bool referenceAllowed = false) {
+		if (isReference && !referenceAllowed) {
 			throw CompileError("a reference in function scope is not lowered yet");
 		}
 		if (type.isStatic) {
 			throw CompileError("variables in function scope cannot be declared static");
 		}
-		if (!type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+		// A reference names a place that is already in its own address space, so
+		// "const device S &r = buffer[i];" is the one way to spell it.
+		if (!isReference && !type.isPointer && (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
 			throw CompileError(std::string("variables in function scope cannot be in the ")
 				+ addressSpaceName(type.addressSpace) + " address space");
 		}
@@ -1219,8 +1221,8 @@ void Parser::declareLocal(const std::string& name) {
 			"that name, which mslc does not support");
 	}
 
-	if (!_locals.empty()) {
-		_locals.back().insert(name);
+	if (!_locals.empty() && !_locals.back().insert(name).second) {
+		throw CompileError("redefinition of \"" + name + "\" in the same scope");
 	}
 }
 
@@ -2076,6 +2078,11 @@ void Parser::parseResourceType(Type& type) {
 		component = typeName(channel);
 	} else {
 		advance();
+		Type alias;
+		if (!_enumTypes.count(component) && resolveTypeName(component, alias) && !alias.isVector() && !alias.isMatrix() && alias.namedType.empty()) {
+			alias.isConst = false;
+			component = typeName(alias);
+		}
 	}
 	if (component != "float" && component != "half" && component != "uint") {
 		throw CompileError(name + "<" + component + "> is not lowered yet; mslc lowers the "
@@ -2097,7 +2104,7 @@ void Parser::parseResourceType(Type& type) {
 			throw CompileError("expected an access qualifier name after \"access::\"");
 		}
 		access = std::string(advance().text);
-		if (access != "sample" && !(name == "texture2d" && component == "uint" && access == "write")) {
+		if (access != "sample" && !(name == "texture2d" && component == "uint" && (access == "write" || access == "read"))) {
 			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
 				"access::sample, which is the default");
 		}
@@ -2105,10 +2112,11 @@ void Parser::parseResourceType(Type& type) {
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
 	type.resource = name == "texturecube" ? ResourceKind::TextureCube : ResourceKind::Texture2D;
-	if (component == "uint" && !(name == "texture2d" && access == "write")) {
-		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::write");
+	if (component == "uint" && !(name == "texture2d" && (access == "write" || access == "read"))) {
+		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::read or access::write");
 	}
-	type.textureAccess = access == "write" ? TextureAccess::Write : TextureAccess::Sample;
+	type.textureAccess = access == "write" ? TextureAccess::Write
+		: access == "read" ? TextureAccess::Read : TextureAccess::Sample;
 	type.scalar = component == "uint" ? ScalarKind::UInt
 		: component == "half" ? ScalarKind::Half : ScalarKind::Float;
 }
@@ -2149,14 +2157,13 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 			throw CompileError(what + "is a pointer, which a helper function does not take yet; "
 				"it takes scalar, vector, matrix and struct values");
 		}
-		if (param.isReference) {
-			throw CompileError(what + "is a reference, which a helper function does not take yet; "
-				"it takes scalar, vector, matrix and struct values");
-		}
 		if (param.type.arrayLength || (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket)) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
 		}
-		if (param.type.addressSpace != AddressSpace::None) {
+		// A reference to a thread variable may spell its space out; any other
+		// parameter has none to name.
+		if (param.type.addressSpace != AddressSpace::None
+			&& !(param.isReference && param.type.addressSpace == AddressSpace::Thread)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}
@@ -2258,6 +2265,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("a struct field has more than one [[sample_mask]] attribute");
 			}
 			attributes.sampleMask = true;
+		} else if (name == "point_size") {
+			if (attributes.pointSize) {
+				throw CompileError("a struct field has more than one [[point_size]] attribute");
+			}
+			attributes.pointSize = true;
 		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
@@ -2287,7 +2299,7 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[user(name)]] and the "
+				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
@@ -2302,6 +2314,7 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 	expect(TokenKind::LBracket, "to open an attribute list");
 	expect(TokenKind::LBracket, "to open an attribute");
 
+	std::set<std::string> seen;
 	while (!at(TokenKind::EndOfFile)) {
 		if (match(TokenKind::RBracket)) {
 			break;
@@ -2314,11 +2327,21 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 
 		const std::string name(advance().text);
 
+		// [[user]], [[depth]], [[sample_mask]], [[point_size]] and the interpolation
+		// attributes say more than once in their own words, where the field is parsed.
+		if (!seen.insert(name).second && name != "user" && name != "depth" && name != "sample_mask"
+			&& name != "point_size" && !interpolationFromName(name)) {
+			throw CompileError("attribute \"" + name + "\" cannot appear more than once on a declaration");
+		}
+
 		std::optional<uint32_t> argument;
 		std::string identifier;
 		if (at(TokenKind::LParen)) {
 			if (name == "sample_mask") {
 				throw CompileError("[[sample_mask]] takes no argument");
+			}
+			if (name == "point_size") {
+				throw CompileError("[[point_size]] takes no argument");
 			}
 			advance();
 			if (name == "user" || name == "depth") {
@@ -2426,13 +2449,74 @@ void Parser::measure(Expression& expression) const {
 	}
 }
 
+// The initialiser a local may have after its name: "= value", a braced list,
+// or constructor arguments. A const local has to have one.
+void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
+	if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
+		&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
+		throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
+	}
+
+	if (match(TokenKind::Assign)) {
+		declaration.initializer = parseInitializer();
+	} else if (at(TokenKind::LBrace)) {
+		declaration.initializer = parseInitializerList();
+	} else if (at(TokenKind::LParen)) {
+		// Direct initialisation, float3 specularTerm(0); . The name comes
+		// first here, so the list after it constructs the variable's own
+		// type rather than calling it, and the two spellings are the same
+		// value. Metal has no other form: "float3(0) specularTerm;" is a
+		// parse error there, which xcrun metal confirms.
+		advance();
+		const size_t atLine = line();
+		std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
+		declaration.initializer = constructWithConstructor(declaration.type, arguments, atLine);
+		if (!declaration.initializer) {
+			auto construct = std::make_unique<Expression>();
+			construct->kind = ExpressionKind::Construct;
+			construct->line = atLine;
+			construct->constructType = declaration.type;
+			construct->arguments = std::move(arguments);
+			measure(*construct);
+			declaration.initializer = std::move(construct);
+		}
+	} else {
+		std::vector<ExpressionPtr> none;
+		declaration.initializer = constructWithConstructor(declaration.type, none, line());
+	}
+}
+
+void Parser::appendStatement(std::vector<StatementPtr>& out) {
+	out.push_back(parseStatement());
+	for (StatementPtr& tail: _declaratorTail) {
+		out.push_back(std::move(tail));
+	}
+	_declaratorTail.clear();
+}
+
 StatementPtr Parser::parseBody() {
 	if (at(TokenKind::LBrace)) {
 		return parseCompoundStatement();
 	}
 
 	const NestingScope scope(*this);
-	return parseStatement();
+	const LocalScope locals(*this);
+	StatementPtr body = parseStatement();
+	if (_declaratorTail.empty() && body->kind != StatementKind::DeclarationStatement) {
+		return body;
+	}
+
+	// "if (c) int a, b;" is one declaration in a scope of its own, and so is a
+	// lone one: without a block its name would replace the enclosing one.
+	auto block = std::make_unique<Statement>();
+	block->kind = StatementKind::Compound;
+	block->line = body->line;
+	block->children.push_back(std::move(body));
+	for (StatementPtr& tail: _declaratorTail) {
+		block->children.push_back(std::move(tail));
+	}
+	_declaratorTail.clear();
+	return block;
 }
 
 StatementPtr Parser::parseCompoundStatement() {
@@ -2445,7 +2529,7 @@ StatementPtr Parser::parseCompoundStatement() {
 	expect(TokenKind::LBrace, "to open a block");
 
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
-		statement->children.push_back(parseStatement());
+		appendStatement(statement->children);
 	}
 
 	expect(TokenKind::RBrace, "to close a block");
@@ -2488,6 +2572,10 @@ StatementPtr Parser::parseStatement() {
 		return parseWhileStatement();
 	}
 
+	if (atKeyword("switch")) {
+		return parseSwitchStatement();
+	}
+
 	if (atKeyword("return")) {
 		return parseReturnStatement();
 	}
@@ -2508,6 +2596,22 @@ StatementPtr Parser::parseStatement() {
 		const std::string keyword(advance().text);
 		statement->kind = keyword == "break" ? StatementKind::Break : StatementKind::Continue;
 		expect(TokenKind::Semicolon, "after a jump statement");
+		return statement;
+	}
+
+	// The one attribute a statement carries is the fall-through marker, which
+	// lowers to nothing: a case's block already branches to the next, and the
+	// attribute only tells the reader the fall-through is meant.
+	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
+		&& lookahead(2).kind == TokenKind::Identifier && lookahead(2).text == "fallthrough"
+		&& lookahead(3).kind == TokenKind::RBracket && lookahead(4).kind == TokenKind::RBracket) {
+		advance();
+		advance();
+		advance();
+		advance();
+		advance();
+		expect(TokenKind::Semicolon, "after a [[fallthrough]] attribute");
+		statement->kind = StatementKind::ExpressionStatement;
 		return statement;
 	}
 
@@ -2533,7 +2637,15 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			declaration.type = parseType(true);
-			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
+			declaration.isReference = at(TokenKind::Ampersand);
+			rejectLocalQualifiers(declaration.type, declaration.isReference, true);
+			if (declaration.isReference) {
+				advance();
+				if (declaration.type.isPointer || declaration.type.arrayLength
+					|| declaration.type.resource != ResourceKind::None) {
+					throw CompileError("a reference to a pointer, an array or a resource is not lowered yet");
+				}
+			}
 
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
@@ -2541,43 +2653,45 @@ StatementPtr Parser::parseStatement() {
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
 
+			if (declaration.isReference) {
+				if (!match(TokenKind::Assign)) {
+					throw CompileError("the reference \"" + declaration.name + "\" needs an initialiser");
+				}
+				declaration.initializer = parseExpression();
+				statement->declaration = std::move(declaration);
+				expect(TokenKind::Semicolon, "after a reference declaration");
+				return statement;
+			}
+
 			if (declaration.type.resource != ResourceKind::None) {
 				parseSamplerLocal(declaration);
 				statement->declaration = std::move(declaration);
 				return statement;
 			}
 
-			if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
-				&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
-				throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
-			}
+			parseLocalInitializer(declaration);
 
-			if (match(TokenKind::Assign)) {
-				declaration.initializer = parseInitializer();
-			} else if (at(TokenKind::LBrace)) {
-				declaration.initializer = parseInitializerList();
-			} else if (at(TokenKind::LParen)) {
-				// Direct initialisation, float3 specularTerm(0); . The name comes
-				// first here, so the list after it constructs the variable's own
-				// type rather than calling it, and the two spellings are the same
-				// value. Metal has no other form: "float3(0) specularTerm;" is a
-				// parse error there, which xcrun metal confirms.
-				advance();
-				const size_t atLine = line();
-				std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
-				declaration.initializer = constructWithConstructor(declaration.type, arguments, atLine);
-				if (!declaration.initializer) {
-					auto construct = std::make_unique<Expression>();
-					construct->kind = ExpressionKind::Construct;
-					construct->line = atLine;
-					construct->constructType = declaration.type;
-					construct->arguments = std::move(arguments);
-					measure(*construct);
-					declaration.initializer = std::move(construct);
+			// "T a, b = 1, c;" declares each name with the type the first one has.
+			// A star binds to the name it precedes, so a pointer would need its own
+			// rule, and locals of pointer type are not lowered anyway.
+			while (at(TokenKind::Comma)) {
+				if (declaration.type.isPointer || declaration.type.arrayLength) {
+					throw CompileError("several declarators after a pointer or an array are not lowered yet");
 				}
-			} else {
-				std::vector<ExpressionPtr> none;
-				declaration.initializer = constructWithConstructor(declaration.type, none, line());
+				advance();
+				auto next = std::make_unique<Statement>();
+				next->kind = StatementKind::DeclarationStatement;
+				next->line = line();
+				VariableDeclaration another;
+				another.type = declaration.type;
+				if (kind() != TokenKind::Identifier) {
+					throw CompileError("expected a variable name, found " + std::string(tokenKindName(kind())));
+				}
+				another.name = std::string(advance().text);
+				declareLocal(another.name);
+				parseLocalInitializer(another);
+				next->declaration = std::move(another);
+				_declaratorTail.push_back(std::move(next));
 			}
 
 			expect(TokenKind::Semicolon, "after a declaration");
@@ -2846,6 +2960,58 @@ StatementPtr Parser::parseWhileStatement() {
 	expect(TokenKind::RParen, "after a while condition");
 
 	statement->whileBody = parseBody();
+
+	return statement;
+}
+
+// A switch parses into a flat list of labels, each holding the statements up
+// to the next label: the block structure the lowering wants is one block per
+// label, branching to the next for a fall-through. Statements before the first
+// label are reachable from nowhere, as C++ says, and are kept in the preamble.
+StatementPtr Parser::parseSwitchStatement() {
+	auto statement = std::make_unique<Statement>();
+	statement->kind = StatementKind::Switch;
+	statement->line = line();
+	const LocalScope locals(*this);
+
+	expectKeyword("switch", "at the start of a switch");
+	expect(TokenKind::LParen, "after 'switch'");
+	statement->expression = parseExpression();
+	expect(TokenKind::RParen, "after a switch selector");
+
+	// C++ takes any statement for a body, but a case label can only live inside
+	// a block, so the block is the only body that holds a switch's meaning.
+	if (!at(TokenKind::LBrace)) {
+		throw CompileError("a switch body needs braces around its case labels");
+	}
+	advance();
+
+	SwitchCase* kase = nullptr;
+	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		if (atKeyword("case")) {
+			advance();
+			SwitchCase next;
+			next.line = line();
+			next.value = parseAssignment();
+			expect(TokenKind::Colon, "after a case value");
+			statement->switchCases.push_back(std::move(next));
+			kase = &statement->switchCases.back();
+			continue;
+		}
+		if (atKeyword("default")) {
+			advance();
+			SwitchCase next;
+			next.line = line();
+			expect(TokenKind::Colon, "after 'default'");
+			statement->switchCases.push_back(std::move(next));
+			kase = &statement->switchCases.back();
+			continue;
+		}
+
+		appendStatement(kase ? kase->body : statement->switchPreamble);
+	}
+
+	expect(TokenKind::RBrace, "to close a switch body");
 
 	return statement;
 }

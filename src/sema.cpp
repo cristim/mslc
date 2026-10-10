@@ -332,6 +332,12 @@ namespace {
 		Refract,
 		// Two three-component vectors.
 		Cross,
+		// Round to nearest with halves away from zero, which GLSL.std.450's Round
+		// leaves to the implementation, so it is built from Trunc, FAbs and FSign.
+		RoundHalfAway,
+		// -1, 0 or 1 with the zeros keeping their sign and a NaN giving 0, where
+		// GLSL.std.450's FSign leaves both open.
+		SignExact,
 	};
 
 	// GLSL.std.450 numbers its instructions from 1, so 0 marks a builtin with no
@@ -355,6 +361,9 @@ namespace {
 		{ "floor", 1, MathShape::Componentwise, 8, kNoInstruction, kNoInstruction },
 		{ "ceil", 1, MathShape::Componentwise, 9, kNoInstruction, kNoInstruction },
 		{ "fract", 1, MathShape::Componentwise, 10, kNoInstruction, kNoInstruction },
+		{ "round", 1, MathShape::RoundHalfAway, 3, kNoInstruction, kNoInstruction },
+		{ "rint", 1, MathShape::Componentwise, 2, kNoInstruction, kNoInstruction },
+		{ "sign", 1, MathShape::SignExact, 6, kNoInstruction, kNoInstruction },
 		{ "sin", 1, MathShape::Componentwise, 13, kNoInstruction, kNoInstruction },
 		{ "cos", 1, MathShape::Componentwise, 14, kNoInstruction, kNoInstruction },
 		{ "tan", 1, MathShape::Componentwise, 15, kNoInstruction, kNoInstruction },
@@ -445,6 +454,15 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) collectIdentifiers(*nested, names);
 		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) collectIdentifiers(*kase.value, names);
+			for (const StatementPtr& child: kase.body) {
+				collectIdentifiers(*child, names);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectIdentifiers(*child, names);
+		}
 	}
 
 	// The identifiers a body names where no parameter or local of that name is in
@@ -467,7 +485,8 @@ namespace {
 		if (!statement) return;
 		// A compound statement and a for loop open a scope; a declaration belongs to
 		// the one around it.
-		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For;
+		const bool opensScope = statement->kind == StatementKind::Compound || statement->kind == StatementKind::For
+			|| statement->kind == StatementKind::Switch;
 		if (opensScope) scopes.emplace_back();
 		collectUnshadowed(statement->expression.get(), scopes, names);
 		collectUnshadowed(statement->whileCondition.get(), scopes, names);
@@ -487,6 +506,15 @@ namespace {
 		for (const Statement* nested: { statement->thenBranch.get(), statement->elseBranch.get(),
 			statement->forBody.get(), statement->whileBody.get() }) {
 			collectUnshadowed(nested, scopes, names);
+		}
+		for (const StatementPtr& child: statement->switchPreamble) {
+			collectUnshadowed(child.get(), scopes, names);
+		}
+		for (const SwitchCase& kase: statement->switchCases) {
+			collectUnshadowed(kase.value.get(), scopes, names);
+			for (const StatementPtr& child: kase.body) {
+				collectUnshadowed(child.get(), scopes, names);
+			}
 		}
 		if (opensScope) scopes.pop_back();
 	}
@@ -767,10 +795,32 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 	return structure;
 }
 
+spirv::Id TypeTable::matrixReferenceStruct(spirv::Id matrixType) {
+	const auto cached = _matrixReferenceStructs.find(matrixType);
+	if (cached != _matrixReferenceStructs.end()) {
+		return cached->second;
+	}
+
+	const Id structure = _builder.emitDecl(spirv::OpTypeStruct, { matrixType });
+	_builder.emit(spirv::OpDecorate, { structure, static_cast<uint32_t>(spirv::Decoration::Block) });
+	_builder.emit(spirv::OpMemberDecorate, { structure, 0,
+		static_cast<uint32_t>(spirv::Decoration::Offset), 0u });
+	decorateMatrixMember(structure, 0, matrixType);
+
+	_matrixReferenceStructs.emplace(matrixType, structure);
+	return structure;
+}
+
 spirv::Id TypeTable::pointeeOf(spirv::Id pointerType) const {
 	for (const auto& [key, id]: _pointers) {
 		if (id == pointerType) {
 			return key.second;
+		}
+	}
+
+	for (const auto& [pointee, id]: _bufferPointers) {
+		if (id == pointerType) {
+			return pointee;
 		}
 	}
 
@@ -781,6 +831,12 @@ std::optional<spirv::StorageClassValue> TypeTable::storageClassOf(Id pointerType
 	for (const auto& [key, id]: _pointers) {
 		if (id == pointerType) {
 			return key.first;
+		}
+	}
+
+	for (const auto& [pointee, id]: _bufferPointers) {
+		if (id == pointerType) {
+			return spirv::StorageClass::PhysicalStorageBuffer;
 		}
 	}
 
@@ -1112,15 +1168,21 @@ Id TypeTable::image(ResourceKind kind) {
 	return cached;
 }
 
-Id TypeTable::uintWriteImage() {
-	if (_uintWriteImage == InvalidId) {
-		_builder.emit(spirv::OpCapability, {
-			static_cast<uint32_t>(spirv::Capability::StorageImageWriteWithoutFormat) });
-		_uintWriteImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
+Id TypeTable::uintStorageImage(TextureAccess access) {
+	const bool read = access == TextureAccess::Read;
+	bool& declared = read ? _storageReadDeclared : _storageWriteDeclared;
+	if (!declared) {
+		declared = true;
+		_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(read
+			? spirv::Capability::StorageImageReadWithoutFormat
+			: spirv::Capability::StorageImageWriteWithoutFormat) });
+	}
+	if (_uintStorageImage == InvalidId) {
+		_uintStorageImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
 			spirv::Dim::Dim2D, 0u, 0u, 0u, 2u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
-	return _uintWriteImage;
+	return _uintStorageImage;
 }
 
 Id TypeTable::samplerType() {
@@ -1395,6 +1457,20 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 
 namespace {
 
+	// SPIR-V constant operands cannot contain arithmetic or runtime loads.
+	struct FoldedConstant {
+		bool isComposite = false;
+		Id type = InvalidId;
+		std::vector<Id> parts;
+
+		// Floats are rounded to their own width; integers are sign- or zero-extended
+		// after truncation, so casting a signed value to int64_t preserves its value.
+		ScalarKind scalar = ScalarKind::Void;
+		double number = 0.0;
+		uint64_t integer = 0;
+		bool boolean = false;
+	};
+
 	// A name bound in the function being emitted. The value's SPIR-V type is
 	// recorded in the builder, so this only tracks what a name refers to.
 	struct Binding {
@@ -1425,9 +1501,16 @@ namespace {
 		// True for a const local and for a buffer in constant memory or declared
 		// const: Metal rejects a store through it.
 		bool readOnly = false;
+		// True when id is the address of an element or a member rather than a
+		// variable, as for a reference local bound to one.
+		bool isAddress = false;
+		// True for a const local of integral type whose initialiser is a constant
+		// expression: C++ lets it stand in a constant expression.
+		bool constantValue = false;
 		// True for a sampler declared with coord::pixel. Vulkan forbids an
 		// implicit-lod lookup through an unnormalized sampler.
 		bool unnormalizedSampler = false;
+		std::optional<FoldedConstant> folded;
 	};
 
 	// A constexpr sampler of the entry point being emitted. Samplers with equal
@@ -1457,28 +1540,6 @@ namespace {
 	struct ConstantBinding {
 		Id id = InvalidId;
 		const StructDecl* structType = nullptr;
-	};
-
-	// A file-scope "constant" folded to a value. SPIR-V takes only constants as a
-	// constant's operands, so an initialiser that refers to an earlier constant
-	// or does arithmetic has to be folded here rather than emitted as the
-	// expression it was written as.
-	struct FoldedConstant {
-		// A composite: the type it was declared as, and the constants making it
-		// up, which have already been emitted.
-		bool isComposite = false;
-		Id type = InvalidId;
-		std::vector<Id> parts;
-
-		// A scalar: the kind to declare it as, and its value. A float or half
-		// is a double that holds exactly what its own width does; an integer is
-		// its 64 bits, reduced to the kind's width and then sign-extended for a
-		// signed kind or zero-extended for an unsigned one, so that a signed
-		// value reads back through a cast to int64_t.
-		ScalarKind scalar = ScalarKind::Void;
-		double number = 0.0;
-		uint64_t integer = 0;
-		bool boolean = false;
 	};
 
 	// A scalar constant as the kind it is declared with. An integer wraps to the
@@ -1585,6 +1646,34 @@ namespace {
 		}
 	}
 
+	// Whether an integer case value is one the selector's type holds, which C++
+	// asks of a case label where a braced initialiser asks it of a value.
+	bool fitsInKind(const FoldedConstant& constant, ScalarKind to) {
+		const uint32_t width = mappingFor(to).width;
+		if (isSignedInteger(constant.scalar)) {
+			const int64_t value = static_cast<int64_t>(constant.integer);
+			if (isSignedInteger(to)) {
+				if (width >= 64) {
+					return true;
+				}
+				const int64_t low = -(int64_t{ 1 } << (width - 1));
+				const int64_t high = (int64_t{ 1 } << (width - 1)) - 1;
+				return value >= low && value <= high;
+			}
+			if (value < 0) {
+				return false;
+			}
+			return width >= 64 || static_cast<uint64_t>(value) <= ((uint64_t{ 1 } << width) - 1);
+		}
+
+		const uint64_t value = constant.integer;
+		if (isSignedInteger(to)) {
+			return width >= 64 ? static_cast<int64_t>(value) >= 0
+				: value <= ((uint64_t{ 1 } << (width - 1)) - 1);
+		}
+		return width >= 64 || value <= ((uint64_t{ 1 } << width) - 1);
+	}
+
 	// An Input or Output variable carrying one value across a stage boundary: a
 	// returned value, or one field of a returned or [[stage_in]] struct. The
 	// variable's type can differ from the value's, because a half crosses as a
@@ -1643,6 +1732,17 @@ namespace {
 				collectCalls(**branch, out);
 			}
 		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value) {
+				collectCalls(*kase.value, out);
+			}
+			for (const StatementPtr& child: kase.body) {
+				collectCalls(*child, out);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectCalls(*child, out);
+		}
 	}
 
 	bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
@@ -1653,6 +1753,9 @@ namespace {
 		for (size_t i = 0; i < a.parameters.size(); ++i) {
 			const Type& x = a.parameters[i].type;
 			const Type& y = b.parameters[i].type;
+			if (a.parameters[i].isMutableReference() != b.parameters[i].isMutableReference()) {
+				return false;
+			}
 			if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
 				|| x.isPacked != y.isPacked || x.namedType != y.namedType
 				|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
@@ -1822,10 +1925,18 @@ namespace {
 		// needs the value rather than a reference to a constant.
 		std::map<std::string, FoldedConstant> _folded;
 		std::map<Id, FoldedConstant> _localFolded;
+		// Set when a fold meets an operation a constant expression may not contain:
+		// a signed overflow, a division by zero, a shift by a bad count, a NaN. The
+		// value is still computed, since only a constexpr needs it to be an error.
+		bool _foldDomainError = false;
 		std::map<spirv::Id, const StructDecl*> _structByValue;
 		// The pointee of every buffer parameter, in declaration order, which is
 		// what the binding-0 block is built from once the loop is done.
 		std::vector<Id> _bufferMembers;
+		// The bool or bool vector type of a member that holds one by reference.
+		std::map<uint32_t, Id> _bufferBoolTypes;
+		// The matrix type of a member that holds one by reference, wrapped in a struct.
+		std::map<uint32_t, Id> _bufferMatrixTypes;
 		// The binding-0 block, and the loaded buffer pointer for each member.
 		TypeTable::AddressBlock _addressBlock;
 		std::map<uint32_t, Id> _bufferBases;
@@ -1885,6 +1996,10 @@ namespace {
 		// The [[stage_in]] parameter and one Input per field.
 		const Parameter* _stageIn = nullptr;
 		std::vector<StageVariable> _stageInputs;
+		// At most one BuiltIn FragCoord Input variable per fragment entry point,
+		// whether it comes from a stage-struct [[position]] field or a direct
+		// [[position]]/[[frag_coord]] parameter.
+		bool _hasFragCoordInput = false;
 
 		// A helper's body is emitted once per stage that reaches it.
 		struct HelperFunction {
@@ -1990,6 +2105,7 @@ namespace {
 		void checkStageInterfacesAgree() const;
 		void emitFunctionBody(const Statement& statement);
 		void emitStatement(const Statement& statement);
+		void emitSwitch(const Statement& statement);
 		void emitExpressionStatement(const Expression& expression);
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
@@ -1998,7 +2114,7 @@ namespace {
 		void requireStorable(const Expression& target) const;
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
-		void emitVariableDeclaration(const VariableDeclaration& declaration);
+		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
@@ -2025,6 +2141,10 @@ namespace {
 		ArithmeticConversion usualArithmeticConversion(Id leftType, Id rightType);
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
+		void emitReferenceDeclaration(const VariableDeclaration& declaration);
+		void validateConstexprInitializer(const VariableDeclaration& declaration);
+		bool readsRuntimeValue(const Expression& expression) const;
+		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
 		Id emitElementAccess(const Expression& expression, bool asAddress);
@@ -2046,12 +2166,18 @@ namespace {
 		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
 		Id helperParameterType(const Type& type);
+		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
+			size_t first) const;
+		Id referenceArgument(const Expression& argument, const Parameter& parameter,
+			const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts);
 		Id resourceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function);
 		Id resourcePointee(const Type& type);
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
 		bool returnsVoid(const FunctionDecl& function) const;
+		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
+		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
@@ -2465,8 +2591,16 @@ namespace {
 		// A buffer is reached through the address block, so the binding has no id
 		// of its own to load, and loading it wrote an OpLoad of id 0.
 		if (binding.bufferPointeeType != InvalidId) {
-			throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
-				"which is not lowered yet");
+			if (binding.isBuffer) {
+				throw CompileError("the buffer \"" + expression.name + "\" is used as a value, "
+					"which is not lowered yet");
+			}
+
+			// A reference parameter names the one value its buffer holds, so its
+			// use as a value reads the whole of it.
+			const Id loaded = loadFromBuffer(bufferBase(binding), binding.pointeeType);
+			const Id declared = declaredTypeOf(binding.pointeeMsl);
+			return _builder.typeOf(loaded) == declared ? loaded : convertImplicit(loaded, declared);
 		}
 
 		if (!binding.isPointer) {
@@ -2477,6 +2611,12 @@ namespace {
 		// is what the pointer addresses, so load it. Index and member
 		// expressions ask for the address itself, and go through the address
 		// path instead.
+		if (binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
+			const Id inBuffer = loadFromBuffer(binding.id, binding.pointeeType);
+			const Id declared = declaredTypeOf(binding.pointeeMsl);
+			return _builder.typeOf(inBuffer) == declared ? inBuffer : convertImplicit(inBuffer, declared);
+		}
+
 		const Id loaded = loadFrom(binding.id, binding.pointeeType);
 
 		// A builtin whose MSL type is a scalar but whose SPIR-V form is a
@@ -2539,6 +2679,18 @@ namespace {
 		// an access chain has to match its base.
 		if (binding.bufferPointeeType != InvalidId) {
 			const Id base = bufferBase(binding);
+
+			// A matrix reference holds the address of the matrix itself, so an index
+			// names one of its columns.
+			if (!binding.isBuffer) {
+				if (const auto* matrix = _types.matrixInfo(binding.pointeeType)) {
+					const Id column = _builder.emitTyped(spirv::OpAccessChain,
+						_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, matrix->column),
+						{ base, index });
+					return asAddress ? column : loadFromBuffer(column, matrix->column);
+				}
+			}
+
 			const bool packed = binding.pointeeMsl.isPacked;
 			const bool bytes = _types.isBool(binding.pointeeType);
 			const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
@@ -2568,6 +2720,12 @@ namespace {
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(binding.storageClass, elementType),
 			{ binding.id, index });
+
+		// A reference local bound to a place in a buffer holds that place's address,
+		// so a load through it carries the buffer's Aligned operand.
+		if (binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer) {
+			return asAddress ? address : loadFromBuffer(address, elementType);
+		}
 
 		return asAddress ? address : loadFrom(address, elementType);
 	}
@@ -2911,7 +3069,8 @@ namespace {
 		// the address form does the work and this loads. A buffer's load carries the
 		// Aligned operand the same rule as any other access through its pointer.
 		const auto it = _bindings.find(rootName);
-		return it != _bindings.end() && it->second.bufferPointeeType != InvalidId
+		return it != _bindings.end() && (it->second.bufferPointeeType != InvalidId
+				|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)
 			? loadFromBuffer(address, fieldType)
 			: loadFrom(address, fieldType);
 	}
@@ -3007,8 +3166,11 @@ namespace {
 
 		// A packed member of a laid-out struct is stored as an array of its
 		// components, and is viewed as the vector once it has an address.
-		const bool packed = fromBuffer && current.isPacked;
-		const bool bytes = fromBuffer && _types.isBool(outFieldType);
+		// A reference local bound to a buffer element holds that element's address
+		// and has no buffer of its own, but its fields are laid out the same way.
+		const bool inBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
+		const bool packed = inBuffer && current.isPacked;
+		const bool bytes = inBuffer && _types.isBool(outFieldType);
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(storageClass, packed
 				? _types.packedStorage(current.scalar, current.vectorWidth)
@@ -4138,7 +4300,7 @@ namespace {
 	}
 
 	Id Emitter::resourcePointee(const Type& type) {
-		if (type.textureAccess == TextureAccess::Write) return _types.uintWriteImage();
+		if (type.textureAccess != TextureAccess::Sample) return _types.uintStorageImage(type.textureAccess);
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
 	}
 
@@ -4182,7 +4344,9 @@ namespace {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
 			for (const Parameter& parameter: definition.parameters) {
-				helper.parameterTypes.push_back(helperParameterType(parameter.type));
+				helper.parameterTypes.push_back(parameter.isMutableReference()
+					? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
+					: helperParameterType(parameter.type));
 				signature.push_back(helper.parameterTypes.back());
 			}
 
@@ -4202,7 +4366,9 @@ namespace {
 		}
 
 		std::vector<uint32_t> operands { slot.first->second };
+		std::vector<std::pair<Id, Id>> copyOuts;
 		const size_t first = receiver ? 1 : 0;
+		rejectAliasedReferenceArguments(call, definition, first);
 		if (first) {
 			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
 			_pendingObject = InvalidId;
@@ -4212,6 +4378,11 @@ namespace {
 			const Parameter& parameter = definition.parameters[first + i];
 			if (parameter.type.resource != ResourceKind::None) {
 				operands.push_back(resourceArgument(*call.arguments[i], parameter, definition.name));
+				continue;
+			}
+
+			if (parameter.isMutableReference()) {
+				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
 				continue;
 			}
 
@@ -4225,7 +4396,108 @@ namespace {
 			}
 		}
 
-		return _builder.emitTyped(spirv::OpFunctionCall, helper.returnType, operands);
+		const Id result = _builder.emitTyped(spirv::OpFunctionCall, helper.returnType, operands);
+		for (const auto& [place, temporary]: copyOuts) {
+			const Id type = valueTypeAt(place);
+			_builder.emit(spirv::OpStore, { place, loadFrom(temporary, type) });
+		}
+		return result;
+	}
+
+	// An element, a member, or a reference local bound to one is passed through a
+	// temporary copied back after the call, so a second reference argument naming
+	// the same storage would have its write overwritten by the stale copy. Two
+	// bare variables are the same pointer and alias as C++ does.
+	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
+		size_t first) const {
+		struct Passed { std::string root; bool temporary; };
+		std::vector<Passed> passed;
+		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			if (!definition.parameters[first + i].isMutableReference()) {
+				continue;
+			}
+			const Expression& argument = *call.arguments[i];
+			if (argument.kind != ExpressionKind::Identifier && argument.kind != ExpressionKind::Index
+				&& argument.kind != ExpressionKind::Member) {
+				continue;
+			}
+			const Expression& root = storeRoot(argument);
+			if (root.kind != ExpressionKind::Identifier) {
+				continue;
+			}
+			const auto bound = _bindings.find(root.name);
+			passed.push_back({ root.name, argument.kind != ExpressionKind::Identifier
+				|| (bound != _bindings.end() && bound->second.isAddress) });
+		}
+
+		for (size_t i = 0; i < passed.size(); ++i) {
+			for (size_t j = i + 1; j < passed.size(); ++j) {
+				const bool sameRoot = passed[i].root == passed[j].root;
+				const bool viaAddress = (passed[i].temporary || passed[j].temporary)
+					&& (_bindings.count(passed[i].root) && _bindings.at(passed[i].root).isAddress
+						|| _bindings.count(passed[j].root) && _bindings.at(passed[j].root).isAddress);
+				if ((sameRoot && (passed[i].temporary || passed[j].temporary)) || viaAddress) {
+					throw CompileError("the call to \"" + definition.name + "\" passes the same variable "
+						"through two reference parameters, one of them as a member or element; that is "
+						"not lowered yet");
+				}
+			}
+		}
+	}
+
+	// The variable a non-const reference parameter names: the caller's own, so a
+	// store in the helper is a store to it. Only a place in the thread's own
+	// storage can be passed, since the parameter is a pointer into it.
+	Id Emitter::referenceArgument(const Expression& argument, const Parameter& parameter,
+		const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts) {
+		const std::string what = "argument " + std::to_string(position) + " of the call to \"" + function + "\"";
+		if (argument.kind != ExpressionKind::Identifier && argument.kind != ExpressionKind::Index
+			&& argument.kind != ExpressionKind::Member) {
+			throw CompileError(what + " has to be a variable, an element or a member: parameter \""
+				+ parameter.name + "\" is a reference to it");
+		}
+		if (argument.kind == ExpressionKind::Member && !structOf(*argument.left)) {
+			throw CompileError(what + " is a component of a vector, which a reference parameter cannot "
+				"name yet");
+		}
+
+		const Expression& root = storeRoot(argument);
+		if (root.kind == ExpressionKind::Identifier) {
+			const auto binding = _bindings.find(root.name);
+			if (binding != _bindings.end() && binding->second.readOnly) {
+				throw CompileError(what + " is const or in constant memory, and parameter \""
+					+ parameter.name + "\" is a reference that can change it");
+			}
+		}
+
+		const Id address = emitPlaceAddress(argument);
+		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
+		if (!storageClass || *storageClass != spirv::StorageClass::Function) {
+			throw CompileError(what + " is not a variable of this function; a reference parameter takes "
+				"a local, a member of one, or a reference parameter of the caller");
+		}
+		if (valueTypeAt(address) != declaredTypeOf(parameter.type)) {
+			throw CompileError(what + " is not the type of parameter \"" + parameter.name + "\", "
+				+ typeName(parameter.type) + "; a conversion would make a temporary");
+		}
+
+		// A function parameter has to be a pointer to a variable, which an element
+		// or a member of one is not, so those go through a temporary copied back
+		// after the call.
+		if (argument.kind == ExpressionKind::Identifier) {
+			const auto named = _bindings.find(argument.name);
+			if (named != _bindings.end() && !named->second.isAddress) {
+				return address;
+			}
+		}
+
+		const Id type = declaredTypeOf(parameter.type);
+		const Id temporary = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Function, type),
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		_builder.emit(spirv::OpStore, { temporary, loadFrom(address, type) });
+		copyOuts.emplace_back(address, temporary);
+		return temporary;
 	}
 
 	// A parameter is a value the body may assign to, as in C++, and the caller's
@@ -4263,6 +4535,11 @@ namespace {
 				bound.storageClass = spirv::StorageClass::UniformConstant;
 				bound.pointeeMsl = parameter.type;
 				_bindings[parameter.name] = bound;
+				continue;
+			}
+
+			if (parameter.isMutableReference()) {
+				bindLocal(parameter.name, values[i], declaredTypeOf(parameter.type), parameter.type);
 				continue;
 			}
 
@@ -4373,7 +4650,8 @@ namespace {
 		const uint32_t bits = _types.bitWidth(type);
 
 		const bool takesScalars = builtin.shape == MathShape::Componentwise
-			|| builtin.shape == MathShape::Saturate;
+			|| builtin.shape == MathShape::Saturate || builtin.shape == MathShape::RoundHalfAway
+			|| builtin.shape == MathShape::SignExact;
 		// Metal has no double, and GLSL.std.450's transcendentals take only 16 and
 		// 32 bits.
 		if (isFloat ? bits > 32 : !takesIntegers) {
@@ -4436,6 +4714,13 @@ namespace {
 			values.push_back(one);
 		}
 
+		if (builtin.shape == MathShape::RoundHalfAway) {
+			return emitRoundHalfAway(values[0], type, bits);
+		}
+		if (builtin.shape == MathShape::SignExact) {
+			return emitSignExact(values[0], type, bits);
+		}
+
 		const uint32_t instruction = isFloat ? builtin.floatInstruction
 			: isSigned ? builtin.signedInstruction : builtin.unsignedInstruction;
 		if (instruction == kNoInstruction) {
@@ -4453,6 +4738,67 @@ namespace {
 		std::vector<uint32_t> operands { _glslSet, instruction };
 		operands.insert(operands.end(), values.begin(), values.end());
 		return _builder.emitTyped(spirv::OpExtInst, result, operands);
+	}
+
+	// round(x): the whole number nearest x, a half going away from zero. Trunc
+	// gives the whole part; when the fraction is at least a half the result is one
+	// further along the sign of x. Infinity and NaN come out as themselves, since
+	// their fraction is NaN and so is never at least a half.
+	Id Emitter::emitRoundHalfAway(Id value, Id type, uint32_t bits) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+
+		const auto extended = [&](uint32_t instruction, Id operand) {
+			return _builder.emitTyped(spirv::OpExtInst, type, { _glslSet, instruction, operand });
+		};
+		constexpr uint32_t kTrunc = 3;
+		constexpr uint32_t kFAbs = 4;
+		constexpr uint32_t kFSign = 6;
+
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = width > 1 ? _types.componentOf(type) : type;
+		Id half = _builder.emitDeclTyped(spirv::OpConstant, component, { bits == 16 ? 0x3800u : 0x3F000000u });
+		if (width > 1) {
+			half = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+				std::vector<uint32_t>(width, half));
+		}
+
+		const Id whole = extended(kTrunc, value);
+		const Id fraction = _builder.emitTyped(spirv::OpFSub, type, { value, whole });
+		const Id magnitude = extended(kFAbs, fraction);
+		const Id boolType = width > 1 ? _types.vector(ScalarKind::Bool, width) : _boolType;
+		const Id atLeastHalf = _builder.emitTyped(spirv::OpFOrdGreaterThanEqual, boolType, { magnitude, half });
+		const Id further = _builder.emitTyped(spirv::OpFAdd, type, { whole, extended(kFSign, value) });
+		return _builder.emitTyped(spirv::OpSelect, type, { atLeastHalf, further, whole });
+	}
+
+	// sign(x): FSign, except that a zero keeps its own sign and a NaN gives 0.
+	Id Emitter::emitSignExact(Id value, Id type, uint32_t bits) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = width > 1 ? _types.componentOf(type) : type;
+		Id zero = _builder.emitDeclTyped(spirv::OpConstant, component, { 0u });
+		if (width > 1) {
+			zero = _builder.emitDeclTyped(spirv::OpConstantComposite, type,
+				std::vector<uint32_t>(width, zero));
+		}
+		static_cast<void>(bits);
+
+		constexpr uint32_t kFSign = 6;
+		const Id boolType = width > 1 ? _types.vector(ScalarKind::Bool, width) : _boolType;
+		const Id sign = _builder.emitTyped(spirv::OpExtInst, type, { _glslSet, kFSign, value });
+		const Id isZero = _builder.emitTyped(spirv::OpFOrdEqual, boolType, { value, zero });
+		const Id isNaN = _builder.emitTyped(spirv::OpIsNan, boolType, { value });
+		const Id keptZero = _builder.emitTyped(spirv::OpSelect, type, { isZero, value, sign });
+		return _builder.emitTyped(spirv::OpSelect, type, { isNaN, zero, keptZero });
 	}
 
 	// The constant a folded value becomes: a scalar as an OpConstant of its kind,
@@ -4568,10 +4914,11 @@ namespace {
 				const auto local = _bindings.find(expression.name);
 				if (local != _bindings.end()) {
 					const auto value = _localFolded.find(local->second.id);
-					if (value == _localFolded.end()) {
+					if (value != _localFolded.end()) { return value->second; }
+					if (!local->second.folded) {
 						throw CompileError("a local in this initializer is not a supported constant expression");
 					}
-					return value->second;
+					return *local->second.folded;
 				}
 				// Declaration order is what makes this resolvable, and the module's
 				// constants are declared in the order the source declares them.
@@ -4640,6 +4987,10 @@ namespace {
 		// result wraps in its own width like the instruction the lowering emits.
 		operand.scalar = promotedKind(operand.scalar);
 		if (op == UnaryOperator::Negate) {
+			if (isSignedInteger(operand.scalar)
+				&& operand.integer == normalizeInteger(operand.scalar, uint64_t{ 1 } << (mappingFor(operand.scalar).width - 1))) {
+				_foldDomainError = true;
+			}
 			operand.integer = normalizeInteger(operand.scalar, uint64_t{ 0 } - operand.integer);
 		} else if (op == UnaryOperator::BitNot) {
 			operand.integer = normalizeInteger(operand.scalar, ~operand.integer);
@@ -4649,6 +5000,26 @@ namespace {
 	}
 
 	FoldedConstant Emitter::foldBinary(const Expression& expression) {
+		// && and || do not evaluate the right operand once the left decides the
+		// result, so an operation in it that no constant expression holds is not
+		// reached either.
+		if (expression.binaryOperator == BinaryOperator::LogicalAnd
+			|| expression.binaryOperator == BinaryOperator::LogicalOr) {
+			const auto truth = [](const FoldedConstant& value) {
+				if (value.isComposite) {
+					throw CompileError("a composite constant cannot be an operand of a binary operator");
+				}
+				return value.scalar == ScalarKind::Bool ? value.boolean
+					: isFloatKind(value.scalar) ? value.number != 0.0 : value.integer != 0;
+			};
+			const bool isAnd = expression.binaryOperator == BinaryOperator::LogicalAnd;
+			const bool decided = truth(foldExpression(*expression.left)) != isAnd;
+			FoldedConstant folded;
+			folded.scalar = ScalarKind::Bool;
+			folded.boolean = decided ? !isAnd : truth(foldExpression(*expression.right));
+			return folded;
+		}
+
 		const FoldedConstant left = foldExpression(*expression.left);
 		const FoldedConstant right = foldExpression(*expression.right);
 
@@ -4681,11 +5052,15 @@ namespace {
 				case BinaryOperator::Multiply: folded.number = l * r; break;
 				// A float division by zero is infinity, which is what the language
 				// says, so it is not treated as a mistake here.
-				case BinaryOperator::Divide: folded.number = l / r; break;
+				case BinaryOperator::Divide:
+					if (r == 0.0) { _foldDomainError = true; }
+					folded.number = l / r;
+					break;
 				default:
 					throw CompileError("this operator is recognised but not folded yet");
 			}
 
+			if (std::isnan(folded.number)) { _foldDomainError = true; }
 			folded.number = roundedToKind(folded.scalar, folded.number);
 			return folded;
 		}
@@ -4700,6 +5075,7 @@ namespace {
 			const uint32_t width = mappingFor(folded.scalar).width;
 			const bool negative = isSignedInteger(right.scalar) && static_cast<int64_t>(right.integer) < 0;
 			if (negative || right.integer >= width) {
+				_foldDomainError = true;
 				throw CompileError("a shift of a constant is by a count outside 0 to "
 					+ std::to_string(width - 1));
 			}
@@ -4723,6 +5099,23 @@ namespace {
 		const bool isSigned = isSignedInteger(folded.scalar);
 
 		uint64_t value = 0;
+		if (isSigned && (op == BinaryOperator::Add || op == BinaryOperator::Subtract
+			|| op == BinaryOperator::Multiply)) {
+			// The exact result has to lie in the type; a signed overflow is undefined
+			// in C++ and so no constant expression.
+			const auto sl = static_cast<int64_t>(l);
+			const auto sr = static_cast<int64_t>(r);
+			int64_t exact = 0;
+			bool overflow = op == BinaryOperator::Add ? __builtin_add_overflow(sl, sr, &exact)
+				: op == BinaryOperator::Subtract ? __builtin_sub_overflow(sl, sr, &exact)
+				: __builtin_mul_overflow(sl, sr, &exact);
+			const uint32_t width = mappingFor(folded.scalar).width;
+			if (!overflow && width < 64) {
+				const int64_t most = (int64_t{ 1 } << (width - 1)) - 1;
+				overflow = exact > most || exact < -most - 1;
+			}
+			if (overflow) { _foldDomainError = true; }
+		}
 		switch (op) {
 			case BinaryOperator::Add: value = l + r; break;
 			case BinaryOperator::Subtract: value = l - r; break;
@@ -4730,6 +5123,7 @@ namespace {
 			case BinaryOperator::Modulo:
 			case BinaryOperator::Divide:
 				if (r == 0) {
+					_foldDomainError = true;
 					throw CompileError("an integer constant divides by zero");
 				}
 
@@ -4741,6 +5135,7 @@ namespace {
 					const uint64_t most = normalizeInteger(folded.scalar,
 						uint64_t{ 1 } << (mappingFor(folded.scalar).width - 1));
 					const bool overflows = sr == -1 && l == most;
+					if (overflows) { _foldDomainError = true; }
 					value = overflows ? (op == BinaryOperator::Divide ? l : 0)
 						: static_cast<uint64_t>(op == BinaryOperator::Divide ? sl / sr : sl % sr);
 				} else {
@@ -4850,7 +5245,13 @@ namespace {
 	// folded and the result declared as one of the module's constants, with no
 	// binding of its own.
 	Id Emitter::declareGlobalConstant(const VariableDeclaration& declaration) {
+		_foldDomainError = false;
 		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
+		if (_foldDomainError && declaration.type.isConstexpr) {
+			throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
+				"constant expression");
+		}
+		_foldDomainError = false;
 		const Id id = emitConstant(folded);
 
 		ConstantBinding binding;
@@ -5088,6 +5489,7 @@ namespace {
 						case ParameterAttributes::Builtin::InstanceID:
 							return spirv::BuiltIn::InstanceIndex;
 						case ParameterAttributes::Builtin::FragCoord:
+						case ParameterAttributes::Builtin::Position:
 							return spirv::BuiltIn::FragCoord;
 						case ParameterAttributes::Builtin::FrontFacing:
 							return spirv::BuiltIn::FrontFacing;
@@ -5132,6 +5534,26 @@ namespace {
 						+ (_entryPoint->stage == Stage::Kernel ? "kernel"
 							: _entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
 						+ " function (parameter \"" + parameter.name + "\")");
+				}
+
+				// A direct FragCoord-mapped parameter (either MSL spelling) has to
+				// declare a float4: nothing else reinterprets the builtin's fixed
+				// Vulkan type, so a narrower or wider declaration would silently
+				// alias or misread it. At most one FragCoord source (this
+				// parameter, another parameter, or a stage-struct [[position]]
+				// field) may exist per fragment entry point, since Vulkan forbids
+				// two Input variables decorated with the same BuiltIn.
+				if (spvBuiltin == spirv::BuiltIn::FragCoord) {
+					if (declaredTypeOf(parameter.type) != _types.vector(ScalarKind::Float, 4)) {
+						throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+							builtinName(*parameter.attributes.builtin) + "]], which has to be a float4");
+					}
+					if (_hasFragCoordInput) {
+						throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+							builtinName(*parameter.attributes.builtin) + "]], which collides with this "
+							"function's other fragment position input");
+					}
+					_hasFragCoordInput = true;
 				}
 
 				_builder.setSection(spirv::Section::Annotations);
@@ -5222,12 +5644,6 @@ namespace {
 		} else {
 			// A matrix's layout is a MatrixStride, which SPIR-V only allows on a
 			// struct member, and a buffer reached directly is not wrapped in one.
-			if (parameter.type.isMatrix() && !parameter.type.isPointer) {
-				throw CompileError("parameter \"" + parameter.name + "\" is a " + typeName(parameter.type)
-					+ " reached by reference, which is not lowered yet; pass a pointer to it, "
-						"or put it in a struct");
-			}
-
 			pointeeType = declaredTypeOf(parameter.type);
 		}
 
@@ -5238,6 +5654,17 @@ namespace {
 		// wrapped in { T runtime_array[] } and the parameter indexes through
 		// that -- for a struct element as much as for a scalar one.
 		Id bufferPointee = pointeeType;
+		// A bool is a byte in a buffer, so the reference's own memory is that byte (or
+		// the bytes of a bool vector), mapped back to a bool where it is used.
+		const bool matrixReference = !parameter.type.isPointer && parameter.type.isMatrix();
+		if (matrixReference) {
+			// { matrix m; }: the matrix is member 0, which carries its layout.
+			bufferPointee = _types.matrixReferenceStruct(pointeeType);
+		}
+		const bool boolReference = !parameter.type.isPointer && _types.isBool(pointeeType);
+		if (boolReference) {
+			bufferPointee = _types.boolStorage(pointeeType);
+		}
 		bool isBuffer = false;
 		if (parameter.type.isPointer) {
 			bufferPointee = _types.blockStructFor(pointeeType, parameter.type.isPacked);
@@ -5250,6 +5677,12 @@ namespace {
 		// goes in the reflection.
 		const auto memberIndex = static_cast<uint32_t>(_bufferMembers.size());
 		_bufferMembers.push_back(bufferPointee);
+		if (boolReference) {
+			_bufferBoolTypes[memberIndex] = pointeeType;
+		}
+		if (matrixReference) {
+			_bufferMatrixTypes[memberIndex] = pointeeType;
+		}
 
 		// The block is emitted after the loop, once every member is known.
 		Binding binding;
@@ -5393,6 +5826,8 @@ namespace {
 			const Id variable = declareDescriptorVariable(imageType, binding);
 			if (entry.parameter->type.textureAccess == TextureAccess::Write) {
 				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonReadable) });
+			} else if (entry.parameter->type.textureAccess == TextureAccess::Read) {
+				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonWritable) });
 			}
 
 			Binding bound;
@@ -5407,7 +5842,8 @@ namespace {
 				+ std::to_string(entry.metalIndex)
 				+ ", \"descriptor\": " + descriptorJson(binding)
 				+ ", \"texture_access\": \""
-				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write" : "Sample") + "\""
+				+ (entry.parameter->type.textureAccess == TextureAccess::Write ? "Write"
+					: entry.parameter->type.textureAccess == TextureAccess::Read ? "Read" : "Sample") + "\""
 				+ ", \"param_index\": " + std::to_string(entry.index)
 				+ ", \"name\": \"" + entry.parameter->name + "\" }");
 		}
@@ -5452,6 +5888,11 @@ namespace {
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
 				reserveLocalSamplers(*nested, used);
+			}
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				reserveLocalSamplers(*child, used);
 			}
 		}
 	}
@@ -5622,7 +6063,7 @@ namespace {
 
 	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
 		if (texture.pointeeMsl.textureAccess != TextureAccess::Write) {
-			throw CompileError("the texture method \"write\" is not lowered yet on sampled textures");
+			throw CompileError("the texture method \"write\" is not lowered yet on textures that are not access::write");
 		}
 		if (call.arguments.size() != 2) {
 			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
@@ -5649,6 +6090,14 @@ namespace {
 				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
 			}
 			return emitTextureSize(call, texture, true);
+		}
+		if (texture.pointeeMsl.textureAccess == TextureAccess::Read) {
+			if (method == "read") return emitTextureRead(call, texture);
+			if (method == "get_width" || method == "get_height") {
+				return emitTextureSize(call, texture, method == "get_width");
+			}
+			throw CompileError("access::read textures lower only read(), get_width() and get_height(); \""
+				+ method + "\" is not lowered yet");
 		}
 		if (method == "sample") {
 			return emitTextureSample(call, texture);
@@ -5759,9 +6208,13 @@ namespace {
 	}
 
 	// read(uint2 coordinate [, lod]): a texel by integer coordinate, with no
-	// sampler. Metal takes uint2 and ushort2 and rejects int2 and float2.
+	// sampler. access::read storage images take no lod. Metal takes uint2 and ushort2 and rejects int2 and float2.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
+		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Read;
+		if (storage && arguments.size() == 2) {
+			throw CompileError("mip arguments are unsupported on access::read textures; read takes only a coordinate");
+		}
 		if (arguments.empty() || arguments.size() > 2) {
 			throw CompileError("read takes a coordinate and optionally a lod; this call passes "
 				+ std::to_string(arguments.size()));
@@ -5777,6 +6230,12 @@ namespace {
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
 
+		if (storage) {
+			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
+			return _builder.emitTyped(spirv::OpImageRead,
+				_types.vector(ScalarKind::UInt, 4), { storageImage, coordinate });
+		}
+
 		Id lod = arguments.size() == 2 ? emitLod(*arguments[1], "read") : constantU32(0);
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
@@ -5788,12 +6247,16 @@ namespace {
 	// get_width() and get_height(), of level 0 or of the lod given.
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, bool width) {
 		const std::string name = width ? "get_width" : "get_height";
+		const bool readOnly = texture.pointeeMsl.textureAccess == TextureAccess::Read;
+		if (readOnly && !call.arguments.empty()) {
+			throw CompileError("mip arguments are unsupported on access::read textures; " + name + " takes no arguments");
+		}
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "
 				+ std::to_string(call.arguments.size()));
 		}
 
-		const bool storage = texture.pointeeMsl.textureAccess == TextureAccess::Write;
+		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample;
 		const Id lod = storage ? InvalidId
 			: call.arguments.empty() ? constantU32(0) : emitLod(*call.arguments[0], name);
 
@@ -5829,8 +6292,19 @@ namespace {
 			const Id memberAddress = _builder.emitTyped(spirv::OpAccessChain,
 				_types.pointer(spirv::StorageClass::Uniform, memberType),
 				{ _addressBlock.variable, constantU32(static_cast<uint32_t>(k)) });
-			_bufferBases.emplace(static_cast<uint32_t>(k),
-				_builder.emitTyped(spirv::OpLoad, memberType, { memberAddress }));
+			Id base = _builder.emitTyped(spirv::OpLoad, memberType, { memberAddress });
+			const auto matrixType = _bufferMatrixTypes.find(static_cast<uint32_t>(k));
+			if (matrixType != _bufferMatrixTypes.end()) {
+				// The base of the reference is the matrix inside its wrapper struct.
+				base = _builder.emitTyped(spirv::OpAccessChain,
+					_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, matrixType->second),
+					{ base, constantU32(0) });
+			}
+			_bufferBases.emplace(static_cast<uint32_t>(k), base);
+			const auto boolType = _bufferBoolTypes.find(static_cast<uint32_t>(k));
+			if (boolType != _bufferBoolTypes.end()) {
+				boolAddress(base, boolType->second);
+			}
 		}
 	}
 
@@ -5968,6 +6442,8 @@ namespace {
 			} else if (const auto named = field.attributes.userName
 				? locnLocation(*field.attributes.userName) : std::nullopt) {
 				locations.emplace_back(*named);
+			} else if (field.attributes.pointSize) {
+				locations.emplace_back(std::nullopt);
 			} else {
 				while (claimed.count(next) != 0) {
 					++next;
@@ -5990,6 +6466,7 @@ namespace {
 		std::vector<StageVariable> variables;
 		const std::vector<std::optional<uint32_t>> locations = stageLocations(decl);
 		bool hasPosition = false;
+		bool hasPointSize = false;
 
 		for (size_t index = 0; index < decl.fields.size(); ++index) {
 			const StructField& field = decl.fields[index];
@@ -6003,11 +6480,6 @@ namespace {
 					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
 					: what + " has [[sample_mask]], which is not valid on a vertex output");
 			}
-			if (field.attributes.attributeIndex) {
-				throw CompileError(what + " has [[attribute(n)]], which mslc does not lower "
-					"on a struct crossing from the vertex to the fragment stage");
-			}
-
 			if (field.attributes.colorIndex) {
 				throw CompileError(isInput
 					? what + " is [[color(n)]] on a fragment input, which is framebuffer fetch: mslc does "
@@ -6019,6 +6491,26 @@ namespace {
 			const Interpolation interpolation = field.attributes.interpolation;
 			if (field.attributes.position && interpolation != Interpolation::None) {
 				throw CompileError(what + " is [[position]], which cannot also have an interpolation attribute");
+			}
+			if (field.attributes.pointSize) {
+				if (isInput) {
+					throw CompileError(what + " has [[point_size]] on a fragment input, which mslc does not lower yet");
+				}
+				if (field.attributes.position) {
+					throw CompileError(what + " has an incompatible point_size attribute combination");
+				}
+				if (field.attributes.userName || interpolation != Interpolation::None) {
+					throw CompileError(what + " combines point_size with user or interpolation, which mslc does not lower");
+				}
+				if (hasPointSize) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[point_size]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::Float || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[point_size]], which has to be a scalar float");
+				}
+				hasPointSize = true;
 			}
 
 			const StageVariable variable = declareStageVariable(field.type, storageClass, what);
@@ -6032,10 +6524,22 @@ namespace {
 					throw CompileError(what + " is [[position]], which has to be a float4");
 				}
 
+				if (isInput) {
+					if (_hasFragCoordInput) {
+						throw CompileError(what + " is [[position]], which collides with this "
+							"function's other fragment position input");
+					}
+					_hasFragCoordInput = true;
+				}
+
 				hasPosition = true;
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
 					static_cast<uint32_t>(isInput ? spirv::BuiltIn::FragCoord : spirv::BuiltIn::Position) });
+			} else if (field.attributes.pointSize) {
+				_builder.emit(spirv::OpDecorate, { variable.variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::PointSize) });
 			} else {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::Location), *locations[index] });
@@ -6097,6 +6601,10 @@ namespace {
 			}
 			if (field.attributes.position) {
 				throw CompileError(what + " is [[position]], which a vertex function's [[stage_in]] "
+					"struct cannot carry");
+			}
+			if (field.attributes.pointSize) {
+				throw CompileError(what + " has [[point_size]], which a vertex function's [[stage_in]] "
 					"struct cannot carry");
 			}
 			if (field.attributes.interpolation != Interpolation::None || field.attributes.colorIndex) {
@@ -6207,6 +6715,9 @@ namespace {
 				throw CompileError(what + " has [[position]] or [[attribute(n)]], which is not valid on "
 					"a fragment output");
 			}
+			if (field.attributes.pointSize) {
+				throw CompileError(what + " has [[point_size]], which is only valid on a vertex output");
+			}
 			if (!field.attributes.colorIndex) {
 				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
 					"fragment function's returned struct needs one");
@@ -6221,7 +6732,14 @@ namespace {
 				throw CompileError(what + " reuses [[color(" + std::to_string(index) + ")]]");
 			}
 
-			variables.push_back(declareStageVariable(field.type, spirv::StorageClass::Output, what));
+			Type carried = field.type;
+			if ((carried.scalar == ScalarKind::Short || carried.scalar == ScalarKind::UShort)
+				&& carried.vectorWidth <= 4 && !carried.isPointer && !carried.arrayLength && !carried.isPacked) {
+				carried.scalar = carried.scalar == ScalarKind::Short ? ScalarKind::Int : ScalarKind::UInt;
+			}
+			StageVariable variable = declareStageVariable(carried, spirv::StorageClass::Output, what);
+			variable.valueType = declaredTypeOf(field.type);
+			variables.push_back(variable);
 			_builder.emit(spirv::OpDecorate, { variables.back().variable,
 				static_cast<uint32_t>(spirv::Decoration::Location), index });
 		}
@@ -6243,8 +6761,18 @@ namespace {
 
 		if (type.namedType.empty()) {
 			if (_entryPoint->stage == Stage::Vertex) {
-				throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
-					+ " rather than a struct, which is not lowered yet");
+				// A bare float4 return is the vertex position (MSL 5.2.3).
+				const std::string what = "the value vertex function \"" + _entryPoint->name + "\" returns";
+				if (type.isPointer || type.isMatrix() || type.vectorWidth != 4 || type.scalar != ScalarKind::Float) {
+					throw CompileError("vertex function \"" + _entryPoint->name + "\" returns " + spelled
+						+ ", and a vertex function returns a struct with a [[position]] field or a float4 "
+						"position");
+				}
+				_outputs.push_back(declareStageVariable(type, spirv::StorageClass::Output, what));
+				_builder.emit(spirv::OpDecorate, { _outputs.back().variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::Position) });
+				return;
 			}
 
 			_outputs.push_back(declareStageVariable(type, spirv::StorageClass::Output,
@@ -6376,7 +6904,7 @@ namespace {
 				const auto locations = stageLocations(*decl);
 				for (size_t index = 0; index < decl->fields.size(); ++index) {
 					const StructField& field = decl->fields[index];
-					if (!field.attributes.position) {
+					if (!field.attributes.position && !field.attributes.pointSize) {
 						fields.push_back({ field.attributes.userName.value_or(field.name),
 							typeName(field.type), *locations[index] });
 					}
@@ -6429,9 +6957,187 @@ namespace {
 	// A local variable becomes a Function-storage pointer, which the
 	// expression path then loads from, so a local and a parameter behave the
 	// same way when a name is used.
-	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration) {
+	// T& r = place; names the place the initialiser denotes, so a use of r loads
+	// from it and a store through r writes to it. A local variable is aliased by
+	// copying its binding; an element or a member, or a reference parameter, is a
+	// place reached by address, which the binding then holds.
+	void Emitter::emitReferenceDeclaration(const VariableDeclaration& declaration) {
+		const Expression& place = *declaration.initializer;
+		if (place.kind != ExpressionKind::Identifier && place.kind != ExpressionKind::Index
+			&& place.kind != ExpressionKind::Member) {
+			throw CompileError("the reference \"" + declaration.name + "\" has to be bound to a variable, "
+				"an element or a member; binding it to a value is not lowered yet");
+		}
+
+		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a component of a "
+				"vector, which is not lowered yet");
+		}
+
+		const Expression& root = storeRoot(place);
+		if (root.kind != ExpressionKind::Identifier) {
+			throw CompileError("the reference \"" + declaration.name + "\" is bound to a place mslc "
+				"cannot name");
+		}
+		const auto rootBinding = _bindings.find(root.name);
+		const bool rootReadOnly = rootBinding != _bindings.end() && rootBinding->second.readOnly;
+		const bool constReference = declaration.type.isConst
+			|| declaration.type.addressSpace == AddressSpace::Constant;
+		if (rootReadOnly && !constReference) {
+			throw CompileError("the reference \"" + declaration.name + "\" is not const but is bound to "
+				"constant memory or a const variable");
+		}
+
+		if (place.kind == ExpressionKind::Identifier && rootBinding != _bindings.end()
+			&& rootBinding->second.bufferPointeeType == InvalidId && rootBinding->second.isPointer
+			&& rootBinding->second.storageClass == spirv::StorageClass::Function) {
+			Binding alias = rootBinding->second;
+			alias.readOnly = alias.readOnly || constReference;
+			requireSameReferent(declaration, alias.pointeeType);
+			_bindings[declaration.name] = alias;
+			return;
+		}
+
+		const Id address = emitPlaceAddress(place);
+		const Id pointee = valueTypeAt(address);
+		const auto storageClass = _types.storageClassOf(_builder.typeOf(address));
+		if (pointee == InvalidId || !storageClass) {
+			throw CompileError("cannot determine what the reference \"" + declaration.name + "\" names");
+		}
+		requireSameReferent(declaration, pointee);
+
+		Binding binding;
+		binding.id = address;
+		binding.isPointer = true;
+		binding.pointeeType = pointee;
+		binding.storageClass = *storageClass;
+		binding.pointeeMsl = declaration.type;
+		binding.structType = declaration.type.namedType.empty()
+			? nullptr : _unit.findStruct(declaration.type.namedType);
+		binding.readOnly = constReference || rootReadOnly;
+		binding.isAddress = true;
+		_bindings[declaration.name] = binding;
+	}
+
+	// A reference binds without a conversion: a different type would be a
+	// temporary, which is a value and not the place.
+	void Emitter::requireSameReferent(const VariableDeclaration& declaration, Id referent) {
+		if (!declaration.type.namedType.empty()) {
+			TypeTable::StructForm have;
+			if (!_types.structForm(referent, have) || have.name != declaration.type.namedType) {
+				throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
+					"it is bound to");
+			}
+			return;
+		}
+		if (referent != declaredTypeOf(declaration.type)) {
+			throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
+				"it is bound to; a conversion would make a temporary");
+		}
+	}
+
+	// True when the expression reads something only known when the shader runs: a
+	// parameter, a local that is not a constant, an element of a buffer, or a
+	// store. Used to refuse such an initialiser on a constexpr; a form that is
+	// not recognised as runtime is left to the lowering, which folds what it can.
+	bool Emitter::readsRuntimeValue(const Expression& expression) const {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+				return false;
+			case ExpressionKind::Assign:
+				return true;
+			case ExpressionKind::Unary:
+				if (expression.unaryOperator == UnaryOperator::PreIncrement
+					|| expression.unaryOperator == UnaryOperator::PreDecrement
+					|| expression.unaryOperator == UnaryOperator::PostIncrement
+					|| expression.unaryOperator == UnaryOperator::PostDecrement) {
+					return true;
+				}
+				break;
+			case ExpressionKind::Identifier: {
+				const auto local = _bindings.find(expression.name);
+				if (local == _bindings.end()) {
+					return false;
+				}
+				return _localFolded.count(local->second.id) == 0 && !local->second.pointeeMsl.isConstexpr
+					&& !local->second.constantValue;
+			}
+			default:
+				break;
+		}
+
+		if (expression.left && readsRuntimeValue(*expression.left)) {
+			return true;
+		}
+		if (expression.right && readsRuntimeValue(*expression.right)) {
+			return true;
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			if (readsRuntimeValue(*argument)) {
+				return true;
+			}
+		}
+		for (const InitializerElement& element: expression.elements) {
+			if (readsRuntimeValue(*element.value)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// A constexpr brace initializer has to be made of constants. This is checked
+	// for a declaration that is never reached too, which is invalid all the same.
+	void Emitter::validateConstexprInitializer(const VariableDeclaration& declaration) {
+		if (!declaration.type.isConstexpr || !declaration.initializer) {
+			return;
+		}
+
+		if (declaration.initializer->kind != ExpressionKind::InitList) {
+			const std::string notConstant = "constexpr variable \"" + declaration.name
+				+ "\" must be initialized by a constant expression";
+			if (readsRuntimeValue(*declaration.initializer)) {
+				throw CompileError(notConstant);
+			}
+
+			// What can be folded is checked for the operations no constant expression
+			// holds, such as a signed overflow or a division by zero. What cannot be
+			// folded is left to the lowering.
+			if (declaration.type.isScalar() && declaration.type.namedType.empty()) {
+				_foldDomainError = false;
+				try {
+					foldInitializer(declaration.type, *declaration.initializer);
+				} catch (const CompileError&) {
+					// not a form the folder knows
+				}
+				const bool outside = _foldDomainError;
+				_foldDomainError = false;
+				if (outside) {
+					throw CompileError(notConstant);
+				}
+			}
+			return;
+		}
+
+		const auto validate = [&](const auto& self, const Expression& expression) -> void {
+			if (expression.kind == ExpressionKind::InitList) {
+				for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
+			} else if (!canFoldExpression(expression, declaration.name)) {
+				throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
+			}
+		};
+		validate(validate, *declaration.initializer);
+	}
+
+	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
+			return;
+		}
+
+		if (declaration.isReference) {
+			emitReferenceDeclaration(declaration);
 			return;
 		}
 
@@ -6455,35 +7161,36 @@ namespace {
 
 		const Id typeId = declaredTypeOf(declaration.type);
 
-		if (declaration.type.isConstexpr && declaration.initializer
-			&& declaration.initializer->kind == ExpressionKind::InitList) {
-			const auto validate = [&](const auto& self, const Expression& expression) -> void {
-				if (expression.kind == ExpressionKind::InitList) {
-					for (const InitializerElement& element: expression.elements) { self(self, *element.value); }
-				} else if (!canFoldExpression(expression, declaration.name)) {
-					throw CompileError("a constexpr brace initializer requires a supported constant expression; this form is not lowered yet");
-				}
-			};
-			validate(validate, *declaration.initializer);
+		if (!storageOnly) {
+			validateConstexprInitializer(declaration);
 		}
 
 		Id initial = InvalidId;
-		if (declaration.initializer) {
+		if (!storageOnly && declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
 				? emitInitListValue(declaration.type, *declaration.initializer)
 				: emitExpression(*declaration.initializer);
 			initial = convertImplicit(initializer, typeId);
-		} else {
+		} else if (!storageOnly) {
 			initial = _types.zero(typeId);
 		}
 
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
 		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
-		_builder.emit(spirv::OpStore, { id, initial });
+		if (!storageOnly) {
+			_builder.emit(spirv::OpStore, { id, initial });
+		}
 
 		bindLocal(declaration.name, id, typeId, declaration.type);
-		if (declaration.initializer && !_types.isAggregate(typeId)
+		const Type& declared = declaration.type;
+		if (declaration.initializer && declared.isConst && !declared.isConstexpr && !declared.isPointer
+			&& !declared.isVector() && !declared.isMatrix() && declared.namedType.empty()
+			&& !declared.arrayLength && !isFloatKind(declared.scalar)
+			&& !readsRuntimeValue(*declaration.initializer)) {
+			_bindings[declaration.name].constantValue = true;
+		}
+		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
 			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
 			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
@@ -6507,6 +7214,15 @@ namespace {
 					const FoldedConstant converted = convertConstant(folded, to);
 					if (!isFloatKind(to) || std::isfinite(converted.number)) { _localFolded[id] = converted; }
 				}
+			}
+		}
+		if (!storageOnly && declaration.type.isConst && declaration.initializer
+			&& declaration.type.namedType.empty() && declaration.type.isScalar()
+			&& !isFloatKind(declaration.type.scalar)) {
+			try {
+				_bindings[declaration.name].folded = foldInitializer(declaration.type, *declaration.initializer);
+			} catch (const CompileError&) {
+				// A const local may have a runtime initializer without being a constant expression.
 			}
 		}
 	}
@@ -6558,8 +7274,14 @@ namespace {
 			// plain value is loaded, so only this case takes the binding.
 			const auto it = _bindings.find(left.name);
 			if (it != _bindings.end() && it->second.isPointer
-				&& it->second.storageClass == spirv::StorageClass::Function) {
+				&& it->second.bufferPointeeType == InvalidId
+				&& (it->second.storageClass == spirv::StorageClass::Function
+					|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)) {
 				address = it->second.id;
+			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
+				&& !it->second.isBuffer) {
+				// A reference parameter is the one value its buffer holds.
+				address = bufferBase(it->second);
 			} else {
 				address = emitExpression(left);
 			}
@@ -6789,6 +7511,164 @@ namespace {
 		_builder.emit(spirv::OpStore, { address, convertImplicit(value, pointeeType) });
 	}
 
+	// What stands for the value of a constexpr that is never reached: only that it
+	// is a constant matters to the declarations after it, not what it holds.
+	static FoldedConstant placeholderConstant(const Type& type) {
+		FoldedConstant constant;
+		constant.scalar = type.scalar;
+		return constant;
+	}
+
+	// A switch is a selection: OpSelectionMerge names the block after the body,
+	// and OpSwitch sends the selector to one case's block, each of which
+	// branches to the next for a fall-through or, through a break, to the merge.
+	// A switch with no default sends every unmatched value to the merge.
+	void Emitter::emitSwitch(const Statement& statement) {
+		Id selector = emitExpression(*statement.expression);
+		const Id emittedType = _builder.typeOf(selector);
+
+		// The selector arrives as a value, so its MSL type is recovered from the
+		// SPIR-V one. A bool is an integer type C++ accepts here; OpSwitch does
+		// not, so it switches on the bool's int value, 1 or 0.
+		const std::optional<ScalarKind> selectorKind = _types.scalarKindOf(emittedType);
+		if (!selectorKind || isFloatKind(*selectorKind)) {
+			const auto diagnosticKind = selectorKind ? selectorKind
+				: _types.scalarKindOf(_types.componentOf(emittedType));
+			std::string name = diagnosticKind ? std::string(scalarKindName(*diagnosticKind)) : "void";
+			if (diagnosticKind && _types.vectorWidth(emittedType) > 1) {
+				name += std::to_string(_types.vectorWidth(emittedType));
+			}
+			throw CompileError("statement requires expression of integer type ('" + name + "' invalid)");
+		}
+
+		const ScalarKind kind = promotedKind(*selectorKind);
+		if (kind != *selectorKind) {
+			selector = convert(selector, emittedType, _intType);
+		}
+
+		const Id mergeLabel = _builder.nextId();
+		Id defaultLabel = InvalidId;
+		std::vector<Id> labels(statement.switchCases.size());
+		std::vector<uint64_t> literals(statement.switchCases.size(), 0);
+
+		for (Id& label: labels) {
+			label = _builder.nextId();
+		}
+
+		std::set<uint64_t> seen;
+		{
+			const BindingScope validationScope(_bindings);
+			for (const StatementPtr& child: statement.switchPreamble) {
+				if (child->kind == StatementKind::DeclarationStatement) {
+					const auto& declaration = *child->declaration;
+					if (!statement.switchCases.empty() && (declaration.initializer
+						|| declaration.type.resource == ResourceKind::Sampler)) {
+						throw CompileError("switch label bypasses variable initialization");
+					}
+					_bindings[declaration.name] = Binding{};
+				}
+			}
+			for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+				const SwitchCase& kase = statement.switchCases[i];
+				if (!kase.value) {
+					if (defaultLabel != InvalidId) {
+						throw CompileError("multiple default labels in one switch");
+					}
+					defaultLabel = labels[i];
+				} else {
+					FoldedConstant folded;
+					try {
+						folded = foldExpression(*kase.value);
+					} catch (const CompileError&) {
+						throw CompileError("case value is not a constant expression");
+					}
+					if (folded.isComposite || isFloatKind(folded.scalar)) {
+						throw CompileError("case value is not an integer constant expression");
+					}
+					// A bool case value is its int value, as the selector is.
+					if (folded.scalar == ScalarKind::Bool) {
+						folded.scalar = ScalarKind::Int;
+						folded.integer = folded.boolean ? 1 : 0;
+					}
+
+					if (!fitsInKind(folded, kind)) {
+						throw CompileError("case value evaluates to " + integerText(folded)
+							+ ", which cannot be narrowed to type '" + scalarKindName(kind) + "'");
+					}
+
+					literals[i] = normalizeInteger(kind, folded.integer);
+					if (!seen.insert(literals[i]).second) {
+						FoldedConstant asSelector;
+						asSelector.scalar = kind;
+						asSelector.integer = literals[i];
+						throw CompileError("duplicate case value '" + integerText(asSelector) + "'");
+					}
+				}
+				for (const StatementPtr& child: kase.body) {
+					if (child->kind == StatementKind::DeclarationStatement) {
+						const auto& declaration = *child->declaration;
+						if (i + 1 < statement.switchCases.size() && (declaration.initializer
+							|| declaration.type.resource == ResourceKind::Sampler)) {
+							throw CompileError("switch label bypasses variable initialization");
+						}
+						_bindings[declaration.name] = Binding{};
+					}
+				}
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			if (child->kind == StatementKind::DeclarationStatement) {
+				emitVariableDeclaration(*child->declaration, true);
+			}
+		}
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		std::vector<uint32_t> operands = {
+			selector, defaultLabel != InvalidId ? defaultLabel : mergeLabel };
+		const uint32_t width = mappingFor(kind).width;
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			if (!statement.switchCases[i].value) {
+				continue;
+			}
+			// A literal is as wide as the selector: two words for a 64-bit one.
+			operands.push_back(static_cast<uint32_t>(literals[i]));
+			if (width > 32) {
+				operands.push_back(static_cast<uint32_t>(literals[i] >> 32));
+			}
+			operands.push_back(labels[i]);
+		}
+		terminate(spirv::OpSwitch, operands);
+
+		const ControlDepthScope depth(_controlDepth);
+		// A break leaves the switch; a continue belongs to the loop around it,
+		// which is what a target with no continue label tells the jump lowering.
+		_jumpTargets.push_back({ mergeLabel, InvalidId });
+		struct PopTarget {
+			std::vector<JumpTarget>& targets;
+			~PopTarget() { targets.pop_back(); }
+		} popTarget{ _jumpTargets };
+
+		for (size_t i = 0; i < statement.switchCases.size(); ++i) {
+			beginBlock(labels[i]);
+			for (const StatementPtr& child: statement.switchCases[i].body) {
+				if (_terminated) {
+					if (child->kind == StatementKind::DeclarationStatement) {
+						validateConstexprInitializer(*child->declaration);
+						emitVariableDeclaration(*child->declaration, true);
+						if (child->declaration->type.isConstexpr) {
+							_localFolded[_bindings[child->declaration->name].id]
+								= placeholderConstant(child->declaration->type);
+						}
+					}
+					continue;
+				}
+				emitStatement(*child);
+			}
+			branchUnlessTerminated(i + 1 < labels.size() ? labels[i + 1] : mergeLabel);
+		}
+
+		beginBlock(mergeLabel);
+	}
+
 	void Emitter::emitStatement(const Statement& statement) {
 		switch (statement.kind) {
 			case StatementKind::Compound: {
@@ -6797,7 +7677,17 @@ namespace {
 				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
 					if (_terminated) {
-						break;
+						if (child->kind == StatementKind::DeclarationStatement) {
+							validateConstexprInitializer(*child->declaration);
+							// Its name still counts as a constant for the declarations after it.
+							if (child->declaration->type.isConstexpr) {
+								Binding dead;
+								dead.id = _builder.nextId();
+								_localFolded[dead.id] = placeholderConstant(child->declaration->type);
+								_bindings[child->declaration->name] = dead;
+							}
+						}
+						continue;
 					}
 					emitStatement(*child);
 				}
@@ -6949,6 +7839,13 @@ namespace {
 				}
 				terminate(spirv::OpKill, {});
 				return;
+			case StatementKind::Switch: {
+				// A local declared under one label is visible under the ones after
+				// it, as C++ says, so the whole body shares one scope.
+				const BindingScope scope(_bindings);
+				emitSwitch(statement);
+				return;
+			}
 		}
 	}
 
@@ -7131,6 +8028,8 @@ namespace {
 			// point's own, and the interface is the list this OpEntryPoint names.
 			_bindings.clear();
 			_bufferMembers.clear();
+			_bufferBoolTypes.clear();
+			_bufferMatrixTypes.clear();
 			_bufferBases.clear();
 			_interface.clear();
 			_reflection.clear();
@@ -7145,6 +8044,7 @@ namespace {
 			_outputs.clear();
 			_stageIn = nullptr;
 			_stageInputs.clear();
+			_hasFragCoordInput = false;
 			_terminated = false;
 
 			emitEntryPoint(functionType);

@@ -240,6 +240,8 @@ private:
 	void parseResourceType(Type& type);
 	bool parseQualifier(Type& type, bool afterPointer);
 	void parseSamplerLocal(VariableDeclaration& declaration);
+	void parseLocalInitializer(VariableDeclaration& declaration);
+	void appendStatement(std::vector<StatementPtr>& out);
 	SamplerState parseSamplerOptions(TokenKind closing);
 	bool parseAddressSpace(AddressSpace& space);
 	std::optional<uint32_t> tryParseArrayLength();
@@ -261,10 +263,14 @@ private:
 
 	// Statements
 	StatementPtr parseStatement();
+	// The declarations after the first of "T a, b, c;", which parseStatement leaves
+	// for the list it is appending to.
+	std::vector<StatementPtr> _declaratorTail;
 	StatementPtr parseCompoundStatement();
 	StatementPtr parseIfStatement();
 	StatementPtr parseForStatement();
 	StatementPtr parseWhileStatement();
+	StatementPtr parseSwitchStatement();
 	StatementPtr parseReturnStatement();
 
 	// Expressions, by precedence level.
