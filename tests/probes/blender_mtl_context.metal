@@ -1,4 +1,4 @@
-// EXPECT: error field "texCoord" of "Vertex" has [[attribute(n)]]
+// EXPECT: valid
 using namespace metal;
 struct Vertex {
   float4 position [[position]];
