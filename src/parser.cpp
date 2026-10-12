@@ -3227,8 +3227,11 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 		if (isTypeQualifier(head) || addressSpaceFor(head)) {
 			throw CompileError("a cast to a qualified, pointer or reference type is not supported");
 		}
+		// A cast to void evaluates the operand and discards it; the empty type stands
+		// for void, which is what a Type holds until something sets it.
 		if (head == "void") {
-			throw CompileError("a cast to void is not supported");
+			nameTokens = 1;
+			return Type();
 		}
 	}
 
