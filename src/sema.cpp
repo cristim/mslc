@@ -2984,6 +2984,29 @@ namespace {
 			// An element of a buffer has the buffer's own type.
 			case ExpressionKind::Index: return structOf(*expression.left);
 
+			// A helper that returns a struct, including a struct's constructor, which
+			// is one.
+			case ExpressionKind::Call: {
+				// A lookup by name only: findHelper evaluates a receiver it does not know
+				// the type of, and this has to leave no code behind.
+				const HelperFunction* helper = nullptr;
+				if (expression.left->kind == ExpressionKind::Identifier) {
+					const auto found = _helpers.find(expression.left->name);
+					helper = found == _helpers.end() ? nullptr : &found->second;
+				} else if (expression.left->kind == ExpressionKind::Member) {
+					const StructDecl* owner = structOf(*expression.left->left);
+					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName)
+						: _helpers.end();
+					helper = found == _helpers.end() ? nullptr : &found->second;
+				}
+				if (!helper) {
+					return nullptr;
+				}
+				const Type& returned = helper->definition->returnType;
+				return returned.namedType.empty() || returned.isPointer || returned.arrayLength
+					? nullptr : _unit.findStruct(returned.namedType);
+			}
+
 			default: return nullptr;
 		}
 	}
@@ -3048,6 +3071,21 @@ namespace {
 	Id Emitter::emitMember(const Expression& expression) {
 		if (!structOf(*expression.left)) {
 			return emitSwizzle(expression);
+		}
+
+		// A member of a value a helper returned has no address; the call is made and
+		// the field taken from the struct it produced.
+		if (expression.left->kind == ExpressionKind::Call) {
+			const StructDecl* decl = structOf(*expression.left);
+			std::string declName;
+			const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
+			if (field == decl->fields.size()) {
+				throw CompileError("struct \"" + declName + "\" has no member \""
+					+ expression.memberName + "\"");
+			}
+			const Id value = emitExpression(*expression.left);
+			return _builder.emitTyped(spirv::OpCompositeExtract,
+				declaredTypeOf(decl->fields[field].type), { value, static_cast<uint32_t>(field) });
 		}
 
 		const ConstantBinding* constant = constantFor(expression.left.get());
