@@ -1,3 +1,4 @@
+#include <limits>
 #include "parser.h"
 
 #include <algorithm>
@@ -3699,6 +3700,30 @@ ExpressionPtr Parser::parsePrimary() {
 				throw CompileError("\"" + resolved + "\" has a constructor with nothing to do, and a value of it is not lowered");
 			}
 			return call;
+		}
+
+		// INFINITY, HUGE_VALF, HUGE_VALH and NAN expand to these compiler builtins: each is
+		// the one value its name says, so it is the float constant.
+		if ((resolved == "__builtin_inff" || resolved == "__builtin_huge_valf" || resolved == "__builtin_huge_valh"
+			|| resolved == "__builtin_nanf") && lookahead().kind == TokenKind::LParen) {
+			const bool wantsString = resolved == "__builtin_nanf";
+			if (wantsString ? !(lookahead(2).kind == TokenKind::StringLiteral && lookahead(3).kind == TokenKind::RParen)
+				: lookahead(2).kind != TokenKind::RParen) {
+				throw CompileError("\"" + resolved + "\" takes " + (wantsString ? "a string" : "no arguments"));
+			}
+			auto expression = std::make_unique<Expression>();
+			expression->line = line();
+			expression->kind = ExpressionKind::FloatLiteral;
+			expression->floatValue = wantsString ? std::numeric_limits<double>::quiet_NaN()
+				: std::numeric_limits<double>::infinity();
+			expression->floatIsHalf = resolved == "__builtin_huge_valh";
+			consumeName();
+			advance();
+			if (wantsString) {
+				advance();
+			}
+			advance();
+			return expression;
 		}
 
 		// An enumerator is the integer it was declared with.
