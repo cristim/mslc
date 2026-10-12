@@ -2181,6 +2181,8 @@ namespace {
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
+		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
+			const std::string& spelled);
 		Id emitInitListValue(const Type& target, const Expression& list);
 		Id emitListScalarValue(const Type& target, const Expression& expression);
 		Id convertListScalar(Id value, const Type& target, const Expression& expression);
@@ -3193,6 +3195,51 @@ namespace {
 			std::vector<uint32_t>(_types.vectorWidth(vectorType), widened));
 	}
 
+	// float2x2(1.0f) is the diagonal matrix with 1.0 on it and 0 elsewhere, also for a
+	// matrix that is not square, and float2x2(m) copies a matrix of the same shape,
+	// converting its elements (measured with Apple's compiler and a GPU run). A matrix
+	// of another shape is not a conversion Apple has either.
+	Id Emitter::emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
+		const std::string& spelled) {
+		const Id value = emitExpression(argument);
+		const Id fromType = _builder.typeOf(value);
+		const auto* to = _types.matrixInfo(toType);
+
+		if (const auto* from = _types.matrixInfo(fromType)) {
+			if (from->columns != to->columns || from->rows != to->rows) {
+				throw CompileError("no matching conversion from a matrix of another shape to " + spelled);
+			}
+			if (fromType == toType) {
+				return value;
+			}
+
+			std::vector<uint32_t> columns;
+			for (uint32_t column = 0; column < to->columns; ++column) {
+				const Id piece = _builder.emitTyped(spirv::OpCompositeExtract, from->column, { value, column });
+				columns.push_back(convert(piece, from->column, to->column));
+			}
+			return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
+		}
+
+		if (_types.vectorWidth(fromType) != 1 || _types.bitWidth(fromType) == 0) {
+			throw CompileError("no matching conversion from this value to " + spelled
+				+ "; a matrix is built from a scalar, a matrix of its own shape, or one vector per column");
+		}
+
+		const Id componentType = _types.componentOf(to->column);
+		const Id diagonal = convert(value, fromType, componentType);
+		const Id zero = _types.zero(componentType);
+		std::vector<uint32_t> columns;
+		for (uint32_t column = 0; column < to->columns; ++column) {
+			std::vector<uint32_t> elements(to->rows, zero);
+			if (column < to->rows) {
+				elements[column] = diagonal;
+			}
+			columns.push_back(_builder.emitTyped(spirv::OpCompositeConstruct, to->column, elements));
+		}
+		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
+	}
+
 	Id Emitter::emitConstruct(const Expression& expression) {
 		if (!expression.constructType) {
 			throw CompileError("a constructor needs the type it constructs");
@@ -3225,10 +3272,14 @@ namespace {
 
 		const Id toType = declaredTypeOf(target);
 
-		// Only the column form, one vector per column. A single scalar is a
-		// diagonal matrix and a list of scalars fills it element by element; both
-		// are their own lowering and are reported rather than guessed at.
+		// One vector per column, a single scalar for the diagonal, or one matrix of
+		// the same shape. A list of scalars filling it element by element is its own
+		// lowering and is reported rather than guessed at.
 		if (target.isMatrix()) {
+			if (expression.arguments.size() == 1) {
+				return emitMatrixFromValue(*expression.arguments.front(), target, toType, spelled);
+			}
+
 			if (expression.arguments.size() != target.matrixColumns) {
 				throw CompileError(spelled + " built from " + std::to_string(expression.arguments.size())
 					+ " values is not lowered yet; mslc builds a matrix from one "
