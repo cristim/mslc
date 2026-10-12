@@ -77,6 +77,10 @@ struct Type {
 	// semantic analysis.
 	std::string namedType;
 
+	// Set for an unscoped enum, to its tag: the type is stored as its underlying
+	// integer, but Apple does not convert an integer or another enum to it.
+	std::string enumName;
+
 	bool isPointer = false;
 	bool isConst = false;
 
@@ -205,6 +209,8 @@ struct Expression {
 	// spelling and value. A long that did not fit holds the wrapped bits.
 	ScalarKind intKind = ScalarKind::Int;
 	double floatValue = 0.0;
+	// An enumerator: the tag of the enum it belongs to, on the literal it became.
+	std::string enumName;
 	// Written with an `h` suffix: the literal is a half, not a float.
 	bool floatIsHalf = false;
 	bool boolValue = false;
