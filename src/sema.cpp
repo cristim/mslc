@@ -8065,13 +8065,9 @@ namespace {
 			// OpKill ends the block for good, so what follows in the same source
 			// block is unreachable, as after a return.
 			case StatementKind::Discard:
-				// A helper is not a stage, and a helper that returns a value cannot
-				// drop the fragment that called it without changing the ABI mslc
-				// has fixed. Apple accepts the helper; mslc reports it.
-				if (_helper) {
-					throw CompileError("discard_fragment() in a helper function is not lowered yet; "
-						"mslc drops the fragment in a fragment function only");
-				}
+				// A helper is emitted once for each entry point that calls it, so the
+				// stage here is the caller's: OpKill in it drops that caller's fragment,
+				// and a helper called from a vertex or kernel function is refused below.
 				if (_entryPoint->stage != Stage::Fragment) {
 					throw CompileError(std::string("discard_fragment() is not allowed within a ")
 						+ (_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
