@@ -1162,6 +1162,7 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 		out.matrixColumns = 0;
 		out.isPacked = false;
 		out.namedType.clear();
+		out.enumName = enumType->second;
 		return true;
 	}
 
@@ -1175,6 +1176,7 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.matrixColumns = alias->second.matrixColumns;
 	out.isPacked = alias->second.isPacked;
 	out.namedType = alias->second.namedType;
+	out.enumName = alias->second.enumName;
 	out.isConst = out.isConst || alias->second.isConst;
 	return true;
 }
@@ -1647,7 +1649,7 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 		}
 
 		declareName(name, "enum constant");
-		_enumConstants[name] = {value, ScalarKind::Int};
+		_enumConstants[name] = {value, ScalarKind::Int, tag.empty() ? std::string("<anonymous>") : tag};
 		names.push_back(name);
 		lowest = std::min(lowest, value);
 		highest = std::max(highest, value);
@@ -3675,6 +3677,7 @@ ExpressionPtr Parser::parsePrimary() {
 			expression->kind = ExpressionKind::IntLiteral;
 			const int64_t value = constant->second.value;
 			expression->intKind = constant->second.kind;
+			expression->enumName = constant->second.owner;
 			expression->intValue = static_cast<uint64_t>(value < 0 ? -value : value);
 			if (value >= 0) {
 				return expression;
@@ -3684,6 +3687,7 @@ ExpressionPtr Parser::parsePrimary() {
 			negated->kind = ExpressionKind::Unary;
 			negated->line = expression->line;
 			negated->unaryOperator = UnaryOperator::Negate;
+			negated->enumName = expression->enumName;
 			negated->left = std::move(expression);
 			measure(*negated);
 			return negated;

@@ -39,6 +39,7 @@ class Parser {
 	struct EnumConstant {
 		int64_t value;
 		ScalarKind kind; // the underlying type of the enum it belongs to
+		std::string owner; // the tag of that enum, or "<anonymous>" when it has none
 	};
 	std::map<std::string, EnumConstant> _enumConstants;
 	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type

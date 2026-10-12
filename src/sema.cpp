@@ -2152,6 +2152,8 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
+		std::optional<std::string> enumOf(const Expression& expression);
+		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
 		bool readsRuntimeValue(const Expression& expression) const;
 		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
@@ -7233,6 +7235,103 @@ namespace {
 		validate(validate, *declaration.initializer);
 	}
 
+	// Which unscoped enum an expression has the type of. Apple converts neither an
+	// integer nor another enum to an enum, so a store has to be of the target's own.
+	// A name for "known not to be an enum" is the empty string; an expression whose
+	// type is not worked out here is unknown, and a caller then accepts it.
+	std::optional<std::string> Emitter::enumOf(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral: return expression.enumName;
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Binary:
+				return std::string();
+			case ExpressionKind::Unary:
+				// Arithmetic on an enum is an int. ++ and -- keep the operand's type but
+				// are not allowed on an enum at all.
+				if (isStep(expression.unaryOperator)) {
+					return std::nullopt;
+				}
+				// The parser builds -1 for a negative enumerator and tags it; a minus written
+				// in the source in front of an enumerator is arithmetic and is not.
+				return std::optional<std::string>(expression.enumName);
+			case ExpressionKind::Identifier: {
+				const auto local = _bindings.find(expression.name);
+				if (local != _bindings.end()) {
+					const Type& type = local->second.pointeeMsl;
+					if (type.isPointer || type.arrayLength) {
+						return std::nullopt;
+					}
+					return type.enumName;
+				}
+				for (const VariableDeclaration& global: _unit.globals) {
+					if (global.name == expression.name) {
+						return global.type.isPointer || global.type.arrayLength
+							? std::nullopt : std::optional<std::string>(global.type.enumName);
+					}
+				}
+				return std::nullopt;
+			}
+			case ExpressionKind::Member: {
+				const StructDecl* decl = structOf(*expression.left);
+				if (!decl) {
+					return std::nullopt;
+				}
+				std::string declName;
+				const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
+				if (field == decl->fields.size()) {
+					return std::nullopt;
+				}
+				const Type& type = decl->fields[field].type;
+				return type.isPointer || type.arrayLength ? std::nullopt
+					: std::optional<std::string>(type.enumName);
+			}
+			case ExpressionKind::Construct:
+				return expression.constructType ? std::optional<std::string>(expression.constructType->enumName)
+					: std::nullopt;
+			case ExpressionKind::Conditional: {
+				// The arms are the value: the same enum in both is that enum, and an arm that is
+				// known not to be one makes the whole an integer.
+				const auto first = enumOf(*expression.arguments.at(0));
+				const auto second = enumOf(*expression.arguments.at(1));
+				if (first && second && *first == *second) {
+					return first;
+				}
+				if ((first && first->empty()) || (second && second->empty())) {
+					return std::string();
+				}
+				return std::nullopt;
+			}
+			case ExpressionKind::Call: {
+				if (expression.left->kind != ExpressionKind::Identifier) {
+					return std::nullopt;
+				}
+				const auto helper = _helpers.find(expression.left->name);
+				if (helper == _helpers.end()) {
+					return std::nullopt;
+				}
+				const Type& returned = helper->second.definition->returnType;
+				return returned.isPointer || returned.arrayLength ? std::nullopt
+					: std::optional<std::string>(returned.enumName);
+			}
+			default:
+				return std::nullopt;
+		}
+	}
+
+	// The error for a store of something that is not the target's enum. An
+	// enumerator of an anonymous enum can not be told from the target's here, so it passes.
+	void Emitter::requireEnumValue(const std::string& target, const Expression& value,
+		const std::string& what) {
+		const auto given = enumOf(value);
+		if (!given || *given == target || *given == "<anonymous>") {
+			return;
+		}
+		throw CompileError(what + " has the enum type " + target + ", and "
+			+ (given->empty() ? std::string("an integer") : "a value of the enum " + *given)
+			+ " does not convert to it; write a cast, as (" + target + ")value");
+	}
+
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
@@ -7266,6 +7365,11 @@ namespace {
 
 		if (!storageOnly) {
 			validateConstexprInitializer(declaration);
+		}
+		if (!storageOnly && !declaration.type.enumName.empty() && declaration.initializer
+			&& declaration.initializer->kind != ExpressionKind::InitList) {
+			requireEnumValue(declaration.type.enumName, *declaration.initializer,
+				"the variable \"" + declaration.name + "\"");
 		}
 
 		// The name is in scope in its own initializer, so the binding is installed
@@ -7524,6 +7628,10 @@ namespace {
 
 		// ++x and x++ as a statement are x += 1; their value is not lowered.
 		if (expression.kind == ExpressionKind::Unary && isStep(expression.unaryOperator)) {
+			if (const auto stepped = enumOf(*expression.left); stepped && !stepped->empty()) {
+				throw CompileError("++ and -- do not apply to the enum " + *stepped
+					+ "; Apple does not convert an integer back to it");
+			}
 			Expression one;
 			one.kind = ExpressionKind::IntLiteral;
 			one.intValue = 1;
@@ -7585,6 +7693,13 @@ namespace {
 	void Emitter::emitAssignment(const Expression& left, const Expression& right,
 		std::optional<BinaryOperator> compound) {
 		requireStorable(left);
+		if (const auto target = enumOf(left); target && !target->empty() && *target != "<anonymous>") {
+			if (compound) {
+				throw CompileError("a compound assignment does not apply to the enum " + *target
+					+ "; Apple does not convert the integer result back to it");
+			}
+			requireEnumValue(*target, right, "the target of the assignment");
+		}
 
 		if (left.kind == ExpressionKind::Member
 			&& !structOf(*left.left)) {
