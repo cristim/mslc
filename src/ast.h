@@ -45,11 +45,12 @@ enum class ScalarKind {
 };
 
 // The texture and sampler types an entry point can take. A texture's component
-// type, the T of texture2d<T> or texturecube<T>, is in Type::scalar.
+// type, the T of texture2d<T>, texturecube<T> or texture3d<T>, is in Type::scalar.
 enum class ResourceKind {
 	None,
 	Texture2D,
 	TextureCube,
+	Texture3D,
 	Sampler,
 };
 
@@ -97,10 +98,13 @@ struct Type {
 	bool isVector() const { return vectorWidth > 1; }
 	bool isMatrix() const { return matrixColumns > 0; }
 	bool isTexture() const {
-		return resource == ResourceKind::Texture2D || resource == ResourceKind::TextureCube;
+		return resource == ResourceKind::Texture2D || resource == ResourceKind::TextureCube
+			|| resource == ResourceKind::Texture3D;
 	}
 };
 
+// The MSL spelling of a resource kind, such as "texture2d".
+const char* resourceKindName(ResourceKind kind);
 const char* scalarKindName(ScalarKind kind);
 uint32_t scalarBitWidth(ScalarKind kind);
 

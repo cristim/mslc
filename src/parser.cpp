@@ -177,9 +177,9 @@ namespace {
 			|| text == "volatile" || text == "__restrict";
 	}
 
-	// The texture and sampler type names. Only texture2d, texturecube and sampler are lowered;
-	// the rest are recognised so they are reported by name rather than read as a
-	// struct type and failing later.
+	// The texture and sampler type names. Only texture2d, texturecube, texture3d
+	// and sampler are lowered; the rest are recognised so they are reported by
+	// name rather than read as a struct type and failing later.
 	bool isResourceTypeName(std::string_view text) {
 		static const std::set<std::string_view> names = {
 			"sampler", "texture1d", "texture1d_array", "texture2d", "texture2d_array",
@@ -2060,9 +2060,15 @@ void Parser::parseResourceType(Type& type) {
 		return;
 	}
 
-	if (name != "texture2d" && name != "texturecube") {
-		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d<float>, "
-			"texture2d<half>, texturecube<float>, texturecube<half> and sampler");
+	static const std::map<std::string_view, ResourceKind> textures = {
+		{ "texture2d", ResourceKind::Texture2D },
+		{ "texturecube", ResourceKind::TextureCube },
+		{ "texture3d", ResourceKind::Texture3D },
+	};
+	const auto lowered = textures.find(name);
+	if (lowered == textures.end()) {
+		throw CompileError("\"" + name + "\" is not lowered yet; mslc lowers texture2d, texturecube "
+			"and texture3d of float or half, and sampler");
 	}
 
 	expect(TokenKind::Less, ("to open the sampled type of " + name).c_str());
@@ -2111,7 +2117,7 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	expect(TokenKind::Greater, ("to close the sampled type of " + name).c_str());
-	type.resource = name == "texturecube" ? ResourceKind::TextureCube : ResourceKind::Texture2D;
+	type.resource = lowered->second;
 	if (component == "uint" && !(name == "texture2d" && (access == "write" || access == "read"))) {
 		throw CompileError(name + "<uint> is not lowered yet; mslc lowers uint only with texture2d access::read or access::write");
 	}
