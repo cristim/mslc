@@ -1,6 +1,6 @@
 // EXPECT: valid
 // DISASM: Sin
-// DISASM: FClamp
+// DISASM: NClamp
 //
 // metal::name is the standard library's name, with or without "using namespace metal".
 #include <metal_stdlib>

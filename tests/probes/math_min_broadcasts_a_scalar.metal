@@ -1,7 +1,7 @@
 // EXPECT: valid
 // A scalar beside a vector is broadcast to it, on either side, as Metal does.
-// DISASM-MATCH: OpExtInst %v3float %[0-9]+ FMin %
-// DISASM-MATCH: OpExtInst %v3float %[0-9]+ FMax %
+// DISASM-MATCH: OpExtInst %v3float %[0-9]+ NMin %
+// DISASM-MATCH: OpExtInst %v3float %[0-9]+ NMax %
 // DISASM-MATCH: OpCompositeConstruct %v3float
 kernel void math_min_broadcasts_a_scalar(
     device const float* f [[buffer(0)]],

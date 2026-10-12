@@ -382,10 +382,14 @@ namespace {
 		{ "log2", 1, MathShape::Componentwise, 30, kNoInstruction, kNoInstruction },
 		{ "sqrt", 1, MathShape::Componentwise, 31, kNoInstruction, kNoInstruction },
 		{ "rsqrt", 1, MathShape::Componentwise, 32, kNoInstruction, kNoInstruction },
-		{ "min", 2, MathShape::Componentwise, 37, 39, 38 },
-		{ "max", 2, MathShape::Componentwise, 40, 42, 41 },
-		{ "clamp", 3, MathShape::Componentwise, 43, 45, 44 },
-		{ "saturate", 1, MathShape::Saturate, 43, kNoInstruction, kNoInstruction },
+		// NMin and NMax (79, 80) return the other operand when one is a NaN, as Metal does;
+		// FMin and FMax leave that case open.
+		{ "min", 2, MathShape::Componentwise, 79, 39, 38 },
+		{ "max", 2, MathShape::Componentwise, 80, 42, 41 },
+		// NClamp (81) turns a NaN operand into the lower bound, as Metal does, where FClamp is
+		// undefined for it; saturate below is a clamp to [0, 1].
+		{ "clamp", 3, MathShape::Componentwise, 81, 45, 44 },
+		{ "saturate", 1, MathShape::Saturate, 81, kNoInstruction, kNoInstruction },
 		{ "mix", 3, MathShape::Componentwise, 46, kNoInstruction, kNoInstruction },
 		{ "step", 2, MathShape::Componentwise, 48, kNoInstruction, kNoInstruction },
 		{ "smoothstep", 3, MathShape::Componentwise, 49, kNoInstruction, kNoInstruction },
