@@ -6216,16 +6216,16 @@ namespace {
 		if (method == "sample") {
 			return emitTextureSample(call, texture);
 		}
-		if (texture.pointeeMsl.resource == ResourceKind::TextureCube) {
-			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
-				"lowers sample on a texturecube");
-		}
-		if (method == "read") {
-			return emitTextureRead(call, texture);
-		}
 		if (method == "get_width" || method == "get_height") {
 			return emitTextureSize(call, texture,
 				method == "get_width" ? SizeComponent::Width : SizeComponent::Height);
+		}
+		if (texture.pointeeMsl.resource == ResourceKind::TextureCube) {
+			throw CompileError("the texturecube method \"" + method + "\" is not lowered yet; mslc "
+				"lowers sample, get_width and get_height on a texturecube");
+		}
+		if (method == "read") {
+			return emitTextureRead(call, texture);
 		}
 		if (method == "get_depth" && texture.pointeeMsl.resource == ResourceKind::Texture3D) {
 			return emitTextureSize(call, texture, SizeComponent::Depth);
