@@ -79,6 +79,10 @@ struct Type {
 	// semantic analysis.
 	std::string namedType;
 
+	// Set for atomic_uint and atomic_int: the scalar is the integer they hold, which is
+	// only read and written by the atomic_*_explicit functions.
+	bool isAtomic = false;
+
 	// Set for an unscoped enum, to its tag: the type is stored as its underlying
 	// integer, but Apple does not convert an integer or another enum to it.
 	std::string enumName;
@@ -203,6 +207,8 @@ enum class BinaryOperator {
 
 enum class UnaryOperator {
 	Negate, Plus, Not, BitNot, PreIncrement, PreDecrement, PostIncrement, PostDecrement,
+	// &x[i]: the address of an element, which only an atomic function takes.
+	AddressOf,
 };
 
 struct Expression {
