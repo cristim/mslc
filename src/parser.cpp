@@ -766,6 +766,10 @@ void Parser::parseStructBody(StructDecl& decl) {
 
 		StructField field;
 		field.type = parseType();
+		if (field.type.isAtomic && !field.type.isPointer) {
+			throw CompileError("an atomic member of a struct (\"" + decl.name + "\") is not lowered yet; "
+				"mslc lowers a device atomic_uint or atomic_int pointer parameter");
+		}
 		expectFieldName(field.name);
 		if (field.type.isStatic) {
 			throw CompileError("a static data member is not supported (\"" + field.name + "\" in \""
@@ -1164,6 +1168,16 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 		out.isPacked = false;
 		out.namedType.clear();
 		out.enumName = enumType->second;
+		return true;
+	}
+
+	if (text == "atomic_uint" || text == "atomic_int") {
+		out.scalar = text == "atomic_uint" ? ScalarKind::UInt : ScalarKind::Int;
+		out.vectorWidth = 0;
+		out.matrixColumns = 0;
+		out.isPacked = false;
+		out.namedType.clear();
+		out.isAtomic = true;
 		return true;
 	}
 
@@ -3222,7 +3236,17 @@ ExpressionPtr Parser::parseUnary() {
 	}
 
 	if (at(TokenKind::Ampersand)) {
-		throw CompileError("taking an address with '&' is not supported");
+		// The address of an element is not a value mslc holds; the atomic_*_explicit
+		// functions take one, and the emitter refuses it anywhere else.
+		auto address = std::make_unique<Expression>();
+		address->kind = ExpressionKind::Unary;
+		address->unaryOperator = UnaryOperator::AddressOf;
+		address->line = line();
+		advance();
+		const NestingScope scope(*this);
+		address->left = parseUnary();
+		measure(*address);
+		return address;
 	}
 
 	if (at(TokenKind::Minus) || at(TokenKind::Plus) || at(TokenKind::Bang) || at(TokenKind::Tilde)

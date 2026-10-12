@@ -2205,6 +2205,8 @@ namespace {
 		bool returnsVoid(const FunctionDecl& function) const;
 		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
 		Id emitSignExact(Id value, Id type, uint32_t bits);
+		Id atomicAddress(const Expression& argument, const std::string& function, bool& isSigned);
+		Id emitAtomicCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
@@ -2693,6 +2695,11 @@ namespace {
 		}
 
 		const Binding& binding = it->second;
+
+		if (binding.pointeeMsl.isAtomic) {
+			throw CompileError("\"" + expression.left->name + "\" points at atomics, which are read and written "
+				"only by the atomic_*_explicit functions");
+		}
 
 		if (expression.arguments.size() != 1) {
 			throw CompileError("expected exactly one index, found " +
@@ -3628,6 +3635,10 @@ namespace {
 	}
 
 	Id Emitter::emitUnary(const Expression& expression) {
+		if (expression.unaryOperator == UnaryOperator::AddressOf) {
+			throw CompileError("taking an address with '&' is not supported; only an atomic_*_explicit "
+				"function takes the address of an element");
+		}
 		const Id operand = emitExpression(*expression.left);
 		const Id type = _builder.typeOf(operand);
 
@@ -4312,6 +4323,104 @@ namespace {
 		return emitBinaryOperation(op, current, value);
 	}
 
+	// The atomic functions of Metal that take the pointer of a device atomic_uint or
+	// atomic_int, with the memory order spelled out. Only the relaxed order exists.
+	static bool isAtomicFunction(const std::string& name) {
+		static const char* const names[] = {
+			"atomic_fetch_add_explicit", "atomic_fetch_sub_explicit", "atomic_fetch_min_explicit",
+			"atomic_fetch_max_explicit", "atomic_fetch_and_explicit", "atomic_fetch_or_explicit",
+			"atomic_fetch_xor_explicit", "atomic_exchange_explicit", "atomic_load_explicit",
+			"atomic_store_explicit", "atomic_compare_exchange_weak_explicit",
+			"atomic_compare_exchange_strong_explicit",
+		};
+		return std::find(std::begin(names), std::end(names), name) != std::end(names);
+	}
+
+	// The address of the atomic an argument names: the pointer itself is its first
+	// element, and &p[i] is element i. Anything else is not a pointer to an atomic.
+	Id Emitter::atomicAddress(const Expression& argument, const std::string& function, bool& isSigned) {
+		const Expression* pointer = &argument;
+		const Expression* index = nullptr;
+		if (argument.kind == ExpressionKind::Unary && argument.unaryOperator == UnaryOperator::AddressOf) {
+			const Expression& element = *argument.left;
+			if (element.kind != ExpressionKind::Index || element.isDereference
+				|| element.left->kind != ExpressionKind::Identifier || element.arguments.size() != 1) {
+				throw CompileError(function + " takes the address of an element of an atomic buffer, as &counters[i]");
+			}
+			pointer = element.left.get();
+			index = element.arguments[0].get();
+		}
+
+		if (pointer->kind != ExpressionKind::Identifier) {
+			throw CompileError(function + " takes a pointer parameter to an atomic, or the address of one of its elements");
+		}
+		const auto found = _bindings.find(pointer->name);
+		if (found == _bindings.end() || !found->second.isBuffer || !found->second.pointeeMsl.isAtomic) {
+			throw CompileError(function + " takes a device atomic_uint or atomic_int pointer, and \""
+				+ pointer->name + "\" is not one");
+		}
+
+		const Binding& binding = found->second;
+		if (binding.pointeeMsl.addressSpace == AddressSpace::Constant) {
+			throw CompileError(function + " takes a device atomic, and \"" + pointer->name
+				+ "\" points into the constant address space");
+		}
+		if (binding.readOnly && function != "atomic_load_explicit") {
+			throw CompileError(function + " changes the atomic, and \"" + pointer->name
+				+ "\" points at a constant or const one; only atomic_load_explicit reads it");
+		}
+		isSigned = binding.pointeeMsl.scalar == ScalarKind::Int;
+		const Id indexId = index ? stepIndex(*index, "buffer element") : constantU32(0);
+		return _builder.emitTyped(spirv::OpAccessChain,
+			_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, binding.pointeeType),
+			{ bufferBase(binding), constantU32(0), indexId });
+	}
+
+	Id Emitter::emitAtomicCall(const Expression& expression) {
+		const std::string& name = expression.left->name;
+		const bool isStore = name == "atomic_store_explicit";
+		const bool isLoad = name == "atomic_load_explicit";
+		if (name.rfind("atomic_compare_exchange", 0) == 0) {
+			throw CompileError(name + " is not lowered yet; the fetch, exchange, load and store functions are");
+		}
+
+		const size_t expected = isLoad ? 2 : 3;
+		if (expression.arguments.size() != expected) {
+			throw CompileError(name + " takes " + std::to_string(expected) + " arguments: the pointer, "
+				+ (isLoad ? "" : "the value, ") + "and memory_order_relaxed");
+		}
+		const Expression& order = *expression.arguments.back();
+		if (order.kind != ExpressionKind::Identifier || order.name != "memory_order_relaxed") {
+			throw CompileError(name + " takes memory_order_relaxed, the only memory order Metal has");
+		}
+
+		bool isSigned = false;
+		const Id address = atomicAddress(*expression.arguments[0], name, isSigned);
+		const Id type = isSigned ? _intType : _uintType;
+		const Id scope = constantU32(1);      // Device
+		const Id semantics = constantU32(0);  // Relaxed
+
+		if (isLoad) {
+			return _builder.emitTyped(spirv::OpAtomicLoad, type, { address, scope, semantics });
+		}
+
+		const Id value = convertImplicit(emitExpression(*expression.arguments[1]), type);
+		if (isStore) {
+			_builder.emit(spirv::OpAtomicStore, { address, scope, semantics, value });
+			return InvalidId;
+		}
+
+		uint16_t opcode = spirv::OpAtomicIAdd;
+		if (name == "atomic_fetch_sub_explicit") opcode = spirv::OpAtomicISub;
+		else if (name == "atomic_fetch_min_explicit") opcode = isSigned ? spirv::OpAtomicSMin : spirv::OpAtomicUMin;
+		else if (name == "atomic_fetch_max_explicit") opcode = isSigned ? spirv::OpAtomicSMax : spirv::OpAtomicUMax;
+		else if (name == "atomic_fetch_and_explicit") opcode = spirv::OpAtomicAnd;
+		else if (name == "atomic_fetch_or_explicit") opcode = spirv::OpAtomicOr;
+		else if (name == "atomic_fetch_xor_explicit") opcode = spirv::OpAtomicXor;
+		else if (name == "atomic_exchange_explicit") opcode = spirv::OpAtomicExchange;
+		return _builder.emitTyped(opcode, type, { address, scope, semantics, value });
+	}
+
 	Id Emitter::emitCall(const Expression& expression) {
 		const Expression* receiver = nullptr;
 		HelperFunction* helper = findHelper(expression, receiver);
@@ -4331,6 +4440,13 @@ namespace {
 			}
 
 			return emitHelperCall(expression, *helper, receiver);
+		}
+
+		if (isAtomicFunction(expression.left->name)) {
+			if (expression.left->name == "atomic_store_explicit") {
+				throw CompileError("atomic_store_explicit returns void and has no value");
+			}
+			return emitAtomicCall(expression);
 		}
 
 		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
@@ -7456,6 +7572,11 @@ namespace {
 			return;
 		}
 
+		if (declaration.type.isAtomic && !declaration.type.isPointer) {
+			throw CompileError("a local atomic \"" + declaration.name + "\" is not allowed: an atomic lives in a "
+				"device buffer, and a function takes a pointer to it");
+		}
+
 		if (declaration.isReference) {
 			emitReferenceDeclaration(declaration);
 			return;
@@ -7762,6 +7883,11 @@ namespace {
 		}
 
 		// A call whose value is dropped, which is the only way to call a void helper.
+		if (expression.kind == ExpressionKind::Call && expression.left->kind == ExpressionKind::Identifier
+			&& expression.left->name == "atomic_store_explicit") {
+			emitAtomicCall(expression);
+			return;
+		}
 		if (expression.kind == ExpressionKind::Call) {
 			const Expression* receiver = nullptr;
 			if (HelperFunction* helper = findHelper(expression, receiver)) {
