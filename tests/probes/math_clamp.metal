@@ -1,10 +1,10 @@
 // EXPECT: valid
-// clamp picks FClamp, SClamp or UClamp from the operand's own type, the way
+// clamp picks NClamp, SClamp or UClamp from the operand's own type, the way
 // min and max do, and broadcasts scalar bounds beside a vector.
-// DISASM-MATCH: OpExtInst %float %[0-9]+ FClamp %
+// DISASM-MATCH: OpExtInst %float %[0-9]+ NClamp %
 // DISASM-MATCH: OpExtInst %int %[0-9]+ SClamp %
 // DISASM-MATCH: OpExtInst %uint %[0-9]+ UClamp %
-// DISASM-MATCH: OpExtInst %v3float %[0-9]+ FClamp %
+// DISASM-MATCH: OpExtInst %v3float %[0-9]+ NClamp %
 kernel void math_clamp(
     device const float* f [[buffer(0)]],
     device const int* s [[buffer(1)]],
