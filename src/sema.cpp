@@ -338,6 +338,9 @@ namespace {
 		// -1, 0 or 1 with the zeros keeping their sign and a NaN giving 0, where
 		// GLSL.std.450's FSign leaves both open.
 		SignExact,
+		// fmod: the remainder with the dividend's sign, which is OpFRem and not an
+		// extended instruction.
+		FloatRemainder,
 	};
 
 	// GLSL.std.450 numbers its instructions from 1, so 0 marks a builtin with no
@@ -361,6 +364,7 @@ namespace {
 		{ "floor", 1, MathShape::Componentwise, 8, kNoInstruction, kNoInstruction },
 		{ "ceil", 1, MathShape::Componentwise, 9, kNoInstruction, kNoInstruction },
 		{ "fract", 1, MathShape::Componentwise, 10, kNoInstruction, kNoInstruction },
+		{ "fmod", 2, MathShape::FloatRemainder, kNoInstruction, kNoInstruction, kNoInstruction },
 		{ "round", 1, MathShape::RoundHalfAway, 3, kNoInstruction, kNoInstruction },
 		{ "rint", 1, MathShape::Componentwise, 2, kNoInstruction, kNoInstruction },
 		{ "sign", 1, MathShape::SignExact, 6, kNoInstruction, kNoInstruction },
@@ -4764,7 +4768,7 @@ namespace {
 
 		const bool takesScalars = builtin.shape == MathShape::Componentwise
 			|| builtin.shape == MathShape::Saturate || builtin.shape == MathShape::RoundHalfAway
-			|| builtin.shape == MathShape::SignExact;
+			|| builtin.shape == MathShape::SignExact || builtin.shape == MathShape::FloatRemainder;
 		// Metal has no double, and GLSL.std.450's transcendentals take only 16 and
 		// 32 bits.
 		if (isFloat ? bits > 32 : !takesIntegers) {
@@ -4832,6 +4836,19 @@ namespace {
 		}
 		if (builtin.shape == MathShape::SignExact) {
 			return emitSignExact(values[0], type, bits);
+		}
+		if (builtin.shape == MathShape::FloatRemainder) {
+			if (bits == 16) {
+				// The quotient of a half remainder can pass the half range (65504 / 6), and a
+				// driver that forms it in half precision answers infinity where Apple answers
+				// the remainder, so it is computed in float and narrowed.
+				const uint32_t width = _types.vectorWidth(type);
+				const Id wide = width > 1 ? _types.vector(ScalarKind::Float, width) : _types.scalar(ScalarKind::Float);
+				const Id a = convert(values[0], type, wide);
+				const Id b = convert(values[1], type, wide);
+				return convert(_builder.emitTyped(spirv::OpFRem, wide, { a, b }), wide, type);
+			}
+			return _builder.emitTyped(spirv::OpFRem, type, { values[0], values[1] });
 		}
 
 		const uint32_t instruction = isFloat ? builtin.floatInstruction
