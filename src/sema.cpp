@@ -396,6 +396,15 @@ namespace {
 		{ "fwidth", 1, MathShape::Fwidth, kNoInstruction, kNoInstruction, kNoInstruction },
 	};
 
+	// A construct whose type is void: the cast (void)e.
+	static bool isVoidCast(const Expression& expression) {
+		return expression.kind == ExpressionKind::Construct && expression.constructType
+			&& expression.constructType->scalar == ScalarKind::Void
+			&& !expression.constructType->isPointer && !expression.constructType->arrayLength
+			&& expression.constructType->namedType.empty() && !expression.constructType->isVector()
+			&& !expression.constructType->isMatrix() && expression.arguments.size() == 1;
+	}
+
 	const MathBuiltin* findMathBuiltin(const std::string& name) {
 		for (const MathBuiltin& builtin: kMathBuiltins) {
 			if (name == builtin.name) {
@@ -3247,6 +3256,11 @@ namespace {
 
 		const Type& target = *expression.constructType;
 		const std::string spelled = typeName(target);
+
+		if (isVoidCast(expression)) {
+			throw CompileError("a cast to void has no value; it can only be a statement of its own, "
+				"as in (void)x;");
+		}
 
 		// Only a scalar or a vector is a value a constructor produces. A pointer,
 		// an array or a struct is not: "float* p(0)" is a null pointer in C++ and
@@ -7456,6 +7470,20 @@ namespace {
 	}
 
 	void Emitter::emitExpressionStatement(const Expression& expression) {
+		// (void)e and static_cast<void>(e): e is evaluated for its effects and its
+		// value dropped, so an assignment or a call in it still happens.
+		if (isVoidCast(expression)) {
+			// (void)param; is the idiom for an unused parameter: reading a texture, a
+			// sampler or a buffer name has no value to evaluate, so naming a parameter is
+			// all there is to do. An undeclared name is still reported.
+			const Expression& operand = *expression.arguments.front();
+			if (operand.kind == ExpressionKind::Identifier && findResourceBinding(operand.name)) {
+				return;
+			}
+			emitExpressionStatement(operand);
+			return;
+		}
+
 		// ++x and x++ as a statement are x += 1; their value is not lowered.
 		if (expression.kind == ExpressionKind::Unary && isStep(expression.unaryOperator)) {
 			Expression one;
