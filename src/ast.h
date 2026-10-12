@@ -320,6 +320,9 @@ struct VariableDeclaration {
 struct Statement {
 	StatementKind kind;
 
+	// ExpressionStatement with no expression: [[fallthrough]];
+	bool isFallthrough = false;
+
 	// Compound
 	std::vector<StatementPtr> children;
 

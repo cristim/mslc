@@ -264,6 +264,8 @@ private:
 
 	// Statements
 	StatementPtr parseStatement();
+	// Switch bodies being parsed, which is where [[fallthrough]] is allowed.
+	int _switchDepth = 0;
 	// The declarations after the first of "T a, b, c;", which parseStatement leaves
 	// for the list it is appending to.
 	std::vector<StatementPtr> _declaratorTail;

@@ -2613,7 +2613,11 @@ StatementPtr Parser::parseStatement() {
 		advance();
 		advance();
 		expect(TokenKind::Semicolon, "after a [[fallthrough]] attribute");
+		if (_switchDepth == 0) {
+			throw CompileError("fallthrough annotation is outside switch statement");
+		}
 		statement->kind = StatementKind::ExpressionStatement;
+		statement->isFallthrough = true;
 		return statement;
 	}
 
@@ -2988,8 +2992,23 @@ StatementPtr Parser::parseSwitchStatement() {
 	}
 	advance();
 
+	struct DepthGuard {
+		int& depth;
+		explicit DepthGuard(int& value): depth(value) { ++depth; }
+		~DepthGuard() { --depth; }
+	} depthGuard(_switchDepth);
+
 	SwitchCase* kase = nullptr;
+	bool markerPending = false;
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
+		// A [[fallthrough]]; directly in a case has to be the last statement before
+		// the next label, as Apple requires.
+		// A null statement between the marker and the label does not count, as in Apple.
+		if (markerPending && !atKeyword("case") && !atKeyword("default") && !at(TokenKind::Semicolon)) {
+			throw CompileError("fallthrough annotation does not directly precede switch label");
+		}
+		const bool carriedMarker = markerPending;
+		markerPending = false;
 		if (atKeyword("case")) {
 			advance();
 			SwitchCase next;
@@ -3010,9 +3029,16 @@ StatementPtr Parser::parseSwitchStatement() {
 			continue;
 		}
 
-		appendStatement(kase ? kase->body : statement->switchPreamble);
+		std::vector<StatementPtr>& into = kase ? kase->body : statement->switchPreamble;
+		appendStatement(into);
+		const Statement* added = into.empty() ? nullptr : into.back().get();
+		markerPending = added && (added->isFallthrough
+			|| (carriedMarker && added->kind == StatementKind::ExpressionStatement && !added->expression));
 	}
 
+	if (markerPending) {
+		throw CompileError("fallthrough annotation does not directly precede switch label");
+	}
 	expect(TokenKind::RBrace, "to close a switch body");
 
 	return statement;
