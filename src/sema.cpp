@@ -6527,9 +6527,21 @@ namespace {
 				"allow across a stage boundary; use " + typeName(Type { type.scalar, type.vectorWidth }));
 		}
 
+		// A bool crosses from a vertex function to a fragment function as an unsigned
+		// integer that is 0 or 1; Apple refuses it as a colour output, and a bool
+		// vertex attribute has no layout here.
+		const bool crossesStages = (_entryPoint->stage == Stage::Vertex && storageClass == spirv::StorageClass::Output)
+			|| (_entryPoint->stage == Stage::Fragment && storageClass == spirv::StorageClass::Input);
+		const bool carriedBool = type.scalar == ScalarKind::Bool && crossesStages;
+		// A char or a short is stored in 32 bits across the boundary, as a half is in a
+		// float; Apple accepts them there and refuses 64-bit integers.
+		const bool narrowInteger = crossesStages && (type.scalar == ScalarKind::Char || type.scalar == ScalarKind::UChar
+			|| type.scalar == ScalarKind::Short || type.scalar == ScalarKind::UShort);
+
 		const uint32_t bits = scalarBitWidth(type.scalar);
 		if (type.isPointer || type.arrayLength || !type.namedType.empty() || type.isMatrix()
-			|| type.scalar == ScalarKind::Bool || (bits != 32 && type.scalar != ScalarKind::Half)) {
+			|| (type.scalar == ScalarKind::Bool && !carriedBool)
+			|| (bits != 32 && type.scalar != ScalarKind::Half && !carriedBool && !narrowInteger)) {
 			throw CompileError(what + " is a " + typeName(type) + ", which mslc does not pass "
 				"between stages yet; it passes a scalar or a vector of 32-bit components or of half");
 		}
@@ -6537,6 +6549,13 @@ namespace {
 		Type carried = type;
 		if (carried.scalar == ScalarKind::Half) {
 			carried.scalar = ScalarKind::Float;
+		}
+		if (carriedBool) {
+			carried.scalar = ScalarKind::UInt;
+		}
+		if (narrowInteger) {
+			carried.scalar = type.scalar == ScalarKind::Char || type.scalar == ScalarKind::Short
+				? ScalarKind::Int : ScalarKind::UInt;
 		}
 
 		StageVariable stage;
