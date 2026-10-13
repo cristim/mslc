@@ -1247,18 +1247,19 @@ void Parser::declareName(const std::string& name, const char* what) {
 }
 
 void Parser::declareLocal(const std::string& name) {
-	// A name that resolves to a declaration inside a namespace is hidden the same way.
-	QualifiedName unqualified;
-	unqualified.parts = {name};
-	const std::string key = resolveName(unqualified);
-	const char* what = _enumConstants.count(key) ? "enum constant"
-		: _typedefs.count(key) ? "typedef"
-		: _enumTypes.count(key) ? "enum type"
-		: nullptr;
-
-	if (what) {
-		throw CompileError("a variable named \"" + name + "\" would hide the " + std::string(what) + " of "
-			"that name, which mslc does not support");
+	// A name that resolves to a declaration inside a namespace is hidden the same way. A
+	// declaration is not a use, so several declarations the name finds are not ambiguous.
+	const std::string* bound = blockName(name);
+	const std::set<std::string> keys = bound && !bound->empty() ? std::set<std::string>{*bound} : unqualifiedFound(name);
+	for (const std::string& key : keys) {
+		const char* what = _enumConstants.count(key) ? "enum constant"
+			: _typedefs.count(key) ? "typedef"
+			: _enumTypes.count(key) ? "enum type"
+			: nullptr;
+		if (what) {
+			throw CompileError("a variable named \"" + name + "\" would hide the " + std::string(what) + " of "
+				"that name, which mslc does not support");
+		}
 	}
 
 	if (_blocks.empty()) {
@@ -1432,45 +1433,13 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 
 	const std::string& last = name.parts.back();
 	if (name.parts.size() == 1 && !name.global) {
-		// A using declaration in the innermost block that declares the name is the
-		// answer; a local there leaves the namespaces to be searched.
-		if (const std::string* bound = blockName(last); bound && !bound->empty()) {
-			return *bound;
+		// The innermost block that declares the name decides: a local hides every
+		// namespace's name, and a using declaration there is the answer.
+		if (const std::string* bound = blockName(last)) {
+			return bound->empty() ? last : *bound;
 		}
-
-		// [namespace.udir]: a using directive in U nominating T makes T's names
-		// appear in the nearest namespace L containing both, for lookups from inside U.
-		// So each enclosing namespace L, innermost out, offers its own names plus
-		// those of directives that land in it; the first level that has any decides.
-		for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
-			const std::string level = joinParts(_namespacePath, 0, depth);
-			std::set<std::string> found;
-			collectOwn(level, last, found);
-			for (size_t user = 0; user <= _namespacePath.size(); ++user) {
-				const std::string from = joinParts(_namespacePath, 0, user);
-				const auto entry = _scopes.find(from);
-				if (entry == _scopes.end()) {
-					continue;
-				}
-				for (const std::string& target : entry->second.directives) {
-					if (nearestCommon(from, target) == level) {
-						std::set<std::string> seen;
-						collectMembers(target, last, seen, found, false);
-					}
-				}
-			}
-			const std::string function = namespacePrefix(_namespacePath.size());
-			for (const BlockScope& block : _blocks) {
-				for (const std::string& target : block.directives) {
-					if (nearestCommon(function, target) == level) {
-						std::set<std::string> seen;
-						collectMembers(target, last, seen, found, false);
-					}
-				}
-			}
-			if (!found.empty()) {
-				return pick(found, last);
-			}
+		if (const std::set<std::string> found = unqualifiedFound(last); !found.empty()) {
+			return pick(found, last);
 		}
 		return last;
 	}
@@ -1543,6 +1512,44 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 			+ "\" is not a namespace the file declares");
 	}
 	throw CompileError("no member named \"" + last + "\" in the namespace \"" + scope + "\" (in \"" + spelled + "\")");
+}
+
+std::set<std::string> Parser::unqualifiedFound(const std::string& last) const {
+	// [namespace.udir]: a using directive in U nominating T makes T's names
+	// appear in the nearest namespace L containing both, for lookups from inside U.
+	// So each enclosing namespace L, innermost out, offers its own names plus
+	// those of directives that land in it; the first level that has any decides.
+	for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
+		const std::string level = joinParts(_namespacePath, 0, depth);
+		std::set<std::string> found;
+		collectOwn(level, last, found);
+		for (size_t user = 0; user <= _namespacePath.size(); ++user) {
+			const std::string from = joinParts(_namespacePath, 0, user);
+			const auto entry = _scopes.find(from);
+			if (entry == _scopes.end()) {
+				continue;
+			}
+			for (const std::string& target : entry->second.directives) {
+				if (nearestCommon(from, target) == level) {
+					std::set<std::string> seen;
+					collectMembers(target, last, seen, found, false);
+				}
+			}
+		}
+		const std::string function = namespacePrefix(_namespacePath.size());
+		for (const BlockScope& block : _blocks) {
+			for (const std::string& target : block.directives) {
+				if (nearestCommon(function, target) == level) {
+					std::set<std::string> seen;
+					collectMembers(target, last, seen, found, false);
+				}
+			}
+		}
+		if (!found.empty()) {
+			return found;
+		}
+	}
+	return {};
 }
 
 std::string Parser::peekResolved(size_t& tokens) const {
