@@ -3734,7 +3734,8 @@ ExpressionPtr Parser::parsePrimary() {
 				+ "of that name hides here; mslc keeps the two apart only under a namespace name");
 		}
 		if (_memberFields && kind() == TokenKind::Identifier && !isLocal(std::string(current().text))
-			&& _memberFields->count(std::string(current().text)) && isLocal("this")) {
+			&& _memberFields->count(std::string(current().text)) && isLocal("this")
+			&& lookahead().kind != TokenKind::ColonColon) {
 			const size_t atLine = line();
 			auto member = makeThisMember(std::string(advance().text), atLine);
 			return member;
@@ -3753,8 +3754,9 @@ ExpressionPtr Parser::parsePrimary() {
 				return makeThisMember(name, atLine);
 			}
 		}
+		// A local hides a namespace's name only where it is not followed by "::".
 		const std::string resolved = kind() == TokenKind::Identifier && isLocal(std::string(current().text))
-			? std::string(current().text) : peekResolved(spelledTokens);
+			&& lookahead().kind != TokenKind::ColonColon ? std::string(current().text) : peekResolved(spelledTokens);
 		const auto consumeName = [&] {
 			for (size_t i = 0; i < spelledTokens; ++i) {
 				advance();
