@@ -1299,17 +1299,24 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 }
 
 void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-	std::set<std::string>& found) const {
+	std::set<std::string>& found, bool qualified) const {
 	if (!seen.insert(scope).second) {
 		return;
 	}
-	collectOwn(scope, name, found);
+	// [namespace.qual]: a qualified name searches a namespace's directives only when
+	// the namespace itself declares nothing of that name.
+	std::set<std::string> own;
+	collectOwn(scope, name, own);
+	found.insert(own.begin(), own.end());
+	if (qualified && !own.empty()) {
+		return;
+	}
 	const auto entry = _scopes.find(scope);
 	if (entry == _scopes.end()) {
 		return;
 	}
 	for (const std::string& directive : entry->second.directives) {
-		collectMembers(directive, name, seen, found);
+		collectMembers(directive, name, seen, found, qualified);
 	}
 }
 
@@ -1400,7 +1407,7 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 				for (const std::string& target : entry->second.directives) {
 					if (nearestCommon(from, target) == level) {
 						std::set<std::string> seen;
-						collectMembers(target, last, seen, found);
+						collectMembers(target, last, seen, found, false);
 					}
 				}
 			}
@@ -1419,7 +1426,7 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	if (found) {
 		std::set<std::string> seen;
 		std::set<std::string> members;
-		collectMembers(scope, last, seen, members);
+		collectMembers(scope, last, seen, members, true);
 		if (!members.empty()) {
 			return pick(members, spelled);
 		}
