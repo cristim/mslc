@@ -1159,8 +1159,9 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 
 	// An unscoped enum without a fixed underlying type is stored as an int, or as
 	// an unsigned int when a value passes INT_MAX, and promotes to that type in
-	// arithmetic, so it is that type here. Apple also refuses an int where an enum
-	// is expected; mslc does not track that distinction.
+	// arithmetic, so it is that type here. sema rejects an int or another enum
+	// where an enum is expected in an initializer or an assignment
+	// (requireEnumValue); other conversion sites are tracked in #235.
 	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()) {
 		out.scalar = _enumUnderlying.at(enumType->second);
 		out.vectorWidth = 0;

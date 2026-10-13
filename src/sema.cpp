@@ -6918,6 +6918,11 @@ namespace {
 				hasPointSize = true;
 			}
 
+			if (!isInput && !field.type.enumName.empty()) {
+				throw CompileError(what + " has the enum type " + field.type.enumName + ", which Apple's "
+					"compiler does not allow in a vertex function's returned struct");
+			}
+
 			const StageVariable variable = declareStageVariable(field.type, storageClass, what);
 			const bool integral = !_types.isFloat(variable.interfaceType);
 
