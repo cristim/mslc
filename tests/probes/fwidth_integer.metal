@@ -1,2 +1,2 @@
-// EXPECT: error fwidth takes float scalars or vectors, half is not supported yet
+// EXPECT: error fwidth takes float or half scalars or vectors
 fragment float4 main() { fwidth(1); return float4(1.0f); }
