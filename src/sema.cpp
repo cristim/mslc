@@ -2271,6 +2271,7 @@ namespace {
 		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id atomicAddress(const Expression& argument, const std::string& function, bool& isSigned);
 		Id emitAtomicCall(const Expression& expression);
+		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
@@ -4606,6 +4607,63 @@ namespace {
 		return _builder.emitTyped(opcode, type, { address, scope, semantics, value });
 	}
 
+	// The mem_flags a barrier names, as the SPIR-V memory semantics they select, and
+	// the widest scope among them. Metal's mem_flags is an enum class, so only the
+	// qualified spelling joined with | is a flag set.
+	static void collectMemFlags(const Expression& flags, const std::string& function,
+		uint32_t& semantics, bool& crossesWorkgroup) {
+		if (flags.kind == ExpressionKind::Binary && flags.binaryOperator == BinaryOperator::BitOr) {
+			collectMemFlags(*flags.left, function, semantics, crossesWorkgroup);
+			collectMemFlags(*flags.right, function, semantics, crossesWorkgroup);
+			return;
+		}
+		const std::string prefix = "mem_flags::";
+		if (flags.kind != ExpressionKind::Identifier || flags.name.rfind(prefix, 0) != 0) {
+			throw CompileError(function + " takes mem_flags::mem_none, mem_device, mem_threadgroup or "
+				"mem_texture, joined with |");
+		}
+		const std::string flag = flags.name.substr(prefix.size());
+		if (flag == "mem_none") {
+			return;
+		}
+		if (flag == "mem_device") {
+			semantics |= 64;  // UniformMemory, which includes buffers
+			crossesWorkgroup = true;
+		} else if (flag == "mem_threadgroup") {
+			semantics |= 256;  // WorkgroupMemory
+		} else if (flag == "mem_texture") {
+			semantics |= 2048;  // ImageMemory
+			crossesWorkgroup = true;
+		} else {
+			throw CompileError(function + " does not lower mem_flags::" + flag + "; mem_none, mem_device, "
+				"mem_threadgroup and mem_texture are the flags mslc supports");
+		}
+	}
+
+	void Emitter::emitBarrierCall(const Expression& expression) {
+		const std::string& name = expression.left->name;
+		if (expression.arguments.size() != 1) {
+			throw CompileError(name + " takes one argument: the mem_flags to order");
+		}
+		if (_entryPoint->stage != Stage::Kernel) {
+			throw CompileError(name + " is only supported in a kernel function; Vulkan allows a "
+				"control barrier only in compute shaders");
+		}
+
+		uint32_t semantics = 0;
+		bool crossesWorkgroup = false;
+		collectMemFlags(*expression.arguments.front(), name, semantics, crossesWorkgroup);
+		if (semantics != 0) {
+			semantics |= 8;  // AcquireRelease
+		}
+
+		const bool isSimd = name == "simdgroup_barrier";
+		const uint32_t executionScope = isSimd ? 3 : 2;  // Subgroup : Workgroup
+		const uint32_t memoryScope = isSimd ? 3 : (crossesWorkgroup ? 1 : 2);  // Device : Workgroup
+		_builder.emit(spirv::OpControlBarrier, { constantU32(executionScope), constantU32(memoryScope),
+			constantU32(semantics) });
+	}
+
 	Id Emitter::emitCall(const Expression& expression) {
 		const Expression* receiver = nullptr;
 		HelperFunction* helper = findHelper(expression, receiver);
@@ -4625,6 +4683,10 @@ namespace {
 			}
 
 			return emitHelperCall(expression, *helper, receiver);
+		}
+
+		if (expression.left->name == "threadgroup_barrier" || expression.left->name == "simdgroup_barrier") {
+			throw CompileError(expression.left->name + " returns void and has no value");
 		}
 
 		if (isAtomicFunction(expression.left->name)) {
@@ -8702,6 +8764,11 @@ namespace {
 			const Expression* receiver = nullptr;
 			if (HelperFunction* helper = findHelper(expression, receiver)) {
 				emitHelperCall(expression, *helper, receiver);
+				return;
+			}
+			if (expression.left->kind == ExpressionKind::Identifier
+				&& (expression.left->name == "threadgroup_barrier" || expression.left->name == "simdgroup_barrier")) {
+				emitBarrierCall(expression);
 				return;
 			}
 			if (expression.left->kind == ExpressionKind::Member && expression.left->memberName == "write") {
