@@ -1489,6 +1489,10 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	if (!found && parts.size() == 2 && parts.front() == kStdlibNamespace && last == "discard_fragment") {
 		return "metal::discard_fragment";
 	}
+	// mem_flags is an enum class of the standard library; the barrier lowering reads its enumerators.
+	if (!found && parts.size() == 2 && parts.front() == "mem_flags") {
+		return spelled;
+	}
 	if (!found) {
 		throw CompileError("\"" + joinParts(parts, 0, parts.size() - 1) + "\" in \"" + spelled
 			+ "\" is not a namespace the file declares");
