@@ -215,6 +215,7 @@ namespace {
 		if (name == "threadgroup_position_in_grid") { return Builtin::ThreadgroupPositionInGrid; }
 		if (name == "thread_position_in_threadgroup") { return Builtin::ThreadPositionInThreadgroup; }
 		if (name == "thread_index_in_threadgroup") { return Builtin::ThreadIndexInThreadgroup; }
+		if (name == "threads_per_threadgroup") { return Builtin::ThreadsPerThreadgroup; }
 		if (name == "vertex_id") { return Builtin::VertexID; }
 		if (name == "instance_id") { return Builtin::InstanceID; }
 		if (name == "position") { return Builtin::Position; }

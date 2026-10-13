@@ -2043,6 +2043,10 @@ namespace {
 		std::vector<StageVariable> _outputs;
 		// The [[stage_in]] parameter and one Input per field.
 		const Parameter* _stageIn = nullptr;
+		// The kernel's [[threads_per_threadgroup]] parameter, and the spec constants
+		// that hold the workgroup size it reads.
+		const Parameter* _threadsPerThreadgroup = nullptr;
+		Id _localSize[3] = { InvalidId, InvalidId, InvalidId };
 		std::vector<StageVariable> _stageInputs;
 		// At most one BuiltIn FragCoord Input variable per fragment entry point,
 		// whether it comes from a stage-struct [[position]] field or a direct
@@ -2091,6 +2095,7 @@ namespace {
 	}
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
+		void loadThreadsPerThreadgroup();
 		// The address of a packed vector's storage, viewed as a pointer to the
 		// vector itself, which is what a load or store wants.
 		Id packedVectorAddress(Id storageAddress, Id vectorType);
@@ -5956,6 +5961,8 @@ namespace {
 				return "thread_position_in_threadgroup";
 			case ParameterAttributes::Builtin::ThreadIndexInThreadgroup:
 				return "thread_index_in_threadgroup";
+			case ParameterAttributes::Builtin::ThreadsPerThreadgroup:
+				return "threads_per_threadgroup";
 			case ParameterAttributes::Builtin::VertexID: return "vertex_id";
 			case ParameterAttributes::Builtin::InstanceID: return "instance_id";
 			case ParameterAttributes::Builtin::Position: return "position";
@@ -5977,6 +5984,7 @@ namespace {
 			case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
 			case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
 			case ParameterAttributes::Builtin::ThreadIndexInThreadgroup:
+			case ParameterAttributes::Builtin::ThreadsPerThreadgroup:
 				return stage == Stage::Kernel;
 			case ParameterAttributes::Builtin::VertexID:
 			case ParameterAttributes::Builtin::InstanceID:
@@ -6087,6 +6095,33 @@ namespace {
 
 			if (parameter.attributes.builtin) {
 				requireThreadAddressSpace(parameter, "a builtin");
+
+				if (*parameter.attributes.builtin == ParameterAttributes::Builtin::ThreadsPerThreadgroup) {
+					if (_entryPoint->stage != Stage::Kernel) {
+						throw CompileError("builtin \"threads_per_threadgroup\" is not available in a "
+							+ std::string(_entryPoint->stage == Stage::Vertex ? "vertex" : "fragment")
+							+ " function (parameter \"" + parameter.name + "\")");
+					}
+
+					const Type& type = parameter.type;
+					const bool width = type.vectorWidth <= 3;
+					const bool unsignedInt = type.scalar == ScalarKind::UInt || type.scalar == ScalarKind::UShort;
+					if (!width || !unsignedInt || type.isPointer || type.isMatrix() || type.arrayLength
+						|| !type.namedType.empty() || type.isPacked || parameter.isReference) {
+						throw CompileError("parameter \"" + parameter.name + "\" is a " + typeName(type)
+							+ ", which is not valid for [[threads_per_threadgroup]]; it takes uint or ushort, "
+								"or a vector of two or three of them");
+					}
+
+					if (_threadsPerThreadgroup) {
+						throw CompileError("[[threads_per_threadgroup]] is on both \""
+							+ _threadsPerThreadgroup->name + "\" and \"" + parameter.name
+							+ "\"; a function takes it once");
+					}
+
+					_threadsPerThreadgroup = &parameter;
+					continue;
+				}
 				const spirv::BuiltInValue spvBuiltin = [&]() {
 					switch (*parameter.attributes.builtin) {
 						case ParameterAttributes::Builtin::ThreadPositionInGrid:
@@ -7562,6 +7597,35 @@ namespace {
 		bindLocal(_stageIn->name, local, structType, _stageIn->type);
 	}
 
+	// [[threads_per_threadgroup]] is the workgroup size, which the module holds as
+	// three spec constants for indium to fill in. indium refuses a partial
+	// threadgroup, so the size is the same for every group. The parameter lives
+	// in the function's own storage, as a by-value parameter does.
+	void Emitter::loadThreadsPerThreadgroup() {
+		if (!_threadsPerThreadgroup) {
+			return;
+		}
+
+		const Type& type = _threadsPerThreadgroup->type;
+		const Id declared = declaredTypeOf(type);
+		const Id component = _types.scalar(type.scalar);
+		const uint32_t width = type.isScalar() ? 1 : type.vectorWidth;
+		std::vector<uint32_t> parts;
+		for (uint32_t i = 0; i < width; ++i) {
+			parts.push_back(type.scalar == ScalarKind::UInt ? _localSize[i]
+				: _builder.emitTyped(spirv::OpUConvert, component, { _localSize[i] }));
+		}
+
+		const Id value = width == 1 ? parts[0]
+			: _builder.emitTyped(spirv::OpCompositeConstruct, declared, parts);
+		const Id local = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Function, declared),
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		_builder.emit(spirv::OpStore, { local, value });
+
+		bindLocal(_threadsPerThreadgroup->name, local, declared, type);
+	}
+
 	// Every entry point is a void function, so a returned value is written to
 	// the Output variables and the function returns nothing.
 	void Emitter::emitReturn(const Statement& statement) {
@@ -8988,6 +9052,9 @@ namespace {
 				{ _options.localSizeY });
 			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
 				{ _options.localSizeZ });
+			_localSize[0] = x;
+			_localSize[1] = y;
+			_localSize[2] = z;
 			_builder.emit(spirv::OpDecorate, { x,
 				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
 			_builder.emit(spirv::OpDecorate, { y,
@@ -9037,6 +9104,7 @@ namespace {
 		beginBlock(_builder.nextId());
 		preloadBufferBases();
 		loadStageInputs();
+		loadThreadsPerThreadgroup();
 		emitFunctionBody(*_entryPoint->body);
 		if (!_terminated) {
 			terminate(spirv::OpReturn, { });
@@ -9131,6 +9199,7 @@ namespace {
 			_addressBlock = {};
 			_outputs.clear();
 			_stageIn = nullptr;
+			_threadsPerThreadgroup = nullptr;
 			_stageInputs.clear();
 			_hasFragCoordInput = false;
 			_terminated = false;
