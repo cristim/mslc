@@ -3546,6 +3546,9 @@ namespace {
 	}
 
 	Id Emitter::convertListScalar(Id value, const Type& target, const Expression& expression) {
+		if (!target.enumName.empty()) {
+			requireEnumValue(target.enumName, expression, "an element of the initializer list");
+		}
 		const auto from = _types.scalarKindOf(_builder.typeOf(value));
 		if (!from) { throw CompileError("a scalar initializer list needs a scalar value"); }
 		const ScalarKind to = target.scalar;
@@ -3663,6 +3666,7 @@ namespace {
 		}
 		Type component;
 		component.scalar = target.scalar;
+		component.enumName = target.enumName;
 		if (target.isScalar()) {
 			if (list.elements.size() != 1) { throw CompileError("excess elements in a scalar initializer list"); }
 			return emitListScalarValue(component, *list.elements.front().value);
@@ -4676,6 +4680,10 @@ namespace {
 				continue;
 			}
 
+			if (!parameter.type.enumName.empty()) {
+				requireEnumValue(parameter.type.enumName, *call.arguments[i],
+					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
+			}
 			const Id value = emitExpression(*call.arguments[i]);
 			try {
 				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
