@@ -49,6 +49,8 @@ class Parser {
 	// that collides with another declaration is reported, as it is in Apple's
 	// compiler, instead of the later one silently winning.
 	std::map<std::string, std::string> _declared;
+	// The second kind of a name declared as a tag and as a function or variable.
+	std::map<std::string, std::string> _declaredBesideTag;
 
 	// The namespaces the file declares. A declaration inside one is stored under
 	// its qualified name, "A::B::x", in every table above, so a name lookup is a
@@ -57,7 +59,9 @@ class Parser {
 	// namespaces a using directive named and the names a using declaration brought in.
 	struct NamespaceScope {
 		std::vector<std::string> directives;
-		std::map<std::string, std::string> declarations;
+		// A name to what using declarations brought in under it: several functions
+		// overload, so a call is resolved (or found ambiguous) where it is made.
+		std::map<std::string, std::set<std::string>> declarations;
 	};
 	std::vector<std::string> _namespacePath;
 	std::set<std::string> _namespaces;
@@ -171,6 +175,16 @@ private:
 	// Records a file-scope name, or throws when it is already taken by something
 	// the typedef and enum support has to keep distinct from it.
 	void declareName(const std::string& name, const char* what);
+
+	// [namespace.udecl]: a declaration and a using declaration of one name in one
+	// namespace conflict, unless one is a struct or enum tag beside a function or
+	// variable, or both are functions with different parameters. "function" is the
+	// declaration being parsed when "name" is one, and null otherwise.
+	bool conflictsWithUsing(const std::string& own, const std::vector<std::string_view>& ownKinds,
+		const std::string& target, const FunctionDecl* function) const;
+	// What a declared name is: one kind, or a struct or enum tag and a function or variable.
+	std::vector<std::string_view> kindsOf(const std::string& name) const;
+	void rejectUsingConflict(const std::string& name, std::string_view what, const FunctionDecl* function) const;
 
 	// Records a parameter or a local, and throws when it would hide a typedef or an
 	// enum constant.
