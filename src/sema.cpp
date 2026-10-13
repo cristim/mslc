@@ -2170,6 +2170,10 @@ namespace {
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
+		void emitValueDeclaration(const VariableDeclaration& declaration, const Type& type, Id deduced,
+			bool storageOnly);
+		void emitAutoDeclaration(const VariableDeclaration& declaration);
+		Type deduceAutoType(const Type& written, Id valueType, const std::string& name);
 		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
@@ -2219,10 +2223,11 @@ namespace {
 		};
 		std::vector<FileScopeArray> _fileScopeArrays;
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
+		void validateConstexprInitializer(const VariableDeclaration& declaration, const Type& type);
 		std::optional<std::string> enumOf(const Expression& expression);
 		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
 		bool readsRuntimeValue(const Expression& expression) const;
-		void requireSameReferent(const VariableDeclaration& declaration, Id referent);
+		void requireSameReferent(const VariableDeclaration& declaration, const Type& type, Id referent);
 		Id emitIndex(const Expression& expression, bool asAddress);
 		bool isElementAccess(const Expression& expression) const;
 		Id emitElementAccess(const Expression& expression, bool asAddress);
@@ -7795,7 +7800,9 @@ namespace {
 			&& rootBinding->second.storageClass == spirv::StorageClass::Function) {
 			Binding alias = rootBinding->second;
 			alias.readOnly = alias.readOnly || constReference;
-			requireSameReferent(declaration, alias.pointeeType);
+			const Type referenced = declaration.type.isAuto
+				? deduceAutoType(declaration.type, alias.pointeeType, declaration.name) : declaration.type;
+			requireSameReferent(declaration, referenced, alias.pointeeType);
 			_bindings[declaration.name] = alias;
 			return;
 		}
@@ -7806,16 +7813,18 @@ namespace {
 		if (pointee == InvalidId || !storageClass) {
 			throw CompileError("cannot determine what the reference \"" + declaration.name + "\" names");
 		}
-		requireSameReferent(declaration, pointee);
+		const Type referenced = declaration.type.isAuto
+			? deduceAutoType(declaration.type, pointee, declaration.name) : declaration.type;
+		requireSameReferent(declaration, referenced, pointee);
 
 		Binding binding;
 		binding.id = address;
 		binding.isPointer = true;
 		binding.pointeeType = pointee;
 		binding.storageClass = *storageClass;
-		binding.pointeeMsl = declaration.type;
-		binding.structType = declaration.type.namedType.empty()
-			? nullptr : _unit.findStruct(declaration.type.namedType);
+		binding.pointeeMsl = referenced;
+		binding.structType = referenced.namedType.empty()
+			? nullptr : _unit.findStruct(referenced.namedType);
 		binding.readOnly = constReference || rootReadOnly;
 		binding.isAddress = true;
 		_bindings[declaration.name] = binding;
@@ -7823,16 +7832,16 @@ namespace {
 
 	// A reference binds without a conversion: a different type would be a
 	// temporary, which is a value and not the place.
-	void Emitter::requireSameReferent(const VariableDeclaration& declaration, Id referent) {
-		if (!declaration.type.namedType.empty()) {
+	void Emitter::requireSameReferent(const VariableDeclaration& declaration, const Type& type, Id referent) {
+		if (!type.namedType.empty()) {
 			TypeTable::StructForm have;
-			if (!_types.structForm(referent, have) || have.name != declaration.type.namedType) {
+			if (!_types.structForm(referent, have) || have.name != type.namedType) {
 				throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
 					"it is bound to");
 			}
 			return;
 		}
-		if (referent != declaredTypeOf(declaration.type)) {
+		if (referent != declaredTypeOf(type)) {
 			throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
 				"it is bound to; a conversion would make a temporary");
 		}
@@ -7892,7 +7901,13 @@ namespace {
 	// A constexpr brace initializer has to be made of constants. This is checked
 	// for a declaration that is never reached too, which is invalid all the same.
 	void Emitter::validateConstexprInitializer(const VariableDeclaration& declaration) {
-		if (!declaration.type.isConstexpr || !declaration.initializer) {
+		if (!declaration.type.isAuto) {
+			validateConstexprInitializer(declaration, declaration.type);
+		}
+	}
+
+	void Emitter::validateConstexprInitializer(const VariableDeclaration& declaration, const Type& type) {
+		if (!type.isConstexpr || !declaration.initializer) {
 			return;
 		}
 
@@ -7906,10 +7921,10 @@ namespace {
 			// What can be folded is checked for the operations no constant expression
 			// holds, such as a signed overflow or a division by zero. What cannot be
 			// folded is left to the lowering.
-			if (declaration.type.isScalar() && declaration.type.namedType.empty()) {
+			if (type.isScalar() && type.namedType.empty()) {
 				_foldDomainError = false;
 				try {
-					foldInitializer(declaration.type, *declaration.initializer);
+					foldInitializer(type, *declaration.initializer);
 				} catch (const CompileError&) {
 					// not a form the folder knows
 				}
@@ -8165,12 +8180,94 @@ namespace {
 	}
 
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
-		if (declaration.type.resource != ResourceKind::None) {
+		if (declaration.type.isAuto) {
+			if (storageOnly) {
+				throw CompileError("the auto variable \"" + declaration.name + "\" is declared where its "
+					"initialiser is not evaluated, so its type cannot be deduced; this is not lowered yet");
+			}
+			if (declaration.isReference) {
+				emitReferenceDeclaration(declaration);
+			} else {
+				emitAutoDeclaration(declaration);
+			}
+			return;
+		}
+
+		emitValueDeclaration(declaration, declaration.type, InvalidId, storageOnly);
+	}
+
+	// The type an auto takes from the value it is initialised with, keeping what the
+	// declaration wrote around the auto: const, constexpr and the address space.
+	Type Emitter::deduceAutoType(const Type& written, Id valueType, const std::string& name) {
+		Type deduced;
+		deduced.isConst = written.isConst;
+		deduced.isConstexpr = written.isConstexpr;
+		deduced.isStatic = written.isStatic;
+		deduced.addressSpace = written.addressSpace;
+
+		const std::string quoted = "\"" + name + "\"";
+		if (valueType == InvalidId) {
+			throw CompileError("variable " + quoted + " has incomplete type 'void'");
+		}
+		if (const auto scalar = _types.scalarKindOf(valueType)) {
+			deduced.scalar = *scalar;
+			return deduced;
+		}
+		if (const TypeTable::MatrixInfo* matrix = _types.matrixInfo(valueType)) {
+			deduced.scalar = matrix->scalar;
+			deduced.matrixColumns = matrix->columns;
+			deduced.vectorWidth = matrix->rows;
+			return deduced;
+		}
+		if (const Id component = _types.componentOf(valueType); component != InvalidId) {
+			deduced.scalar = *_types.scalarKindOf(component);
+			deduced.vectorWidth = _types.vectorWidth(valueType);
+			return deduced;
+		}
+		TypeTable::StructForm form;
+		if (_types.structForm(valueType, form)) {
+			deduced.namedType = form.name;
+			return deduced;
+		}
+		throw CompileError("the type of " + quoted + " cannot be deduced from its initialiser: it is an array, "
+			"a pointer, a texture or another type that is not lowered as a local value yet");
+	}
+
+	// An auto local: the initialiser is evaluated first, and the variable takes the
+	// type of the value it produced. The name may not appear in the initialiser.
+	void Emitter::emitAutoDeclaration(const VariableDeclaration& declaration) {
+		const Expression& initializer = *declaration.initializer;
+		if (initializer.kind == ExpressionKind::InitList && !initializer.constructType) {
+			throw CompileError("the auto variable \"" + declaration.name + "\" initialised from a braced "
+				"list is not lowered yet");
+		}
+		if (const auto given = enumOf(initializer); given && !given->empty()) {
+			throw CompileError("the auto variable \"" + declaration.name + "\" would have the enum type "
+				+ *given + ", which is not lowered yet; write the enum type");
+		}
+
+		std::set<std::string> names;
+		collectIdentifiers(initializer, names);
+		if (names.count(declaration.name)) {
+			throw CompileError("variable \"" + declaration.name + "\" declared with deduced type 'auto' "
+				"cannot appear in its own initializer");
+		}
+
+		const Id value = emitExpression(initializer);
+		const Type type = deduceAutoType(declaration.type, _builder.typeOf(value), declaration.name);
+		emitValueDeclaration(declaration, type, value, false);
+	}
+
+	// A local of value type. deduced is the already evaluated initialiser of an
+	// auto, or InvalidId when the declaration's own initialiser is evaluated here.
+	void Emitter::emitValueDeclaration(const VariableDeclaration& declaration, const Type& type, Id deduced,
+		bool storageOnly) {
+		if (type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
 			return;
 		}
 
-		if (declaration.type.isAtomic && !declaration.type.isPointer) {
+		if (type.isAtomic && !type.isPointer) {
 			throw CompileError("a local atomic \"" + declaration.name + "\" is not allowed: an atomic lives in a "
 				"device buffer, and a function takes a pointer to it");
 		}
@@ -8187,25 +8284,25 @@ namespace {
 		// float 0.0 into a pointer and "float[2] v;" declared one float, both of
 		// which validate. The type is quoted as the source spelled it, so the
 		// message names "float *" rather than "float".
-		if (declaration.type.isPointer) {
-			throw CompileError("a local of type " + typeName(declaration.type)
+		if (type.isPointer) {
+			throw CompileError("a local of type " + typeName(type)
 				+ " is not lowered yet, since a pointer is not a value mslc can declare "
 					"in a function's own storage");
 		}
 
-		if (declaration.type.arrayLength) {
+		if (type.arrayLength) {
 			emitLocalArray(declaration, storageOnly);
 			return;
 		}
 
-		const Id typeId = declaredTypeOf(declaration.type);
+		const Id typeId = declaredTypeOf(type);
 
 		if (!storageOnly) {
-			validateConstexprInitializer(declaration);
+			validateConstexprInitializer(declaration, type);
 		}
-		if (!storageOnly && !declaration.type.enumName.empty() && declaration.initializer
+		if (!storageOnly && !type.enumName.empty() && declaration.initializer
 			&& declaration.initializer->kind != ExpressionKind::InitList) {
-			requireEnumValue(declaration.type.enumName, *declaration.initializer,
+			requireEnumValue(type.enumName, *declaration.initializer,
 				"the variable \"" + declaration.name + "\"");
 		}
 
@@ -8219,12 +8316,14 @@ namespace {
 		const Id pointerType = _types.pointer(spirv::StorageClass::Function, typeId);
 		const Id id = _builder.emitDeclTyped(spirv::OpVariable, pointerType,
 			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
-		bindLocal(declaration.name, id, typeId, declaration.type);
+		bindLocal(declaration.name, id, typeId, type);
 
 		Id initial = InvalidId;
-		if (!storageOnly && declaration.initializer) {
+		if (deduced != InvalidId) {
+			initial = convertImplicit(deduced, typeId);
+		} else if (!storageOnly && declaration.initializer) {
 			const Id initializer = declaration.initializer->kind == ExpressionKind::InitList
-				? emitInitListValue(declaration.type, *declaration.initializer)
+				? emitInitListValue(type, *declaration.initializer)
 				: emitExpression(*declaration.initializer);
 			initial = convertImplicit(initializer, typeId);
 		} else if (!storageOnly) {
@@ -8235,7 +8334,7 @@ namespace {
 			_builder.emit(spirv::OpStore, { id, initial });
 		}
 
-		const Type& declared = declaration.type;
+		const Type& declared = type;
 		if (declaration.initializer && declared.isConst && !declared.isConstexpr && !declared.isPointer
 			&& !declared.isVector() && !declared.isMatrix() && declared.namedType.empty()
 			&& !declared.arrayLength && !isFloatKind(declared.scalar)
@@ -8243,17 +8342,17 @@ namespace {
 			_bindings[declaration.name].constantValue = true;
 		}
 		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
-			&& (declaration.type.isConstexpr || (declaration.type.isConst && !isFloatKind(declaration.type.scalar)))) {
+			&& (type.isConstexpr || (type.isConst && !isFloatKind(type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
 			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
 				expression = expression->elements.front().value.get();
 			}
 			FoldedConstant folded;
-			folded.scalar = declaration.type.scalar;
+			folded.scalar = type.scalar;
 			const bool empty = expression->kind == ExpressionKind::InitList && expression->elements.empty();
 			if (empty || canFoldExpression(*expression, declaration.name)) {
 				if (!empty) { folded = foldExpression(*expression); }
-				const ScalarKind to = declaration.type.scalar;
+				const ScalarKind to = type.scalar;
 				if (to == ScalarKind::Bool) {
 					folded.boolean = folded.scalar == ScalarKind::Bool ? folded.boolean
 						: isFloatKind(folded.scalar) ? folded.number != 0 : folded.integer != 0;
@@ -8268,11 +8367,11 @@ namespace {
 				}
 			}
 		}
-		if (!storageOnly && declaration.type.isConst && declaration.initializer
-			&& declaration.type.namedType.empty() && declaration.type.isScalar()
-			&& !isFloatKind(declaration.type.scalar)) {
+		if (!storageOnly && type.isConst && declaration.initializer
+			&& type.namedType.empty() && type.isScalar()
+			&& !isFloatKind(type.scalar)) {
 			try {
-				_bindings[declaration.name].folded = foldInitializer(declaration.type, *declaration.initializer);
+				_bindings[declaration.name].folded = foldInitializer(type, *declaration.initializer);
 			} catch (const CompileError&) {
 				// A const local may have a runtime initializer without being a constant expression.
 			}
@@ -8768,7 +8867,7 @@ namespace {
 						if (child->kind == StatementKind::DeclarationStatement) {
 							validateConstexprInitializer(*child->declaration);
 							// Its name still counts as a constant for the declarations after it.
-							if (child->declaration->type.isConstexpr) {
+							if (child->declaration->type.isConstexpr && !child->declaration->type.isAuto) {
 								Binding dead;
 								dead.id = _builder.nextId();
 								_localFolded[dead.id] = placeholderConstant(child->declaration->type);

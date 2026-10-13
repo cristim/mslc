@@ -2074,7 +2074,7 @@ size_t Parser::parseSpecifierRun(Type& type) {
 	return words;
 }
 
-Type Parser::parseType(bool allowResource) {
+Type Parser::parseType(bool allowResource, bool allowAuto) {
 	Type type;
 
 	// MSL writes the address space and the const qualifier in either order, and
@@ -2103,7 +2103,13 @@ Type Parser::parseType(bool allowResource) {
 		}
 	};
 
-	if (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) {
+	if (kind() == TokenKind::Identifier && current().text == "auto") {
+		if (!allowAuto) {
+			throw CompileError("\"auto\" is only lowered for a local variable, where the initialiser gives the type");
+		}
+		advance();
+		type.isAuto = true;
+	} else if (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) {
 		parseSpecifierRun(type);
 	} else if (kind() == TokenKind::Identifier && nameTokens == 1 && isResourceTypeName(current().text)) {
 		if (!allowResource) {
@@ -2586,9 +2592,38 @@ void Parser::measure(Expression& expression) const {
 	}
 }
 
+// The initialiser of an auto local, which the type is deduced from: "= value",
+// or a single value in parentheses or braces. "= {v}" is a list, which Apple
+// deduces as a different type, so it is left as one for the lowering to refuse.
+void Parser::parseAutoInitializer(VariableDeclaration& declaration) {
+	const std::string quoted = "\"" + declaration.name + "\"";
+	if (match(TokenKind::Assign)) {
+		declaration.initializer = parseInitializer();
+	} else if (match(TokenKind::LParen)) {
+		std::vector<ExpressionPtr> arguments = parseArgumentList("to close the initialiser of an auto variable");
+		if (arguments.size() != 1) {
+			throw CompileError("the auto variable " + quoted + " needs exactly one value to deduce its type from");
+		}
+		declaration.initializer = std::move(arguments.front());
+	} else if (at(TokenKind::LBrace)) {
+		ExpressionPtr list = parseInitializerList();
+		if (list->elements.size() != 1 || !list->elements.front().fieldName.empty()) {
+			throw CompileError("the auto variable " + quoted + " needs exactly one value to deduce its type from");
+		}
+		declaration.initializer = std::move(list->elements.front().value);
+	} else {
+		throw CompileError("the variable " + quoted + " is declared with auto and needs an initialiser to deduce its type from");
+	}
+}
+
 // The initialiser a local may have after its name: "= value", a braced list,
 // or constructor arguments. A const local has to have one.
 void Parser::parseLocalInitializer(VariableDeclaration& declaration) {
+	if (declaration.type.isAuto) {
+		parseAutoInitializer(declaration);
+		return;
+	}
+
 	if (declaration.type.isConst && !declaration.type.isPointer && !at(TokenKind::Assign)
 		&& !at(TokenKind::LParen) && !at(TokenKind::LBracket) && !at(TokenKind::LBrace)) {
 		throw CompileError("the const variable \"" + declaration.name + "\" needs an initialiser");
@@ -2770,16 +2805,19 @@ StatementPtr Parser::parseStatement() {
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
 				|| _unit.findStruct(name) != nullptr))
-			|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
+			|| (kind() == TokenKind::Identifier && (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
 
 		if (looksLikeType) {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
-			declaration.type = parseType(true);
+			declaration.type = parseType(true, true);
 			if (declaration.type.arrayLength) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
+			}
+			if (declaration.type.isAuto && declaration.type.isPointer) {
+				throw CompileError("a local pointer declared with auto is not lowered yet");
 			}
 			declaration.isReference = at(TokenKind::Ampersand);
 			rejectLocalQualifiers(declaration.type, declaration.isReference, true);
@@ -2803,6 +2841,9 @@ StatementPtr Parser::parseStatement() {
 				if (declaration.isReference || declaration.type.isPointer || declaration.type.arrayLength
 					|| declaration.type.resource != ResourceKind::None) {
 					throw CompileError("an array of references, pointers or resources is not lowered yet");
+				}
+				if (declaration.type.isAuto) {
+					throw CompileError("an array cannot be declared with auto; write the element type");
 				}
 				deduceLength = parseArrayDimensions(declaration.type);
 				if (deduceLength && !at(TokenKind::Assign)) {
@@ -2835,6 +2876,10 @@ StatementPtr Parser::parseStatement() {
 			// A star binds to the name it precedes, so a pointer would need its own
 			// rule, and locals of pointer type are not lowered anyway.
 			while (at(TokenKind::Comma)) {
+				if (declaration.type.isAuto) {
+					throw CompileError("several declarators after auto are not lowered yet; Apple requires each to "
+						"deduce the same type, so declare each variable on its own line");
+				}
 				if (declaration.type.isPointer || declaration.type.arrayLength) {
 					throw CompileError("several declarators after a pointer or an array are not lowered yet");
 				}
@@ -3068,20 +3113,26 @@ StatementPtr Parser::parseForStatement() {
 		size_t nameTokens = 0;
 		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
 			? peekResolved(nameTokens) : std::string();
-		const bool looksLikeType = (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text))
+		const bool looksLikeType = (kind() == TokenKind::Identifier
+				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
 				&& (resolveTypeName(name, probe) || _unit.findStruct(name) != nullptr));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
-			declaration.type = parseType();
+			declaration.type = parseType(false, true);
 			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
+			if (declaration.type.isAuto && (declaration.type.isPointer || declaration.type.arrayLength)) {
+				throw CompileError("a pointer or an array declared with auto is not lowered yet");
+			}
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a loop variable name in a for initialiser");
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
-			if (match(TokenKind::Assign)) {
+			if (declaration.type.isAuto) {
+				parseAutoInitializer(declaration);
+			} else if (match(TokenKind::Assign)) {
 				declaration.initializer = parseInitializer();
 			} else if (at(TokenKind::LBrace)) {
 				declaration.initializer = parseInitializerList();

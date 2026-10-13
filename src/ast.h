@@ -91,6 +91,10 @@ struct Type {
 	bool isPointer = false;
 	bool isConst = false;
 
+	// Written as auto: the scalar, vector and name above are not known until
+	// semantic analysis deduces them from the initialiser. Only a local has one.
+	bool isAuto = false;
+
 	// As written. Only a local or a file-scope constant can be constexpr, and
 	// nothing inside a function can be static; the parser reports both where
 	// the context is known.
