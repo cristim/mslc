@@ -57,7 +57,7 @@ private:
 	std::map<ResourceKind, spirv::Id> _images;
 	std::map<ResourceKind, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
-	spirv::Id _uintStorageImage = spirv::InvalidId;
+	std::map<ScalarKind, spirv::Id> _storageImages;
 	bool _storageReadDeclared = false;
 	bool _storageWriteDeclared = false;
 
@@ -91,7 +91,11 @@ public:
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
 	spirv::Id image(ResourceKind kind);
-	spirv::Id uintStorageImage(TextureAccess access);
+	// The storage image (Sampled 2, format Unknown) an access::read or access::write
+	// texture2d is declared as, with a uint or a float sampled type; a half texture
+	// is a float image narrowed after the read, as for a sampled one. Iridium
+	// declares every non-sample texture this way (indium src/iridium/air.cpp:772).
+	spirv::Id storageImage(TextureAccess access, ScalarKind element);
 	spirv::Id samplerType();
 	spirv::Id sampledImage(ResourceKind kind);
 
