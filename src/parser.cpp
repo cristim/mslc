@@ -2242,6 +2242,21 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 	if (helper) {
 		const std::string what = "parameter \"" + param.name + "\" of helper function \"" + helperName + "\" ";
+		// "float p[3]", "float p[]" and "float m[3][3]" decay to a thread pointer to the
+		// first element; the first length is dropped and the lengths inside it stay.
+		if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+			if (param.type.isPointer || param.isReference || param.type.resource != ResourceKind::None
+				|| param.type.isAtomic) {
+				throw CompileError(what + "is an array of pointers, references, atomics or resources, "
+					"which a helper function does not take yet");
+			}
+			parseArrayDimensions(param.type);
+			param.type.arrayLength.reset();
+			param.type.isPointer = true;
+			if (param.type.addressSpace == AddressSpace::None) {
+				param.type.addressSpace = AddressSpace::Thread;
+			}
+		}
 		// A pointer to the caller's local array; the emitter checks the argument.
 		const bool threadPointer = param.type.isPointer && !param.isReference
 			&& param.type.addressSpace == AddressSpace::Thread && param.type.resource == ResourceKind::None
@@ -2251,7 +2266,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 				"a resource, which a helper function does not take yet; it takes scalar, vector, matrix "
 				"and struct values and a thread pointer to a local array");
 		}
-		if (param.type.arrayLength || (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket)) {
+		if (param.type.arrayLength) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
 		}
 		// A reference to a thread variable may spell its space out; any other
