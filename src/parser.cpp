@@ -1463,13 +1463,15 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 			local.insert(brought->second.begin(), brought->second.end());
 		}
 	}
-	// A function or variable this scope declares, directly or through a using
-	// declaration, hides a struct or enum tag of the same name in value lookup
-	// (g1/g2/g4/g6, h4, h6-h8): calling or reading the name finds the object, not
-	// "ambiguous" with the tag it would otherwise look like beside it. This combines
-	// only what one scope contributes; a directive's own members are collected by a
-	// separate call (g3), so two directives bringing in a struct and a function stay
-	// ambiguous, as Apple reports it.
+	// A function, variable or enumerator this scope declares, directly or through a
+	// using declaration, hides a struct or enum tag of the same name in value lookup
+	// (g1/g2/g4/g6, h4, h6-h8): calling or reading the name finds that one, not
+	// "ambiguous" with the tag it would otherwise look like beside it. A typedef does
+	// not hide a tag this way (g7, j5 stay ambiguous: a typedef names a type, same as
+	// the tag, so a use of the plain name cannot tell which type is meant). This
+	// combines only what one scope contributes; a directive's own members are
+	// collected by a separate call (g3), so two directives bringing in a struct and a
+	// function stay ambiguous, as Apple reports it.
 	const auto isPureTag = [this](const std::string& target) {
 		const std::vector<std::string_view> kinds = kindsOf(target);
 		if (kinds.empty()) {
@@ -1482,15 +1484,23 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 		}
 		return true;
 	};
-	bool hasNonTag = false;
+	const auto isHider = [this](const std::string& target) {
+		for (const std::string_view kind : kindsOf(target)) {
+			if (kind == "function" || kind == "variable" || kind == "enum constant") {
+				return true;
+			}
+		}
+		return false;
+	};
+	bool hasHider = false;
 	for (const std::string& candidate : local) {
-		if (!isPureTag(candidate)) {
-			hasNonTag = true;
+		if (isHider(candidate)) {
+			hasHider = true;
 			break;
 		}
 	}
 	for (const std::string& candidate : local) {
-		if (!hasNonTag || !isPureTag(candidate)) {
+		if (!hasHider || !isPureTag(candidate)) {
 			found.insert(candidate);
 		}
 	}
@@ -3032,10 +3042,15 @@ StatementPtr Parser::parseStatement() {
 		size_t nameTokens = 0;
 		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
 			? peekResolved(nameTokens) : std::string();
+		// A local hides a struct tag of its own spelling only where it is not
+		// qualified with "::": a bare name that could be the local or the tag is the
+		// local, but "A::S" or "::S" still names the struct (j1).
+		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+			&& isLocal(name);
 		const bool looksLikeType =
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
-				|| (_unit.findStruct(name) != nullptr && !isLocal(name))))
+				|| (_unit.findStruct(name) != nullptr && !localHidesStruct)))
 			|| (kind() == TokenKind::Identifier && (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
@@ -3344,10 +3359,14 @@ StatementPtr Parser::parseForStatement() {
 		size_t nameTokens = 0;
 		const std::string name = kind() == TokenKind::Identifier || at(TokenKind::ColonColon)
 			? peekResolved(nameTokens) : std::string();
+		// A local hides a struct tag of its own spelling only where it is not
+		// qualified with "::" (j8, j9; see parseStatement's identical guard).
+		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+			&& isLocal(name);
 		const bool looksLikeType = (kind() == TokenKind::Identifier
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !isLocal(name))));
+				&& (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
