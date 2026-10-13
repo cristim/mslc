@@ -5078,6 +5078,7 @@ namespace {
 
 		std::vector<uint32_t> operands { slot.first->second };
 		std::vector<std::pair<Id, Id>> copyOuts;
+		std::vector<std::optional<StdlibOperand>> argumentOperands(call.arguments.size());
 		const size_t first = receiver ? 1 : 0;
 		rejectAliasedReferenceArguments(call, definition, first);
 		if (first) {
@@ -5107,12 +5108,35 @@ namespace {
 					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
 			}
 			const Id value = emitExpression(*call.arguments[i]);
+			const Id valueType = _builder.typeOf(value);
+			const uint32_t width = _types.vectorWidth(valueType);
+			if (const auto scalar = _types.scalarKindOf(width > 1 ? _types.componentOf(valueType) : valueType)) {
+				argumentOperands[i] = StdlibOperand{*scalar, width};
+			}
 			try {
 				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
 			} catch (const CompileError& error) {
 				throw CompileError("argument " + std::to_string(i + 1) + " of the call to \""
 					+ definition.name + "\" cannot be converted to the parameter type "
 					+ typeName(definition.parameters[first + i].type) + ": " + error.what());
+			}
+		}
+
+		// The standard library's overloads compete with this function where its names are
+		// visible beside it. Where its parameters are one of theirs, Apple never calls it
+		// alone (ambiguous, or another library overload wins); where the arguments are exactly
+		// one of theirs, that one wins or ties.
+		if (call.left->besideStdlib) {
+			const size_t tail = definition.name.rfind("::");
+			const std::string stdlibName = tail == std::string::npos ? definition.name : definition.name.substr(tail + 2);
+			std::vector<std::optional<StdlibOperand>> parameterOperands;
+			for (const Parameter& parameter: definition.parameters) {
+				parameterOperands.push_back(stdlibOperand(parameter));
+			}
+			if (isStdlibSignature(stdlibName, parameterOperands) || isStdlibSignature(stdlibName, argumentOperands)) {
+				throw CompileError("the call to \"" + definition.name + "\" also matches the standard library's \""
+					+ stdlibName + "\", which is visible beside it; Apple resolves the two by overload, which mslc "
+					"does not model");
 			}
 		}
 

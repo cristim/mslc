@@ -62,6 +62,8 @@ class Parser {
 		// A name to what using declarations brought in under it: several functions
 		// overload, so a call is resolved (or found ambiguous) where it is made.
 		std::map<std::string, std::set<std::string>> declarations;
+		// Standard library names a using declaration brought in, as "using metal::clamp;".
+		std::set<std::string> stdlibDeclarations;
 	};
 	std::vector<std::string> _namespacePath;
 	std::set<std::string> _namespaces;
@@ -216,8 +218,10 @@ private:
 	// that names nothing is a CompileError.
 	std::string resolveName(const QualifiedName& name) const;
 	// The declarations an unqualified name finds at the innermost namespace level that has
-	// any, without reporting several as ambiguous (a declaration site is not a use).
-	std::set<std::string> unqualifiedFound(const std::string& last) const;
+	// any, without reporting several as ambiguous (a declaration site is not a use). With
+	// "besideStdlib", also whether the standard library's names are visible there or nearer:
+	// the level is namespace metal, or a using directive or declaration brings them to it.
+	std::set<std::string> unqualifiedFound(const std::string& last, bool* besideStdlib = nullptr) const;
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
