@@ -6652,20 +6652,49 @@ namespace {
 		return it->second;
 	}
 
+	// write(value, uint2 coordinate) in statement position. A uint texture takes a
+	// uint scalar, which is put in every channel. A float or half texture takes a
+	// vector of exactly its own element type, or any number, converted to that type
+	// and put in every channel (measured with Apple's compiler: half4 into a float
+	// texture is refused, a float scalar into a half texture is not). The
+	// coordinate is a uint2 or a ushort2; an explicit lod is not lowered.
 	void Emitter::emitTextureWrite(const Expression& call, const Binding& texture) {
 		if (texture.pointeeMsl.textureAccess != TextureAccess::Write) {
 			throw CompileError("the texture method \"write\" is not lowered yet on textures that are not access::write");
 		}
+		const ScalarKind element = texture.pointeeMsl.scalar;
+		const bool integer = element == ScalarKind::UInt;
+		const std::string takes = std::string("texture write takes exactly ")
+			+ (integer ? "a uint scalar" : element == ScalarKind::Half ? "a half4 or a number" : "a float4 or a number")
+			+ " and a uint2 or ushort2 coordinate";
 		if (call.arguments.size() != 2) {
-			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
+			throw CompileError(takes);
 		}
 		const Id value = emitExpression(*call.arguments[0]);
-		const Id coordinate = emitExpression(*call.arguments[1]);
-		if (_builder.typeOf(value) != _uintType
-			|| _builder.typeOf(coordinate) != _types.vector(ScalarKind::UInt, 2)) {
-			throw CompileError("texture write takes exactly a uint scalar and a uint2 coordinate");
+		Id coordinate = emitExpression(*call.arguments[1]);
+		const Id coordinateType = _builder.typeOf(coordinate);
+		const Id valueType = _builder.typeOf(value);
+		const Id texelType = _types.vector(integer ? ScalarKind::UInt : ScalarKind::Float, 4);
+		const bool unsignedPair = _types.vectorWidth(coordinateType) == 2 && !_types.isFloat(coordinateType)
+			&& !_types.isSignedInt(coordinateType) && (_types.bitWidth(coordinateType) == 32 || _types.bitWidth(coordinateType) == 16);
+		const bool numeric = _types.vectorWidth(valueType) == 1;
+		const bool ownVector = valueType == _types.vector(element, 4);
+		if (!unsignedPair || (integer ? valueType != _uintType : !(numeric || ownVector))) {
+			throw CompileError(takes);
 		}
-		const Id texel = broadcast(value, _types.vector(ScalarKind::UInt, 4));
+		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, 2));
+		// The image's sampled type is float whatever the texture's element.
+		Id texel;
+		if (ownVector) {
+			texel = convert(value, valueType, texelType);
+		} else if (integer) {
+			texel = broadcast(value, texelType);
+		} else {
+			// A number is narrowed to the element type before it is widened to the
+			// image's float, so a half texture stores the value rounded to half.
+			const Id narrowed = convert(value, valueType, _types.scalar(element));
+			texel = broadcast(narrowed, texelType);
+		}
 		const Id image = loadFrom(texture.id, texture.pointeeType);
 		_builder.emit(spirv::OpImageWrite, { image, coordinate, texel });
 	}
@@ -6678,7 +6707,7 @@ namespace {
 		}
 		if (texture.pointeeMsl.textureAccess == TextureAccess::Write) {
 			if (method != "get_width" || !call.arguments.empty()) {
-				throw CompileError("write-only textures lower only get_width() and statement write(uint, uint2)");
+				throw CompileError("write-only textures lower only get_width() and statement write(value, coordinate)");
 			}
 			return emitTextureSize(call, texture, SizeComponent::Width);
 		}
