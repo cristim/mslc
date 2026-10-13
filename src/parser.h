@@ -236,12 +236,14 @@ private:
 	// Types
 	// allowResource is true where a texture or sampler type may be spelled: an
 	// entry point parameter, and a local declaration, which only a sampler may be.
-	Type parseType(bool allowResource = false);
+	// allowAuto is true only for a local, the one place an auto type is lowered.
+	Type parseType(bool allowResource = false, bool allowAuto = false);
 	size_t parseSpecifierRun(Type& type);
 	void parseResourceType(Type& type);
 	bool parseQualifier(Type& type, bool afterPointer);
 	void parseSamplerLocal(VariableDeclaration& declaration);
 	void parseLocalInitializer(VariableDeclaration& declaration);
+	void parseAutoInitializer(VariableDeclaration& declaration);
 	void appendStatement(std::vector<StatementPtr>& out);
 	SamplerState parseSamplerOptions(TokenKind closing);
 	bool parseAddressSpace(AddressSpace& space);

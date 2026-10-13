@@ -46,8 +46,8 @@ std::string typeName(const Type& type) {
 				: type.textureAccess == TextureAccess::Read ? ", access::read>" : ">");
 	}
 
-	std::string name = type.namedType.empty()
-		? std::string(scalarKindName(type.scalar))
+	std::string name = type.isAuto ? std::string("auto")
+		: type.namedType.empty() ? std::string(scalarKindName(type.scalar))
 		: type.namedType;
 
 	if (type.namedType.empty() && type.isMatrix()) {
