@@ -25,6 +25,7 @@ const char* scalarKindName(ScalarKind kind) {
 const char* resourceKindName(ResourceKind kind) {
 	switch (kind) {
 		case ResourceKind::None: return "none";
+		case ResourceKind::Texture1D: return "texture1d";
 		case ResourceKind::Texture2D: return "texture2d";
 		case ResourceKind::TextureCube: return "texturecube";
 		case ResourceKind::Texture3D: return "texture3d";
