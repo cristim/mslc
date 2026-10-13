@@ -3711,6 +3711,17 @@ ExpressionPtr Parser::parsePrimary() {
 			return expression;
 		}
 
+		// A struct's name and a braced list is a value of that struct: S{a, b} and
+		// S{.field = a}. It is spelled in a return, an argument or an initialiser.
+		if (!isLocal(resolved) && _unit.findStruct(resolved) && lookahead(spelledTokens).kind == TokenKind::LBrace) {
+			consumeName();
+			ExpressionPtr list = parseInitializerList();
+			Type type;
+			type.namedType = resolved;
+			list->constructType = type;
+			return list;
+		}
+
 		// A struct's name and an argument list call its constructor.
 		if (!isLocal(resolved) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
 			const size_t atLine = line();
