@@ -3009,6 +3009,11 @@ namespace {
 			// An element of a buffer has the buffer's own type.
 			case ExpressionKind::Index: return structOf(*expression.left);
 
+			// S{...} is a value of the struct it names.
+			case ExpressionKind::InitList:
+				return expression.constructType && !expression.constructType->namedType.empty()
+					? _unit.findStruct(expression.constructType->namedType) : nullptr;
+
 			// A helper that returns a struct, including a struct's constructor, which
 			// is one.
 			case ExpressionKind::Call: {
@@ -3100,7 +3105,7 @@ namespace {
 
 		// A member of a value a helper returned has no address; the call is made and
 		// the field taken from the struct it produced.
-		if (expression.left->kind == ExpressionKind::Call) {
+		if (expression.left->kind == ExpressionKind::Call || expression.left->kind == ExpressionKind::InitList) {
 			const StructDecl* decl = structOf(*expression.left);
 			std::string declName;
 			const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
@@ -5573,6 +5578,11 @@ namespace {
 			case ExpressionKind::Construct: return emitConstruct(expression);
 			case ExpressionKind::Conditional: return emitConditional(expression);
 			case ExpressionKind::InitList:
+				// S{...} names its struct; a bare list does not and is only an initialiser.
+				if (expression.constructType) {
+					return emitInitListValue(*expression.constructType, expression);
+				}
+				break;
 			case ExpressionKind::Assign: break;
 		}
 
