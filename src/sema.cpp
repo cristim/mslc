@@ -7356,6 +7356,70 @@ namespace {
 				}
 			}
 		}
+
+		// No vertex pairs by name+type; if one covers every input name, report the
+		// first type mismatch rather than staying silent.
+		for (const FunctionDecl* fragment: _entryPoints) {
+			if (fragment->stage != Stage::Fragment) {
+				continue;
+			}
+
+			for (const Parameter& parameter: fragment->parameters) {
+				if (!parameter.attributes.stageIn) {
+					continue;
+				}
+
+				const auto inputs = interfaceFields(parameter.type.namedType);
+
+				bool fullyPaired = false;
+				for (const FunctionDecl* vertex: _entryPoints) {
+					if (vertex->stage != Stage::Vertex || vertex->returnType.namedType.empty()) {
+						continue;
+					}
+					const auto outputs = interfaceFields(vertex->returnType.namedType);
+					const bool pairs = std::all_of(inputs.begin(), inputs.end(), [&](const auto& input) {
+						return std::find(outputs.begin(), outputs.end(), input) != outputs.end();
+					});
+					if (pairs) {
+						fullyPaired = true;
+						break;
+					}
+				}
+				if (fullyPaired) {
+					continue;
+				}
+
+				for (const FunctionDecl* vertex: _entryPoints) {
+					if (vertex->stage != Stage::Vertex || vertex->returnType.namedType.empty()) {
+						continue;
+					}
+					const auto outputs = interfaceFields(vertex->returnType.namedType);
+					const bool namesCovered = std::all_of(inputs.begin(), inputs.end(), [&](const auto& input) {
+						return std::find_if(outputs.begin(), outputs.end(), [&](const auto& output) {
+							return output.name == input.name;
+						}) != outputs.end();
+					});
+					if (!namesCovered) {
+						continue;
+					}
+
+					for (const auto& input: inputs) {
+						const auto candidate = std::find_if(outputs.begin(), outputs.end(), [&](const auto& output) {
+							return output.name == input.name;
+						});
+						// namesCovered already guarantees candidate != outputs.end().
+						if (candidate->type != input.type) {
+							throw CompileError("vertex function \"" + vertex->name + "\" writes \""
+								+ input.name + "\" as " + candidate->type + " and fragment function \""
+								+ fragment->name + "\" reads it as " + input.type + "; mslc requires a "
+								"stage-crossing field to have one type on both sides, since Apple rejects "
+								"the mismatch when the pipeline is created");
+						}
+					}
+					break;
+				}
+			}
+		}
 	}
 
 
