@@ -159,7 +159,17 @@ bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
 	for (size_t i = 0; i < a.parameters.size(); ++i) {
 		const Type& x = a.parameters[i].type;
 		const Type& y = b.parameters[i].type;
-		if (a.parameters[i].isMutableReference() != b.parameters[i].isMutableReference()) {
+		// An array parameter is a pointer to its element whatever its length, and a const
+		// on a parameter passed by value is not part of the signature; on a pointer or a
+		// reference, it and the address space are.
+		const bool pointerX = x.isPointer || x.arrayLength.has_value();
+		const bool pointerY = y.isPointer || y.arrayLength.has_value();
+		const bool referenceX = a.parameters[i].isReference;
+		if (referenceX != b.parameters[i].isReference || pointerX != pointerY
+			|| x.innerArrayLengths != y.innerArrayLengths) {
+			return false;
+		}
+		if ((pointerX || referenceX) && (x.isConst != y.isConst || x.addressSpace != y.addressSpace)) {
 			return false;
 		}
 		if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
