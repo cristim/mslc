@@ -1126,7 +1126,8 @@ namespace {
 	bool sameType(const Type& a, const Type& b) {
 		return a.scalar == b.scalar && a.vectorWidth == b.vectorWidth
 			&& a.matrixColumns == b.matrixColumns && a.isPacked == b.isPacked
-			&& a.namedType == b.namedType && a.isConst == b.isConst;
+			&& a.namedType == b.namedType && a.isConst == b.isConst
+			&& a.enumName == b.enumName;
 	}
 
 	// Names the typedef and enum support has to keep distinct from everything else.
@@ -1596,8 +1597,14 @@ void Parser::parseTypedef() {
 	Type existing;
 	if (resolveTypeName(name, existing)) {
 		if (!sameType(existing, target)) {
-			throw CompileError("typedef redefinition with different types ('" + typeName(target) + "' vs '"
-				+ typeName(existing) + "')");
+			const auto spelled = [](Type type) {
+				if (!type.enumName.empty()) {
+					type.namedType = type.enumName;
+				}
+				return typeName(type);
+			};
+			throw CompileError("typedef redefinition with different types ('" + spelled(target) + "' vs '"
+				+ spelled(existing) + "')");
 		}
 		return;
 	}
