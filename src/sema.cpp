@@ -4880,6 +4880,9 @@ namespace {
 				+ ", so a return needs a value");
 		}
 
+		if (!_helper->returnType.enumName.empty()) {
+			requireEnumValue(_helper->returnType.enumName, *statement.expression, "the value " + quoted + " returns");
+		}
 		const Id value = emitExpression(*statement.expression);
 		terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(_helper->returnType)) });
 	}
