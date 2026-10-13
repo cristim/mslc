@@ -436,7 +436,7 @@ namespace {
 		const Type& type = parameter.type;
 		if (parameter.isReference || type.addressSpace != AddressSpace::None || type.isPointer || type.arrayLength
 			|| type.matrixColumns || type.isPacked || !type.namedType.empty() || type.resource != ResourceKind::None
-			|| type.isAtomic) {
+			|| type.isAtomic || !type.enumName.empty()) {
 			return std::nullopt;
 		}
 		return StdlibOperand{type.scalar, type.vectorWidth ? type.vectorWidth : 1};
@@ -5079,6 +5079,20 @@ namespace {
 		std::vector<uint32_t> operands { slot.first->second };
 		std::vector<std::pair<Id, Id>> copyOuts;
 		std::vector<std::optional<StdlibOperand>> argumentOperands(call.arguments.size());
+		// An enum-typed argument is an exact match for an enum parameter, which beats the
+		// int promotion a library signature would need; leaving no operand reads as no
+		// match, same as any other type the library's signatures do not model.
+		const auto stdlibArgumentOperand = [&](const Expression& argument, Id type) -> std::optional<StdlibOperand> {
+			const auto enumName = enumOf(argument);
+			if (enumName && !enumName->empty()) {
+				return std::nullopt;
+			}
+			const uint32_t width = _types.vectorWidth(type);
+			if (const auto scalar = _types.scalarKindOf(width > 1 ? _types.componentOf(type) : type)) {
+				return StdlibOperand{*scalar, width};
+			}
+			return std::nullopt;
+		};
 		const size_t first = receiver ? 1 : 0;
 		rejectAliasedReferenceArguments(call, definition, first);
 		if (first) {
@@ -5100,6 +5114,7 @@ namespace {
 
 			if (parameter.isMutableReference()) {
 				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
+				argumentOperands[i] = stdlibArgumentOperand(*call.arguments[i], valueTypeAt(operands.back()));
 				continue;
 			}
 
@@ -5108,11 +5123,7 @@ namespace {
 					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
 			}
 			const Id value = emitExpression(*call.arguments[i]);
-			const Id valueType = _builder.typeOf(value);
-			const uint32_t width = _types.vectorWidth(valueType);
-			if (const auto scalar = _types.scalarKindOf(width > 1 ? _types.componentOf(valueType) : valueType)) {
-				argumentOperands[i] = StdlibOperand{*scalar, width};
-			}
+			argumentOperands[i] = stdlibArgumentOperand(*call.arguments[i], _builder.typeOf(value));
 			try {
 				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
 			} catch (const CompileError& error) {

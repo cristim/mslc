@@ -225,8 +225,10 @@ private:
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
+	// With "besideStdlib", also whether the walk visited namespace metal or a scope with a
+	// "using metal::name;" of this name, directly or through a directive it follows.
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-		std::set<std::string>& found, bool qualified) const;
+		std::set<std::string>& found, bool qualified, bool* besideStdlib = nullptr) const;
 	bool isLocal(const std::string& name) const;
 	// What the innermost block that declares the name binds it to: "" for a local,
 	// the declaration a using declaration names, or nullptr when no block does.
