@@ -444,6 +444,13 @@ void Parser::parseDeclaration() {
 		"expected a struct, kernel, vertex, fragment or helper function declaration");
 }
 
+// A struct or enum tag may share its name with a function or a variable.
+static bool tagBesideObject(std::string_view a, std::string_view b) {
+	const auto isTag = [](std::string_view kindName) { return kindName == "struct" || kindName == "enum"; };
+	const auto isObject = [](std::string_view kindName) { return kindName == "function" || kindName == "variable"; };
+	return (isTag(a) && isObject(b)) || (isObject(a) && isTag(b));
+}
+
 // "namespace" is consumed. A name declared in the body is stored under its
 // qualified name; an anonymous namespace is the namespace "(anonymous namespace)",
 // which its enclosing namespace uses, so its names are visible there unqualified.
@@ -464,7 +471,9 @@ void Parser::parseNamespace() {
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a namespace name, found " + std::string(tokenKindName(kind())));
 			}
-			if (_declared.count(qualify(std::string(current().text)))) {
+			const auto enclosing = _scopes.find(namespacePrefix(_namespacePath.size()));
+			if (_declared.count(qualify(std::string(current().text)))
+				|| (enclosing != _scopes.end() && enclosing->second.declarations.count(std::string(current().text)))) {
 				throw CompileError("\"" + qualify(std::string(current().text)) + "\" is declared and "
 					"cannot also be a namespace");
 			}
@@ -535,7 +544,42 @@ void Parser::parseUsing() {
 		return; // a name of the standard library, which is visible already
 	}
 	if (_blocks.empty()) {
-		_scopes[scope].declarations[name.parts.back()] = resolved;
+		// [namespace.udecl]: the name must not already be another declaration of this namespace.
+		const std::string& last = name.parts.back();
+		const std::string own = scope.empty() ? last : scope + "::" + last;
+		std::set<std::string>& brought = _scopes[scope].declarations[last];
+		// Functions brought in under one name overload, and a tag may sit beside a function
+		// or variable; any other pair of kinds is a clash. metal::discard_fragment, which has
+		// no kinds, is a function.
+		const auto kindsOrFunction = [&](const std::string& target) {
+			std::vector<std::string_view> kinds = kindsOf(target);
+			if (kinds.empty()) {
+				kinds.push_back("function");
+			}
+			return kinds;
+		};
+		const auto clash = [&](const std::string& a, const std::string& b) {
+			for (const std::string_view x : kindsOrFunction(a)) {
+				for (const std::string_view y : kindsOrFunction(b)) {
+					if (!(x == "function" && y == "function") && !tagBesideObject(x, y)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
+		for (const std::string& earlier : brought) {
+			if (earlier != resolved && clash(earlier, resolved)) {
+				throw CompileError("the using declaration of \"" + resolved + "\" conflicts with the using "
+					"declaration of \"" + earlier + "\" in the same namespace");
+			}
+		}
+		if (const std::vector<std::string_view> kinds = kindsOf(own);
+			!kinds.empty() && conflictsWithUsing(own, kinds, resolved, nullptr)) {
+			throw CompileError("the using declaration of \"" + resolved + "\" conflicts with \"" + own
+				+ "\" declared earlier in the same namespace");
+		}
+		brought.insert(resolved);
 		return;
 	}
 	const auto [entry, inserted] = _blocks.back().names.emplace(name.parts.back(), resolved);
@@ -631,6 +675,7 @@ bool Parser::tryParseHelperFunction() {
 	declareName(decl.name, "function");
 	const LocalScope parameters(*this);
 	parseHelperParameters(decl, quoted);
+	rejectUsingConflict(decl.name, "function", &decl);
 
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("attributes on " + quoted + " are not lowered yet");
@@ -1231,18 +1276,92 @@ void Parser::declareName(const std::string& name, const char* what) {
 			+ what);
 	}
 
+	if (_namespaces.count(name)) {
+		throw CompileError("redefinition of \"" + name + "\": declared as namespace and again as " + what);
+	}
+
 	// Functions overload, and a struct or enum tag may share a name with a function
 	// or a variable; every other pair of declarations of one name is a redefinition.
 	const auto [existing, inserted] = _declared.emplace(name, what);
-	const auto isTag = [](std::string_view kindName) { return kindName == "struct" || kindName == "enum"; };
-	const auto isObject = [](std::string_view kindName) { return kindName == "function" || kindName == "variable"; };
 	const std::string_view now(what);
 	const bool overload = now == "function" && existing->second == "function";
-	const bool tagBesideObject = (isTag(now) && isObject(existing->second))
-		|| (isObject(now) && isTag(existing->second));
-	if (!inserted && !overload && !tagBesideObject) {
+	const bool besideTag = tagBesideObject(now, existing->second);
+	if (!inserted && !overload && !besideTag) {
 		throw CompileError("redefinition of \"" + name + "\": declared as " + existing->second
 			+ " and again as " + what);
+	}
+	if (besideTag) {
+		// A tag and an object: a second object of the name is checked against the first.
+		const auto [second, first] = _declaredBesideTag.emplace(name, what);
+		if (!first && !(now == "function" && second->second == "function")) {
+			throw CompileError("redefinition of \"" + name + "\": declared as " + second->second
+				+ " and again as " + what);
+		}
+	}
+
+	// A function is checked once its parameters are known; an enumerator declared after a
+	// using declaration of its name is accepted, as Apple does, and is ambiguous where used.
+	if (std::string_view(what) != "function" && std::string_view(what) != "enum constant") {
+		rejectUsingConflict(name, what, nullptr);
+	}
+}
+
+std::vector<std::string_view> Parser::kindsOf(const std::string& name) const {
+	std::vector<std::string_view> kinds;
+	if (const auto first = _declared.find(name); first != _declared.end()) {
+		kinds.push_back(first->second);
+	}
+	if (const auto second = _declaredBesideTag.find(name); second != _declaredBesideTag.end()) {
+		kinds.push_back(second->second);
+	}
+	return kinds;
+}
+
+bool Parser::conflictsWithUsing(const std::string& own, const std::vector<std::string_view>& ownKinds,
+	const std::string& target, const FunctionDecl* function) const {
+	const auto named = [&](const std::string& name, const auto& visit) {
+		for (const std::vector<FunctionDecl>* list : {&_unit.helpers, &_unit.functions}) {
+			for (const FunctionDecl& decl : *list) {
+				if (decl.name == name && visit(decl)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	const auto sameAsTarget = [&](const FunctionDecl& candidate) {
+		return named(target, [&](const FunctionDecl& decl) { return sameParameterTypes(candidate, decl); });
+	};
+	// metal::discard_fragment has no kinds, and no file declaration is checked against it.
+	for (const std::string_view targetKind : kindsOf(target)) {
+		for (const std::string_view ownKind : ownKinds) {
+			if (tagBesideObject(ownKind, targetKind)) {
+				continue;
+			}
+			if (ownKind != "function" || targetKind != "function"
+				|| (function ? sameAsTarget(*function) : named(own, sameAsTarget))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void Parser::rejectUsingConflict(const std::string& name, std::string_view what, const FunctionDecl* function) const {
+	const size_t tail = name.rfind("::");
+	const auto entry = _scopes.find(tail == std::string::npos ? std::string() : name.substr(0, tail));
+	if (entry == _scopes.end()) {
+		return;
+	}
+	const auto brought = entry->second.declarations.find(tail == std::string::npos ? name : name.substr(tail + 2));
+	if (brought == entry->second.declarations.end()) {
+		return;
+	}
+	for (const std::string& target : brought->second) {
+		if (conflictsWithUsing(name, {what}, target, function)) {
+			throw CompileError("\"" + name + "\" conflicts with the using declaration of \"" + target
+				+ "\" in the same namespace");
+		}
 	}
 }
 
@@ -1326,7 +1445,7 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 		return;
 	}
 	if (const auto brought = entry->second.declarations.find(name); brought != entry->second.declarations.end()) {
-		found.insert(brought->second);
+		found.insert(brought->second.begin(), brought->second.end());
 	}
 }
 
@@ -2595,6 +2714,7 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	}
 
 	expect(TokenKind::RParen, "to close a parameter list");
+	rejectUsingConflict(decl.name, "function", &decl);
 
 	// Two parameters of one kind cannot take the same slot.
 	std::set<std::pair<std::string, uint32_t>> slots;
