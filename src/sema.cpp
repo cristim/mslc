@@ -991,8 +991,27 @@ bool TypeTable::structForm(spirv::Id type, StructForm& out) {
 	return true;
 }
 
+spirv::Id TypeTable::array(spirv::Id element, uint32_t length) {
+	const auto key = std::make_pair(element, length);
+	const auto cached = _arrays.find(key);
+	if (cached != _arrays.end()) {
+		return cached->second;
+	}
+
+	const Id lengthId = _builder.emitDeclTyped(spirv::OpConstant, scalar(ScalarKind::UInt), { length });
+	const Id id = _builder.emitDecl(spirv::OpTypeArray, { element, lengthId });
+	_arrays.emplace(key, id);
+	_arrayElement.emplace(id, element);
+	return id;
+}
+
+spirv::Id TypeTable::arrayElement(spirv::Id type) const {
+	const auto found = _arrayElement.find(type);
+	return found == _arrayElement.end() ? spirv::InvalidId : found->second;
+}
+
 bool TypeTable::isAggregate(spirv::Id type) const {
-	if (_widthOfVector.count(type) > 0 || _matrixInfo.count(type) > 0) {
+	if (_widthOfVector.count(type) > 0 || _matrixInfo.count(type) > 0 || _arrayElement.count(type) > 0) {
 		return true;
 	}
 
@@ -2167,6 +2186,7 @@ namespace {
 		Id emitMatrixProduct(BinaryOperator op, Id left, Id right);
 		Id emitUnary(const Expression& expression);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
+		void emitLocalArray(const VariableDeclaration& declaration, bool storageOnly);
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
 		std::optional<std::string> enumOf(const Expression& expression);
 		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
@@ -2613,6 +2633,11 @@ namespace {
 
 		const Binding& binding = *found;
 
+		if (binding.pointeeMsl.arrayLength && !binding.isBuffer && binding.bufferPointeeType == InvalidId) {
+			throw CompileError("\"" + expression.name + "\" is an array, which is not a value: index it, as "
+				+ expression.name + "[i]");
+		}
+
 		if (binding.pointeeMsl.resource != ResourceKind::None) {
 			throw CompileError("\"" + expression.name + "\" is a " + typeName(binding.pointeeMsl)
 				+ ", which mslc uses as the receiver of a texture call or as sample's sampler "
@@ -2674,6 +2699,8 @@ namespace {
 	// assignment target asks for the address. Without this the operands of
 	// "a[i] + b[i]" would be pointers, and the addition would be typed as
 	// integer.
+	static std::optional<int64_t> literalIndex(const Expression& expression);
+
 	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
 		if (isElementAccess(expression)) {
 			return emitElementAccess(expression, asAddress);
@@ -2750,9 +2777,18 @@ namespace {
 			return asAddress ? address : loadFromBuffer(address, binding.pointeeType);
 		}
 
-		// Indexing a matrix names one of its columns, not another matrix.
+		// Indexing a matrix names one of its columns, not another matrix, and an array
+		// names one of its elements.
 		const auto* matrix = _types.matrixInfo(binding.pointeeType);
-		const Id elementType = matrix ? matrix->column : binding.pointeeType;
+		const Id arrayElement = _types.arrayElement(binding.pointeeType);
+		if (arrayElement != InvalidId) {
+			const Expression& at = *expression.arguments[0];
+			if (const auto literal = literalIndex(at); literal && *literal >= *binding.pointeeMsl.arrayLength) {
+				throw CompileError("the index " + std::to_string(*literal) + " is outside the array \""
+					+ expression.left->name + "\" of " + std::to_string(*binding.pointeeMsl.arrayLength));
+			}
+		}
+		const Id elementType = arrayElement != InvalidId ? arrayElement : matrix ? matrix->column : binding.pointeeType;
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(binding.storageClass, elementType),
 			{ binding.id, index });
@@ -2780,7 +2816,8 @@ namespace {
 		}
 
 		const auto it = _bindings.find(expression.left->name);
-		return it != _bindings.end() && !it->second.isBuffer && !_types.matrixInfo(it->second.pointeeType);
+		return it != _bindings.end() && !it->second.isBuffer && !_types.matrixInfo(it->second.pointeeType)
+			&& _types.arrayElement(it->second.pointeeType) == InvalidId;
 	}
 
 	// The index of a literal, with a sign. Anything else is not known here and is
@@ -3200,6 +3237,17 @@ namespace {
 				// Only a pointer names a buffer, and only a buffer is an array. A
 				// struct reached directly is one value, whether through a reference
 				// or through the address a buffer of scalars put in a register.
+				// A local array is indexed by an access chain step into the array.
+				if (!fromBuffer && current.arrayLength && binding.storageClass == spirv::StorageClass::Function) {
+					if (const auto literal = literalIndex(*step.index); literal && *literal >= *current.arrayLength) {
+						throw CompileError("the index " + std::to_string(*literal) + " is outside the array \""
+							+ rootName + "\" of " + std::to_string(*current.arrayLength));
+					}
+					operands.push_back(stepIndex(*step.index, "array element"));
+					current.arrayLength.reset();
+					continue;
+				}
+
 				if (!fromBuffer || !binding.isBuffer) {
 					if (step.isDereference) {
 						throw CompileError(notAPointer(rootName));
@@ -7576,6 +7624,76 @@ namespace {
 			+ " does not convert to it; write a cast, as (" + target + ")value");
 	}
 
+	// A fixed-length array in the function's own storage: float a[4], const float3 d[3] = {...}
+	// and a[] = {...}. A shorter list zero-fills the rest, as in C++, and a longer one is an
+	// error. An index is not checked at run time, and a constant one past the end is refused.
+	void Emitter::emitLocalArray(const VariableDeclaration& declaration, bool storageOnly) {
+		const Type& type = declaration.type;
+		if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
+			throw CompileError("an array of " + typeName(type) + " is not lowered yet; mslc lowers an array "
+				"of scalars, vectors, matrices and structs in the function's own storage");
+		}
+
+		Type element = type;
+		element.arrayLength.reset();
+		const uint32_t length = *type.arrayLength;
+		const Id elementType = declaredTypeOf(element);
+		const Id arrayType = _types.array(elementType, length);
+
+		// A struct with a constructor runs it for every element the list does not give, which
+		// is not lowered: zero-filling would skip it and read a different value.
+		if (!element.namedType.empty()) {
+			const StructDecl* decl = _unit.findStruct(element.namedType);
+			const size_t given = declaration.initializer ? declaration.initializer->elements.size() : 0;
+			if (decl && decl->hasConstructors && given < length) {
+				throw CompileError("an array of " + element.namedType + ", which has a constructor, needs a "
+					"value for every element; the constructor is not run for the rest yet");
+			}
+		}
+
+		Id initial = InvalidId;
+		if (!storageOnly) {
+			if (!declaration.initializer) {
+				initial = _types.zero(arrayType);
+			} else if (declaration.initializer->kind != ExpressionKind::InitList) {
+				throw CompileError("array initializer must be an initializer list");
+			} else {
+				const Expression& list = *declaration.initializer;
+				if (list.elements.size() > length) {
+					throw CompileError("excess elements in array initializer");
+				}
+				Expression none;
+				none.kind = ExpressionKind::InitList;
+				std::vector<uint32_t> parts;
+				for (const InitializerElement& entry: list.elements) {
+					if (!entry.fieldName.empty()) {
+						throw CompileError("a field designator requires a struct initializer");
+					}
+					if (entry.value->kind == ExpressionKind::InitList) {
+						parts.push_back(emitInitListValue(element, *entry.value));
+					} else {
+						const Id value = emitExpression(*entry.value);
+						parts.push_back(element.namedType.empty() && element.isScalar()
+							? convertListScalar(value, element, *entry.value)
+							: convertImplicit(value, elementType));
+					}
+				}
+				while (parts.size() < length) {
+					parts.push_back(emitInitListValue(element, none));
+				}
+				initial = _builder.emitTyped(spirv::OpCompositeConstruct, arrayType, parts);
+			}
+		}
+
+		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Function, arrayType),
+			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		if (!storageOnly) {
+			_builder.emit(spirv::OpStore, { variable, initial });
+		}
+		bindLocal(declaration.name, variable, arrayType, type);
+	}
+
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
 		if (declaration.type.resource != ResourceKind::None) {
 			declareLocalSampler(declaration);
@@ -7606,8 +7724,8 @@ namespace {
 		}
 
 		if (declaration.type.arrayLength) {
-			throw CompileError("a local of array type " + typeName(declaration.type)
-				+ " is not lowered yet; an array has no single SPIR-V type to store into");
+			emitLocalArray(declaration, storageOnly);
+			return;
 		}
 
 		const Id typeId = declaredTypeOf(declaration.type);
@@ -7947,6 +8065,12 @@ namespace {
 	void Emitter::emitAssignment(const Expression& left, const Expression& right,
 		std::optional<BinaryOperator> compound) {
 		requireStorable(left);
+		if (left.kind == ExpressionKind::Identifier) {
+			const auto named = _bindings.find(left.name);
+			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer) {
+				throw CompileError("array type " + typeName(named->second.pointeeMsl) + " is not assignable");
+			}
+		}
 		if (const auto target = enumOf(left); target && !target->empty() && *target != "<anonymous>") {
 			if (compound) {
 				throw CompileError("a compound assignment does not apply to the enum " + *target

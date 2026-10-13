@@ -37,6 +37,8 @@ public:
 private:
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, spirv::Id> _matrices;
 	std::map<spirv::Id, MatrixInfo> _matrixInfo;
+	std::map<std::pair<spirv::Id, uint32_t>, spirv::Id> _arrays;
+	std::map<spirv::Id, spirv::Id> _arrayElement;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -77,6 +79,10 @@ public:
 	spirv::Id vector(ScalarKind kind, uint32_t width);
 	spirv::Id pointer(spirv::StorageClassValue storageClass, spirv::Id pointee);
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
+	// A fixed-length array of element, in Function storage, so it carries no stride.
+	spirv::Id array(spirv::Id element, uint32_t length);
+	// The element type of an array this table made, or InvalidId for anything else.
+	spirv::Id arrayElement(spirv::Id type) const;
 
 	// The image a texture2d, texturecube, texture3d or texture2d_array of float or
 	// half is declared as: a float sampled type, sampled by a sampler (Sampled 1),

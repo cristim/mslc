@@ -2665,6 +2665,9 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			declaration.type = parseType(true);
+			if (declaration.type.arrayLength) {
+				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
+			}
 			declaration.isReference = at(TokenKind::Ampersand);
 			rejectLocalQualifiers(declaration.type, declaration.isReference, true);
 			if (declaration.isReference) {
@@ -2680,6 +2683,32 @@ StatementPtr Parser::parseStatement() {
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+
+			// "float a[4]" and "float a[] = {...}": the length follows the name.
+			bool deduceLength = false;
+			if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+				if (declaration.isReference || declaration.type.isPointer || declaration.type.arrayLength
+					|| declaration.type.resource != ResourceKind::None) {
+					throw CompileError("an array of references, pointers or resources is not lowered yet");
+				}
+				advance();
+				if (at(TokenKind::RBracket)) {
+					deduceLength = true;
+				} else {
+					const int64_t length = parseConstantIndex("an array length");
+					if (length <= 0) {
+						throw CompileError("zero-length arrays are not permitted in C++");
+					}
+					declaration.type.arrayLength = static_cast<uint32_t>(length);
+				}
+				expect(TokenKind::RBracket, "to close an array length");
+				if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+					throw CompileError("a multi-dimensional array is not lowered yet; mslc lowers one dimension");
+				}
+				if (deduceLength && !at(TokenKind::Assign)) {
+					throw CompileError("the array \"" + declaration.name + "\" has no size and needs an initialiser list");
+				}
+			}
 
 			if (declaration.isReference) {
 				if (!match(TokenKind::Assign)) {
@@ -2698,6 +2727,13 @@ StatementPtr Parser::parseStatement() {
 			}
 
 			parseLocalInitializer(declaration);
+			if (deduceLength) {
+				if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList
+					|| declaration.initializer->elements.empty()) {
+					throw CompileError("the array \"" + declaration.name + "\" has no size and needs an initialiser list");
+				}
+				declaration.type.arrayLength = static_cast<uint32_t>(declaration.initializer->elements.size());
+			}
 
 			// "T a, b = 1, c;" declares each name with the type the first one has.
 			// A star binds to the name it precedes, so a pointer would need its own
