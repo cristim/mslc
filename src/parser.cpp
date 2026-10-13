@@ -4248,18 +4248,18 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->kind = ExpressionKind::Identifier;
 		expression->line = line();
 		expression->name = resolved;
-		// A function the file adds to namespace metal sits beside the library's own.
-		const std::string stdlibMember = std::string(kStdlibNamespace) + "::";
-		expression->besideStdlib = resolved.compare(0, stdlibMember.size(), stdlibMember) == 0
-			&& resolved.find("::", stdlibMember.size()) == std::string::npos;
-		// A qualified call into a namespace that itself brought the library's name in with
-		// "using metal::name;" finds that name there too (Apple's qualified lookup sees both).
-		if (const size_t ownerEnd = resolved.rfind("::"); ownerEnd != std::string::npos) {
-			const std::string owner = resolved.substr(0, ownerEnd);
-			const std::string member = resolved.substr(ownerEnd + 2);
-			const auto scope = _scopes.find(owner);
-			if (scope != _scopes.end() && scope->second.stdlibDeclarations.count(member)) {
-				expression->besideStdlib = true;
+		// A qualified call is looked up at the scope it WROTE, not at the scope the member
+		// it found happens to live in: "B::clamp" can resolve to "A::clamp" through a using
+		// declaration or directive in B, but it is still B's lookup that also reaches the
+		// library when B brings metal in too (directly, as namespace metal itself, or
+		// transitively), so collectMembers walks from the written scope.
+		expression->besideStdlib = false;
+		if (spelled.parts.size() > 1) {
+			const std::string scope = namespaceOf(spelled, spelled.parts.size() - 1);
+			if (!scope.empty()) {
+				std::set<std::string> seen;
+				std::set<std::string> found;
+				collectMembers(scope, spelled.parts.back(), seen, found, true, &expression->besideStdlib);
 			}
 		}
 		bool foundBesideStdlib = false;
