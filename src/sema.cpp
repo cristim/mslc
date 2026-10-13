@@ -1536,9 +1536,10 @@ namespace {
 		// walks that rather than the SPIR-V ids, so it can tell a struct from an
 		// array from a scalar and find the declaration for the next field.
 		Type pointeeMsl;
-		// True when the MSL type is a scalar but the SPIR-V form is a vector,
-		// so a use wants one component rather than the whole vector.
-		bool scalarComponentOfVector = false;
+		// Nonzero for a compute id: how many leading lanes of the uvec3 the
+		// declared type wants (1 scalar, 2 or 3), converted to the declared
+		// element type.
+		uint32_t leadingLanes = 0;
 		// True when the name is a descriptor over a wrapped buffer, so indexing
 		// it needs a struct member index before the element index.
 		bool isBuffer = false;
@@ -2713,13 +2714,17 @@ namespace {
 
 		const Id loaded = loadFrom(binding.id, binding.pointeeType);
 
-		// A builtin whose MSL type is a scalar but whose SPIR-V form is a
-		// vector is that vector's first component: "uint index
-		// [[thread_position_in_grid]]" is GlobalInvocationId.x, not the whole
-		// vector.
-		if (binding.scalarComponentOfVector) {
-			const Id scalarType = _types.scalar(ScalarKind::UInt);
-			return _builder.emitTyped(spirv::OpCompositeExtract, scalarType, { loaded, 0u });
+		// A compute id is the leading lanes of its uvec3, in the declared
+		// element type: "uint index [[thread_position_in_grid]]" is
+		// GlobalInvocationId.x, and a ushort2 is its .xy narrowed.
+		if (binding.leadingLanes > 0) {
+			const Id narrowed = binding.leadingLanes == 1
+				? _builder.emitTyped(spirv::OpCompositeExtract, _types.scalar(ScalarKind::UInt), { loaded, 0u })
+				: binding.leadingLanes == 2
+				? _builder.emitTyped(spirv::OpVectorShuffle,
+					_types.vector(ScalarKind::UInt, 2), { loaded, loaded, 0u, 1u })
+				: loaded;
+			return convert(narrowed, _builder.typeOf(narrowed), declaredTypeOf(binding.pointeeMsl));
 		}
 
 		return loaded;
@@ -6204,6 +6209,18 @@ namespace {
 					_hasFragCoordInput = true;
 				}
 
+				// Apple takes a compute id as uint or ushort, scalar or up to three
+				// wide, and rejects int, float and a fourth lane.
+				const bool computeId = spvBuiltin == spirv::BuiltIn::GlobalInvocationId
+					|| spvBuiltin == spirv::BuiltIn::LocalInvocationId
+					|| spvBuiltin == spirv::BuiltIn::WorkgroupId;
+				if (computeId && (parameter.type.vectorWidth > 3 || parameter.type.vectorWidth == 1
+					|| (parameter.type.scalar != ScalarKind::UInt && parameter.type.scalar != ScalarKind::UShort))) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+						builtinName(*parameter.attributes.builtin) + "]], which has to be a uint or ushort "
+						"scalar or a vector of two or three of them");
+				}
+
 				_builder.setSection(spirv::Section::Annotations);
 				_builder.emit(spirv::OpDecorate, { id,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
@@ -6225,8 +6242,11 @@ namespace {
 				binding.isPointer = true;
 				binding.pointeeType = typeId;
 				binding.storageClass = spirv::StorageClass::Input;
-				binding.scalarComponentOfVector = parameter.type.isScalar()
-					&& _types.vectorWidth(typeId) > 1;
+				const uint32_t declaredLanes = std::max(parameter.type.vectorWidth, 1u);
+				if (computeId) {
+					binding.leadingLanes = declaredLanes;
+					binding.pointeeMsl = parameter.type;
+				}
 				binding.readOnly = parameter.type.isConst;
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
