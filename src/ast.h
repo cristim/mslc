@@ -48,6 +48,7 @@ enum class ScalarKind {
 // type, the T of texture2d<T> and the others, is in Type::scalar.
 enum class ResourceKind {
 	None,
+	Texture1D,
 	Texture2D,
 	TextureCube,
 	Texture3D,
@@ -107,8 +108,8 @@ struct Type {
 	bool isVector() const { return vectorWidth > 1; }
 	bool isMatrix() const { return matrixColumns > 0; }
 	bool isTexture() const {
-		return resource == ResourceKind::Texture2D || resource == ResourceKind::TextureCube
-			|| resource == ResourceKind::Texture3D || resource == ResourceKind::Texture2DArray;
+		return resource == ResourceKind::Texture1D || resource == ResourceKind::Texture2D
+			|| resource == ResourceKind::TextureCube || resource == ResourceKind::Texture3D || resource == ResourceKind::Texture2DArray;
 	}
 };
 
