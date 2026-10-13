@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <set>
 
 namespace mslc {
@@ -2197,6 +2198,26 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
 		void emitLocalArray(const VariableDeclaration& declaration, bool storageOnly);
+		Id arrayTypeOf(const Type& type);
+		struct ArrayLeaves {
+			// The value of one element given its list entry, or its zero fill for none.
+			std::function<Id(const Type& element, const Expression* entry)> element;
+			std::function<Id(Id type, const std::vector<uint32_t>& parts)> compose;
+		};
+		Id emitArrayInit(const Type& type, const std::vector<InitializerElement>& entries, size_t& position,
+			bool braced, const ArrayLeaves& leaves);
+		Id emitLocalArrayIndex(const Expression& expression, bool asAddress);
+		const Binding* arrayRootBinding(const Expression& expression, size_t& depth) const;
+		void declareFileScopeArray(const VariableDeclaration& declaration, size_t position);
+		void bindFileScopeArrays(size_t declaredBefore);
+		struct FileScopeArray {
+			std::string name;
+			size_t position = 0;
+			Id variable = InvalidId;
+			Id type = InvalidId;
+			Type msl;
+		};
+		std::vector<FileScopeArray> _fileScopeArrays;
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
 		std::optional<std::string> enumOf(const Expression& expression);
 		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
@@ -2713,7 +2734,74 @@ namespace {
 	// integer.
 	static std::optional<int64_t> literalIndex(const Expression& expression);
 
+	// A name indexed down a chain, a[i][j], where the name is an array of more than one
+	// dimension in the function's own storage or a file-scope constant array, and the chain
+	// does not go past the array's dimensions. Anything deeper indexes an element, a vector.
+	const Binding* Emitter::arrayRootBinding(const Expression& expression, size_t& depth) const {
+		depth = 0;
+		const Expression* current = &expression;
+		while (current->kind == ExpressionKind::Index && !current->isDereference) {
+			++depth;
+			current = current->left.get();
+		}
+		if (depth == 0 || current->kind != ExpressionKind::Identifier) {
+			return nullptr;
+		}
+		const auto it = _bindings.find(current->name);
+		if (it == _bindings.end()) {
+			return nullptr;
+		}
+		const Binding& binding = it->second;
+		const bool ownStorage = binding.storageClass == spirv::StorageClass::Function
+			|| binding.storageClass == spirv::StorageClass::Private;
+		return ownStorage && binding.isPointer && !binding.isBuffer && binding.bufferPointeeType == InvalidId
+			&& binding.pointeeMsl.arrayRank() >= 2 && depth <= binding.pointeeMsl.arrayRank() ? &binding : nullptr;
+	}
+
+	// a[i][j] on a multi-dimensional array: one access chain with a step per index.
+	Id Emitter::emitLocalArrayIndex(const Expression& expression, bool asAddress) {
+		size_t depth = 0;
+		const Binding& binding = *arrayRootBinding(expression, depth);
+
+		std::vector<const Expression*> indices(depth);
+		const Expression* current = &expression;
+		for (size_t level = depth; level-- > 0; current = current->left.get()) {
+			if (current->arguments.size() != 1) {
+				throw CompileError("expected exactly one index, found " + std::to_string(current->arguments.size()));
+			}
+			indices[level] = current->arguments[0].get();
+		}
+
+		const std::string& name = current->name;
+		Type msl = binding.pointeeMsl;
+		Id type = binding.pointeeType;
+		std::vector<uint32_t> operands { binding.id };
+		for (const Expression* index: indices) {
+			if (const auto literal = literalIndex(*index); literal && *literal >= *msl.arrayLength) {
+				throw CompileError("the index " + std::to_string(*literal) + " is outside the array \""
+					+ name + "\" of " + std::to_string(*msl.arrayLength));
+			}
+			operands.push_back(stepIndex(*index, "array element"));
+			msl.dropOuterDimension();
+			type = _types.arrayElement(type);
+		}
+
+		if (msl.arrayLength) {
+			throw CompileError("\"" + name + "\" indexed this far is still an array, which is not a value: "
+				"index it down to an element");
+		}
+
+		const Id address = _builder.emitTyped(spirv::OpAccessChain,
+			_types.pointer(binding.storageClass, type), operands);
+		return asAddress ? address : loadFrom(address, type);
+	}
+
 	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
+		size_t depth = 0;
+		if (arrayRootBinding(expression, depth)) {
+			return emitLocalArrayIndex(expression, asAddress);
+		}
+
 		if (isElementAccess(expression)) {
 			return emitElementAccess(expression, asAddress);
 		}
@@ -3252,13 +3340,14 @@ namespace {
 				// struct reached directly is one value, whether through a reference
 				// or through the address a buffer of scalars put in a register.
 				// A local array is indexed by an access chain step into the array.
-				if (!fromBuffer && current.arrayLength && binding.storageClass == spirv::StorageClass::Function) {
+				if (!fromBuffer && current.arrayLength && (binding.storageClass == spirv::StorageClass::Function
+					|| binding.storageClass == spirv::StorageClass::Private)) {
 					if (const auto literal = literalIndex(*step.index); literal && *literal >= *current.arrayLength) {
 						throw CompileError("the index " + std::to_string(*literal) + " is outside the array \""
 							+ rootName + "\" of " + std::to_string(*current.arrayLength));
 					}
 					operands.push_back(stepIndex(*step.index, "array element"));
-					current.arrayLength.reset();
+					current.dropOuterDimension();
 					continue;
 				}
 
@@ -4903,6 +4992,7 @@ namespace {
 
 		_helper = &definition;
 		_bindings.clear();
+		bindFileScopeArrays(definition.globalsBefore);
 		_terminated = false;
 		_controlDepth = 0;
 
@@ -5696,13 +5786,80 @@ namespace {
 	// before the entry point that reads it, which is what lets the folder resolve
 	// one constant's initialiser against the ones above it.
 	void Emitter::declareGlobals() {
-		for (const VariableDeclaration& global: _unit.globals) {
+		for (size_t position = 0; position < _unit.globals.size(); ++position) {
+			const VariableDeclaration& global = _unit.globals[position];
 			if (global.sampler) {
 				_fileScopeSamplers[global.name] = &global;
 				continue;
 			}
 			_builder.setSection(spirv::Section::TypesGlobals);
+			if (global.type.arrayLength) {
+				declareFileScopeArray(global, position);
+				continue;
+			}
 			declareGlobalConstant(global);
+		}
+	}
+
+	// A file-scope constant array is a Private variable with a constant initialiser, which
+	// no store reaches. Vulkan has no way to index a constant composite by a run-time index,
+	// so the alternative is a Function copy at every use; one module-scope variable is read
+	// in place by a kernel and a helper alike, and indexing it is one access chain.
+	void Emitter::declareFileScopeArray(const VariableDeclaration& declaration, size_t position) {
+		const Type& type = declaration.type;
+		if (type.isPointer || type.resource != ResourceKind::None) {
+			throw CompileError("a file-scope array of pointers or resources is not lowered yet");
+		}
+		if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList) {
+			throw CompileError("array initializer must be an initializer list");
+		}
+
+		ArrayLeaves leaves;
+		leaves.element = [&](const Type& leaf, const Expression* entry) {
+			if (!entry) {
+				return _types.zero(declaredTypeOf(leaf));
+			}
+			_foldDomainError = false;
+			const FoldedConstant folded = foldInitializer(leaf, *entry);
+			if (_foldDomainError && type.isConstexpr) {
+				throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
+					"constant expression");
+			}
+			_foldDomainError = false;
+			return emitConstant(folded);
+		};
+		leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
+			return _builder.emitDeclTyped(spirv::OpConstantComposite, composite, parts);
+		};
+		size_t consumed = 0;
+		const Id initial = emitArrayInit(type, declaration.initializer->elements, consumed, true, leaves);
+
+		FileScopeArray array;
+		array.name = declaration.name;
+		array.position = position;
+		array.type = _builder.typeOf(initial);
+		array.msl = type;
+		array.variable = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Private, array.type),
+			{ static_cast<uint32_t>(spirv::StorageClass::Private), initial });
+		_fileScopeArrays.push_back(array);
+	}
+
+	// The arrays a function can see are the ones declared above it. A parameter or local
+	// of the same name is bound afterwards and wins.
+	void Emitter::bindFileScopeArrays(size_t declaredBefore) {
+		for (const FileScopeArray& array: _fileScopeArrays) {
+			if (array.position >= declaredBefore) {
+				continue;
+			}
+			Binding binding;
+			binding.id = array.variable;
+			binding.isPointer = true;
+			binding.pointeeType = array.type;
+			binding.storageClass = spirv::StorageClass::Private;
+			binding.pointeeMsl = array.msl;
+			binding.readOnly = true;
+			_bindings[array.name] = binding;
 		}
 	}
 
@@ -7860,9 +8017,64 @@ namespace {
 			+ " does not convert to it; write a cast, as (" + target + ")value");
 	}
 
-	// A fixed-length array in the function's own storage: float a[4], const float3 d[3] = {...}
-	// and a[] = {...}. A shorter list zero-fills the rest, as in C++, and a longer one is an
-	// error. An index is not checked at run time, and a constant one past the end is refused.
+	// The SPIR-V type of an array type, one array per dimension, outermost first.
+	Id Emitter::arrayTypeOf(const Type& type) {
+		Type base = type;
+		base.arrayLength.reset();
+		base.innerArrayLengths.clear();
+		Id id = declaredTypeOf(base);
+		for (auto inner = type.innerArrayLengths.rbegin(); inner != type.innerArrayLengths.rend(); ++inner) {
+			id = _types.array(id, *inner);
+		}
+		return _types.array(id, *type.arrayLength);
+	}
+
+	// The value of an array from a (possibly nested) list. A row that is not in braces takes
+	// the following entries, as in C++ brace elision; a shorter list zero-fills the rest. The
+	// list is consumed from position, and a braced list that leaves entries over is an error.
+	Id Emitter::emitArrayInit(const Type& type, const std::vector<InitializerElement>& entries,
+		size_t& position, bool braced, const ArrayLeaves& leaves) {
+		Type element = type;
+		element.dropOuterDimension();
+		const bool rows = element.arrayLength.has_value();
+		const uint32_t length = *type.arrayLength;
+
+		std::vector<uint32_t> parts;
+		while (parts.size() < length && position < entries.size()) {
+			const InitializerElement& entry = entries[position];
+			if (!entry.fieldName.empty()) {
+				throw CompileError("a field designator requires a struct initializer");
+			}
+			if (rows && entry.value->kind != ExpressionKind::InitList) {
+				parts.push_back(emitArrayInit(element, entries, position, false, leaves));
+				continue;
+			}
+			++position;
+			if (rows) {
+				size_t inner = 0;
+				parts.push_back(emitArrayInit(element, entry.value->elements, inner, true, leaves));
+			} else {
+				parts.push_back(leaves.element(element, entry.value.get()));
+			}
+		}
+		if (braced && position < entries.size()) {
+			throw CompileError("excess elements in array initializer");
+		}
+		while (parts.size() < length) {
+			if (rows) {
+				size_t none = 0;
+				parts.push_back(emitArrayInit(element, {}, none, true, leaves));
+			} else {
+				parts.push_back(leaves.element(element, nullptr));
+			}
+		}
+		return leaves.compose(arrayTypeOf(type), parts);
+	}
+
+	// A fixed-length array in the function's own storage: float a[4], float a[2][3],
+	// const float3 d[3] = {...} and a[] = {...}. A shorter list zero-fills the rest, as in
+	// C++, and a longer one is an error. An index is not checked at run time, and a
+	// constant one past the end is refused.
 	void Emitter::emitLocalArray(const VariableDeclaration& declaration, bool storageOnly) {
 		const Type& type = declaration.type;
 		if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
@@ -7872,18 +8084,22 @@ namespace {
 
 		Type element = type;
 		element.arrayLength.reset();
-		const uint32_t length = *type.arrayLength;
-		const Id elementType = declaredTypeOf(element);
-		const Id arrayType = _types.array(elementType, length);
+		element.innerArrayLengths.clear();
+		const Id arrayType = arrayTypeOf(type);
 
 		// A struct with a constructor runs it for every element the list does not give, which
 		// is not lowered: zero-filling would skip it and read a different value.
 		if (!element.namedType.empty()) {
 			const StructDecl* decl = _unit.findStruct(element.namedType);
-			const size_t given = declaration.initializer ? declaration.initializer->elements.size() : 0;
-			if (decl && decl->hasConstructors && given < length) {
-				throw CompileError("an array of " + element.namedType + ", which has a constructor, needs a "
-					"value for every element; the constructor is not run for the rest yet");
+			if (decl && decl->hasConstructors) {
+				size_t elements = 1;
+				for (const uint32_t length: type.innerArrayLengths) { elements *= length; }
+				elements *= *type.arrayLength;
+				const size_t given = declaration.initializer ? declaration.initializer->elements.size() : 0;
+				if (given < elements || type.arrayRank() > 1) {
+					throw CompileError("an array of " + element.namedType + ", which has a constructor, needs a "
+						"value for every element; the constructor is not run for the rest yet");
+				}
 			}
 		}
 
@@ -7894,30 +8110,26 @@ namespace {
 			} else if (declaration.initializer->kind != ExpressionKind::InitList) {
 				throw CompileError("array initializer must be an initializer list");
 			} else {
-				const Expression& list = *declaration.initializer;
-				if (list.elements.size() > length) {
-					throw CompileError("excess elements in array initializer");
-				}
 				Expression none;
 				none.kind = ExpressionKind::InitList;
-				std::vector<uint32_t> parts;
-				for (const InitializerElement& entry: list.elements) {
-					if (!entry.fieldName.empty()) {
-						throw CompileError("a field designator requires a struct initializer");
+				ArrayLeaves leaves;
+				leaves.element = [&](const Type& leaf, const Expression* entry) {
+					if (!entry) {
+						return emitInitListValue(leaf, none);
 					}
-					if (entry.value->kind == ExpressionKind::InitList) {
-						parts.push_back(emitInitListValue(element, *entry.value));
-					} else {
-						const Id value = emitExpression(*entry.value);
-						parts.push_back(element.namedType.empty() && element.isScalar()
-							? convertListScalar(value, element, *entry.value)
-							: convertImplicit(value, elementType));
+					if (entry->kind == ExpressionKind::InitList) {
+						return emitInitListValue(leaf, *entry);
 					}
-				}
-				while (parts.size() < length) {
-					parts.push_back(emitInitListValue(element, none));
-				}
-				initial = _builder.emitTyped(spirv::OpCompositeConstruct, arrayType, parts);
+					const Id value = emitExpression(*entry);
+					return leaf.namedType.empty() && leaf.isScalar()
+						? convertListScalar(value, leaf, *entry)
+						: convertImplicit(value, declaredTypeOf(leaf));
+				};
+				leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
+					return _builder.emitTyped(spirv::OpCompositeConstruct, composite, parts);
+				};
+				size_t position = 0;
+				initial = emitArrayInit(type, declaration.initializer->elements, position, true, leaves);
 			}
 		}
 
@@ -8877,11 +9089,15 @@ namespace {
 			// function is not visible in another, the buffers are that entry
 			// point's own, and the interface is the list this OpEntryPoint names.
 			_bindings.clear();
+			bindFileScopeArrays(_entryPoint->globalsBefore);
 			_bufferMembers.clear();
 			_bufferBoolTypes.clear();
 			_bufferMatrixTypes.clear();
 			_bufferBases.clear();
 			_interface.clear();
+			for (const FileScopeArray& array: _fileScopeArrays) {
+				_interface.push_back(array.variable);
+			}
 			_reflection.clear();
 			_embeddedSamplers.clear();
 			_fileScopeSamplerBindings.clear();

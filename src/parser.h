@@ -246,6 +246,10 @@ private:
 	SamplerState parseSamplerOptions(TokenKind closing);
 	bool parseAddressSpace(AddressSpace& space);
 	std::optional<uint32_t> tryParseArrayLength();
+	// "[N]", "[N][M]" or "[]" after a declarator's name, set on the type; true for "[]".
+	bool parseArrayDimensions(Type& type);
+	// The omitted outermost length of "T a[] = {...}", taken from the list.
+	void deduceArrayLength(VariableDeclaration& declaration);
 
 	// Parameters
 	// helperName is set for a helper function's parameter, which has fewer forms
