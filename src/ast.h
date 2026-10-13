@@ -159,6 +159,7 @@ struct ParameterAttributes {
 		ThreadgroupPositionInGrid,
 		ThreadPositionInThreadgroup,
 		ThreadIndexInThreadgroup,
+		ThreadsPerThreadgroup,
 		VertexID,
 		InstanceID,
 		Position,
