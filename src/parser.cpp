@@ -1444,13 +1444,34 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		// "::x" names a file-scope declaration, or a builtin.
 		return last;
 	}
-	// "S::member": a member function of a struct is named by the struct.
-	if (!found && parts.size() > 1 && !name.global) {
+	if (!found && parts.size() > 1) {
 		QualifiedName owner = name;
 		owner.parts.pop_back();
-		const std::string structName = resolveName(owner);
-		if (_unit.findStruct(structName)) {
-			return structName + "::" + last;
+		const std::string ownerName = resolveName(owner);
+		// "S::member": a member function of a struct is named by the struct.
+		if (!name.global && _unit.findStruct(ownerName)) {
+			return ownerName + "::" + last;
+		}
+		// "E::v" and "A::E::v": an unscoped enum's name qualifies its enumerators,
+		// which are declared in the enum's enclosing namespace.
+		Type ownerType;
+		if (resolveTypeName(ownerName, ownerType) && !ownerType.enumName.empty()) {
+			const std::string& tag = ownerType.enumName;
+			const size_t enclosing = tag.rfind("::");
+			const std::string key = enclosing == std::string::npos ? last : tag.substr(0, enclosing + 2) + last;
+			const auto constant = _enumConstants.find(key);
+			if (constant != _enumConstants.end() && constant->second.owner == tag) {
+				return key;
+			}
+			// "typedef enum { v } T;": v's owner is "<anonymous>", which can not be told
+			// from another anonymous enum's, so T::v (and a typedef of T) is not resolved.
+			if (constant != _enumConstants.end() && constant->second.owner == "<anonymous>"
+				&& _declared.at(tag) == "typedef") {
+				throw CompileError("\"" + spelled + "\" qualifies an enumerator by the typedef of an anonymous "
+					"enum, which mslc does not support; write \"" + last + "\"");
+			}
+			throw CompileError("no member named \"" + last + "\" in the enum \"" + ownerName + "\" (in \""
+				+ spelled + "\")");
 		}
 	}
 	if (!found && parts.size() == 2 && parts.front() == kStdlibNamespace && last == "discard_fragment") {
