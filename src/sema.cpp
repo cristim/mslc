@@ -4906,9 +4906,17 @@ namespace {
 
 		if (builtin.shape == MathShape::Fwidth) {
 			const Id type = _builder.typeOf(values[0]);
-			if (!_types.isFloat(type) || _types.bitWidth(type) != 32) {
-				throw CompileError("fwidth takes float scalars or vectors, half is not supported yet");
+			if (!_types.isFloat(type)) {
+				throw CompileError("fwidth takes float or half scalars or vectors");
 			}
+
+			if (_types.bitWidth(type) == 16) {
+				const Id float32Type = _types.vector(ScalarKind::Float, _types.vectorWidth(type));
+				const Id widened = convert(values[0], type, float32Type);
+				const Id result = _builder.emitTyped(spirv::OpFwidth, float32Type, { widened });
+				return convert(result, float32Type, type);
+			}
+
 			return _builder.emitTyped(spirv::OpFwidth, type, { values[0] });
 		}
 
