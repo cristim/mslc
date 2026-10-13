@@ -552,6 +552,7 @@ void Parser::parseUsing() {
 	expect(TokenKind::Semicolon, "after a using declaration");
 	const std::string resolved = resolveName(name);
 	if (_blocks.empty() && !_declared.count(resolved) && resolved != "metal::discard_fragment") {
+		_scopes[scope].stdlibDeclarations.insert(name.parts.back());
 		return; // a name of the standard library, which is visible already
 	}
 	if (_blocks.empty()) {
@@ -1690,15 +1691,19 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	throw CompileError("no member named \"" + last + "\" in the namespace \"" + scope + "\" (in \"" + spelled + "\")");
 }
 
-std::set<std::string> Parser::unqualifiedFound(const std::string& last) const {
+std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* besideStdlib) const {
 	// [namespace.udir]: a using directive in U nominating T makes T's names
 	// appear in the nearest namespace L containing both, for lookups from inside U.
 	// So each enclosing namespace L, innermost out, offers its own names plus
 	// those of directives that land in it; the first level that has any decides.
+	bool stdlibNearer = false;
 	for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
 		const std::string level = joinParts(_namespacePath, 0, depth);
 		std::set<std::string> found;
 		collectOwn(level, last, found);
+		const auto own = _scopes.find(level);
+		const bool declaredHere = own != _scopes.end() && own->second.stdlibDeclarations.count(last);
+		bool stdlibHere = level == kStdlibNamespace || declaredHere;
 		for (size_t user = 0; user <= _namespacePath.size(); ++user) {
 			const std::string from = joinParts(_namespacePath, 0, user);
 			const auto entry = _scopes.find(from);
@@ -1709,6 +1714,7 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last) const {
 				if (nearestCommon(from, target) == level) {
 					std::set<std::string> seen;
 					collectMembers(target, last, seen, found, false);
+					stdlibHere = stdlibHere || target == kStdlibNamespace;
 				}
 			}
 		}
@@ -1718,12 +1724,23 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last) const {
 				if (nearestCommon(function, target) == level) {
 					std::set<std::string> seen;
 					collectMembers(target, last, seen, found, false);
+					stdlibHere = stdlibHere || target == kStdlibNamespace;
 				}
 			}
 		}
+		// "using metal::name;" makes the library's name this level's own, which hides every
+		// outer declaration of it: the name is the library's.
+		if (found.empty() && declaredHere) {
+			return {};
+		}
 		if (!found.empty()) {
+			if (besideStdlib) {
+				*besideStdlib = stdlibHere || stdlibNearer;
+			}
 			return found;
 		}
+		// Namespace metal's own names may hide the user's function found further out.
+		stdlibNearer = stdlibNearer || stdlibHere;
 	}
 	return {};
 }
@@ -4229,6 +4246,15 @@ ExpressionPtr Parser::parsePrimary() {
 		expression->kind = ExpressionKind::Identifier;
 		expression->line = line();
 		expression->name = resolved;
+		// A function the file adds to namespace metal sits beside the library's own.
+		const std::string stdlibMember = std::string(kStdlibNamespace) + "::";
+		expression->besideStdlib = resolved.compare(0, stdlibMember.size(), stdlibMember) == 0
+			&& resolved.find("::", stdlibMember.size()) == std::string::npos;
+		bool foundBesideStdlib = false;
+		if (spelledTokens == 1 && kind() == TokenKind::Identifier && !blockName(std::string(current().text))) {
+			unqualifiedFound(std::string(current().text), &foundBesideStdlib);
+		}
+		expression->besideStdlib = expression->besideStdlib || foundBesideStdlib;
 		consumeName();
 		return expression;
 	}

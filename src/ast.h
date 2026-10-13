@@ -259,6 +259,10 @@ struct Expression {
 	// Member: written "p->m" rather than "v.m".
 	bool isArrow = false;
 
+	// Identifier: a name found where the standard library's names are also visible, so a
+	// call is resolved against both.
+	bool besideStdlib = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 
