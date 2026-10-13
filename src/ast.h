@@ -464,6 +464,10 @@ struct FunctionDecl {
 	bool isHelper() const { return stage == Stage::None; }
 };
 
+// Two declarations of one function name take the same parameters: a redeclaration,
+// not an overload.
+bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b);
+
 struct TranslationUnit {
 	std::vector<StructDecl> structs;
 	std::vector<FunctionDecl> functions;

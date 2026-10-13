@@ -151,4 +151,25 @@ const StructDecl* TranslationUnit::findStruct(const std::string& name) const {
 	return nullptr;
 }
 
+bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
+	if (a.parameters.size() != b.parameters.size()) {
+		return false;
+	}
+
+	for (size_t i = 0; i < a.parameters.size(); ++i) {
+		const Type& x = a.parameters[i].type;
+		const Type& y = b.parameters[i].type;
+		if (a.parameters[i].isMutableReference() != b.parameters[i].isMutableReference()) {
+			return false;
+		}
+		if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
+			|| x.isPacked != y.isPacked || x.namedType != y.namedType
+			|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 }
