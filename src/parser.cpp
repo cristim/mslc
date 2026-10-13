@@ -451,6 +451,17 @@ static bool tagBesideObject(std::string_view a, std::string_view b) {
 	return (isTag(a) && isObject(b)) || (isObject(a) && isTag(b));
 }
 
+// A struct or enum tag beside any other kind at all (a typedef, an enum constant, a
+// function or a variable): wider than tagBesideObject. Apple exempts this wherever a
+// using declaration brings the tag in, whether beside another using declaration of one
+// alias or beside a name the enclosing scope already declared; it does not exempt a tag
+// a using declaration already brought in from a later plain declaration of another kind
+// (h2/h3), so declareName's own check, and rejectUsingConflict's, keep tagBesideObject.
+static bool tagBesideNonTag(std::string_view a, std::string_view b) {
+	const auto isTag = [](std::string_view kindName) { return kindName == "struct" || kindName == "enum"; };
+	return isTag(a) != isTag(b);
+}
+
 // "namespace" is consumed. A name declared in the body is stored under its
 // qualified name; an anonymous namespace is the namespace "(anonymous namespace)",
 // which its enclosing namespace uses, so its names are visible there unqualified.
@@ -561,7 +572,7 @@ void Parser::parseUsing() {
 		const auto clash = [&](const std::string& a, const std::string& b) {
 			for (const std::string_view x : kindsOrFunction(a)) {
 				for (const std::string_view y : kindsOrFunction(b)) {
-					if (!(x == "function" && y == "function") && !tagBesideObject(x, y)) {
+					if (!(x == "function" && y == "function") && !tagBesideNonTag(x, y)) {
 						return true;
 					}
 				}
@@ -574,8 +585,11 @@ void Parser::parseUsing() {
 					"declaration of \"" + earlier + "\" in the same namespace");
 			}
 		}
+		// An already-declared name's tag is exempt beside any new using-declared kind, not
+		// only a function or variable (g6/h1/h4): a using declaration is the direction
+		// Apple accepts this in; the other order (h2/h3) stays narrow, in rejectUsingConflict.
 		if (const std::vector<std::string_view> kinds = kindsOf(own);
-			!kinds.empty() && conflictsWithUsing(own, kinds, resolved, nullptr)) {
+			!kinds.empty() && conflictsWithUsing(own, kinds, resolved, nullptr, true)) {
 			throw CompileError("the using declaration of \"" + resolved + "\" conflicts with \"" + own
 				+ "\" declared earlier in the same namespace");
 		}
@@ -1318,7 +1332,7 @@ std::vector<std::string_view> Parser::kindsOf(const std::string& name) const {
 }
 
 bool Parser::conflictsWithUsing(const std::string& own, const std::vector<std::string_view>& ownKinds,
-	const std::string& target, const FunctionDecl* function) const {
+	const std::string& target, const FunctionDecl* function, bool wideTagExemption) const {
 	const auto named = [&](const std::string& name, const auto& visit) {
 		for (const std::vector<FunctionDecl>* list : {&_unit.helpers, &_unit.functions}) {
 			for (const FunctionDecl& decl : *list) {
@@ -1335,7 +1349,7 @@ bool Parser::conflictsWithUsing(const std::string& own, const std::vector<std::s
 	// metal::discard_fragment has no kinds, and no file declaration is checked against it.
 	for (const std::string_view targetKind : kindsOf(target)) {
 		for (const std::string_view ownKind : ownKinds) {
-			if (tagBesideObject(ownKind, targetKind)) {
+			if (wideTagExemption ? tagBesideNonTag(ownKind, targetKind) : tagBesideObject(ownKind, targetKind)) {
 				continue;
 			}
 			if (ownKind != "function" || targetKind != "function"
@@ -1358,7 +1372,10 @@ void Parser::rejectUsingConflict(const std::string& name, std::string_view what,
 		return;
 	}
 	for (const std::string& target : brought->second) {
-		if (conflictsWithUsing(name, {what}, target, function)) {
+		// A later plain declaration against a using declaration already in scope keeps the
+		// narrow exemption (tag beside a function or variable only): a using-declared tag
+		// is not hidden by a typedef or enumerator declared after it (h2, h3).
+		if (conflictsWithUsing(name, {what}, target, function, false)) {
 			throw CompileError("\"" + name + "\" conflicts with the using declaration of \"" + target
 				+ "\" in the same namespace");
 		}
@@ -1436,16 +1453,46 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 	if (scope == kStdlibNamespace && name == "discard_fragment") {
 		found.insert("metal::discard_fragment");
 	}
+	std::set<std::string> local;
 	const std::string key = scope.empty() ? name : scope + "::" + name;
 	if (_declared.count(key)) {
-		found.insert(key);
+		local.insert(key);
 	}
-	const auto entry = _scopes.find(scope);
-	if (entry == _scopes.end()) {
-		return;
+	if (const auto entry = _scopes.find(scope); entry != _scopes.end()) {
+		if (const auto brought = entry->second.declarations.find(name); brought != entry->second.declarations.end()) {
+			local.insert(brought->second.begin(), brought->second.end());
+		}
 	}
-	if (const auto brought = entry->second.declarations.find(name); brought != entry->second.declarations.end()) {
-		found.insert(brought->second.begin(), brought->second.end());
+	// A function or variable this scope declares, directly or through a using
+	// declaration, hides a struct or enum tag of the same name in value lookup
+	// (g1/g2/g4/g6, h4, h6-h8): calling or reading the name finds the object, not
+	// "ambiguous" with the tag it would otherwise look like beside it. This combines
+	// only what one scope contributes; a directive's own members are collected by a
+	// separate call (g3), so two directives bringing in a struct and a function stay
+	// ambiguous, as Apple reports it.
+	const auto isPureTag = [this](const std::string& target) {
+		const std::vector<std::string_view> kinds = kindsOf(target);
+		if (kinds.empty()) {
+			return false;
+		}
+		for (const std::string_view kind : kinds) {
+			if (kind != "struct" && kind != "enum") {
+				return false;
+			}
+		}
+		return true;
+	};
+	bool hasNonTag = false;
+	for (const std::string& candidate : local) {
+		if (!isPureTag(candidate)) {
+			hasNonTag = true;
+			break;
+		}
+	}
+	for (const std::string& candidate : local) {
+		if (!hasNonTag || !isPureTag(candidate)) {
+			found.insert(candidate);
+		}
 	}
 }
 
@@ -2988,7 +3035,7 @@ StatementPtr Parser::parseStatement() {
 		const bool looksLikeType =
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
-				|| _unit.findStruct(name) != nullptr))
+				|| (_unit.findStruct(name) != nullptr && !isLocal(name))))
 			|| (kind() == TokenKind::Identifier && (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| atKeyword("enum") || atKeyword("device") || atKeyword("constant")
 			|| atKeyword("threadgroup") || atKeyword("thread");
@@ -3300,7 +3347,7 @@ StatementPtr Parser::parseForStatement() {
 		const bool looksLikeType = (kind() == TokenKind::Identifier
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& (resolveTypeName(name, probe) || _unit.findStruct(name) != nullptr));
+				&& (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !isLocal(name))));
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
