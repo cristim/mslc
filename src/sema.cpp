@@ -2286,6 +2286,7 @@ namespace {
 		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id atomicAddress(const Expression& argument, const std::string& function, bool& isSigned);
 		Id emitAtomicCall(const Expression& expression);
+		Id emitSelectCall(const Expression& expression);
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
@@ -4782,6 +4783,10 @@ namespace {
 			return emitAtomicCall(expression);
 		}
 
+		if (expression.left->name == "select") {
+			return emitSelectCall(expression);
+		}
+
 		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
@@ -4789,6 +4794,71 @@ namespace {
 		}
 
 		return emitMathBuiltin(*builtin, expression.arguments);
+	}
+
+	// select(a, b, c): b where c holds, else a. Apple's library declares it only for a
+	// bool or boolN condition, never an integer vector, and a scalar condition beside
+	// vector operands applies to every lane (a numeric scalar converts as in an if).
+	// The operands are one type, or a scalar beside a vector, which is broadcast;
+	// two scalars of different types are ambiguous there, and so are they here.
+	Id Emitter::emitSelectCall(const Expression& expression) {
+		if (expression.arguments.size() != 3) {
+			throw CompileError("select takes 3 arguments, and this call passes "
+				+ std::to_string(expression.arguments.size()));
+		}
+
+		Id values[3];
+		for (size_t i = 0; i < 3; ++i) {
+			values[i] = emitExpression(*expression.arguments[i]);
+		}
+
+		for (size_t i = 0; i < 2; ++i) {
+			const Id type = _builder.typeOf(values[i]);
+			if (_types.matrixInfo(type) || _types.bitWidth(type) == 0) {
+				throw CompileError("select takes bool, numeric or vector operands");
+			}
+		}
+
+		Id aType = _builder.typeOf(values[0]);
+		Id bType = _builder.typeOf(values[1]);
+		const uint32_t aWidth = _types.vectorWidth(aType);
+		const uint32_t bWidth = _types.vectorWidth(bType);
+		const Id conditionType = _builder.typeOf(values[2]);
+		const uint32_t conditionWidth = _types.vectorWidth(conditionType);
+
+		if (aWidth == 1 && bWidth == 1) {
+			if (aType != bType) {
+				throw CompileError("the operands of select have to be one type: Apple reports a call "
+					"with two scalars of different types as ambiguous");
+			}
+			if (conditionWidth > 1) {
+				throw CompileError("select with a vector condition takes vector operands");
+			}
+		} else if (aWidth > 1 && bWidth > 1) {
+			if (aType != bType) {
+				throw CompileError("the operands of select have to be one type, or a scalar beside a vector");
+			}
+		} else if (aWidth == 1) {
+			values[0] = broadcast(values[0], bType);
+			aType = bType;
+		} else {
+			values[1] = broadcast(values[1], aType);
+			bType = aType;
+		}
+
+		const uint32_t width = _types.vectorWidth(aType);
+		Id condition;
+		if (conditionWidth > 1) {
+			if (_types.componentOf(conditionType) != _boolType || conditionWidth != width) {
+				throw CompileError("the condition of select beside " + std::to_string(width)
+					+ "-component operands has to be a bool or a bool" + std::to_string(width));
+			}
+			condition = values[2];
+		} else {
+			condition = asCondition(values[2]);
+		}
+
+		return _builder.emitTyped(spirv::OpSelect, aType, { condition, values[1], values[0] });
 	}
 
 	// The helper a call names. A call through "." is a member function when the
