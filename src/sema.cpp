@@ -2043,6 +2043,9 @@ namespace {
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
+		// The Workgroup variable of each threadgroup local in the kernel body, declared
+		// before the entry point because SPIR-V 1.5 lists every module-scope variable in it.
+		std::map<const VariableDeclaration*, Id> _threadgroupLocals;
 
 		// What a return statement writes: one variable for a returned scalar or
 		// vector, or one per field of a returned struct. Empty for a void function.
@@ -2142,6 +2145,8 @@ namespace {
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
 		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
+		void reserveThreadgroupLocals(const Statement& statement);
+		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
 		// The entry point's own name first, then a file-scope sampler it names.
 		const Binding* findResourceBinding(const std::string& name) const {
@@ -2222,6 +2227,7 @@ namespace {
 		Id emitUnary(const Expression& expression);
 		void emitReferenceDeclaration(const VariableDeclaration& declaration);
 		void emitLocalArray(const VariableDeclaration& declaration, bool storageOnly);
+		void declareThreadgroupLocal(const VariableDeclaration& declaration, const Type& type, Id typeId);
 		Id arrayTypeOf(const Type& type);
 		struct ArrayLeaves {
 			// The value of one element given its list entry, or its zero fill for none.
@@ -6826,6 +6832,8 @@ namespace {
 		std::set<std::string> used;
 		collectIdentifiers(*_entryPoint->body, used);
 		reserveLocalSamplers(*_entryPoint->body, used);
+		_threadgroupLocals.clear();
+		reserveThreadgroupLocals(*_entryPoint->body);
 		reserveFileScopeSamplers();
 	}
 
@@ -6988,6 +6996,41 @@ namespace {
 				reserveLocalSamplers(*child, used);
 			}
 		}
+	}
+
+	void Emitter::reserveThreadgroupLocals(const Statement& statement) {
+		if (statement.declaration) { reserveThreadgroupLocal(*statement.declaration); }
+		if (statement.forInitializer) { reserveThreadgroupLocal(*statement.forInitializer); }
+		for (const StatementPtr& child: statement.children) {
+			reserveThreadgroupLocals(*child);
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			reserveThreadgroupLocals(*child);
+		}
+		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
+			statement.forBody.get(), statement.whileBody.get() }) {
+			if (nested) { reserveThreadgroupLocals(*nested); }
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				reserveThreadgroupLocals(*child);
+			}
+		}
+	}
+
+	// Only a plain value type is reserved; every other form is refused where it is declared.
+	void Emitter::reserveThreadgroupLocal(const VariableDeclaration& declaration) {
+		const Type& type = declaration.type;
+		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer || type.arrayLength
+			|| type.resource != ResourceKind::None || type.isAtomic || declaration.isReference
+			|| declaration.initializer) {
+			return;
+		}
+		const Id typeId = declaredTypeOf(type);
+		_threadgroupLocals[&declaration] = _builder.emitDeclTyped(spirv::OpVariable,
+			_types.pointer(spirv::StorageClass::Workgroup, typeId),
+			{ static_cast<uint32_t>(spirv::StorageClass::Workgroup) });
+		_interface.push_back(_threadgroupLocals[&declaration]);
 	}
 
 	void Emitter::reserveSampler(const VariableDeclaration& declaration) {
@@ -8837,6 +8880,11 @@ namespace {
 
 		const Id typeId = declaredTypeOf(type);
 
+		if (type.addressSpace == AddressSpace::Threadgroup) {
+			declareThreadgroupLocal(declaration, type, typeId);
+			return;
+		}
+
 		if (!storageOnly) {
 			validateConstexprInitializer(declaration, type);
 		}
@@ -8918,6 +8966,26 @@ namespace {
 		}
 	}
 
+	// A threadgroup local is one Workgroup variable at module scope, shared by every
+	// invocation of the group. Apple takes it only in a kernel. mslc refuses an
+	// initialiser: Apple initialises it, but how many invocations run the
+	// initialiser and in what order is not something the source states.
+	void Emitter::declareThreadgroupLocal(const VariableDeclaration& declaration, const Type& type, Id typeId) {
+		if (_helper || _entryPoint->stage != Stage::Kernel) {
+			throw CompileError("variables in the threadgroup address space can only be declared in a kernel function");
+		}
+		if (declaration.initializer) {
+			throw CompileError("a threadgroup local \"" + declaration.name + "\" with an initialiser is not lowered "
+				"yet; declare it without one and assign it after a threadgroup_barrier");
+		}
+		const auto reserved = _threadgroupLocals.find(&declaration);
+		if (reserved == _threadgroupLocals.end()) {
+			throw CompileError("the threadgroup local \"" + declaration.name + "\" is not lowered yet");
+		}
+		bindLocal(declaration.name, reserved->second, typeId, type);
+		_bindings[declaration.name].storageClass = spirv::StorageClass::Workgroup;
+	}
+
 	// pointeeMsl is what a member access on the local resolves its fields against.
 	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl) {
 		Binding binding;
@@ -8967,6 +9035,7 @@ namespace {
 			if (it != _bindings.end() && it->second.isPointer
 				&& it->second.bufferPointeeType == InvalidId
 				&& (it->second.storageClass == spirv::StorageClass::Function
+					|| it->second.storageClass == spirv::StorageClass::Workgroup
 					|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)) {
 				address = it->second.id;
 			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
