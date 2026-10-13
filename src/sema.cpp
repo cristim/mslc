@@ -424,6 +424,59 @@ namespace {
 		return nullptr;
 	}
 
+	// A parameter or argument as the standard library's overloads see it: a scalar
+	// (width 1) or a vector of one scalar kind.
+	struct StdlibOperand {
+		ScalarKind scalar;
+		uint32_t width;
+		bool operator==(const StdlibOperand& other) const { return scalar == other.scalar && width == other.width; }
+	};
+
+	std::optional<StdlibOperand> stdlibOperand(const Parameter& parameter) {
+		const Type& type = parameter.type;
+		if (parameter.isReference || type.addressSpace != AddressSpace::None || type.isPointer || type.arrayLength
+			|| type.matrixColumns || type.isPacked || !type.namedType.empty() || type.resource != ResourceKind::None
+			|| type.isAtomic) {
+			return std::nullopt;
+		}
+		return StdlibOperand{type.scalar, type.vectorWidth ? type.vectorWidth : 1};
+	}
+
+	// The standard library declares "name" with exactly these operands. Only overloads
+	// mslc knows to exist count, so an unknown form reads as no match.
+	bool isStdlibSignature(const std::string& name, const std::vector<std::optional<StdlibOperand>>& operands) {
+		if (name == "discard_fragment") {
+			return operands.empty();
+		}
+		const MathBuiltin* builtin = findMathBuiltin(name);
+		if (!builtin || operands.size() != builtin->arity
+			|| std::any_of(operands.begin(), operands.end(), [](const auto& o) { return !o; })) {
+			return false;
+		}
+		const StdlibOperand first = *operands.front();
+		const bool isFloat = first.scalar == ScalarKind::Float || first.scalar == ScalarKind::Half;
+		// The library's abs, min, max and clamp take every integer kind, unsigned and long too
+		// (abs of an unsigned value is the value, so mslc has no instruction for it).
+		const bool kindTaken = isFloat
+			|| (isIntegerKind(first.scalar) && builtin->signedInstruction != kNoInstruction);
+		const auto same = [&](size_t count) {
+			return std::all_of(operands.begin(), operands.begin() + count, [&](const auto& o) { return *o == first; });
+		};
+		switch (builtin->shape) {
+			case MathShape::VectorToScalar:
+			case MathShape::Vector:
+			case MathShape::Dot:
+				return isFloat && first.width >= 2 && first.width <= 4 && same(operands.size());
+			case MathShape::Cross:
+				return isFloat && first.width == 3 && same(operands.size());
+			case MathShape::Refract:
+				return isFloat && first.width >= 2 && first.width <= 4 && same(2)
+					&& *operands[2] == StdlibOperand{first.scalar, 1};
+			default:
+				return kindTaken && first.width <= 4 && same(operands.size());
+		}
+	}
+
 	// The merge and function control masks. Every one of them is None: Pure
 	// would promise no memory writes, which an entry point that stores to a
 	// buffer breaks, and neither flattening nor unrolling changes what the
@@ -1845,6 +1898,20 @@ namespace {
 
 			if (helper.body && !defined.emplace(helper.name, &helper).second) {
 				throw CompileError("redefinition of \"" + helper.name + "\"");
+			}
+
+			// A prototype in namespace metal redeclares a standard library function; a
+			// definition with one of its parameter lists redefines it.
+			constexpr std::string_view stdlibPrefix = "metal::";
+			if (helper.body && helper.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0) {
+				std::vector<std::optional<StdlibOperand>> operands;
+				for (const Parameter& parameter: helper.parameters) {
+					operands.push_back(stdlibOperand(parameter));
+				}
+				if (isStdlibSignature(helper.name.substr(stdlibPrefix.size()), operands)) {
+					throw CompileError("redefinition of \"" + helper.name + "\": the standard library defines it "
+						"with these parameters");
+				}
 			}
 		}
 
