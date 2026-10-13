@@ -1795,27 +1795,6 @@ namespace {
 		}
 	}
 
-	bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
-		if (a.parameters.size() != b.parameters.size()) {
-			return false;
-		}
-
-		for (size_t i = 0; i < a.parameters.size(); ++i) {
-			const Type& x = a.parameters[i].type;
-			const Type& y = b.parameters[i].type;
-			if (a.parameters[i].isMutableReference() != b.parameters[i].isMutableReference()) {
-				return false;
-			}
-			if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
-				|| x.isPacked != y.isPacked || x.namedType != y.namedType
-				|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
-				return false;
-			}
-		}
-
-		return true;
-	}
-
 	// Everything about the helper functions that the source alone decides, checked
 	// for all of them whether or not an entry point reaches one: the declarations
 	// of a name agree, a call names a function declared above it with the right
@@ -1849,7 +1828,7 @@ namespace {
 
 			const auto previous = first.emplace(helper.name, &helper);
 			if (!previous.second) {
-				if (!sameParameterTypes(*previous.first->second, helper)) {
+				if (!mslc::sameParameterTypes(*previous.first->second, helper)) {
 					throw CompileError("overloading \"" + helper.name + "\" is not lowered yet; Apple "
 						"accepts a function declared again with other parameters, mslc takes one "
 						"signature per name");
