@@ -196,7 +196,7 @@ private:
 	std::string peekResolved(size_t& tokens) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-		std::set<std::string>& found) const;
+		std::set<std::string>& found, bool qualified) const;
 	bool isLocal(const std::string& name) const;
 
 	// Opens the scope of a block, a for statement or a function's parameters.
