@@ -676,12 +676,23 @@ VariableDeclaration Parser::parseGlobalDeclaration() {
 	declaration.name = qualify(std::string(advance().text));
 	declareName(declaration.name, "variable");
 
+	bool deduceLength = false;
+	if (at(TokenKind::LBracket)) {
+		if (declaration.type.isPointer || declaration.type.arrayLength) {
+			throw CompileError("an array of pointers is not lowered yet");
+		}
+		deduceLength = parseArrayDimensions(declaration.type);
+	}
+
 	if (!match(TokenKind::Assign)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
 			+ std::string(tokenKindName(kind())));
 	}
 
 	declaration.initializer = parseInitializer();
+	if (deduceLength) {
+		deduceArrayLength(declaration);
+	}
 
 	expect(TokenKind::Semicolon, "after a file-scope declaration");
 	return declaration;
@@ -1859,6 +1870,49 @@ static void checkAttributeIndex(const std::string& name, uint32_t index) {
 	}
 }
 
+void Parser::deduceArrayLength(VariableDeclaration& declaration) {
+	const Expression* list = declaration.initializer.get();
+	if (!list || list->kind != ExpressionKind::InitList || list->elements.empty()) {
+		throw CompileError("the array \"" + declaration.name + "\" has no size and needs an initialiser list");
+	}
+	if (!declaration.type.innerArrayLengths.empty()) {
+		for (const InitializerElement& element: list->elements) {
+			if (element.value->kind != ExpressionKind::InitList) {
+				throw CompileError("the first length of \"" + declaration.name + "\" is deduced from braced rows; "
+					"write a row in braces, or give the length");
+			}
+		}
+	}
+	declaration.type.arrayLength = static_cast<uint32_t>(list->elements.size());
+}
+
+bool Parser::parseArrayDimensions(Type& type) {
+	bool deduced = false;
+	bool outermost = true;
+	while (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
+		advance();
+		if (at(TokenKind::RBracket)) {
+			if (!outermost) {
+				throw CompileError("only the outermost array length may be omitted");
+			}
+			deduced = true;
+		} else {
+			const int64_t length = parseConstantIndex("an array length");
+			if (length <= 0) {
+				throw CompileError("zero-length arrays are not permitted in C++");
+			}
+			if (outermost) {
+				type.arrayLength = static_cast<uint32_t>(length);
+			} else {
+				type.innerArrayLengths.push_back(static_cast<uint32_t>(length));
+			}
+		}
+		outermost = false;
+		expect(TokenKind::RBracket, "to close an array length");
+	}
+	return deduced;
+}
+
 std::optional<uint32_t> Parser::tryParseArrayLength() {
 	if (!at(TokenKind::LBracket)) {
 		return std::nullopt;
@@ -2699,20 +2753,7 @@ StatementPtr Parser::parseStatement() {
 					|| declaration.type.resource != ResourceKind::None) {
 					throw CompileError("an array of references, pointers or resources is not lowered yet");
 				}
-				advance();
-				if (at(TokenKind::RBracket)) {
-					deduceLength = true;
-				} else {
-					const int64_t length = parseConstantIndex("an array length");
-					if (length <= 0) {
-						throw CompileError("zero-length arrays are not permitted in C++");
-					}
-					declaration.type.arrayLength = static_cast<uint32_t>(length);
-				}
-				expect(TokenKind::RBracket, "to close an array length");
-				if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
-					throw CompileError("a multi-dimensional array is not lowered yet; mslc lowers one dimension");
-				}
+				deduceLength = parseArrayDimensions(declaration.type);
 				if (deduceLength && !at(TokenKind::Assign)) {
 					throw CompileError("the array \"" + declaration.name + "\" has no size and needs an initialiser list");
 				}
@@ -2736,11 +2777,7 @@ StatementPtr Parser::parseStatement() {
 
 			parseLocalInitializer(declaration);
 			if (deduceLength) {
-				if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList
-					|| declaration.initializer->elements.empty()) {
-					throw CompileError("the array \"" + declaration.name + "\" has no size and needs an initialiser list");
-				}
-				declaration.type.arrayLength = static_cast<uint32_t>(declaration.initializer->elements.size());
+				deduceArrayLength(declaration);
 			}
 
 			// "T a, b = 1, c;" declares each name with the type the first one has.

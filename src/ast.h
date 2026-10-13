@@ -99,6 +99,20 @@ struct Type {
 
 	// Set for an array type; the element type is described by the rest.
 	std::optional<uint32_t> arrayLength;
+	// The lengths inside the outermost one, outer to inner: float a[2][3] is
+	// arrayLength 2 and innerArrayLengths {3}.
+	std::vector<uint32_t> innerArrayLengths;
+
+	// The element of an array type: the type with its outermost dimension taken off.
+	void dropOuterDimension() {
+		if (innerArrayLengths.empty()) {
+			arrayLength.reset();
+			return;
+		}
+		arrayLength = innerArrayLengths.front();
+		innerArrayLengths.erase(innerArrayLengths.begin());
+	}
+	size_t arrayRank() const { return arrayLength ? 1 + innerArrayLengths.size() : 0; }
 
 	ResourceKind resource = ResourceKind::None;
 	TextureAccess textureAccess = TextureAccess::Sample;
