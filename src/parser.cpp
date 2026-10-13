@@ -2136,9 +2136,11 @@ void Parser::parseResourceType(Type& type) {
 			throw CompileError("expected an access qualifier name after \"access::\"");
 		}
 		access = std::string(advance().text);
-		if (access != "sample" && !(name == "texture2d" && component == "uint" && (access == "write" || access == "read"))) {
+		const bool readTexture = name == "texture2d" && access == "read";
+		const bool writeTexture = name == "texture2d" && component == "uint" && access == "write";
+		if (access != "sample" && !readTexture && !writeTexture) {
 			throw CompileError(name + " access::" + access + " is not lowered yet; mslc lowers "
-				"access::sample, which is the default");
+				"access::sample, which is the default, texture2d access::read, and texture2d<uint> access::write");
 		}
 	}
 

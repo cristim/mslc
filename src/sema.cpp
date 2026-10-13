@@ -1206,7 +1206,7 @@ Id TypeTable::image(ResourceKind kind) {
 	return cached;
 }
 
-Id TypeTable::uintStorageImage(TextureAccess access) {
+Id TypeTable::storageImage(TextureAccess access, ScalarKind element) {
 	const bool read = access == TextureAccess::Read;
 	bool& declared = read ? _storageReadDeclared : _storageWriteDeclared;
 	if (!declared) {
@@ -1215,12 +1215,13 @@ Id TypeTable::uintStorageImage(TextureAccess access) {
 			? spirv::Capability::StorageImageReadWithoutFormat
 			: spirv::Capability::StorageImageWriteWithoutFormat) });
 	}
-	if (_uintStorageImage == InvalidId) {
-		_uintStorageImage = _builder.emitDecl(spirv::OpTypeImage, { scalar(ScalarKind::UInt),
+	Id& cached = _storageImages[element];
+	if (cached == InvalidId) {
+		cached = _builder.emitDecl(spirv::OpTypeImage, { scalar(element),
 			spirv::Dim::Dim2D, 0u, 0u, 0u, 2u,
 			static_cast<uint32_t>(spirv::ImageFormat::Unknown) });
 	}
-	return _uintStorageImage;
+	return cached;
 }
 
 Id TypeTable::samplerType() {
@@ -4613,7 +4614,10 @@ namespace {
 	}
 
 	Id Emitter::resourcePointee(const Type& type) {
-		if (type.textureAccess != TextureAccess::Sample) return _types.uintStorageImage(type.textureAccess);
+		if (type.textureAccess != TextureAccess::Sample) {
+			return _types.storageImage(type.textureAccess,
+				type.scalar == ScalarKind::UInt ? ScalarKind::UInt : ScalarKind::Float);
+		}
 		return type.isTexture() ? _types.image(type.resource) : _types.samplerType();
 	}
 
@@ -6726,9 +6730,10 @@ namespace {
 		}
 
 		if (storage) {
+			const bool integer = texture.pointeeMsl.scalar == ScalarKind::UInt;
 			const Id storageImage = loadFrom(texture.id, texture.pointeeType);
-			return _builder.emitTyped(spirv::OpImageRead,
-				_types.vector(ScalarKind::UInt, 4), { storageImage, coordinate });
+			return texturePixels(texture, _builder.emitTyped(spirv::OpImageRead,
+				_types.vector(integer ? ScalarKind::UInt : ScalarKind::Float, 4), { storageImage, coordinate }));
 		}
 
 		Id lod = arguments.size() == fixed + 1 ? emitLod(*arguments[fixed], "read") : constantU32(0);
