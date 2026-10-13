@@ -505,11 +505,12 @@ void Parser::parseUsing() {
 		const std::string spelled = (name.global ? "::" : "") + joinParts(name.parts, 0, name.parts.size());
 		expect(TokenKind::Semicolon, "after a using directive");
 
+		std::vector<std::string>& directives = _blocks.empty() ? _scopes[scope].directives : _blocks.back().directives;
+
 		// Nothing is looked up through the standard library's own namespace, and a
 		// file that adds names to it is found by the same spelling.
 		if (name.parts.front() == kStdlibNamespace && name.parts.size() == 1) {
-			NamespaceScope& entry = _scopes[scope];
-			entry.directives.push_back(kStdlibNamespace);
+			directives.push_back(kStdlibNamespace);
 			return;
 		}
 
@@ -517,7 +518,7 @@ void Parser::parseUsing() {
 		if (target.empty()) {
 			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 		}
-		_scopes[scope].directives.push_back(target);
+		directives.push_back(target);
 		return;
 	}
 
@@ -530,10 +531,18 @@ void Parser::parseUsing() {
 	}
 	expect(TokenKind::Semicolon, "after a using declaration");
 	const std::string resolved = resolveName(name);
-	if (!_declared.count(resolved) && resolved != "metal::discard_fragment") {
+	if (_blocks.empty() && !_declared.count(resolved) && resolved != "metal::discard_fragment") {
 		return; // a name of the standard library, which is visible already
 	}
-	_scopes[scope].declarations[name.parts.back()] = resolved;
+	if (_blocks.empty()) {
+		_scopes[scope].declarations[name.parts.back()] = resolved;
+		return;
+	}
+	const auto [entry, inserted] = _blocks.back().names.emplace(name.parts.back(), resolved);
+	if (!inserted && entry->second != resolved) {
+		throw CompileError("the using declaration of \"" + resolved + "\" conflicts with \"" + name.parts.back()
+			+ "\" declared earlier in the same scope");
+	}
 }
 
 static void rejectUnloweredReturn(const Type& returned, const std::string& quoted) {
@@ -1252,8 +1261,13 @@ void Parser::declareLocal(const std::string& name) {
 			"that name, which mslc does not support");
 	}
 
-	if (!_blocks.empty() && !_blocks.back().names.emplace(name, "").second) {
-		throw CompileError("redefinition of \"" + name + "\" in the same scope");
+	if (_blocks.empty()) {
+		return;
+	}
+	const auto [entry, inserted] = _blocks.back().names.emplace(name, "");
+	if (!inserted) {
+		throw CompileError(entry->second.empty() ? "redefinition of \"" + name + "\" in the same scope"
+			: "\"" + name + "\" conflicts with the using declaration of \"" + entry->second + "\" in the same scope");
 	}
 }
 
@@ -1370,8 +1384,19 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
 	const std::vector<std::string>& parts = name.parts;
 	const size_t outermost = name.global ? 0 : _namespacePath.size();
 	for (size_t depth = outermost + 1; depth-- > 0;) {
-		// A namespace that a using directive nominated is searched as well.
+		// A namespace that a using directive nominated is searched as well; a block's
+		// directive at the level where its names appear, as resolveName places them.
 		std::vector<std::string> bases = {namespacePrefix(depth)};
+		if (!name.global) {
+			const std::string function = namespacePrefix(_namespacePath.size());
+			for (const BlockScope& block : _blocks) {
+				for (const std::string& target : block.directives) {
+					if (nearestCommon(function, target) == bases.front()) {
+						bases.push_back(target);
+					}
+				}
+			}
+		}
 		std::set<std::string> seen;
 		for (size_t i = 0; i < bases.size(); ++i) {
 			const std::string candidate = bases[i].empty() ? parts[0] : bases[i] + "::" + parts[0];
@@ -1407,6 +1432,12 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 
 	const std::string& last = name.parts.back();
 	if (name.parts.size() == 1 && !name.global) {
+		// A using declaration in the innermost block that declares the name is the
+		// answer; a local there leaves the namespaces to be searched.
+		if (const std::string* bound = blockName(last); bound && !bound->empty()) {
+			return *bound;
+		}
+
 		// [namespace.udir]: a using directive in U nominating T makes T's names
 		// appear in the nearest namespace L containing both, for lookups from inside U.
 		// So each enclosing namespace L, innermost out, offers its own names plus
@@ -1423,6 +1454,15 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 				}
 				for (const std::string& target : entry->second.directives) {
 					if (nearestCommon(from, target) == level) {
+						std::set<std::string> seen;
+						collectMembers(target, last, seen, found, false);
+					}
+				}
+			}
+			const std::string function = namespacePrefix(_namespacePath.size());
+			for (const BlockScope& block : _blocks) {
+				for (const std::string& target : block.directives) {
+					if (nearestCommon(function, target) == level) {
 						std::set<std::string> seen;
 						collectMembers(target, last, seen, found, false);
 					}
@@ -2742,6 +2782,13 @@ StatementPtr Parser::parseStatement() {
 			"declare it at file scope");
 	}
 
+	// "using namespace N;" and "using N::x;" hold for the rest of the block.
+	if (matchIdentifier("using")) {
+		parseUsing();
+		statement->kind = StatementKind::ExpressionStatement;
+		return statement;
+	}
+
 	if (atKeyword("if")) {
 		return parseIfStatement();
 	}
@@ -3855,7 +3902,7 @@ ExpressionPtr Parser::parsePrimary() {
 			throw CompileError("\"::" + spelled.parts[0] + "\" names the file-scope declaration, which the local "
 				+ "of that name hides here; mslc keeps the two apart only under a namespace name");
 		}
-		if (_memberFields && kind() == TokenKind::Identifier && !isLocal(std::string(current().text))
+		if (_memberFields && kind() == TokenKind::Identifier && !blockName(std::string(current().text))
 			&& _memberFields->count(std::string(current().text)) && isLocal("this")
 			&& lookahead().kind != TokenKind::ColonColon) {
 			const size_t atLine = line();
@@ -3864,7 +3911,7 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 		// A member function named bare calls that function on this, or the static
 		// one of the struct.
-		if (_memberFields && kind() == TokenKind::Identifier && !isLocal(std::string(current().text))
+		if (_memberFields && kind() == TokenKind::Identifier && !blockName(std::string(current().text))
 			&& lookahead().kind == TokenKind::LParen) {
 			const auto function = _memberFunctions.find(std::string(current().text));
 			if (function != _memberFunctions.end()) {
