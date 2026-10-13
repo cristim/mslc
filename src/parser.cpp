@@ -1508,7 +1508,7 @@ void Parser::collectOwn(const std::string& scope, const std::string& name, std::
 }
 
 void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-	std::set<std::string>& found, bool qualified) const {
+	std::set<std::string>& found, bool qualified, bool* besideStdlib) const {
 	if (!seen.insert(scope).second) {
 		return;
 	}
@@ -1517,15 +1517,19 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	std::set<std::string> own;
 	collectOwn(scope, name, own);
 	found.insert(own.begin(), own.end());
+	const auto entry = _scopes.find(scope);
+	if (besideStdlib && (scope == kStdlibNamespace
+		|| (entry != _scopes.end() && entry->second.stdlibDeclarations.count(name)))) {
+		*besideStdlib = true;
+	}
 	if (qualified && !own.empty()) {
 		return;
 	}
-	const auto entry = _scopes.find(scope);
 	if (entry == _scopes.end()) {
 		return;
 	}
 	for (const std::string& directive : entry->second.directives) {
-		collectMembers(directive, name, seen, found, qualified);
+		collectMembers(directive, name, seen, found, qualified, besideStdlib);
 	}
 }
 
@@ -1713,8 +1717,7 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 			for (const std::string& target : entry->second.directives) {
 				if (nearestCommon(from, target) == level) {
 					std::set<std::string> seen;
-					collectMembers(target, last, seen, found, false);
-					stdlibHere = stdlibHere || target == kStdlibNamespace;
+					collectMembers(target, last, seen, found, false, &stdlibHere);
 				}
 			}
 		}
@@ -1723,8 +1726,7 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 			for (const std::string& target : block.directives) {
 				if (nearestCommon(function, target) == level) {
 					std::set<std::string> seen;
-					collectMembers(target, last, seen, found, false);
-					stdlibHere = stdlibHere || target == kStdlibNamespace;
+					collectMembers(target, last, seen, found, false, &stdlibHere);
 				}
 			}
 		}
@@ -4250,6 +4252,16 @@ ExpressionPtr Parser::parsePrimary() {
 		const std::string stdlibMember = std::string(kStdlibNamespace) + "::";
 		expression->besideStdlib = resolved.compare(0, stdlibMember.size(), stdlibMember) == 0
 			&& resolved.find("::", stdlibMember.size()) == std::string::npos;
+		// A qualified call into a namespace that itself brought the library's name in with
+		// "using metal::name;" finds that name there too (Apple's qualified lookup sees both).
+		if (const size_t ownerEnd = resolved.rfind("::"); ownerEnd != std::string::npos) {
+			const std::string owner = resolved.substr(0, ownerEnd);
+			const std::string member = resolved.substr(ownerEnd + 2);
+			const auto scope = _scopes.find(owner);
+			if (scope != _scopes.end() && scope->second.stdlibDeclarations.count(member)) {
+				expression->besideStdlib = true;
+			}
+		}
 		bool foundBesideStdlib = false;
 		if (spelledTokens == 1 && kind() == TokenKind::Identifier && !blockName(std::string(current().text))) {
 			unqualifiedFound(std::string(current().text), &foundBesideStdlib);
