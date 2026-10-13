@@ -1252,18 +1252,23 @@ void Parser::declareLocal(const std::string& name) {
 			"that name, which mslc does not support");
 	}
 
-	if (!_locals.empty() && !_locals.back().insert(name).second) {
+	if (!_blocks.empty() && !_blocks.back().names.emplace(name, "").second) {
 		throw CompileError("redefinition of \"" + name + "\" in the same scope");
 	}
 }
 
-bool Parser::isLocal(const std::string& name) const {
-	for (const std::set<std::string>& scope : _locals) {
-		if (scope.count(name)) {
-			return true;
+const std::string* Parser::blockName(const std::string& name) const {
+	for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+		if (const auto entry = scope->names.find(name); entry != scope->names.end()) {
+			return &entry->second;
 		}
 	}
-	return false;
+	return nullptr;
+}
+
+bool Parser::isLocal(const std::string& name) const {
+	const std::string* bound = blockName(name);
+	return bound && bound->empty();
 }
 
 std::string Parser::qualify(const std::string& name) const {

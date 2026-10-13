@@ -63,9 +63,15 @@ class Parser {
 	std::set<std::string> _namespaces;
 	std::map<std::string, NamespaceScope> _scopes;
 
-	// The names declared in the function being parsed, which hide a file-scope
-	// name of the same spelling that a namespace would otherwise resolve.
-	std::vector<std::set<std::string>> _locals;
+	// The blocks of the function being parsed, innermost last. A name maps to "" for
+	// a local, which hides a file-scope name of that spelling, or to what a using
+	// declaration in the block names. A block's using directives are searched as if
+	// written in the function's namespace, and only while the block is open.
+	struct BlockScope {
+		std::map<std::string, std::string> names;
+		std::vector<std::string> directives;
+	};
+	std::vector<BlockScope> _blocks;
 
 	// Levels of brackets, blocks and unbraced bodies the parser is inside, one
 	// per recursive call. Each structured construct the emitter writes (an if, a
@@ -198,14 +204,17 @@ private:
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
 		std::set<std::string>& found, bool qualified) const;
 	bool isLocal(const std::string& name) const;
+	// What the innermost block that declares the name binds it to: "" for a local,
+	// the declaration a using declaration names, or nullptr when no block does.
+	const std::string* blockName(const std::string& name) const;
 
 	// Opens the scope of a block, a for statement or a function's parameters.
 	class LocalScope {
 		Parser& _parser;
 
 	public:
-		explicit LocalScope(Parser& parser): _parser(parser) { _parser._locals.emplace_back(); }
-		~LocalScope() { _parser._locals.pop_back(); }
+		explicit LocalScope(Parser& parser): _parser(parser) { _parser._blocks.emplace_back(); }
+		~LocalScope() { _parser._blocks.pop_back(); }
 		LocalScope(const LocalScope&) = delete;
 		LocalScope& operator=(const LocalScope&) = delete;
 	};
