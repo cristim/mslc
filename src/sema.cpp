@@ -5079,14 +5079,7 @@ namespace {
 		std::vector<uint32_t> operands { slot.first->second };
 		std::vector<std::pair<Id, Id>> copyOuts;
 		std::vector<std::optional<StdlibOperand>> argumentOperands(call.arguments.size());
-		// An enum-typed argument is an exact match for an enum parameter, which beats the
-		// int promotion a library signature would need; leaving no operand reads as no
-		// match, same as any other type the library's signatures do not model.
-		const auto stdlibArgumentOperand = [&](const Expression& argument, Id type) -> std::optional<StdlibOperand> {
-			const auto enumName = enumOf(argument);
-			if (enumName && !enumName->empty()) {
-				return std::nullopt;
-			}
+		const auto stdlibArgumentOperand = [&](Id type) -> std::optional<StdlibOperand> {
 			const uint32_t width = _types.vectorWidth(type);
 			if (const auto scalar = _types.scalarKindOf(width > 1 ? _types.componentOf(type) : type)) {
 				return StdlibOperand{*scalar, width};
@@ -5114,7 +5107,12 @@ namespace {
 
 			if (parameter.isMutableReference()) {
 				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
-				argumentOperands[i] = stdlibArgumentOperand(*call.arguments[i], valueTypeAt(operands.back()));
+				// An enum-typed parameter is an exact match for an enum argument, which beats the
+				// int promotion a library signature would need; leaving no operand reads as no
+				// match, same as any other type the library's signatures do not model.
+				if (parameter.type.enumName.empty()) {
+					argumentOperands[i] = stdlibArgumentOperand(valueTypeAt(operands.back()));
+				}
 				continue;
 			}
 
@@ -5123,7 +5121,9 @@ namespace {
 					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
 			}
 			const Id value = emitExpression(*call.arguments[i]);
-			argumentOperands[i] = stdlibArgumentOperand(*call.arguments[i], _builder.typeOf(value));
+			if (parameter.type.enumName.empty()) {
+				argumentOperands[i] = stdlibArgumentOperand(_builder.typeOf(value));
+			}
 			try {
 				operands.push_back(convertImplicit(value, helper.parameterTypes[first + i]));
 			} catch (const CompileError& error) {
