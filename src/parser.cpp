@@ -2185,9 +2185,14 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 	if (helper) {
 		const std::string what = "parameter \"" + param.name + "\" of helper function \"" + helperName + "\" ";
-		if (param.type.isPointer) {
-			throw CompileError(what + "is a pointer, which a helper function does not take yet; "
-				"it takes scalar, vector, matrix and struct values");
+		// A pointer to the caller's local array; the emitter checks the argument.
+		const bool threadPointer = param.type.isPointer && !param.isReference
+			&& param.type.addressSpace == AddressSpace::Thread && param.type.resource == ResourceKind::None
+			&& !param.type.isAtomic;
+		if (param.type.isPointer && !threadPointer) {
+			throw CompileError(what + "is a pointer outside the thread address space or to an atomic or "
+				"a resource, which a helper function does not take yet; it takes scalar, vector, matrix "
+				"and struct values and a thread pointer to a local array");
 		}
 		if (param.type.arrayLength || (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket)) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
@@ -2195,7 +2200,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		// A reference to a thread variable may spell its space out; any other
 		// parameter has none to name.
 		if (param.type.addressSpace != AddressSpace::None
-			&& !(param.isReference && param.type.addressSpace == AddressSpace::Thread)) {
+			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}
@@ -3520,6 +3525,7 @@ ExpressionPtr Parser::parsePostfix() {
 			}
 			auto member = std::make_unique<Expression>();
 			member->kind = ExpressionKind::Member;
+			member->isArrow = op == "->";
 			member->line = expression->line;
 			member->left = std::move(expression);
 			member->memberName = std::string(advance().text);

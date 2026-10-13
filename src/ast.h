@@ -236,6 +236,9 @@ struct Expression {
 	// spelling it is about.
 	bool isDereference = false;
 
+	// Member: written "p->m" rather than "v.m".
+	bool isArrow = false;
+
 	// InitList
 	std::vector<InitializerElement> elements;
 

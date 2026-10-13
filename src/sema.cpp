@@ -2050,8 +2050,13 @@ namespace {
 			Id returnType = InvalidId;
 			std::vector<Id> parameterTypes;
 			Id type = InvalidId;
+			// For a helper with a thread pointer parameter, the length of the caller's
+			// array bound to each parameter (zero for any other): the helper is
+			// emitted once per distinct list, so its pointer is to the whole array.
+			std::vector<uint32_t> arrayLengths;
 		};
 		std::map<std::string, HelperFunction> _helpers;
+		std::map<std::pair<const FunctionDecl*, std::vector<uint32_t>>, HelperFunction> _pointerSpecialisations;
 		// Helpers called and not yet emitted. A body cannot be emitted while the
 		// function that calls it is half written, so they wait for its end.
 		std::vector<HelperFunction*> _helperQueue;
@@ -2215,6 +2220,8 @@ namespace {
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
 			size_t first) const;
+		HelperFunction& pointerSpecialisation(const Expression& call, HelperFunction& generic,
+			size_t first, std::vector<Id>& arrays);
 		Id referenceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts);
 		Id resourceArgument(const Expression& argument, const Parameter& parameter,
@@ -2717,7 +2724,7 @@ namespace {
 				"be indexed");
 		}
 
-		if (expression.isDereference && !it->second.isBuffer) {
+		if (expression.isDereference && !it->second.isBuffer && !it->second.pointeeMsl.arrayLength) {
 			throw CompileError(notAPointer(expression.left->name));
 		}
 
@@ -2972,6 +2979,7 @@ namespace {
 	struct AccessStep {
 		bool isIndex = false;
 		bool isDereference = false;
+		bool isArrow = false;
 		const Expression* index = nullptr;
 		std::string memberName;
 	};
@@ -3005,6 +3013,7 @@ namespace {
 				step.index = current->arguments[0].get();
 			} else {
 				step.memberName = current->memberName;
+				step.isArrow = current->isArrow;
 			}
 
 			reversed.push_back(step);
@@ -3258,6 +3267,16 @@ namespace {
 
 				operands.push_back(stepIndex(*step.index, "buffer element"));
 				continue;
+			}
+
+			// "p->m" on a pointer parameter bound to a local array names element zero.
+			if (!fromBuffer && current.arrayLength && binding.storageClass == spirv::StorageClass::Function) {
+				if (!step.isArrow) {
+					throw CompileError("\"" + rootName + "\" is an array, so \"." + step.memberName
+						+ "\" needs an element: index it, as " + rootName + "[i]." + step.memberName);
+				}
+				operands.push_back(constantU32(0));
+				current.arrayLength.reset();
 			}
 
 			const StructDecl* decl = current.namedType.empty()
@@ -4631,14 +4650,20 @@ namespace {
 
 	// Arguments are evaluated left to right and converted to the parameter types.
 	// Resource arguments retain their caller's identity, including writes.
-	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver) {
-		const FunctionDecl& definition = *helper.definition;
+	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver) {
+		const FunctionDecl& definition = *generic.definition;
+		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
+		HelperFunction& helper = pointerSpecialisation(call, generic, receiver ? 1 : 0, arrays);
 
 		if (helper.type == InvalidId) {
 			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
 			std::vector<Id> signature { helper.returnType };
-			for (const Parameter& parameter: definition.parameters) {
-				helper.parameterTypes.push_back(parameter.isMutableReference()
+			for (size_t i = 0; i < definition.parameters.size(); ++i) {
+				const Parameter& parameter = definition.parameters[i];
+				helper.parameterTypes.push_back(parameter.type.isPointer
+					? _types.pointer(spirv::StorageClass::Function,
+						_types.array(declaredTypeOf(parameter.type), helper.arrayLengths[i]))
+					: parameter.isMutableReference()
 					? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
 					: helperParameterType(parameter.type));
 				signature.push_back(helper.parameterTypes.back());
@@ -4675,6 +4700,11 @@ namespace {
 				continue;
 			}
 
+			if (parameter.type.isPointer) {
+				operands.push_back(arrays[first + i]);
+				continue;
+			}
+
 			if (parameter.isMutableReference()) {
 				operands.push_back(referenceArgument(*call.arguments[i], parameter, definition.name, i + 1, copyOuts));
 				continue;
@@ -4700,6 +4730,65 @@ namespace {
 			_builder.emit(spirv::OpStore, { place, loadFrom(temporary, type) });
 		}
 		return result;
+	}
+
+	// A thread pointer parameter takes a local array of its element type. Vulkan
+	// without VariablePointers cannot index a pointer to an element by a run-time
+	// value, so the helper is emitted once per list of array lengths and its
+	// parameter is a pointer to the whole array, which p[i] indexes with an access
+	// chain. The helper then reads and writes the caller's own storage. Apple also
+	// takes &x, a + 1 and a pointer reassigned in the body; none of those is an
+	// array the helper can name, so each is refused.
+	Emitter::HelperFunction& Emitter::pointerSpecialisation(const Expression& call, HelperFunction& generic,
+		size_t first, std::vector<Id>& arrays) {
+		const FunctionDecl& definition = *generic.definition;
+		std::vector<uint32_t> lengths(definition.parameters.size(), 0);
+		bool any = false;
+		for (size_t i = 0; i < call.arguments.size(); ++i) {
+			const Parameter& parameter = definition.parameters[first + i];
+			if (!parameter.type.isPointer) {
+				continue;
+			}
+			any = true;
+
+			const std::string what = "argument " + std::to_string(i + 1) + " of the call to \""
+				+ definition.name + "\"";
+			const Expression& argument = *call.arguments[i];
+			const auto binding = argument.kind == ExpressionKind::Identifier
+				? _bindings.find(argument.name) : _bindings.end();
+			if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.pointeeMsl.arrayLength
+				|| binding->second.storageClass != spirv::StorageClass::Function || binding->second.isAddress) {
+				throw CompileError(what + " has to name a local array (or a pointer parameter of the calling "
+					"helper), since parameter \"" + parameter.name + "\" is a pointer to its elements; "
+					"&x, a + n and pointers into a buffer are not lowered yet");
+			}
+
+			Type element = binding->second.pointeeMsl;
+			element.arrayLength.reset();
+			Type wanted = parameter.type;
+			wanted.isPointer = false;
+			if (declaredTypeOf(element) != declaredTypeOf(wanted) || element.namedType != wanted.namedType) {
+				throw CompileError(what + " is an array of " + typeName(element) + ", and parameter \""
+					+ parameter.name + "\" points at " + typeName(wanted));
+			}
+			if (binding->second.readOnly && !parameter.type.isConst) {
+				throw CompileError(what + " is const, and parameter \"" + parameter.name
+					+ "\" is a pointer that can change it");
+			}
+
+			lengths[first + i] = *binding->second.pointeeMsl.arrayLength;
+			arrays[first + i] = binding->second.id;
+		}
+
+		if (!any) {
+			return generic;
+		}
+
+		const auto slot = _pointerSpecialisations.emplace(std::make_pair(generic.definition, lengths), generic);
+		if (slot.second) {
+			slot.first->second.arrayLengths = lengths;
+		}
+		return slot.first->second;
 	}
 
 	// An element, a member, or a reference local bound to one is passed through a
@@ -4833,6 +4922,16 @@ namespace {
 				bound.storageClass = spirv::StorageClass::UniformConstant;
 				bound.pointeeMsl = parameter.type;
 				_bindings[parameter.name] = bound;
+				continue;
+			}
+
+			if (parameter.type.isPointer) {
+				Type array = parameter.type;
+				array.isPointer = false;
+				array.addressSpace = AddressSpace::None;
+				array.arrayLength = helper.arrayLengths[i];
+				bindLocal(parameter.name, values[i],
+					_types.array(declaredTypeOf(parameter.type), helper.arrayLengths[i]), array);
 				continue;
 			}
 
