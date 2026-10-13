@@ -7659,14 +7659,18 @@ namespace {
 				return expression.constructType ? std::optional<std::string>(expression.constructType->enumName)
 					: std::nullopt;
 			case ExpressionKind::Conditional: {
-				// The arms are the value: the same enum in both is that enum, and an arm that is
-				// known not to be one makes the whole an integer.
+				// The arms are the value: the same enum in both is that enum, an arm that is
+				// known not to be one makes the whole an integer, and two different named
+				// enums undergo the usual arithmetic conversions to int.
 				const auto first = enumOf(*expression.arguments.at(0));
 				const auto second = enumOf(*expression.arguments.at(1));
 				if (first && second && *first == *second) {
 					return first;
 				}
 				if ((first && first->empty()) || (second && second->empty())) {
+					return std::string();
+				}
+				if (first && second && *first != "<anonymous>" && *second != "<anonymous>") {
 					return std::string();
 				}
 				return std::nullopt;
@@ -7682,6 +7686,12 @@ namespace {
 				const Type& returned = helper->second.definition->returnType;
 				return returned.isPointer || returned.arrayLength ? std::nullopt
 					: std::optional<std::string>(returned.enumName);
+			}
+			case ExpressionKind::Index: {
+				if (expression.left->kind != ExpressionKind::Identifier) return std::nullopt;
+				const auto local = _bindings.find(expression.left->name);
+				if (local == _bindings.end()) return std::nullopt;
+				return local->second.pointeeMsl.enumName;
 			}
 			default:
 				return std::nullopt;
