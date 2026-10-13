@@ -179,9 +179,12 @@ private:
 	// [namespace.udecl]: a declaration and a using declaration of one name in one
 	// namespace conflict, unless one is a struct or enum tag beside a function or
 	// variable, or both are functions with different parameters. "function" is the
-	// declaration being parsed when "name" is one, and null otherwise.
+	// declaration being parsed when "name" is one, and null otherwise. wideTagExemption
+	// widens the tag exemption to any other kind (a typedef or an enum constant too),
+	// which only holds for a using declaration checked against a name already declared,
+	// not the other order (parseUsing passes true; rejectUsingConflict passes false).
 	bool conflictsWithUsing(const std::string& own, const std::vector<std::string_view>& ownKinds,
-		const std::string& target, const FunctionDecl* function) const;
+		const std::string& target, const FunctionDecl* function, bool wideTagExemption = false) const;
 	// What a declared name is: one kind, or a struct or enum tag and a function or variable.
 	std::vector<std::string_view> kindsOf(const std::string& name) const;
 	void rejectUsingConflict(const std::string& name, std::string_view what, const FunctionDecl* function) const;
