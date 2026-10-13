@@ -198,6 +198,9 @@ private:
 	// spelling itself when it names no declaration (a builtin). A qualified spelling
 	// that names nothing is a CompileError.
 	std::string resolveName(const QualifiedName& name) const;
+	// The declarations an unqualified name finds at the innermost namespace level that has
+	// any, without reporting several as ambiguous (a declaration site is not a use).
+	std::set<std::string> unqualifiedFound(const std::string& last) const;
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
