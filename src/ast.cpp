@@ -60,9 +60,9 @@ std::string typeName(const Type& type) {
 	}
 	if (type.arrayLength) {
 		name += "[" + std::to_string(*type.arrayLength) + "]";
-		for (const uint32_t inner: type.innerArrayLengths) {
-			name += "[" + std::to_string(inner) + "]";
-		}
+	}
+	for (const uint32_t inner: type.innerArrayLengths) {
+		name += "[" + std::to_string(inner) + "]";
 	}
 	if (type.isPointer) {
 		name += "*";

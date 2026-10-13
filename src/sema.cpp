@@ -4745,6 +4745,16 @@ namespace {
 		return binding->id;
 	}
 
+	// The array a pointer parameter is bound to inside the helper: the caller's array of
+	// the given length, of elements the parameter points at.
+	static Type boundArray(const Type& parameter, uint32_t length) {
+		Type array = parameter;
+		array.isPointer = false;
+		array.addressSpace = AddressSpace::None;
+		array.arrayLength = length;
+		return array;
+	}
+
 	// Arguments are evaluated left to right and converted to the parameter types.
 	// Resource arguments retain their caller's identity, including writes.
 	Id Emitter::emitHelperCall(const Expression& call, HelperFunction& generic, const Expression* receiver) {
@@ -4759,7 +4769,7 @@ namespace {
 				const Parameter& parameter = definition.parameters[i];
 				helper.parameterTypes.push_back(parameter.type.isPointer
 					? _types.pointer(spirv::StorageClass::Function,
-						_types.array(declaredTypeOf(parameter.type), helper.arrayLengths[i]))
+						arrayTypeOf(boundArray(parameter.type, helper.arrayLengths[i])))
 					: parameter.isMutableReference()
 					? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
 					: helperParameterType(parameter.type));
@@ -4860,13 +4870,29 @@ namespace {
 					"&x, a + n and pointers into a buffer are not lowered yet");
 			}
 
+			// An array parameter's own length is not part of its type (it decays), but the
+			// lengths inside it are: float m[2][3] takes an array of rows of three.
 			Type element = binding->second.pointeeMsl;
+			element.dropOuterDimension();
+			std::vector<uint32_t> shape = element.innerArrayLengths;
+			if (element.arrayLength) {
+				shape.insert(shape.begin(), *element.arrayLength);
+			}
 			element.arrayLength.reset();
+			element.innerArrayLengths.clear();
 			Type wanted = parameter.type;
 			wanted.isPointer = false;
-			if (declaredTypeOf(element) != declaredTypeOf(wanted) || element.namedType != wanted.namedType) {
-				throw CompileError(what + " is an array of " + typeName(element) + ", and parameter \""
-					+ parameter.name + "\" points at " + typeName(wanted));
+			const std::vector<uint32_t> wantedShape = wanted.innerArrayLengths;
+			wanted.innerArrayLengths.clear();
+			if (declaredTypeOf(element) != declaredTypeOf(wanted) || element.namedType != wanted.namedType
+				|| shape != wantedShape) {
+				const auto spelled = [&](const Type& base, const std::vector<uint32_t>& lengths) {
+					std::string name = typeName(base);
+					for (const uint32_t length: lengths) { name += "[" + std::to_string(length) + "]"; }
+					return name;
+				};
+				throw CompileError(what + " is an array of " + spelled(element, shape) + ", and parameter \""
+					+ parameter.name + "\" points at " + spelled(wanted, wantedShape));
 			}
 			if (binding->second.readOnly && !parameter.type.isConst) {
 				throw CompileError(what + " is const, and parameter \"" + parameter.name
@@ -5024,12 +5050,8 @@ namespace {
 			}
 
 			if (parameter.type.isPointer) {
-				Type array = parameter.type;
-				array.isPointer = false;
-				array.addressSpace = AddressSpace::None;
-				array.arrayLength = helper.arrayLengths[i];
-				bindLocal(parameter.name, values[i],
-					_types.array(declaredTypeOf(parameter.type), helper.arrayLengths[i]), array);
+				const Type array = boundArray(parameter.type, helper.arrayLengths[i]);
+				bindLocal(parameter.name, values[i], arrayTypeOf(array), array);
 				continue;
 			}
 
