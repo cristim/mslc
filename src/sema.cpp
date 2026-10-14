@@ -2250,7 +2250,11 @@ namespace {
 			bool storageOnly);
 		void emitAutoDeclaration(const VariableDeclaration& declaration);
 		Type deduceAutoType(const Type& written, Id valueType, const std::string& name);
-		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
+		// storage is where the variable itself lives: Function for an ordinary
+		// local, Workgroup for a threadgroup one. It is what the index path walks
+		// the binding with, so it has to be the real one.
+		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl,
+			spirv::StorageClassValue storage = spirv::StorageClass::Function);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
 		void branchUnlessTerminated(Id label);
@@ -7207,12 +7211,16 @@ namespace {
 	// Only a plain value type is reserved; every other form is refused where it is declared.
 	void Emitter::reserveThreadgroupLocal(const VariableDeclaration& declaration) {
 		const Type& type = declaration.type;
-		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer || type.arrayLength
+		// An array is reserved here too. emitLocalArray looks the variable up in
+		// this table when it runs, so the same shape serves both, and a
+		// threadgroup array has to be in the OpEntryPoint interface just as a
+		// threadgroup scalar does.
+		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer
 			|| type.resource != ResourceKind::None || declaration.isReference
-			|| declaration.initializer) {
+			|| (!type.arrayLength && declaration.initializer)) {
 			return;
 		}
-		const Id typeId = declaredTypeOf(type);
+		const Id typeId = type.arrayLength ? arrayTypeOf(type) : declaredTypeOf(type);
 		_threadgroupLocals[&declaration] = _builder.emitDeclTyped(spirv::OpVariable,
 			_types.pointer(spirv::StorageClass::Workgroup, typeId),
 			{ static_cast<uint32_t>(spirv::StorageClass::Workgroup) });
@@ -8883,10 +8891,25 @@ namespace {
 	// constant one past the end is refused.
 	void Emitter::emitLocalArray(const VariableDeclaration& declaration, bool storageOnly) {
 		const Type& type = declaration.type;
-		if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
+
+		// A threadgroup array is shared by every invocation of the workgroup, so it
+		// lives in Workgroup storage rather than the function's own. Nothing else
+		// changes: the type, the initialiser and the index paths are the same.
+		//
+		// No ArrayStride is emitted, deliberately. Workgroup storage has an implicit
+		// layout, and VUID-StandaloneSpirv-None-10684 rejects an explicit one on it:
+		// "the Workgroup storage class has an explicit layout from the ArrayStride
+		// decoration". An element is reached with OpAccessChain whose result type is
+		// a pointer to the element, not to the array.
+		const bool threadgroup = type.addressSpace == AddressSpace::Threadgroup;
+		if (type.resource != ResourceKind::None
+			|| (!threadgroup && type.addressSpace != AddressSpace::None)) {
 			throw CompileError("an array of " + typeName(type) + " is not lowered yet; mslc lowers an array "
-				"of scalars, vectors, matrices and structs in the function's own storage");
+				"of scalars, vectors, matrices and structs in the function's own storage or in "
+				"threadgroup storage");
 		}
+		const spirv::StorageClassValue storage =
+			threadgroup ? spirv::StorageClass::Workgroup : spirv::StorageClass::Function;
 
 		Type element = type;
 		element.arrayLength.reset();
@@ -8939,13 +8962,27 @@ namespace {
 			}
 		}
 
-		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
-			_types.pointer(spirv::StorageClass::Function, arrayType),
-			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		// A threadgroup array was already declared, and added to the entry point's
+		// interface, by the reserveThreadgroupLocal pre-pass that runs before
+		// OpEntryPoint is emitted. Re-declaring it here would put a second
+		// Workgroup variable in the module that no entry point lists.
+		Id variable = InvalidId;
+		if (threadgroup) {
+			const auto reserved = _threadgroupLocals.find(&declaration);
+			if (reserved == _threadgroupLocals.end()) {
+				throw CompileError("the threadgroup array \"" + declaration.name
+					+ "\" was not reserved before the entry point was emitted");
+			}
+			variable = reserved->second;
+		} else {
+			variable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(storage, arrayType),
+				{ static_cast<uint32_t>(storage) });
+		}
 		if (!storageOnly) {
 			_builder.emit(spirv::OpStore, { variable, initial });
 		}
-		bindLocal(declaration.name, variable, arrayType, type);
+		bindLocal(declaration.name, variable, arrayType, type, storage);
 	}
 
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
@@ -9174,12 +9211,13 @@ namespace {
 	}
 
 	// pointeeMsl is what a member access on the local resolves its fields against.
-	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl) {
+	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl,
+		spirv::StorageClassValue storage) {
 		Binding binding;
 		binding.id = variable;
 		binding.isPointer = true;
 		binding.pointeeType = type;
-		binding.storageClass = spirv::StorageClass::Function;
+		binding.storageClass = storage;
 		binding.pointeeMsl = msl;
 		binding.readOnly = msl.isConst;
 		_bindings[name] = binding;
