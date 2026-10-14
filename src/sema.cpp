@@ -2750,6 +2750,10 @@ namespace {
 		}
 
 		const Binding& binding = *found;
+		if (binding.pointeeMsl.isAtomic) {
+			throw CompileError("the atomic \"" + expression.name + "\" cannot be read as an ordinary value; "
+				"use atomic_load_explicit");
+		}
 
 		if (binding.pointeeMsl.arrayLength && !binding.isBuffer && binding.bufferPointeeType == InvalidId) {
 			throw CompileError("\"" + expression.name + "\" is an array, which is not a value: index it, as "
@@ -4666,31 +4670,43 @@ namespace {
 		return std::find(std::begin(names), std::end(names), name) != std::end(names);
 	}
 
-	// The address of the atomic an argument names: the pointer itself is its first
-	// element, and &p[i] is element i. Anything else is not a pointer to an atomic.
 	Id Emitter::atomicAddress(const Expression& argument, const std::string& function, bool& isSigned) {
 		const Expression* pointer = &argument;
 		const Expression* index = nullptr;
+		bool addressOfLocal = false;
 		if (argument.kind == ExpressionKind::Unary && argument.unaryOperator == UnaryOperator::AddressOf) {
 			const Expression& element = *argument.left;
-			if (element.kind != ExpressionKind::Index || element.isDereference
-				|| element.left->kind != ExpressionKind::Identifier || element.arguments.size() != 1) {
-				throw CompileError(function + " takes the address of an element of an atomic buffer, as &counters[i]");
+			if (element.kind == ExpressionKind::Identifier) {
+				pointer = &element;
+				addressOfLocal = true;
+			} else if (element.kind == ExpressionKind::Index && !element.isDereference
+				&& element.left->kind == ExpressionKind::Identifier && element.arguments.size() == 1) {
+				pointer = element.left.get();
+				index = element.arguments[0].get();
+			} else {
+				throw CompileError(function + " takes &local for a threadgroup atomic, or &counters[i] for an atomic buffer");
 			}
-			pointer = element.left.get();
-			index = element.arguments[0].get();
 		}
 
 		if (pointer->kind != ExpressionKind::Identifier) {
-			throw CompileError(function + " takes a pointer parameter to an atomic, or the address of one of its elements");
+			throw CompileError(function + " takes &local for a scalar threadgroup atomic, an atomic buffer "
+				"pointer, or the address of one of its elements");
 		}
 		const auto found = _bindings.find(pointer->name);
-		if (found == _bindings.end() || !found->second.isBuffer || !found->second.pointeeMsl.isAtomic) {
-			throw CompileError(function + " takes a device atomic_uint or atomic_int pointer, and \""
+		if (found == _bindings.end() || !found->second.pointeeMsl.isAtomic
+			|| (!found->second.isBuffer && found->second.storageClass != spirv::StorageClass::Workgroup)) {
+			throw CompileError(function + " takes a device atomic_uint or atomic_int pointer, or &local for a "
+				"scalar threadgroup atomic, and \""
 				+ pointer->name + "\" is not one");
 		}
 
 		const Binding& binding = found->second;
+		if (binding.storageClass == spirv::StorageClass::Workgroup && (!addressOfLocal || index)) {
+			throw CompileError(function + " takes the address of a scalar threadgroup atomic, as &" + pointer->name);
+		}
+		if (binding.isBuffer && addressOfLocal) {
+			throw CompileError(function + " takes the address of an element of an atomic buffer, as &counters[i]");
+		}
 		if (binding.pointeeMsl.addressSpace == AddressSpace::Constant) {
 			throw CompileError(function + " takes a device atomic, and \"" + pointer->name
 				+ "\" points into the constant address space");
@@ -4700,6 +4716,9 @@ namespace {
 				+ "\" points at a constant or const one; only atomic_load_explicit reads it");
 		}
 		isSigned = binding.pointeeMsl.scalar == ScalarKind::Int;
+		if (binding.storageClass == spirv::StorageClass::Workgroup) {
+			return binding.id;
+		}
 		const Id indexId = index ? stepIndex(*index, "buffer element") : constantU32(0);
 		return _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, binding.pointeeType),
@@ -4737,7 +4756,7 @@ namespace {
 		bool isSigned = false;
 		const Id address = atomicAddress(*expression.arguments[0], name, isSigned);
 		const Id type = isSigned ? _intType : _uintType;
-		const Id scope = constantU32(1);      // Device
+		const Id scope = constantU32(_types.storageClassOf(_builder.typeOf(address)) == spirv::StorageClass::Workgroup ? 2 : 1);
 		const Id semantics = constantU32(0);  // Relaxed
 
 		if (isLoad) {
@@ -7189,7 +7208,7 @@ namespace {
 	void Emitter::reserveThreadgroupLocal(const VariableDeclaration& declaration) {
 		const Type& type = declaration.type;
 		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer || type.arrayLength
-			|| type.resource != ResourceKind::None || type.isAtomic || declaration.isReference
+			|| type.resource != ResourceKind::None || declaration.isReference
 			|| declaration.initializer) {
 			return;
 		}
@@ -9017,7 +9036,8 @@ namespace {
 			return;
 		}
 
-		if (type.isAtomic && !type.isPointer) {
+		if (type.isAtomic && !type.isPointer
+			&& (type.addressSpace != AddressSpace::Threadgroup || type.arrayLength || declaration.isReference)) {
 			throw CompileError("a local atomic \"" + declaration.name + "\" is not allowed: an atomic lives in a "
 				"device buffer, and a function takes a pointer to it");
 		}
@@ -9199,6 +9219,10 @@ namespace {
 			// the address to store to. A buffer parameter is a descriptor and a
 			// plain value is loaded, so only this case takes the binding.
 			const auto it = _bindings.find(left.name);
+			if (it != _bindings.end() && it->second.pointeeMsl.isAtomic) {
+				throw CompileError("the atomic \"" + left.name + "\" cannot be used as an ordinary place; "
+					"use the atomic functions");
+			}
 			if (it != _bindings.end() && it->second.isPointer
 				&& it->second.bufferPointeeType == InvalidId
 				&& (it->second.storageClass == spirv::StorageClass::Function
