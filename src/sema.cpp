@@ -4706,8 +4706,17 @@ namespace {
 			{ bufferBase(binding), constantU32(0), indexId });
 	}
 
+	static std::string builtinCalleeName(const std::string& name) {
+		constexpr std::string_view prefix = "metal::";
+		if (name.compare(0, prefix.size(), prefix) == 0
+			&& name.find("::", prefix.size()) == std::string::npos) {
+			return name.substr(prefix.size());
+		}
+		return name;
+	}
+
 	Id Emitter::emitAtomicCall(const Expression& expression) {
-		const std::string& name = expression.left->name;
+		const std::string name = builtinCalleeName(expression.left->name);
 		const bool isStore = name == "atomic_store_explicit";
 		const bool isLoad = name == "atomic_load_explicit";
 		if (name.rfind("atomic_compare_exchange", 0) == 0) {
@@ -4720,7 +4729,8 @@ namespace {
 				+ (isLoad ? "" : "the value, ") + "and memory_order_relaxed");
 		}
 		const Expression& order = *expression.arguments.back();
-		if (order.kind != ExpressionKind::Identifier || order.name != "memory_order_relaxed") {
+		if (order.kind != ExpressionKind::Identifier
+			|| (order.name != "memory_order_relaxed" && order.name != "metal::memory_order_relaxed")) {
 			throw CompileError(name + " takes memory_order_relaxed, the only memory order Metal has");
 		}
 
@@ -4761,7 +4771,8 @@ namespace {
 			collectMemFlags(*flags.right, function, semantics, crossesWorkgroup);
 			return;
 		}
-		const std::string prefix = "mem_flags::";
+		const std::string prefix = flags.name.rfind("metal::mem_flags::", 0) == 0
+			? "metal::mem_flags::" : "mem_flags::";
 		if (flags.kind != ExpressionKind::Identifier || flags.name.rfind(prefix, 0) != 0) {
 			throw CompileError(function + " takes mem_flags::mem_none, mem_device, mem_threadgroup or "
 				"mem_texture, joined with |");
@@ -4785,7 +4796,7 @@ namespace {
 	}
 
 	void Emitter::emitBarrierCall(const Expression& expression) {
-		const std::string& name = expression.left->name;
+		const std::string name = builtinCalleeName(expression.left->name);
 		if (expression.arguments.size() != 1) {
 			throw CompileError(name + " takes one argument: the mem_flags to order");
 		}
@@ -4819,7 +4830,6 @@ namespace {
 			throw CompileError("only a direct function call is supported");
 		}
 
-		// A helper never has the name of a builtin, which validateHelpers refuses.
 		if (helper) {
 			if (returnsVoid(*helper->definition)) {
 				throw CompileError("a call to \"" + helper->definition->name + "\" returns void and has "
@@ -4829,22 +4839,23 @@ namespace {
 			return emitHelperCall(expression, *helper, receiver);
 		}
 
-		if (expression.left->name == "threadgroup_barrier" || expression.left->name == "simdgroup_barrier") {
-			throw CompileError(expression.left->name + " returns void and has no value");
+		const std::string name = builtinCalleeName(expression.left->name);
+		if (name == "threadgroup_barrier" || name == "simdgroup_barrier") {
+			throw CompileError(name + " returns void and has no value");
 		}
 
-		if (isAtomicFunction(expression.left->name)) {
-			if (expression.left->name == "atomic_store_explicit") {
+		if (isAtomicFunction(name)) {
+			if (name == "atomic_store_explicit") {
 				throw CompileError("atomic_store_explicit returns void and has no value");
 			}
 			return emitAtomicCall(expression);
 		}
 
-		if (expression.left->name == "select") {
+		if (name == "select") {
 			return emitSelectCall(expression);
 		}
 
-		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);
+		const MathBuiltin* builtin = findMathBuiltin(name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
 				"recognises, and it is not a function declared in this file");
@@ -9345,19 +9356,20 @@ namespace {
 		}
 
 		// A call whose value is dropped, which is the only way to call a void helper.
-		if (expression.kind == ExpressionKind::Call && expression.left->kind == ExpressionKind::Identifier
-			&& expression.left->name == "atomic_store_explicit") {
-			emitAtomicCall(expression);
-			return;
-		}
 		if (expression.kind == ExpressionKind::Call) {
 			const Expression* receiver = nullptr;
 			if (HelperFunction* helper = findHelper(expression, receiver)) {
 				emitHelperCall(expression, *helper, receiver);
 				return;
 			}
+			const std::string name = expression.left->kind == ExpressionKind::Identifier
+				? builtinCalleeName(expression.left->name) : std::string();
+			if (name == "atomic_store_explicit") {
+				emitAtomicCall(expression);
+				return;
+			}
 			if (expression.left->kind == ExpressionKind::Identifier
-				&& (expression.left->name == "threadgroup_barrier" || expression.left->name == "simdgroup_barrier")) {
+				&& (name == "threadgroup_barrier" || name == "simdgroup_barrier")) {
 				emitBarrierCall(expression);
 				return;
 			}

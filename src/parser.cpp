@@ -137,6 +137,31 @@ namespace {
 		return isUnpackedTypeName(text, outType) || isPackedVectorName(text, outType);
 	}
 
+	bool isMetalBuiltinTypeName(std::string_view text) {
+		ScalarKind kind;
+		if (isScalarTypeName(text, kind)) {
+			return text.front() == 'u' || text.substr(text.size() - 2) == "_t";
+		}
+		if (text == "atomic_int" || text == "atomic_uint") {
+			return true;
+		}
+		const bool packed = text.substr(0, 7) == "packed_";
+		if (packed) {
+			text.remove_prefix(7);
+		}
+		if (text.size() < 2 || text.back() < '2' || text.back() > '4') {
+			return false;
+		}
+		if (text.size() > 3 && text[text.size() - 2] == 'x') {
+			const auto leaf = text.substr(0, text.size() - 3);
+			return !packed && (leaf == "float" || leaf == "half")
+				&& text[text.size() - 3] >= '2' && text[text.size() - 3] <= '4';
+		}
+		const auto leaf = text.substr(0, text.size() - 1);
+		return leaf.find('_') == std::string_view::npos && isScalarTypeName(leaf, kind)
+			&& kind != ScalarKind::Void && kind != ScalarKind::Double;
+	}
+
 	// The vector typedefs Apple's compiler has without any include: vector_float4,
 	// simd_uint2 and the rest. They name a vector of 2 to 4 components only, so
 	// vector_float and vector_float4x4 are not types, and neither are the double
@@ -1273,7 +1298,14 @@ namespace {
 }
 
 bool Parser::resolveTypeName(std::string_view text, Type& out) const {
-	if (isTypeName(text, out) || isSimdVectorName(text, out)) {
+	std::string_view builtin = text;
+	if (text.substr(0, 7) == "metal::" && !_declared.count(std::string(text))) {
+		const auto candidate = text.substr(7);
+		if (isMetalBuiltinTypeName(candidate)) {
+			builtin = candidate;
+		}
+	}
+	if (isTypeName(builtin, out) || isSimdVectorName(text, out)) {
 		if (out.isPacked && out.scalar == ScalarKind::Bool) {
 			throw CompileError("\"" + std::string(text) + "\" is not supported: a bool vector has "
 				"no storage layout in mslc");
@@ -1305,8 +1337,8 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 		return true;
 	}
 
-	if (text == "atomic_uint" || text == "atomic_int") {
-		out.scalar = text == "atomic_uint" ? ScalarKind::UInt : ScalarKind::Int;
+	if (builtin == "atomic_uint" || builtin == "atomic_int") {
+		out.scalar = builtin == "atomic_uint" ? ScalarKind::UInt : ScalarKind::Int;
 		out.vectorWidth = 0;
 		out.matrixColumns = 0;
 		out.isPacked = false;
@@ -1908,7 +1940,7 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		// metal::name;" or a directive to metal in the namespace or in the namespaces its
 		// directives nominate): the name is the library's.
 		if (libraryVisible) {
-			return last;
+			return std::string(kStdlibNamespace) + "::" + last;
 		}
 	}
 
@@ -1916,13 +1948,6 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	// directive, unless the file extends the namespace with a name of that spelling.
 	const std::string aliasOwner = !name.global && parts.front() == kStdlibNamespace
 		? blockQualifier(parts.front(), NamespaceLookup::Qualifier) : std::string();
-	if (parts.front() == kStdlibNamespace && parts.size() > 1
-		&& (aliasOwner.empty() || _namespaces.count(aliasOwner))) {
-		if (parts.size() != 2 || last != "discard_fragment") {
-			return joinParts(parts, 1, parts.size());
-		}
-	}
-
 	if (parts.size() == 1) {
 		// "::x" names a file-scope declaration, or a builtin.
 		return last;
@@ -1979,8 +2004,10 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 				+ spelled + "\")");
 		}
 	}
-	if (!found && parts.size() == 2 && parts.front() == kStdlibNamespace && last == "discard_fragment") {
-		return "metal::discard_fragment";
+	if (parts.front() == kStdlibNamespace && parts.size() > 1
+		&& (aliasOwner.empty() || _namespaces.count(aliasOwner))
+		&& (parts.size() != 2 || last != "discard_fragment" || !found)) {
+		return joinParts(parts, 0, parts.size());
 	}
 	// mem_flags is an enum class of the standard library; the barrier lowering reads its enumerators.
 	if (!found && parts.size() == 2 && parts.front() == "mem_flags") {
