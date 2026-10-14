@@ -1633,9 +1633,16 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	if (found) {
 		std::set<std::string> seen;
 		std::set<std::string> members;
-		collectMembers(scope, last, seen, members, true);
+		bool libraryVisible = false;
+		collectMembers(scope, last, seen, members, true, &libraryVisible);
 		if (!members.empty()) {
 			return pick(members, spelled);
+		}
+		// Nothing the file declares, but the walk reached the library's names ("using
+		// metal::name;" or a directive to metal in the namespace or in the namespaces its
+		// directives nominate): the name is the library's.
+		if (libraryVisible) {
+			return last;
 		}
 	}
 
