@@ -1585,10 +1585,18 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 		// through a using declaration) is this scope's own answer too, so it joins the union
 		// like any other result (childNamespace rejects it as a namespace itself).
 		std::set<std::string> declared;
-		collectOwn(at, part, declared);
+		const std::string key = at.empty() ? part : at + "::" + part;
+		if (_declared.count(key)) {
+			declared.insert(key);
+		}
+		if (const auto entry = _scopes.find(at); entry != _scopes.end()) {
+			if (const auto brought = entry->second.declarations.find(part); brought != entry->second.declarations.end()) {
+				declared.insert(brought->second.begin(), brought->second.end());
+			}
+		}
 		for (const std::string& candidate : declared) {
 			for (const std::string_view kind : kindsOf(candidate)) {
-				if (kind == "struct" || kind == "enum" || kind == "typedef") {
+				if (kind == "struct" || kind == "enum" || kind == "typedef" || kind == kAnonymousStructTypedef) {
 					own.insert(candidate);
 				}
 			}
@@ -1731,7 +1739,20 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 	if (!found && parts.size() > 1) {
 		QualifiedName owner = name;
 		owner.parts.pop_back();
-		const std::string ownerName = resolveName(owner);
+		std::string ownerName;
+		if (owner.parts.size() > 1) {
+			const std::string enclosing = namespaceOf(owner, owner.parts.size() - 1);
+			if (!enclosing.empty()) {
+				std::set<std::string> seen;
+				const std::set<std::string> qualifiers = namespacesNamed(enclosing, owner.parts.back(), true, seen);
+				if (!qualifiers.empty()) {
+					ownerName = pick(qualifiers, spelled);
+				}
+			}
+		}
+		if (ownerName.empty()) {
+			ownerName = resolveName(owner);
+		}
 		// "S::member": a member function of a struct is named by the struct.
 		if (!name.global && _unit.findStruct(ownerName)) {
 			return ownerName + "::" + last;
