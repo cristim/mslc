@@ -14,6 +14,11 @@ import json
 import struct
 import sys
 
+# Decoration value for SpecId in the SPIR-V 1.6 grammar. Spelled out rather
+# than read from the grammar file so this stays usable as a standalone check,
+# and asserted against the grammar by tests/check_ids_test.py.
+SPECID = 1
+
 # Operand kinds that are ids, or contain ids. Kinds that are plain literals
 # (a number, a literal string, a mode bitmask) are not listed here.
 ID_KINDS = {
@@ -147,12 +152,54 @@ def main():
 
         index += count
 
+    problems += check_specid_uniqueness(words, bound, grammar["instructions"], by_opcode)
+
     if problems:
         for offset, message in problems:
             print("word %d: %s" % (offset, message))
         sys.exit(1)
 
     print("no zero or out-of-range id operands found across %d words" % len(words))
+
+
+def check_specid_uniqueness(words, bound, instructions, instructions_by_opcode):
+    """Reports a SpecId claimed by more than one constant.
+
+    spirv-val accepts a module with two constants decorated SpecId 0, so a
+    driver picks one and the module silently reads whichever it picked. indium
+    writes constantID 0, 1, 2 once per pipeline against the module it was
+    given, so exactly three constants may claim those ids and every
+    OpExecutionModeId LocalSizeId must name those same three.
+    """
+    problems = []
+
+    owners = {}
+    # Words 0..4 are the header (magic, version, generator, bound, schema).
+    index = 5
+    while index < len(words):
+        count = words[index] >> 16
+        opcode = words[index] & 0xFFFF
+        if count == 0:
+            break
+        operands = words[index + 1:index + count]
+        instruction = instructions_by_opcode.get(opcode)
+        if instruction and instruction["opname"] == "OpDecorate":
+            # OpDecorate Target Decoration, then Decoration-specific literals.
+            if len(operands) >= 2 and operands[1] == SPECID:
+                spec_id = operands[2] if len(operands) >= 3 else None
+                target = operands[0]
+                if spec_id is not None:
+                    owners.setdefault(spec_id, []).append(target)
+        index += count
+
+    for spec_id in sorted(owners):
+        targets = owners[spec_id]
+        if len(targets) > 1:
+            problems.append((0, "SpecId %d is claimed by %d constants (%s); indium writes "
+                                "constantID once per pipeline, so a driver picks one and "
+                                "the rest are dead" % (spec_id, len(targets),
+                                                      ", ".join("%%%d" % t for t in targets))))
+    return problems
 
 
 if __name__ == "__main__":

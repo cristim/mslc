@@ -59,6 +59,17 @@ add_test(NAME tools/check-ids-multiword-entry-name
 		${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv.core.grammar.json
 		${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_entry_name.metal)
 
+# A module with several kernels has one set of SpecId decorations for the whole
+# module. Two constants claiming one SpecId is accepted by spirv-val and
+# resolved arbitrarily by a driver, so tools/check_ids.py reports it and this
+# test covers the helper against both a correct module and that one.
+add_test(NAME tools/check-ids-duplicate-specid
+	COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_specid_test.py $<TARGET_FILE:mslc-cli>
+		${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ids.py
+		${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv.core.grammar.json
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/several_kernels_one_module.metal
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_duplicate_specid.spvasm)
+
 # Tests that validate SPIR-V fail, never skip, when this is not found.
 find_program(SPIRV_VAL spirv-val)
 if(NOT SPIRV_VAL)
