@@ -1626,7 +1626,7 @@ std::string Parser::canonicalNamespace(const std::string& path) const {
 }
 
 std::set<std::string> Parser::namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
-	std::set<std::string>& seen, NamespaceLookup mode) const {
+	std::set<std::string>& seen, NamespaceLookup mode, bool* aliases) const {
 	// [namespace.qual], the same tier order collectMembers (above) walks for other names: the
 	// namespaces of "scope"; only when it has none, for a qualified name, what each of its
 	// using directives (an anonymous namespace's included) finds, each on its own.
@@ -1642,6 +1642,9 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 			own.insert(found);
 			if (!_namespaceAliases.count(key)) {
 				continue;
+			}
+			if (aliases) {
+				*aliases = true;
 			}
 		}
 		if (mode == NamespaceLookup::NamespaceOnly) {
@@ -1674,7 +1677,7 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	for (const std::string& at : set) {
 		if (const auto entry = _scopes.find(at); entry != _scopes.end()) {
 			for (const std::string& directive : entry->second.directives) {
-				const std::set<std::string> through = namespacesNamed(directive, part, true, seen, mode);
+				const std::set<std::string> through = namespacesNamed(directive, part, true, seen, mode, aliases);
 				found.insert(through.begin(), through.end());
 			}
 		}
@@ -1725,6 +1728,91 @@ std::string Parser::blockQualifier(const std::string& part, NamespaceLookup mode
 		}
 		return alias->second;
 	}
+	QualifiedName name;
+	name.parts.push_back(part);
+	return aliasQualifier(name, mode);
+}
+
+std::vector<Parser::NamespaceTier> Parser::namespaceTiers(const QualifiedName& name, NamespaceLookup mode) const {
+	std::vector<NamespaceTier> tiers;
+	const size_t outermost = name.global ? 0 : _namespacePath.size();
+	for (size_t depth = outermost + 1; depth-- > 0;) {
+		NamespaceTier tier;
+		const std::string level = namespacePrefix(depth);
+		std::set<std::string> seen;
+		tier.found = namespacesNamed(level, name.parts[0], name.global, seen, mode, &tier.aliases);
+		if (!name.global) {
+			// Transitive nominations retain the original directive's writer, which
+			// determines where their candidates join the unqualified lookup tier.
+			const auto nominated = [&](const std::string& from, const std::string& target) {
+				std::vector<std::string> targets = {target};
+				std::set<std::string> visited;
+				for (size_t i = 0; i < targets.size(); ++i) {
+					if (!visited.insert(targets[i]).second) {
+						continue;
+					}
+					if (nearestCommon(from, targets[i]) == level) {
+						std::set<std::string> ownSeen;
+						const auto found = namespacesNamed(targets[i], name.parts[0], false, ownSeen, mode, &tier.aliases);
+						tier.found.insert(found.begin(), found.end());
+					}
+					if (const auto entry = _scopes.find(targets[i]); entry != _scopes.end()) {
+						targets.insert(targets.end(), entry->second.directives.begin(), entry->second.directives.end());
+					}
+				}
+			};
+			for (size_t user = 0; user <= _namespacePath.size(); ++user) {
+				const std::string from = namespacePrefix(user);
+				if (const auto entry = _scopes.find(from); entry != _scopes.end()) {
+					for (const std::string& target : entry->second.directives) {
+						nominated(from, target);
+					}
+				}
+			}
+			const std::string function = namespacePrefix(_namespacePath.size());
+			for (const BlockScope& block : _blocks) {
+				for (const std::string& target : block.directives) {
+					nominated(function, target);
+				}
+			}
+		}
+		tiers.push_back(std::move(tier));
+	}
+	return tiers;
+}
+
+std::string Parser::aliasQualifier(const QualifiedName& name, NamespaceLookup mode) const {
+	bool aliasLookup = false;
+	for (const auto& tier : namespaceTiers(name, NamespaceLookup::NamespaceOnly)) {
+		if (!tier.found.empty()) {
+			aliasLookup = tier.aliases;
+			break;
+		}
+	}
+	if (!aliasLookup) {
+		return {};
+	}
+	const std::string& part = name.parts[0];
+	if (!name.global && mode == NamespaceLookup::Qualifier) {
+		for (auto block = _blocks.rbegin(); block != _blocks.rend(); ++block) {
+			if (const auto binding = block->names.find(part); binding != block->names.end()) {
+				for (const std::string_view kind : kindsOf(binding->second)) {
+					if (kind == "struct" || kind == "enum" || kind == "typedef" || kind == kAnonymousStructTypedef) {
+						return binding->second;
+					}
+				}
+			}
+		}
+	}
+	for (const auto& tier : namespaceTiers(name, mode)) {
+		if (tier.found.size() > 1) {
+			throw CompileError("reference to \"" + part + "\" is ambiguous: it names " + *tier.found.begin()
+				+ " and " + *std::next(tier.found.begin()));
+		}
+		if (!tier.found.empty()) {
+			return *tier.found.begin();
+		}
+	}
 	return {};
 }
 
@@ -1733,9 +1821,7 @@ std::string Parser::blockQualifier(const std::string& part, NamespaceLookup mode
 std::string Parser::namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode) const {
 	const std::vector<std::string>& parts = name.parts;
 	const size_t outermost = name.global ? 0 : _namespacePath.size();
-	// Later parts follow the namespace's using directives (#279), the same walk
-	// collectMembers uses for other names; the first part's lookup is unchanged, left
-	// to #295 by decision.
+	// Later parts use qualified own hiding; alias first parts use lexical unions.
 	const auto rest = [&](std::string scope) {
 		for (size_t part = 1; part < count; ++part) {
 			scope = childNamespace(scope, parts[part], true, mode);
@@ -1749,7 +1835,10 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 		if (const std::string candidate = blockQualifier(parts[0], mode); !candidate.empty()) {
 			return _namespaces.count(candidate) ? rest(candidate) : std::string();
 		}
+	} else if (const std::string candidate = aliasQualifier(name, mode); !candidate.empty()) {
+		return _namespaces.count(candidate) ? rest(candidate) : std::string();
 	}
+	// Non-alias lookup retains its existing first-match behavior pending #295/#321.
 	for (size_t depth = outermost + 1; depth-- > 0;) {
 		// A namespace that a using directive nominated is searched as well; a block's
 		// directive at the level where its names appear, as resolveName places them.
@@ -1825,7 +1914,10 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 
 	// "metal::sin" is the standard library's "sin", with or without a using
 	// directive, unless the file extends the namespace with a name of that spelling.
-	if (parts.front() == kStdlibNamespace && parts.size() > 1) {
+	const std::string aliasOwner = !name.global && parts.front() == kStdlibNamespace
+		? blockQualifier(parts.front(), NamespaceLookup::Qualifier) : std::string();
+	if (parts.front() == kStdlibNamespace && parts.size() > 1
+		&& (aliasOwner.empty() || _namespaces.count(aliasOwner))) {
 		if (parts.size() != 2 || last != "discard_fragment") {
 			return joinParts(parts, 1, parts.size());
 		}
@@ -1850,8 +1942,9 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 			}
 		}
 		if (ownerName.empty()) {
-			if (!owner.global && owner.parts.size() == 1) {
-				const std::string candidate = blockQualifier(owner.parts[0], NamespaceLookup::Qualifier);
+			if (owner.parts.size() == 1) {
+				const std::string candidate = owner.global ? aliasQualifier(owner, NamespaceLookup::Qualifier)
+					: blockQualifier(owner.parts[0], NamespaceLookup::Qualifier);
 				if (!candidate.empty() && !_namespaces.count(candidate)) {
 					ownerName = candidate;
 				}

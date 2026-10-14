@@ -208,13 +208,19 @@ private:
 	std::string qualify(const std::string& name) const;
 	std::string namespacePrefix(size_t depth) const;
 	enum class NamespaceLookup { Qualifier, NamespaceOnly };
+	struct NamespaceTier {
+		std::set<std::string> found;
+		bool aliases = false;
+	};
+	std::vector<NamespaceTier> namespaceTiers(const QualifiedName& name, NamespaceLookup mode) const;
+	std::string aliasQualifier(const QualifiedName& name, NamespaceLookup mode) const;
 	std::string blockQualifier(const std::string& part, NamespaceLookup mode) const;
 	std::string namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode = NamespaceLookup::Qualifier) const;
 	// The namespace a path names, or "" if it names none.
 	std::string canonicalNamespace(const std::string& path) const;
 	// The namespaces "part" names from "scope", by the walk namespaceOf's later parts use.
 	std::set<std::string> namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
-		std::set<std::string>& seen, NamespaceLookup mode) const;
+		std::set<std::string>& seen, NamespaceLookup mode, bool* aliases = nullptr) const;
 	// The one namespace "part" names inside "scope" ("" if none); several is ambiguous.
 	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified, NamespaceLookup mode) const;
 
