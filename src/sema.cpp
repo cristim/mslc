@@ -4275,11 +4275,21 @@ namespace {
 	// relaxed, which would compile and run with weaker guarantees than the
 	// source asked for.
 	void Emitter::requireRelaxedOrder(const Expression& order, const std::string& callee) {
+		// Metal's atomic builtins take memory_order_relaxed and nothing else:
+		// xcrun -sdk macosx metal reports "use of undeclared identifier
+		// 'memory_order_acquire'", and the same for release and acq_rel. So this
+		// is not narrowing a set Metal supports, it is refusing to invent a name
+		// Apple does not have.
+		//
+		// It is also the only order mslc lowers, because a load that had to carry
+		// acquire semantics has no single OpAtomicLoad: Vulkan accepts
+		// OpAtomicLoad at Acquire with a storage-class semantics bit set
+		// (VUID-StandaloneSpirv-MemorySemantics-10870), but Release and
+		// AcquireRelease are refused outright (-10868), so a full mapping needs
+		// more than one instruction and is not a silent rewrite away.
 		if (order.kind != ExpressionKind::Identifier || order.name != "memory_order_relaxed") {
-			throw CompileError(callee + " with a memory order other than memory_order_relaxed "
-				"is not lowered yet; Vulkan refuses OpAtomicLoad under any non-relaxed order, "
-				"and no atomic instruction gives the acquire and release guarantees the other "
-				"orders ask for");
+			throw CompileError(callee + " takes memory_order_relaxed, which is the only order "
+				"Metal's atomic builtins have; \"" + order.name + "\" is not one");
 		}
 	}
 
