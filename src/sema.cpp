@@ -1503,26 +1503,31 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 	}
 
 	if (!found.empty()) {
-		// Two compute entry points cannot share a module. The workgroup size is
-		// three spec constants at SpecId 0, 1, 2, and indium writes constantID
-		// 0, 1, 2 once per pipeline against the module it was handed, so there is
-		// one set of ids per module and no way to specialise the second entry
-		// point. Declaring a second set would leave two decorated constants per
-		// id, which spirv-val accepts and no driver can resolve. One vertex and
-		// one fragment is the shape indium builds, and it is fine.
-		size_t kernels = 0;
+		// Two entry points of one module cannot share a name: Vulkan's validation
+		// rule is that entry points are identified by name within an execution
+		// model, and a module with two of the same is rejected with "Entry points
+		// cannot share the same name and ExecutionMode". This is reachable now
+		// that a module may carry several kernels, since a header holding a
+		// kernel and included twice declares it twice.
+		std::set<std::string> names;
 		for (const FunctionDecl* function: found) {
-			if (function->stage == Stage::Kernel) {
-				kernels++;
+			if (!names.insert(function->name).second) {
+				throw CompileError("two entry points are named \"" + function->name
+					+ "\"; a module may have several kernels, but entry points are "
+					"identified by name within one execution model, so the names must differ");
 			}
 		}
 
-		if (kernels > 1) {
-			throw CompileError("a source may declare one kernel; mslc has no way to give a "
-				"second one its own workgroup size, because indium specialises one set of "
-				"three constants per module");
-		}
-
+		// A kernel's workgroup size is OpExecutionModeId LocalSizeId over three
+		// spec constants at SpecId 0, 1, 2, and indium writes constantID 0, 1, 2
+		// once per pipeline against the module it was handed, so there is one
+		// set of ids per module. That is why a module carries one size, and it
+		// is also why it can carry several kernels: they all read the same
+		// three constants, and [[threads_per_threadgroup]] reads that same size
+		// rather than naming one of its own.
+		//
+		// A second set of spec constants is still not emitted: two decorated
+		// constants per SpecId validate and no driver can resolve them.
 		return found;
 	}
 
@@ -9844,23 +9849,29 @@ namespace {
 			// given, so a second compute entry point declaring its own 0, 1, 2 would
 			// leave two decorated constants per id, which spirv-val accepts and no
 			// driver can resolve: both entry points would read whichever the driver
-			// picked. A module with more than one compute entry point is refused
-			// below rather than given a second set.
-			const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeX });
-			const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeY });
-			const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
-				{ _options.localSizeZ });
-			_localSize[0] = x;
-			_localSize[1] = y;
-			_localSize[2] = z;
-			_builder.emit(spirv::OpDecorate, { x,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
-			_builder.emit(spirv::OpDecorate, { y,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 1u });
-			_builder.emit(spirv::OpDecorate, { z,
-				static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
+			// picked.
+			//
+			// Created once and reused, so a module with several kernels still has
+			// exactly three SpecId decorations and every LocalSizeId names the same
+			// three ids. Emitting a second set is not a validation error, which is
+			// why this has to be checked here and not by the suite alone.
+			if (_localSize[0] == InvalidId) {
+				const Id x = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+					{ _options.localSizeX });
+				const Id y = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+					{ _options.localSizeY });
+				const Id z = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType,
+					{ _options.localSizeZ });
+				_localSize[0] = x;
+				_localSize[1] = y;
+				_localSize[2] = z;
+				_builder.emit(spirv::OpDecorate, { x,
+					static_cast<uint32_t>(spirv::Decoration::SpecId), 0u });
+				_builder.emit(spirv::OpDecorate, { y,
+					static_cast<uint32_t>(spirv::Decoration::SpecId), 1u });
+				_builder.emit(spirv::OpDecorate, { z,
+					static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
+			}
 
 			// OpExecutionModeId, not OpExecutionMode: a mode whose extra operands
 			// are ids has its own instruction, and OpExecutionMode rejects id
@@ -9871,7 +9882,8 @@ namespace {
 			// in the wrong section and is ignored.
 			_builder.setSection(spirv::Section::ExecutionModes);
 			_builder.emit(spirv::OpExecutionModeId, { _entryPointId,
-				static_cast<uint32_t>(spirv::ExecutionMode::LocalSizeId), x, y, z });
+				static_cast<uint32_t>(spirv::ExecutionMode::LocalSizeId),
+				_localSize[0], _localSize[1], _localSize[2] });
 		}
 
 		if (_entryPoint->stage == Stage::Fragment) {

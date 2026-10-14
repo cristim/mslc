@@ -1,0 +1,76 @@
+; SPIR-V
+; Version: 1.5
+; Generator: Khronos; 0
+; Bound: 74
+; Schema: 0
+               OpCapability Shader
+               OpCapability PhysicalStorageBufferAddresses
+               OpMemoryModel PhysicalStorageBuffer64 GLSL450
+               OpEntryPoint GLCompute %26 "a" %gl_GlobalInvocationID %23
+               OpEntryPoint GLCompute %52 "b" %gl_GlobalInvocationID_0 %23
+               OpExecutionModeId %26 LocalSizeId %28 %29 %30
+               OpExecutionModeId %52 LocalSizeId %54 %55 %56
+               OpDecorate %_runtimearr_int ArrayStride 4
+               OpDecorate %_struct_11 Block
+               OpMemberDecorate %_struct_11 0 Offset 0
+               OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+               OpDecorate %_struct_19 Block
+               OpMemberDecorate %_struct_19 0 Offset 0
+               OpDecorate %23 DescriptorSet 0
+               OpDecorate %23 Binding 0
+               OpDecorate %28 SpecId 0
+               OpDecorate %29 SpecId 1
+               OpDecorate %30 SpecId 2
+               OpDecorate %gl_GlobalInvocationID_0 BuiltIn GlobalInvocationId
+               OpDecorate %54 SpecId 0
+               OpDecorate %55 SpecId 1
+               OpDecorate %56 SpecId 2
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+       %void = OpTypeVoid
+          %8 = OpTypeFunction %void
+%_runtimearr_int = OpTypeRuntimeArray %int
+ %_struct_11 = OpTypeStruct %_runtimearr_int
+     %v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input
+%_ptr_PhysicalStorageBuffer__struct_11 = OpTypePointer PhysicalStorageBuffer %_struct_11
+ %_struct_19 = OpTypeStruct %_ptr_PhysicalStorageBuffer__struct_11
+%_ptr_Uniform__struct_19 = OpTypePointer Uniform %_struct_19
+         %23 = OpVariable %_ptr_Uniform__struct_19 Uniform
+         %28 = OpSpecConstant %uint 1
+         %29 = OpSpecConstant %uint 1
+         %30 = OpSpecConstant %uint 1
+%_ptr_Uniform__ptr_PhysicalStorageBuffer__struct_11 = OpTypePointer Uniform %_ptr_PhysicalStorageBuffer__struct_11
+     %uint_0 = OpConstant %uint 0
+%_ptr_PhysicalStorageBuffer_int = OpTypePointer PhysicalStorageBuffer %int
+   %uint_0_0 = OpConstant %uint 0
+      %int_1 = OpConstant %int 1
+%gl_GlobalInvocationID_0 = OpVariable %_ptr_Input_v3uint Input
+         %54 = OpSpecConstant %uint 1
+         %55 = OpSpecConstant %uint 1
+         %56 = OpSpecConstant %uint 1
+   %uint_0_1 = OpConstant %uint 0
+   %uint_0_2 = OpConstant %uint 0
+      %int_2 = OpConstant %int 2
+         %26 = OpFunction %void None %8
+         %35 = OpLabel
+         %39 = OpAccessChain %_ptr_Uniform__ptr_PhysicalStorageBuffer__struct_11 %23 %uint_0
+         %40 = OpLoad %_ptr_PhysicalStorageBuffer__struct_11 %39
+         %41 = OpLoad %v3uint %gl_GlobalInvocationID
+         %42 = OpCompositeExtract %uint %41 0
+         %45 = OpAccessChain %_ptr_PhysicalStorageBuffer_int %40 %uint_0_0 %42
+               OpStore %45 %int_1 Aligned 4
+               OpReturn
+               OpFunctionEnd
+         %52 = OpFunction %void None %8
+         %61 = OpLabel
+         %64 = OpAccessChain %_ptr_Uniform__ptr_PhysicalStorageBuffer__struct_11 %23 %uint_0_1
+         %65 = OpLoad %_ptr_PhysicalStorageBuffer__struct_11 %64
+         %66 = OpLoad %v3uint %gl_GlobalInvocationID_0
+         %67 = OpCompositeExtract %uint %66 0
+         %69 = OpAccessChain %_ptr_PhysicalStorageBuffer_int %65 %uint_0_2 %67
+               OpStore %69 %int_2 Aligned 4
+               OpReturn
+               OpFunctionEnd
