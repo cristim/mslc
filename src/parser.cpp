@@ -534,6 +534,16 @@ void Parser::parseNamespaceAlias() {
 	if (target.empty()) {
 		throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 	}
+	if (!_blocks.empty()) {
+		if (_blocks.back().names.count(name)) {
+			throw CompileError("\"" + name + "\" is declared and cannot also be a namespace alias");
+		}
+		if (const auto [entry, inserted] = _blocks.back().aliases.emplace(name, target); !inserted && entry->second != target) {
+			throw CompileError("redefinition of \"" + name + "\" as an alias of another namespace (\"" + target
+				+ "\", was \"" + entry->second + "\")");
+		}
+		return;
+	}
 	const std::string qualified = qualify(name);
 	if (qualified == kStdlibNamespace) {
 		throw CompileError("redefinition of \"metal\": it is the standard library's namespace");
@@ -1428,6 +1438,9 @@ void Parser::rejectUsingConflict(const std::string& name, std::string_view what,
 }
 
 void Parser::declareLocal(const std::string& name) {
+	if (!_blocks.empty() && _blocks.back().aliases.count(name)) {
+		throw CompileError("\"" + name + "\" conflicts with a namespace alias in the same scope");
+	}
 	// A name that resolves to a declaration inside a namespace is hidden the same way. A
 	// declaration is not a use, so several declarations the name finds are not ambiguous.
 	const std::string* bound = blockName(name);
@@ -1686,6 +1699,35 @@ std::string Parser::childNamespace(const std::string& scope, const std::string& 
 	return *found.begin();
 }
 
+std::string Parser::blockQualifier(const std::string& part, NamespaceLookup mode) const {
+	for (auto aliasBlock = _blocks.rbegin(); aliasBlock != _blocks.rend(); ++aliasBlock) {
+		const auto alias = aliasBlock->aliases.find(part);
+		if (alias == aliasBlock->aliases.end()) {
+			continue;
+		}
+		if (mode == NamespaceLookup::Qualifier) {
+			for (auto block = _blocks.rbegin();; ++block) {
+				if (const auto binding = block->names.find(part); binding != block->names.end()) {
+					for (const std::string_view kind : kindsOf(binding->second)) {
+						if (kind == "struct" || kind == "enum" || kind == "typedef" || kind == kAnonymousStructTypedef) {
+							if (block != aliasBlock) {
+								return binding->second;
+							}
+							throw CompileError("reference to \"" + part + "\" is ambiguous: it names "
+								+ alias->second + " and " + binding->second);
+						}
+					}
+				}
+				if (block == aliasBlock) {
+					break;
+				}
+			}
+		}
+		return alias->second;
+	}
+	return {};
+}
+
 // The namespace the first "count" parts of a name spell, found from the current
 // namespace outward (or from the file, after a leading "::"), or "" when there is none.
 std::string Parser::namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode) const {
@@ -1703,6 +1745,11 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 		}
 		return scope;
 	};
+	if (!name.global) {
+		if (const std::string candidate = blockQualifier(parts[0], mode); !candidate.empty()) {
+			return _namespaces.count(candidate) ? rest(candidate) : std::string();
+		}
+	}
 	for (size_t depth = outermost + 1; depth-- > 0;) {
 		// A namespace that a using directive nominated is searched as well; a block's
 		// directive at the level where its names appear, as resolveName places them.
@@ -1799,6 +1846,14 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 				const std::set<std::string> qualifiers = namespacesNamed(enclosing, owner.parts.back(), true, seen, NamespaceLookup::Qualifier);
 				if (!qualifiers.empty()) {
 					ownerName = pick(qualifiers, spelled);
+				}
+			}
+		}
+		if (ownerName.empty()) {
+			if (!owner.global && owner.parts.size() == 1) {
+				const std::string candidate = blockQualifier(owner.parts[0], NamespaceLookup::Qualifier);
+				if (!candidate.empty() && !_namespaces.count(candidate)) {
+					ownerName = candidate;
 				}
 			}
 		}
@@ -3122,6 +3177,13 @@ StatementPtr Parser::parseStatement() {
 
 	if (at(TokenKind::Semicolon)) {
 		advance();
+		statement->kind = StatementKind::ExpressionStatement;
+		return statement;
+	}
+
+	if (atKeyword("namespace") && lookahead().kind == TokenKind::Identifier && lookahead(2).kind == TokenKind::Assign) {
+		advance();
+		parseNamespaceAlias();
 		statement->kind = StatementKind::ExpressionStatement;
 		return statement;
 	}
