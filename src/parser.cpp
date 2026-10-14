@@ -1513,7 +1513,8 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 		return;
 	}
 	// [namespace.qual]: a qualified name searches a namespace's directives only when
-	// the namespace itself declares nothing of that name.
+	// the namespace itself declares nothing of that name. namespacesNamed (below) walks a
+	// namespace name the same way, through canonicalNamespace instead of collectOwn.
 	std::set<std::string> own;
 	collectOwn(scope, name, own);
 	found.insert(own.begin(), own.end());
@@ -1560,11 +1561,88 @@ std::string Parser::namespacePrefix(size_t depth) const {
 	return joinParts(_namespacePath, 0, depth);
 }
 
+std::string Parser::canonicalNamespace(const std::string& path) const {
+	return _namespaces.count(path) ? path : std::string();
+}
+
+std::set<std::string> Parser::namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
+	std::set<std::string>& seen) const {
+	// [namespace.qual], the same tier order collectMembers (above) walks for other names: the
+	// namespaces of "scope"; only when it has none, for a qualified name, what each of its
+	// using directives (an anonymous namespace's included) finds, each on its own.
+	if (!seen.insert(scope).second) {
+		return {};
+	}
+	const std::vector<std::string> set = {scope};   // the own tier; an inline namespace of it is added later
+	std::set<std::string> own;
+	for (const std::string& at : set) {
+		seen.insert(at);
+		if (std::string found = canonicalNamespace(at.empty() ? part : at + "::" + part); !found.empty()) {
+			own.insert(found);
+			continue;
+		}
+		// [basic.lookup.qual]/1: a struct, enum or typedef "part" names here (directly or
+		// through a using declaration) is this scope's own answer too, so it joins the union
+		// like any other result (childNamespace rejects it as a namespace itself).
+		std::set<std::string> declared;
+		collectOwn(at, part, declared);
+		for (const std::string& candidate : declared) {
+			for (const std::string_view kind : kindsOf(candidate)) {
+				if (kind == "struct" || kind == "enum" || kind == "typedef") {
+					own.insert(candidate);
+				}
+			}
+		}
+	}
+	if (!own.empty() || !qualified) {
+		return own;
+	}
+	std::set<std::string> found;
+	for (const std::string& at : set) {
+		if (const auto entry = _scopes.find(at); entry != _scopes.end()) {
+			for (const std::string& directive : entry->second.directives) {
+				const std::set<std::string> through = namespacesNamed(directive, part, true, seen);
+				found.insert(through.begin(), through.end());
+			}
+		}
+	}
+	return found;
+}
+
+std::string Parser::childNamespace(const std::string& scope, const std::string& part, bool qualified) const {
+	std::set<std::string> seen;
+	const std::set<std::string> found = namespacesNamed(scope, part, qualified, seen);
+	if (found.size() > 1) {
+		throw CompileError("reference to the namespace \"" + part + "\" "
+			+ (scope.empty() ? std::string("at file scope") : "in \"" + scope + "\"") + " is ambiguous: it names "
+			+ *found.begin() + " and " + *std::next(found.begin()));
+	}
+	// A struct, enum or typedef namespacesNamed found (not a namespace) is not an answer
+	// here, only a competitor for ambiguity above: whatever named it is resolved through
+	// resolveName's own fallback instead.
+	if (found.empty() || !_namespaces.count(*found.begin())) {
+		return std::string();
+	}
+	return *found.begin();
+}
+
 // The namespace the first "count" parts of a name spell, found from the current
 // namespace outward (or from the file, after a leading "::"), or "" when there is none.
 std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
 	const std::vector<std::string>& parts = name.parts;
 	const size_t outermost = name.global ? 0 : _namespacePath.size();
+	// Later parts follow the namespace's using directives (#279), the same walk
+	// collectMembers uses for other names; the first part's lookup is unchanged, left
+	// to #295 by decision.
+	const auto rest = [&](std::string scope) {
+		for (size_t part = 1; part < count; ++part) {
+			scope = childNamespace(scope, parts[part], true);
+			if (scope.empty()) {
+				return std::string();
+			}
+		}
+		return scope;
+	};
 	for (size_t depth = outermost + 1; depth-- > 0;) {
 		// A namespace that a using directive nominated is searched as well; a block's
 		// directive at the level where its names appear, as resolveName places them.
@@ -1581,16 +1659,8 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
 		}
 		std::set<std::string> seen;
 		for (size_t i = 0; i < bases.size(); ++i) {
-			const std::string candidate = bases[i].empty() ? parts[0] : bases[i] + "::" + parts[0];
-			if (_namespaces.count(candidate)) {
-				std::string scope = candidate;
-				for (size_t part = 1; part < count; ++part) {
-					scope += "::" + parts[part];
-					if (!_namespaces.count(scope)) {
-						return "";
-					}
-				}
-				return scope;
+			if (const std::string candidate = childNamespace(bases[i], parts[0], false); !candidate.empty()) {
+				return rest(candidate);
 			}
 			if (!seen.insert(bases[i]).second) {
 				continue;

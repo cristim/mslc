@@ -206,6 +206,13 @@ private:
 	std::string qualify(const std::string& name) const;
 	std::string namespacePrefix(size_t depth) const;
 	std::string namespaceOf(const QualifiedName& name, size_t count) const;
+	// The namespace a path names, or "" if it names none.
+	std::string canonicalNamespace(const std::string& path) const;
+	// The namespaces "part" names from "scope", by the walk namespaceOf's later parts use.
+	std::set<std::string> namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
+		std::set<std::string>& seen) const;
+	// The one namespace "part" names inside "scope" ("" if none); several is ambiguous.
+	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified) const;
 
 	void parseNamespace();
 	void parseUsing();
