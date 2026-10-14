@@ -6750,6 +6750,10 @@ namespace {
 							return spirv::BuiltIn::GlobalInvocationId;
 						case ParameterAttributes::Builtin::ThreadPositionInThreadgroup:
 							return spirv::BuiltIn::LocalInvocationId;
+						// The linear index within the workgroup, which is what
+						// Metal names, rather than a position within it.
+						case ParameterAttributes::Builtin::ThreadIndexInThreadgroup:
+							return spirv::BuiltIn::LocalInvocationIndex;
 						case ParameterAttributes::Builtin::ThreadgroupPositionInGrid:
 							return spirv::BuiltIn::WorkgroupId;
 						// Vulkan forbids VertexId and InstanceId. The Index forms
@@ -6775,6 +6779,12 @@ namespace {
 				switch (spvBuiltin) {
 					case spirv::BuiltIn::VertexIndex:
 					case spirv::BuiltIn::InstanceIndex:
+						typeId = _types.scalar(ScalarKind::UInt);
+						break;
+					// A scalar, unlike the compute ids above: LocalInvocationIndex
+					// is a linear index within the workgroup, so there is no
+					// component to extract and declaring it uvec3 would be wrong.
+					case spirv::BuiltIn::LocalInvocationIndex:
 						typeId = _types.scalar(ScalarKind::UInt);
 						break;
 					case spirv::BuiltIn::FragCoord:
