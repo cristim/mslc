@@ -1,20 +1,16 @@
 // EXPECT: valid
-// One set of SpecIds for the whole module, so every kernel's LocalSizeId names
-// the same three constants. indium writes constantID 0, 1, 2 once per pipeline
-// against the module it was handed; two decorated constants per SpecId leaves it
-// undefined which one a driver binds, and the kernels would read different
-// sizes.
+// Every kernel in a module carries a LocalSizeId naming three ids.
 //
-// spirv-val ACCEPTS a module with two constants per SpecId, so validity is not
-// evidence here. Neither is a DISASM-NOT: both sets carry the same "SpecId 0"
-// text, so a second set cannot be excluded by substring, and the probe runner
-// has no needle that counts occurrences.
+// This probe does NOT pin that those three ids are the same across kernels,
+// which is the property that matters. The probe runner's needles are substring
+// matches, so two identical patterns both match the first instruction and a
+// module with three kernels would satisfy both from one of them, and no needle
+// available here can compare two instructions' operands. tools/check_ids_specid_test.py
+// is what checks that property, by counting SpecId decorations; run it, don't
+// read this file as evidence for it.
 //
-// So this states the weaker thing it can actually pin: every kernel in the
-// module carries a LocalSizeId naming three ids. The count of SpecId
-// decorations is checked by mutation rather than by this file: reverting the
-// shared set fails it.
-// DISASM-MATCH: OpExecutionModeId %[0-9]+ LocalSizeId %[0-9]+ %[0-9]+ %[0-9]+
+// What this file does say is that a module with several kernels names a
+// workgroup size for each of them.
 // DISASM-MATCH: OpExecutionModeId %[0-9]+ LocalSizeId %[0-9]+ %[0-9]+ %[0-9]+
 #include <metal_stdlib>
 using namespace metal;

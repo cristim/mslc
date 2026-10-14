@@ -64,6 +64,11 @@ def main():
             sys.exit("mslc did not compile %s: %s%s" % (source, built.stdout, built.stderr))
 
         owners = specid_owners(good.read_bytes())
+        # The three ids indium writes. Without this, a module carrying no
+        # SpecId at all would leave owners empty and the loop below would pass.
+        if set(owners) != {0, 1, 2}:
+            sys.exit("expected the module to declare SpecId 0, 1 and 2, found %s"
+                     % (sorted(owners) or "none"))
         for spec_id in sorted(owners):
             if len(owners[spec_id]) != 1:
                 sys.exit("the compiler emitted %d constants for SpecId %d, so this test "
