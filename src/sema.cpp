@@ -6848,6 +6848,25 @@ namespace {
 						"scalar or a vector of two or three of them");
 				}
 
+				// LocalInvocationIndex is the odd one out: it is a linear index
+				// rather than a position, so Apple takes it as a uint or ushort
+				// SCALAR and rejects every vector, including uint2 and uint3. Left
+				// to the compute-id rule above it would over-accept float, int, bool
+				// and half, and a uint3 would fall through to the swizzle check and
+				// be reported as ".x swizzles a value that is not a vector", which
+				// names neither the attribute nor the real problem.
+				//
+				// A scalar is vectorWidth 0, not 1: the compute-id rule above reads
+				// "== 1" as the scalar to reject.
+				if (spvBuiltin == spirv::BuiltIn::LocalInvocationIndex
+					&& (parameter.type.vectorWidth > 0
+						|| (parameter.type.scalar != ScalarKind::UInt
+							&& parameter.type.scalar != ScalarKind::UShort))) {
+					throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+						builtinName(*parameter.attributes.builtin) + "]], which has to be a uint or ushort "
+						"scalar");
+				}
+
 				_builder.setSection(spirv::Section::Annotations);
 				_builder.emit(spirv::OpDecorate, { id,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
