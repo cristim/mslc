@@ -1,4 +1,4 @@
-// EXPECT: error "sqrt" conflicts with the using declaration of "sqrt" in the same scope
+// EXPECT: error "sqrt" conflicts with the using declaration of "metal::sqrt" in the same scope
 // A block's using declaration of a stdlib name occupies the name in that block, exactly
 // as a using declaration of a user name does, so a local of the same name conflicts.
 #include <metal_stdlib>
