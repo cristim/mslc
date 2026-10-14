@@ -73,6 +73,23 @@ namespace {
 	// that way, and "float0" is not a type. A matrix is "floatCxR" or "halfCxR"
 	// with C and R from 2 to 4; MSL has no matrix of any other scalar.
 	bool isUnpackedTypeName(std::string_view text, Type& outType) {
+		// atomic_uint is a type name but not a cast target and not a scalar
+		// spelling the vector and matrix suffixes attach to: Metal declares it
+		// once and an atomic_fetch_add on a plain uint* is not the same type.
+		// It is checked here rather than in scalarTypeNames(), which also feeds
+		// isCastTypeName() and would make atomic_uint a cast target.
+		//
+		// It is marked with its own flag rather than by putting "atomic_uint" in
+		// namedType: a non-empty namedType routes the parameter through struct
+		// lookup, which then reports an undeclared struct of that name. The flag
+		// survives into the emitter, where atomic_uint* and uint* are otherwise
+		// the same SPIR-V pointer type.
+		if (text == "atomic_uint") {
+			outType.scalar = ScalarKind::UInt;
+			outType.isAtomic = true;
+			return true;
+		}
+
 		ScalarKind kind;
 		if (isScalarTypeName(text, kind)) {
 			outType.scalar = kind;

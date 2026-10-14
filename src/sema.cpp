@@ -1950,6 +1950,9 @@ namespace {
 		std::map<Id, Id> _boolAddresses;
 
 		Id _uintType = InvalidId;
+		// The scope and order constants the atomic instructions take, created once.
+		Id _atomicScope = InvalidId;
+		Id _atomicRelaxed = InvalidId;
 		Id _intType = InvalidId;
 		Id _boolType = InvalidId;
 		Id _voidType = InvalidId;
@@ -2163,6 +2166,13 @@ namespace {
 		// tells a member read on one apart from a member read on a local.
 		const ConstantBinding* constantFor(const Expression* expression);
 		Id emitCall(const Expression& expression);
+		static bool isAtomicBuiltin(const std::string& name);
+		Id emitAtomicBuiltin(const std::string& name, const std::vector<ExpressionPtr>& arguments);
+		Id atomicPointer(const Expression& argument, const std::string& callee);
+		Id convertAtomicValue(const Expression& expression, Id toType);
+		Id atomicScopeId();
+		Id atomicRelaxedOrderId();
+		void requireRelaxedOrder(const Expression& order, const std::string& callee);
 		HelperFunction* findHelper(const Expression& call, const Expression*& receiver);
 		Id emitHelperCall(const Expression& call, HelperFunction& helper, const Expression* receiver);
 		Id helperParameterType(const Type& type);
@@ -4191,6 +4201,200 @@ namespace {
 		return emitBinaryOperation(op, current, value);
 	}
 
+	// The address an atomic builtin operates on. An atomic_uint* parameter is an
+	// ordinary device pointer parameter, so this walks the same binding-0
+	// address block every buffer access does and returns the pointer to the
+	// unsigned int itself, which is what the atomic instructions take.
+	Id Emitter::atomicPointer(const Expression& argument, const std::string& callee) {
+		if (argument.kind != ExpressionKind::Identifier) {
+			throw CompileError("the first argument of " + callee + " has to be a device "
+				"atomic_uint pointer");
+		}
+
+		const auto it = _bindings.find(argument.name);
+		if (it == _bindings.end() || !it->second.isPointer) {
+			throw CompileError("the first argument of " + callee + " has to be a device "
+				"atomic_uint pointer, and \"" + argument.name + "\" is not one");
+		}
+
+		const Binding& binding = it->second;
+		// atomic_uint* and uint* lower to the same SPIR-V pointer, so the
+		// spelling is the only thing that distinguishes them. An atomic applied
+		// to plain storage is undefined rather than merely unusual, so this is
+		// refused instead of assumed.
+		if (!binding.pointeeMsl.isAtomic) {
+			throw CompileError("the first argument of " + callee + " has to be a device "
+				"atomic_uint pointer, and \"" + argument.name + "\" is a "
+				+ typeName(binding.pointeeMsl));
+		}
+
+		if (binding.readOnly) {
+			throw CompileError("cannot apply " + callee + " to \"" + argument.name
+				+ "\", which is in constant memory");
+		}
+
+		// The pointer has to name a whole uint: the atomic instructions take the
+		// pointee type, and a vector or matrix atomic has no single SPIR-V
+		// equivalent, so it is refused rather than applied element by element.
+		if (binding.pointeeMsl.isVector() || binding.pointeeMsl.isMatrix()) {
+			throw CompileError(callee + " takes a device atomic_uint pointer, not a "
+				+ typeName(binding.pointeeMsl));
+		}
+
+		if (binding.bufferPointeeType == InvalidId) {
+			throw CompileError(callee + " needs a device atomic_uint in a buffer, so it can "
+				"be reached through the binding-0 address block");
+		}
+
+		const Id base = bufferBase(binding);
+		const Id resultType = _types.pointer(spirv::StorageClass::PhysicalStorageBuffer,
+			binding.pointeeType);
+
+		// A buffer's pointee is { T runtime_array[] }, so its first element is
+		// member 0 and then index 0; a struct pointee is indexed directly. This is
+		// the same shape emitIndex() builds, since an atomic_uint* parameter is an
+		// ordinary device pointer parameter.
+		return binding.isBuffer
+			? _builder.emitTyped(spirv::OpAccessChain, resultType,
+				{ base, constantU32(0), constantU32(0) })
+			: _builder.emitTyped(spirv::OpAccessChain, resultType,
+				{ base, constantU32(0) });
+	}
+
+	bool Emitter::isAtomicBuiltin(const std::string& name) {
+		return name == "atomic_fetch_add_explicit" || name == "atomic_store_explicit"
+			|| name == "atomic_load_explicit";
+	}
+
+	// Metal spells the memory order as a trailing argument. Only Relaxed is
+	// lowered. That is not a gap in the mapping but a constraint of the target:
+	// OpAtomicLoad is refused by Vulkan under any non-relaxed order
+	// (VUID-StandaloneSpirv-MemorySemantics-10866, -10868 and -10870), and an
+	// acquire or release order has no equivalent atomic-load instruction. A
+	// non-relaxed order is therefore reported rather than silently treated as
+	// relaxed, which would compile and run with weaker guarantees than the
+	// source asked for.
+	void Emitter::requireRelaxedOrder(const Expression& order, const std::string& callee) {
+		if (order.kind != ExpressionKind::Identifier || order.name != "memory_order_relaxed") {
+			throw CompileError(callee + " with a memory order other than memory_order_relaxed "
+				"is not lowered yet; Vulkan refuses OpAtomicLoad under any non-relaxed order, "
+				"and no atomic instruction gives the acquire and release guarantees the other "
+				"orders ask for");
+		}
+	}
+
+	// Memory Scope Device and Memory Order Relaxed, each created once so a function
+	// with several atomics shares one constant per operand role.
+	Id Emitter::atomicScopeId() {
+		if (_atomicScope == InvalidId) {
+			_atomicScope = constantU32(1);
+		}
+		return _atomicScope;
+	}
+
+	Id Emitter::atomicRelaxedOrderId() {
+		if (_atomicRelaxed == InvalidId) {
+			_atomicRelaxed = constantU32(0);
+		}
+		return _atomicRelaxed;
+	}
+
+	// The value an atomic instruction adds or stores. A literal is emitted as a
+	// constant of the target's own type; anything else goes through the ordinary
+	// conversion. The literal case exists because an int literal converted to
+	// uint becomes an OpBitcast, which is the one instruction spirv-val will not
+	// accept in the block before an atomic.
+	Id Emitter::convertAtomicValue(const Expression& expression, Id toType) {
+		if (expression.kind == ExpressionKind::IntLiteral
+			|| expression.kind == ExpressionKind::BoolLiteral) {
+			FoldedConstant folded;
+			try {
+				folded = foldExpression(expression);
+			} catch (const CompileError&) {
+				return convertImplicit(emitExpression(expression), toType);
+			}
+
+			if (toType == _uintType) {
+				folded.integer = folded.scalar == ScalarKind::Bool
+					? (folded.boolean ? 1 : 0) : folded.integer;
+				folded.scalar = ScalarKind::UInt;
+				folded.boolean = false;
+			}
+
+			return constantU32(static_cast<uint32_t>(folded.integer));
+		}
+
+		return convertImplicit(emitExpression(expression), toType);
+	}
+
+	Id Emitter::emitAtomicBuiltin(const std::string& name, const std::vector<ExpressionPtr>& arguments) {
+		// Memory Scope Device = 1, Memory Order Relaxed = 0, each id of a 32-bit
+		// constant rather than a literal, which the assembler requires.
+		//
+		// Cached rather than emitted per call: spirv-val accepts an atomic whose
+		// scope operand is one of several equivalent OpConstants, but rejects a
+		// block that defines more than one, with "Scope ids must be OpConstant when
+		// Shader capability is present". Two atomics in one function therefore
+		// need the same two ids, not four.
+		const Id scope = atomicScopeId();
+		const Id relaxed = atomicRelaxedOrderId();
+
+		if (name == "atomic_fetch_add_explicit") {
+			if (arguments.size() != 3) {
+				throw CompileError("atomic_fetch_add_explicit takes a pointer, a value and a "
+					"memory order, and this call passes " + std::to_string(arguments.size()));
+			}
+			const Id pointer = atomicPointer(*arguments[0], name);
+			requireRelaxedOrder(*arguments[2], name);
+
+			// The operand type carries the signedness: an unsigned pointer type is
+			// what makes this an unsigned add that wraps at 2^32, matching the
+			// air.atomic.global.add.u.i32 Apple emits for atomic_uint. A signed
+			// result type would validate and wrap at 2^31 instead.
+			//
+			// A plain literal is folded to a uint constant rather than converted: a
+			// literal arrives as an int, and converting it to uint emits an
+			// OpBitcast, which spirv-val then rejects here with "Scope ids must be
+			// OpConstant when Shader capability is present". The rule it trips is
+			// about the scope operand, but the only definition between that
+			// constant and the atomic is the bitcast, and moving the bitcast after
+			// the atomic or removing it makes the same module validate.
+			const Id resultType = _uintType;
+			const Id value = convertAtomicValue(*arguments[1], resultType);
+			return _builder.emitTyped(spirv::OpAtomicIAdd, resultType,
+				{ pointer, value, scope, relaxed });
+		}
+
+		if (name == "atomic_store_explicit") {
+			if (arguments.size() != 3) {
+				throw CompileError("atomic_store_explicit takes a pointer, a value and a "
+					"memory order, and this call passes " + std::to_string(arguments.size()));
+			}
+			const Id pointer = atomicPointer(*arguments[0], name);
+			requireRelaxedOrder(*arguments[2], name);
+			const Id resultType = _uintType;
+			const Id value = convertAtomicValue(*arguments[1], resultType);
+			// OpAtomicStore takes no result id and no result type, and its operands
+			// are pointer, scope, order, value: the value comes last, after the two
+			// scope operands, not second as the other atomic instructions put it.
+			_builder.emit(spirv::OpAtomicStore, { pointer, scope, relaxed, value });
+			return InvalidId;
+		}
+
+		if (name == "atomic_load_explicit") {
+			if (arguments.size() != 2) {
+				throw CompileError("atomic_load_explicit takes a pointer and a memory order, "
+					"and this call passes " + std::to_string(arguments.size()));
+			}
+			const Id pointer = atomicPointer(*arguments[0], name);
+			requireRelaxedOrder(*arguments[1], name);
+			return _builder.emitTyped(spirv::OpAtomicLoad, _uintType,
+				{ pointer, scope, relaxed });
+		}
+
+		throw CompileError("\"" + name + "\" is not an atomic builtin mslc lowers");
+	}
+
 	Id Emitter::emitCall(const Expression& expression) {
 		const Expression* receiver = nullptr;
 		HelperFunction* helper = findHelper(expression, receiver);
@@ -4210,6 +4414,14 @@ namespace {
 			}
 
 			return emitHelperCall(expression, *helper, receiver);
+		}
+
+		// The atomic builtins are not math builtins: they take a device pointer to
+		// an atomic_uint rather than a value, and their result type comes from the
+		// pointee. Dispatched before the math table so an atomic call is never
+		// mistaken for a free function.
+		if (isAtomicBuiltin(expression.left->name)) {
+			return emitAtomicBuiltin(expression.left->name, expression.arguments);
 		}
 
 		const MathBuiltin* builtin = findMathBuiltin(expression.left->name);

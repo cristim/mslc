@@ -80,6 +80,12 @@ struct Type {
 	bool isPointer = false;
 	bool isConst = false;
 
+	// Set for atomic_uint, which lowers to the same SPIR-V type as uint. The
+	// spelling is the only thing that distinguishes an atomic_uint* buffer from
+	// a uint* one, and applying an atomic to plain storage is undefined rather
+	// than merely unusual.
+	bool isAtomic = false;
+
 	// As written. Only a local or a file-scope constant can be constexpr, and
 	// nothing inside a function can be static; the parser reports both where
 	// the context is known.
