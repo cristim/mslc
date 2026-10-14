@@ -1503,26 +1503,31 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 	}
 
 	if (!found.empty()) {
-		// Two compute entry points cannot share a module. The workgroup size is
-		// three spec constants at SpecId 0, 1, 2, and indium writes constantID
-		// 0, 1, 2 once per pipeline against the module it was handed, so there is
-		// one set of ids per module and no way to specialise the second entry
-		// point. Declaring a second set would leave two decorated constants per
-		// id, which spirv-val accepts and no driver can resolve. One vertex and
-		// one fragment is the shape indium builds, and it is fine.
-		size_t kernels = 0;
+		// Two entry points of one module cannot share a name: Vulkan's validation
+		// rule is that entry points are identified by name within an execution
+		// model, and a module with two of the same is rejected with "Entry points
+		// cannot share the same name and ExecutionMode". This is reachable now
+		// that a module may carry several kernels, since a header holding a
+		// kernel and included twice declares it twice.
+		std::set<std::string> names;
 		for (const FunctionDecl* function: found) {
-			if (function->stage == Stage::Kernel) {
-				kernels++;
+			if (!names.insert(function->name).second) {
+				throw CompileError("two entry points are named \"" + function->name
+					+ "\"; a module may have several kernels, but entry points are "
+					"identified by name within one execution model, so the names must differ");
 			}
 		}
 
-		if (kernels > 1) {
-			throw CompileError("a source may declare one kernel; mslc has no way to give a "
-				"second one its own workgroup size, because indium specialises one set of "
-				"three constants per module");
-		}
-
+		// A kernel's workgroup size is OpExecutionModeId LocalSizeId over three
+		// spec constants at SpecId 0, 1, 2, and indium writes constantID 0, 1, 2
+		// once per pipeline against the module it was handed, so there is one
+		// set of ids per module. That is why a module carries one size, and it
+		// is also why it can carry several kernels: they all read the same
+		// three constants, and [[threads_per_threadgroup]] reads that same size
+		// rather than naming one of its own.
+		//
+		// A second set of spec constants is still not emitted: two decorated
+		// constants per SpecId validate and no driver can resolve them.
 		return found;
 	}
 
