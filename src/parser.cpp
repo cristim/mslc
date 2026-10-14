@@ -375,7 +375,11 @@ void Parser::parseDeclaration() {
 	}
 
 	if (matchIdentifier("namespace")) {
-		parseNamespace();
+		if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Assign) {
+			parseNamespaceAlias();
+		} else {
+			parseNamespace();
+		}
 		return;
 	}
 
@@ -483,19 +487,23 @@ void Parser::parseNamespace() {
 				throw CompileError("expected a namespace name, found " + std::string(tokenKindName(kind())));
 			}
 			const auto enclosing = _scopes.find(namespacePrefix(_namespacePath.size()));
+			if (_namespaceAliases.count(qualify(std::string(current().text)))) {
+				throw CompileError("\"" + qualify(std::string(current().text)) + "\" is a namespace alias and cannot also be a namespace");
+			}
 			if (_declared.count(qualify(std::string(current().text)))
 				|| (enclosing != _scopes.end() && enclosing->second.declarations.count(std::string(current().text)))) {
 				throw CompileError("\"" + qualify(std::string(current().text)) + "\" is declared and "
 					"cannot also be a namespace");
+			}
+			if (_namespacePath.size() > outer && lookahead().kind == TokenKind::Assign) {
+				throw CompileError("a namespace alias is declared with one unqualified name, not \""
+					+ namespacePrefix(_namespacePath.size()) + "::" + std::string(current().text) + "\"");
 			}
 			_namespacePath.emplace_back(advance().text);
 			_namespaces.insert(namespacePrefix(_namespacePath.size()));
 			if (!match(TokenKind::ColonColon)) {
 				break;
 			}
-		}
-		if (at(TokenKind::Assign)) {
-			throw CompileError("a namespace alias is not supported");
 		}
 		if (at(TokenKind::LBracket)) {
 			throw CompileError("an attribute on a namespace is not supported");
@@ -508,6 +516,39 @@ void Parser::parseNamespace() {
 	}
 	expect(TokenKind::RBrace, "to close a namespace body");
 	_namespacePath.resize(outer);
+}
+
+void Parser::parseNamespaceAlias() {
+	const std::string name(advance().text);
+	expect(TokenKind::Assign, "after the name of a namespace alias");
+	QualifiedName spelledTarget;
+	if (!peekQualifiedName(spelledTarget)) {
+		throw CompileError("expected the namespace that \"" + name + "\" is an alias of");
+	}
+	for (size_t i = 0; i < spelledTarget.tokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Semicolon, "after a namespace alias");
+	const std::string spelled = (spelledTarget.global ? "::" : "") + joinParts(spelledTarget.parts, 0, spelledTarget.parts.size());
+	const std::string target = namespaceOf(spelledTarget, spelledTarget.parts.size(), NamespaceLookup::NamespaceOnly);
+	if (target.empty()) {
+		throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
+	}
+	const std::string qualified = qualify(name);
+	if (qualified == kStdlibNamespace) {
+		throw CompileError("redefinition of \"metal\": it is the standard library's namespace");
+	}
+	const auto enclosing = _scopes.find(namespacePrefix(_namespacePath.size()));
+	if (_declared.count(qualified) || (enclosing != _scopes.end() && enclosing->second.declarations.count(name))) {
+		throw CompileError("\"" + qualified + "\" is declared and cannot also be a namespace alias");
+	}
+	if (_namespaces.count(qualified)) {
+		throw CompileError("redefinition of \"" + qualified + "\": a namespace and a namespace alias");
+	}
+	if (const auto [entry, inserted] = _namespaceAliases.emplace(qualified, target); !inserted && entry->second != target) {
+		throw CompileError("redefinition of \"" + name + "\" as an alias of another namespace (\"" + target
+			+ "\", was \"" + entry->second + "\")");
+	}
 }
 
 // "using" is consumed: "using namespace N;" or "using N::x;".
@@ -534,7 +575,7 @@ void Parser::parseUsing() {
 			return;
 		}
 
-		const std::string target = namespaceOf(name, name.parts.size());
+		const std::string target = namespaceOf(name, name.parts.size(), NamespaceLookup::NamespaceOnly);
 		if (target.empty()) {
 			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 		}
@@ -1294,6 +1335,9 @@ void Parser::declareName(const std::string& name, const char* what) {
 	if (_namespaces.count(name)) {
 		throw CompileError("redefinition of \"" + name + "\": declared as namespace and again as " + what);
 	}
+	if (_namespaceAliases.count(name)) {
+		throw CompileError("redefinition of \"" + name + "\": declared as namespace alias and again as " + what);
+	}
 
 	// Functions overload, and a struct or enum tag may share a name with a function
 	// or a variable; every other pair of declarations of one name is a redefinition.
@@ -1562,11 +1606,14 @@ std::string Parser::namespacePrefix(size_t depth) const {
 }
 
 std::string Parser::canonicalNamespace(const std::string& path) const {
+	if (const auto alias = _namespaceAliases.find(path); alias != _namespaceAliases.end()) {
+		return alias->second;
+	}
 	return _namespaces.count(path) ? path : std::string();
 }
 
 std::set<std::string> Parser::namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
-	std::set<std::string>& seen) const {
+	std::set<std::string>& seen, NamespaceLookup mode) const {
 	// [namespace.qual], the same tier order collectMembers (above) walks for other names: the
 	// namespaces of "scope"; only when it has none, for a qualified name, what each of its
 	// using directives (an anonymous namespace's included) finds, each on its own.
@@ -1577,15 +1624,20 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	std::set<std::string> own;
 	for (const std::string& at : set) {
 		seen.insert(at);
-		if (std::string found = canonicalNamespace(at.empty() ? part : at + "::" + part); !found.empty()) {
+		const std::string key = at.empty() ? part : at + "::" + part;
+		if (std::string found = canonicalNamespace(key); !found.empty()) {
 			own.insert(found);
+			if (!_namespaceAliases.count(key)) {
+				continue;
+			}
+		}
+		if (mode == NamespaceLookup::NamespaceOnly) {
 			continue;
 		}
 		// [basic.lookup.qual]/1: a struct, enum or typedef "part" names here (directly or
 		// through a using declaration) is this scope's own answer too, so it joins the union
 		// like any other result (childNamespace rejects it as a namespace itself).
 		std::set<std::string> declared;
-		const std::string key = at.empty() ? part : at + "::" + part;
 		if (_declared.count(key)) {
 			declared.insert(key);
 		}
@@ -1609,7 +1661,7 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	for (const std::string& at : set) {
 		if (const auto entry = _scopes.find(at); entry != _scopes.end()) {
 			for (const std::string& directive : entry->second.directives) {
-				const std::set<std::string> through = namespacesNamed(directive, part, true, seen);
+				const std::set<std::string> through = namespacesNamed(directive, part, true, seen, mode);
 				found.insert(through.begin(), through.end());
 			}
 		}
@@ -1617,9 +1669,9 @@ std::set<std::string> Parser::namespacesNamed(const std::string& scope, const st
 	return found;
 }
 
-std::string Parser::childNamespace(const std::string& scope, const std::string& part, bool qualified) const {
+std::string Parser::childNamespace(const std::string& scope, const std::string& part, bool qualified, NamespaceLookup mode) const {
 	std::set<std::string> seen;
-	const std::set<std::string> found = namespacesNamed(scope, part, qualified, seen);
+	const std::set<std::string> found = namespacesNamed(scope, part, qualified, seen, mode);
 	if (found.size() > 1) {
 		throw CompileError("reference to the namespace \"" + part + "\" "
 			+ (scope.empty() ? std::string("at file scope") : "in \"" + scope + "\"") + " is ambiguous: it names "
@@ -1636,7 +1688,7 @@ std::string Parser::childNamespace(const std::string& scope, const std::string& 
 
 // The namespace the first "count" parts of a name spell, found from the current
 // namespace outward (or from the file, after a leading "::"), or "" when there is none.
-std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
+std::string Parser::namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode) const {
 	const std::vector<std::string>& parts = name.parts;
 	const size_t outermost = name.global ? 0 : _namespacePath.size();
 	// Later parts follow the namespace's using directives (#279), the same walk
@@ -1644,7 +1696,7 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
 	// to #295 by decision.
 	const auto rest = [&](std::string scope) {
 		for (size_t part = 1; part < count; ++part) {
-			scope = childNamespace(scope, parts[part], true);
+			scope = childNamespace(scope, parts[part], true, mode);
 			if (scope.empty()) {
 				return std::string();
 			}
@@ -1667,7 +1719,7 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count) const {
 		}
 		std::set<std::string> seen;
 		for (size_t i = 0; i < bases.size(); ++i) {
-			if (const std::string candidate = childNamespace(bases[i], parts[0], false); !candidate.empty()) {
+			if (const std::string candidate = childNamespace(bases[i], parts[0], false, mode); !candidate.empty()) {
 				return rest(candidate);
 			}
 			if (!seen.insert(bases[i]).second) {
@@ -1744,7 +1796,7 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 			const std::string enclosing = namespaceOf(owner, owner.parts.size() - 1);
 			if (!enclosing.empty()) {
 				std::set<std::string> seen;
-				const std::set<std::string> qualifiers = namespacesNamed(enclosing, owner.parts.back(), true, seen);
+				const std::set<std::string> qualifiers = namespacesNamed(enclosing, owner.parts.back(), true, seen, NamespaceLookup::Qualifier);
 				if (!qualifiers.empty()) {
 					ownerName = pick(qualifiers, spelled);
 				}

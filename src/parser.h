@@ -67,6 +67,7 @@ class Parser {
 	};
 	std::vector<std::string> _namespacePath;
 	std::set<std::string> _namespaces;
+	std::map<std::string, std::string> _namespaceAliases;
 	std::map<std::string, NamespaceScope> _scopes;
 
 	// The blocks of the function being parsed, innermost last. A name maps to "" for
@@ -205,16 +206,18 @@ private:
 	// A name as it is declared in the namespace the parser is in.
 	std::string qualify(const std::string& name) const;
 	std::string namespacePrefix(size_t depth) const;
-	std::string namespaceOf(const QualifiedName& name, size_t count) const;
+	enum class NamespaceLookup { Qualifier, NamespaceOnly };
+	std::string namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode = NamespaceLookup::Qualifier) const;
 	// The namespace a path names, or "" if it names none.
 	std::string canonicalNamespace(const std::string& path) const;
 	// The namespaces "part" names from "scope", by the walk namespaceOf's later parts use.
 	std::set<std::string> namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
-		std::set<std::string>& seen) const;
+		std::set<std::string>& seen, NamespaceLookup mode) const;
 	// The one namespace "part" names inside "scope" ("" if none); several is ambiguous.
-	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified) const;
+	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified, NamespaceLookup mode) const;
 
 	void parseNamespace();
+	void parseNamespaceAlias();
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
