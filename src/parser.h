@@ -76,6 +76,7 @@ class Parser {
 	// written in the function's namespace, and only while the block is open.
 	struct BlockScope {
 		std::map<std::string, std::string> names;
+		std::map<std::string, std::string> aliases;
 		std::vector<std::string> directives;
 	};
 	std::vector<BlockScope> _blocks;
@@ -207,6 +208,7 @@ private:
 	std::string qualify(const std::string& name) const;
 	std::string namespacePrefix(size_t depth) const;
 	enum class NamespaceLookup { Qualifier, NamespaceOnly };
+	std::string blockQualifier(const std::string& part, NamespaceLookup mode) const;
 	std::string namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode = NamespaceLookup::Qualifier) const;
 	// The namespace a path names, or "" if it names none.
 	std::string canonicalNamespace(const std::string& path) const;
