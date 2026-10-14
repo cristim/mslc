@@ -1,0 +1,9 @@
+// EXPECT: valid
+// DISASM-MATCH: OpStore %[_0-9a-zA-Z]+ %int_1[_0-9]* Aligned
+// DISASM-NO-MATCH: OpStore %[_0-9a-zA-Z]+ %int_7[_0-9]*
+#include <metal_stdlib>
+using namespace metal;
+namespace M { namespace K { constant int y = 7; } }
+namespace E { enum K { x, y }; }
+namespace A { using namespace M; using E::K; constant int K = 0; }
+kernel void k(device int* out [[buffer(0)]]) { out[0] = int(A::K::y); }
