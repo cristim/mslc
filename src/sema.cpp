@@ -2169,7 +2169,7 @@ namespace {
 		static bool isAtomicBuiltin(const std::string& name);
 		Id emitAtomicBuiltin(const std::string& name, const std::vector<ExpressionPtr>& arguments);
 		Id atomicPointer(const Expression& argument, const std::string& callee);
-		Id convertAtomicValue(const Expression& expression, Id toType);
+		Id atomicOperandValue(const Expression& expression);
 		Id atomicScopeId();
 		Id atomicRelaxedOrderId();
 		void requireRelaxedOrder(const Expression& order, const std::string& callee);
@@ -4304,38 +4304,38 @@ namespace {
 	// conversion. The literal case exists because an int literal converted to
 	// uint becomes an OpBitcast, which is the one instruction spirv-val will not
 	// accept in the block before an atomic.
-	Id Emitter::convertAtomicValue(const Expression& expression, Id toType) {
+	// The value an atomic instruction adds or stores, always an unsigned 32-bit
+	// value because both callers are the atomic_uint builtins. A literal is
+	// emitted as a uint constant; anything else goes through the ordinary
+	// conversion.
+	Id Emitter::atomicOperandValue(const Expression& expression) {
 		if (expression.kind == ExpressionKind::IntLiteral
 			|| expression.kind == ExpressionKind::BoolLiteral) {
 			FoldedConstant folded;
 			try {
 				folded = foldExpression(expression);
 			} catch (const CompileError&) {
-				return convertImplicit(emitExpression(expression), toType);
+				return convertImplicit(emitExpression(expression), _uintType);
 			}
 
-			if (toType == _uintType) {
-				folded.integer = folded.scalar == ScalarKind::Bool
-					? (folded.boolean ? 1 : 0) : folded.integer;
-				folded.scalar = ScalarKind::UInt;
-				folded.boolean = false;
-			}
+			folded.integer = folded.scalar == ScalarKind::Bool
+				? (folded.boolean ? 1 : 0) : folded.integer;
+			folded.scalar = ScalarKind::UInt;
+			folded.boolean = false;
 
 			return constantU32(static_cast<uint32_t>(folded.integer));
 		}
 
-		return convertImplicit(emitExpression(expression), toType);
+		return convertImplicit(emitExpression(expression), _uintType);
 	}
 
 	Id Emitter::emitAtomicBuiltin(const std::string& name, const std::vector<ExpressionPtr>& arguments) {
 		// Memory Scope Device = 1, Memory Order Relaxed = 0, each id of a 32-bit
 		// constant rather than a literal, which the assembler requires.
 		//
-		// Cached rather than emitted per call: spirv-val accepts an atomic whose
-		// scope operand is one of several equivalent OpConstants, but rejects a
-		// block that defines more than one, with "Scope ids must be OpConstant when
-		// Shader capability is present". Two atomics in one function therefore
-		// need the same two ids, not four.
+		// Cached rather than emitted per call so that a function with several
+		// atomics shares one constant per operand role instead of creating an
+		// equivalent constant for each.
 		const Id scope = atomicScopeId();
 		const Id relaxed = atomicRelaxedOrderId();
 
@@ -4352,17 +4352,15 @@ namespace {
 			// air.atomic.global.add.u.i32 Apple emits for atomic_uint. A signed
 			// result type would validate and wrap at 2^31 instead.
 			//
-			// A plain literal is folded to a uint constant rather than converted: a
-			// literal arrives as an int, and converting it to uint emits an
-			// OpBitcast, which spirv-val then rejects here with "Scope ids must be
-			// OpConstant when Shader capability is present". The rule it trips is
-			// about the scope operand, but the only definition between that
-			// constant and the atomic is the bitcast, and moving the bitcast after
-			// the atomic or removing it makes the same module validate.
+			// Operands are Pointer, Memory, Semantics, Value, per the SPIR-V
+			// grammar for OpAtomicIAdd (opcode 234). A literal is folded to a uint
+			// constant rather than converted, because an int literal converted to
+			// uint becomes an OpBitcast and the bitcast would sit in the value
+			// operand; folding keeps the operand a plain constant.
 			const Id resultType = _uintType;
-			const Id value = convertAtomicValue(*arguments[1], resultType);
+			const Id value = atomicOperandValue(*arguments[1]);
 			return _builder.emitTyped(spirv::OpAtomicIAdd, resultType,
-				{ pointer, value, scope, relaxed });
+				{ pointer, scope, relaxed, value });
 		}
 
 		if (name == "atomic_store_explicit") {
@@ -4373,7 +4371,7 @@ namespace {
 			const Id pointer = atomicPointer(*arguments[0], name);
 			requireRelaxedOrder(*arguments[2], name);
 			const Id resultType = _uintType;
-			const Id value = convertAtomicValue(*arguments[1], resultType);
+			const Id value = atomicOperandValue(*arguments[1]);
 			// OpAtomicStore takes no result id and no result type, and its operands
 			// are pointer, scope, order, value: the value comes last, after the two
 			// scope operands, not second as the other atomic instructions put it.

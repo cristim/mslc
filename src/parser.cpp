@@ -3263,6 +3263,15 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 		type.namedType = name;
 	}
 
+	// Apple refuses a cast to atomic_uint: "no matching conversion for C-style
+	// cast from 'int' to 'metal::atomic_uint'". It is a type name so that a
+	// parameter can be declared as one, which is all this change needed, and it
+	// is not something a value can be converted to.
+	if (type.isAtomic) {
+		throw CompileError("a cast to atomic_uint is not supported; it names a type for a "
+			"buffer parameter and not a conversion");
+	}
+
 	return type;
 }
 
