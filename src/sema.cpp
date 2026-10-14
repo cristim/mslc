@@ -2250,7 +2250,25 @@ namespace {
 			bool storageOnly);
 		void emitAutoDeclaration(const VariableDeclaration& declaration);
 		Type deduceAutoType(const Type& written, Id valueType, const std::string& name);
-		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl);
+		// storage is where the variable itself lives: Function for an ordinary
+		// local, Workgroup for a threadgroup one. It is what the index path walks
+		// the binding with, so it has to be the real one.
+		void bindLocal(const std::string& name, Id variable, Id type, const Type& msl,
+			spirv::StorageClassValue storage = spirv::StorageClass::Function);
+
+		// Whether a binding names a variable this compiler declares on its own,
+		// rather than one reached through a descriptor. An array lives in
+		// whichever of these its address space selects, and every path that walks
+		// one has to agree on the list: an array path that omits Workgroup
+		// reports a misleading diagnostic or emits an access chain typed at the
+		// wrong storage class, and neither is caught until something downstream
+		// rejects it. So this is the single place the list lives.
+		bool isLocalStorage(spirv::StorageClassValue storage) const;
+
+		// A threadgroup variable is shared by every invocation of the workgroup,
+		// so it exists in a kernel and nowhere else, and it takes no initialiser.
+		// A scalar and an array share this, so the two cannot drift apart.
+		void checkThreadgroupLocal(const VariableDeclaration& declaration);
 		void beginBlock(Id label);
 		void terminate(uint16_t opcode, std::vector<uint32_t> operands);
 		void branchUnlessTerminated(Id label);
@@ -2845,8 +2863,7 @@ namespace {
 			return nullptr;
 		}
 		const Binding& binding = it->second;
-		const bool ownStorage = binding.storageClass == spirv::StorageClass::Function
-			|| binding.storageClass == spirv::StorageClass::Private;
+		const bool ownStorage = isLocalStorage(binding.storageClass);
 		return ownStorage && binding.isPointer && !binding.isBuffer && binding.bufferPointeeType == InvalidId
 			&& binding.pointeeMsl.arrayRank() >= 2 && depth <= binding.pointeeMsl.arrayRank() ? &binding : nullptr;
 	}
@@ -3462,8 +3479,7 @@ namespace {
 				// struct reached directly is one value, whether through a reference
 				// or through the address a buffer of scalars put in a register.
 				// A local array is indexed by an access chain step into the array.
-				if (!fromBuffer && current.arrayLength && (binding.storageClass == spirv::StorageClass::Function
-					|| binding.storageClass == spirv::StorageClass::Private)) {
+				if (!fromBuffer && current.arrayLength && isLocalStorage(binding.storageClass)) {
 					if (const auto literal = literalIndex(*step.index); literal && *literal >= *current.arrayLength) {
 						throw CompileError("the index " + std::to_string(*literal) + " is outside the array \""
 							+ rootName + "\" of " + std::to_string(*current.arrayLength));
@@ -3486,7 +3502,7 @@ namespace {
 			}
 
 			// "p->m" on a pointer parameter bound to a local array names element zero.
-			if (!fromBuffer && current.arrayLength && binding.storageClass == spirv::StorageClass::Function) {
+			if (!fromBuffer && current.arrayLength && isLocalStorage(binding.storageClass)) {
 				if (!step.isArrow) {
 					throw CompileError("\"" + rootName + "\" is an array, so \"." + step.memberName
 						+ "\" needs an element: index it, as " + rootName + "[i]." + step.memberName);
@@ -7207,12 +7223,16 @@ namespace {
 	// Only a plain value type is reserved; every other form is refused where it is declared.
 	void Emitter::reserveThreadgroupLocal(const VariableDeclaration& declaration) {
 		const Type& type = declaration.type;
-		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer || type.arrayLength
+		// An array is reserved here too. emitLocalArray looks the variable up in
+		// this table when it runs, so the same shape serves both, and a
+		// threadgroup array has to be in the OpEntryPoint interface just as a
+		// threadgroup scalar does.
+		if (type.addressSpace != AddressSpace::Threadgroup || type.isAuto || type.isPointer
 			|| type.resource != ResourceKind::None || declaration.isReference
 			|| declaration.initializer) {
 			return;
 		}
-		const Id typeId = declaredTypeOf(type);
+		const Id typeId = type.arrayLength ? arrayTypeOf(type) : declaredTypeOf(type);
 		_threadgroupLocals[&declaration] = _builder.emitDeclTyped(spirv::OpVariable,
 			_types.pointer(spirv::StorageClass::Workgroup, typeId),
 			{ static_cast<uint32_t>(spirv::StorageClass::Workgroup) });
@@ -8883,10 +8903,42 @@ namespace {
 	// constant one past the end is refused.
 	void Emitter::emitLocalArray(const VariableDeclaration& declaration, bool storageOnly) {
 		const Type& type = declaration.type;
-		if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
+
+		// A threadgroup array is shared by every invocation of the workgroup, so it
+		// lives in Workgroup storage rather than the function's own. Nothing else
+		// changes: the type, the initialiser and the index paths are the same, which
+		// is why every path that walks a local array has to accept this storage
+		// class too (see isLocalStorage).
+		//
+		// No explicit layout is emitted on the array type. Workgroup storage has
+		// an implicit one, and VUID-StandaloneSpirv-None-10684 rejects an explicit
+		// one on it, naming the decoration it found: "the Workgroup storage class
+		// has an explicit layout from the ArrayStride decoration". The rule is
+		// about explicit layout generally, not ArrayStride alone; the same VUID
+		// rejects Offset on a struct reached from a Workgroup array. mslc emits
+		// neither here, so ArrayStride is the only one it could have got wrong.
+		//
+		// A separate rule, VUID-StandaloneSpirv-None-04645, limits Workgroup
+		// storage to the compute execution model, which is why a threadgroup
+		// variable is a kernel-only declaration (see checkThreadgroupLocal).
+		//
+		// An element is reached with OpAccessChain whose result type is a pointer
+		// to the element, not to the array.
+		const bool threadgroup = type.addressSpace == AddressSpace::Threadgroup;
+		if (threadgroup) {
+			// The same two rules a threadgroup scalar obeys: a kernel, and no
+			// initialiser. An array that skipped these used to reach the SPIR-V
+			// writer and come out as a Workgroup variable in a fragment or vertex
+			// entry point, which spirv-val rejects, so mslc exited 0 and wrote a
+			// module it had just made invalid.
+			checkThreadgroupLocal(declaration);
+		} else if (type.resource != ResourceKind::None || type.addressSpace != AddressSpace::None) {
 			throw CompileError("an array of " + typeName(type) + " is not lowered yet; mslc lowers an array "
-				"of scalars, vectors, matrices and structs in the function's own storage");
+				"of scalars, vectors, matrices and structs in the function's own storage or in "
+				"threadgroup storage");
 		}
+		const spirv::StorageClassValue storage =
+			threadgroup ? spirv::StorageClass::Workgroup : spirv::StorageClass::Function;
 
 		Type element = type;
 		element.arrayLength.reset();
@@ -8939,13 +8991,27 @@ namespace {
 			}
 		}
 
-		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
-			_types.pointer(spirv::StorageClass::Function, arrayType),
-			{ static_cast<uint32_t>(spirv::StorageClass::Function) });
+		// A threadgroup array was already declared, and added to the entry point's
+		// interface, by the reserveThreadgroupLocal pre-pass that runs before
+		// OpEntryPoint is emitted. Re-declaring it here would put a second
+		// Workgroup variable in the module that no entry point lists.
+		Id variable = InvalidId;
+		if (threadgroup) {
+			const auto reserved = _threadgroupLocals.find(&declaration);
+			if (reserved == _threadgroupLocals.end()) {
+				throw CompileError("the threadgroup array \"" + declaration.name
+					+ "\" was not reserved before the entry point was emitted");
+			}
+			variable = reserved->second;
+		} else {
+			variable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(storage, arrayType),
+				{ static_cast<uint32_t>(storage) });
+		}
 		if (!storageOnly) {
 			_builder.emit(spirv::OpStore, { variable, initial });
 		}
-		bindLocal(declaration.name, variable, arrayType, type);
+		bindLocal(declaration.name, variable, arrayType, type, storage);
 	}
 
 	void Emitter::emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly) {
@@ -9153,18 +9219,8 @@ namespace {
 		}
 	}
 
-	// A threadgroup local is one Workgroup variable at module scope, shared by every
-	// invocation of the group. Apple takes it only in a kernel. mslc refuses an
-	// initialiser: Apple initialises it, but how many invocations run the
-	// initialiser and in what order is not something the source states.
 	void Emitter::declareThreadgroupLocal(const VariableDeclaration& declaration, const Type& type, Id typeId) {
-		if (_helper || _entryPoint->stage != Stage::Kernel) {
-			throw CompileError("variables in the threadgroup address space can only be declared in a kernel function");
-		}
-		if (declaration.initializer) {
-			throw CompileError("a threadgroup local \"" + declaration.name + "\" with an initialiser is not lowered "
-				"yet; declare it without one and assign it after a threadgroup_barrier");
-		}
+		checkThreadgroupLocal(declaration);
 		const auto reserved = _threadgroupLocals.find(&declaration);
 		if (reserved == _threadgroupLocals.end()) {
 			throw CompileError("the threadgroup local \"" + declaration.name + "\" is not lowered yet");
@@ -9174,15 +9230,36 @@ namespace {
 	}
 
 	// pointeeMsl is what a member access on the local resolves its fields against.
-	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl) {
+	void Emitter::bindLocal(const std::string& name, Id variable, Id type, const Type& msl,
+		spirv::StorageClassValue storage) {
 		Binding binding;
 		binding.id = variable;
 		binding.isPointer = true;
 		binding.pointeeType = type;
-		binding.storageClass = spirv::StorageClass::Function;
+		binding.storageClass = storage;
 		binding.pointeeMsl = msl;
 		binding.readOnly = msl.isConst;
 		_bindings[name] = binding;
+	}
+
+	bool Emitter::isLocalStorage(spirv::StorageClassValue storage) const {
+		return storage == spirv::StorageClass::Function
+			|| storage == spirv::StorageClass::Private
+			|| storage == spirv::StorageClass::Workgroup;
+	}
+
+	// A threadgroup variable is one Workgroup variable at module scope, shared by every
+	// invocation of the group. Apple takes it only in a kernel. mslc refuses an
+	// initialiser: Apple initialises it, but how many invocations run the
+	// initialiser and in what order is not something the source states.
+	void Emitter::checkThreadgroupLocal(const VariableDeclaration& declaration) {
+		if (_helper || _entryPoint->stage != Stage::Kernel) {
+			throw CompileError("variables in the threadgroup address space can only be declared in a kernel function");
+		}
+		if (declaration.initializer) {
+			throw CompileError("a threadgroup local \"" + declaration.name + "\" with an initialiser is not lowered "
+				"yet; declare it without one and assign it after a threadgroup_barrier");
+		}
 	}
 
 	// A label's id is allocated ahead of time so a branch can name it, which
