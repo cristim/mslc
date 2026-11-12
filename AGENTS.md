@@ -142,6 +142,28 @@ Two traps in that harness, both found the hard way:
 Keep a negative control that fires. A read-back harness that cannot fail is not
 evidence.
 
+## Review and merge evidence
+
+Follow an explicit owner direction that changes a review or acceptance gate for
+the named work. A capable independent reviewer is sufficient; do not require an
+exact model pin. When a real-account run would otherwise be required, a realistic
+fixture, mock, recorded run, or local integration is acceptable if it exercises
+the actual path with a representative data shape. State any gaps plainly.
+
+Keep the other applicable evidence: bug regression tests that fail before and
+pass after the fix, fresh base and head builds and tests, both corpus counts, and
+produced-value checks with a firing negative control where correctness depends on
+output values. Before merge, verify the exact head, zero actionable review
+findings, fresh green CI, clean mergeability, and normal branch protections.
+
+For work covered by an explicit owner authorization, if CodeRabbit cannot review
+because of quota, use the authorization `CR waived: quota, adversarial review +
+local verification + green CI`. Record the quota block and exact PR head. Keep
+one deferred review path: schedule one retry by a live worker; if the bot refuses
+a closed PR, keep a durable pending record that schedules that retry. Send later
+findings through a follow-up PR. The quota waiver covers only that review gate.
+It does not authorize purchases, deployments, or deletions.
+
 ## What `master` already gets right
 
 Do not regress these. They are where `master` is better than the older reference
