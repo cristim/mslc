@@ -1,0 +1,27 @@
+Qualified missing Metal members currently lose their namespace identity and can call an unrelated global helper. For example, `metal::ghost(input)` or `N::ghost(input)` through a Metal using directive can reach global `ghost` even though Apple rejects the qualified member.
+
+This change preserves canonical qualified member identity until intrinsic dispatch. Exact owned Metal helpers, struct/enum/type owners and ordinary unqualified or explicitly global helpers retain their own identity. Intrinsics recognize supported canonical names without flattening unknown members into global helper, constant or type lookup.
+
+Closes #334. This is a prerequisite correction for #325; #319, #265 and #134 remain open. Resource/sampler/access/options aliases and inline namespaces remain in #326 and #320.
+
+Final exact-head verification:
+
+- Committed head `ccc7aaa9870854169d9518317e3d4139b463bd22`, reviewed tree `d1aa2dbe55ef04e3530779da7a4e4362c0a0d772`, parent `9d847a1d97d580de7bd743577fb984e94b607787`.
+- Live base rechecked before publication: `9d847a1d97d580de7bd743577fb984e94b607787`.
+- Actual diff: 232 changed lines across 23 files.
+- Independent two-pass source review and full staged inventory are bound to the exact tree. Review receipt SHA-256: `c88485da7b9a54b22987c8803d91ae532cdfabf95a3e0172190c1ed972e2580a`.
+- Fresh cold baseline suite 2517/2517 and head suite 2537/2537 passed.
+- All 1368 prior accepted SPIR-V/reflection pairs are byte-identical: 1236 valid probes and 132 equivalence cases.
+- Blender: 1 of 1 reach spirv-val-valid SPIR-V before and after. Indium: 7 of 7 before and after. All eight indexed corpus pairs are identical, giving 1376 unique preserved pairs overall.
+- Cold vendor treatment: 55 cases, with 34 Apple acceptances and 33 head acceptances. The remaining accepted Apple form is the known unsupported packed-bool case; no other status mismatch.
+- Cold runtime: 24 head positives and 24 deliberately wrong-expectation controls passed their intended exit checks. Baseline trials split into 16 correct outputs and six wrong outputs, with numerical mismatches firing. Builtin, owned helper, statement helper, atomic and vector buffer shapes were exercised with two inputs.
+- Three isolated mutations triggered all ten public probe controls and eight causal numerical observations. All runtime backend error counts are zero, and scratch bytes/modes were restored.
+- Independent final verdict: no actionable product findings after two cold source passes and independent sealed execution.
+
+Sealed final review receipt SHA-256: `268868fd4bc7a30117fa4d4b729ea8a8f0a1aa36aad41fe5c026e3953b388a5a`. It binds the exact source, full execution, fixture/runtime and mutation receipts. Retained harness failures were corrected without product changes.
+
+Coverage limits: runtime used llvmpipe/LLVM 23.1.2. The Khronos validation layer was unavailable. Apple compiler/LLVM supplied language and selected-value oracles; Apple hardware execution is not claimed.
+
+Ownership allocation preserves peer #315's atomic address, Workgroup/Device memory scope, local reservation and ordinary atomic access work. Callee/order identity handling is limited to the documented disjoint allocation; no address or memory-scope change is included.
+
+Required exact-head CI and the durable independent PR review remain publication/merge gates.
