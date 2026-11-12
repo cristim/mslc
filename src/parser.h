@@ -218,6 +218,7 @@ private:
 	std::string namespaceOf(const QualifiedName& name, size_t count, NamespaceLookup mode = NamespaceLookup::Qualifier) const;
 	// The namespace a path names, or "" if it names none.
 	std::string canonicalNamespace(const std::string& path) const;
+	bool isNamespaceTarget(const std::string& path) const;
 	// The namespaces "part" names from "scope", by the walk namespaceOf's later parts use.
 	std::set<std::string> namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
 		std::set<std::string>& seen, NamespaceLookup mode, bool* aliases = nullptr) const;

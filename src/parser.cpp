@@ -555,7 +555,10 @@ void Parser::parseNamespaceAlias() {
 	}
 	expect(TokenKind::Semicolon, "after a namespace alias");
 	const std::string spelled = (spelledTarget.global ? "::" : "") + joinParts(spelledTarget.parts, 0, spelledTarget.parts.size());
-	const std::string target = namespaceOf(spelledTarget, spelledTarget.parts.size(), NamespaceLookup::NamespaceOnly);
+	std::string target = namespaceOf(spelledTarget, spelledTarget.parts.size(), NamespaceLookup::NamespaceOnly);
+	if (target.empty() && spelledTarget.parts.size() == 1 && spelledTarget.parts[0] == kStdlibNamespace) {
+		target = kStdlibNamespace;
+	}
 	if (target.empty()) {
 		throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 	}
@@ -1657,6 +1660,10 @@ std::string Parser::canonicalNamespace(const std::string& path) const {
 	return _namespaces.count(path) ? path : std::string();
 }
 
+bool Parser::isNamespaceTarget(const std::string& path) const {
+	return _namespaces.count(path) || (path == kStdlibNamespace && kindsOf(path).empty());
+}
+
 std::set<std::string> Parser::namespacesNamed(const std::string& scope, const std::string& part, bool qualified,
 	std::set<std::string>& seen, NamespaceLookup mode, bool* aliases) const {
 	// [namespace.qual], the same tier order collectMembers (above) walks for other names: the
@@ -1728,7 +1735,7 @@ std::string Parser::childNamespace(const std::string& scope, const std::string& 
 	// A struct, enum or typedef namespacesNamed found (not a namespace) is not an answer
 	// here, only a competitor for ambiguity above: whatever named it is resolved through
 	// resolveName's own fallback instead.
-	if (found.empty() || !_namespaces.count(*found.begin())) {
+	if (found.empty() || !isNamespaceTarget(*found.begin())) {
 		return std::string();
 	}
 	return *found.begin();
@@ -1865,10 +1872,10 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 	};
 	if (!name.global) {
 		if (const std::string candidate = blockQualifier(parts[0], mode); !candidate.empty()) {
-			return _namespaces.count(candidate) ? rest(candidate) : std::string();
+			return isNamespaceTarget(candidate) ? rest(candidate) : std::string();
 		}
 	} else if (const std::string candidate = aliasQualifier(name, mode); !candidate.empty()) {
-		return _namespaces.count(candidate) ? rest(candidate) : std::string();
+		return isNamespaceTarget(candidate) ? rest(candidate) : std::string();
 	}
 	// Non-alias lookup retains its existing first-match behavior pending #295/#321.
 	for (size_t depth = outermost + 1; depth-- > 0;) {
@@ -2010,6 +2017,11 @@ std::string Parser::resolveName(const QualifiedName& name) const {
 		return joinParts(parts, 0, parts.size());
 	}
 	// mem_flags is an enum class of the standard library; the barrier lowering reads its enumerators.
+	if (parts.size() > 2 && parts[parts.size() - 2] == "mem_flags"
+		&& namespaceOf(name, parts.size() - 2, NamespaceLookup::Qualifier) == kStdlibNamespace) {
+		return "metal::mem_flags::" + last;
+	}
+
 	if (!found && parts.size() == 2 && parts.front() == "mem_flags") {
 		return spelled;
 	}
