@@ -58,6 +58,17 @@ namespace {
 			preprocessOptions.includeDirs.emplace_back(effective.includeDirs[i]);
 		}
 
+		if (effective.macroCount > 0 && !effective.macroNames) {
+			throw mslc::CompileError("macroCount is nonzero but macroNames is NULL");
+		}
+		for (size_t i = 0; i < effective.macroCount; ++i) {
+			if (!effective.macroNames[i]) {
+				throw mslc::CompileError("macroNames has a NULL entry");
+			}
+			const char* value = effective.macroValues ? effective.macroValues[i] : nullptr;
+			preprocessOptions.macros.emplace_back(effective.macroNames[i], value ? value : "1");
+		}
+
 		const mslc::PreprocessedSource preprocessed = mslc::preprocess(
 			std::string_view(source, sourceLength), preprocessOptions);
 		mslc::Parser parser(preprocessed.tokens);
@@ -194,6 +205,9 @@ void mslc_default_options(MslcOptions* options) {
 	options->sourcePath = nullptr;
 	options->includeDirs = nullptr;
 	options->includeDirCount = 0;
+	options->macroNames = nullptr;
+	options->macroValues = nullptr;
+	options->macroCount = 0;
 }
 
 int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* options,
