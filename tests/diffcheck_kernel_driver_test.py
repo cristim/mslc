@@ -43,7 +43,7 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "layout_unread_member")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
@@ -52,6 +52,10 @@ MUTANTS = [
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
     ("texture_sample_two", [[r"(OpVectorShuffle %v2float %\d+ %\d+) 1 0", r"\1 0 1"]], "mismatched"),
+    # layout: a member the kernel never reads moves; no output changes, only the layout does
+    ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4", r"\1 12"]], "reflection-mismatch"),
+    # layout: the element stride of an array of vectors
+    ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
 ]
 
 rc, out, data = run(probe("texture_read"))

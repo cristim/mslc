@@ -27,7 +27,9 @@ import graphics
 import hostenv
 import hosts
 import inputs
+import layout
 import resources
+import spirvio
 
 OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
 
@@ -111,6 +113,13 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     layouts = {b["index"]: b for b in apple["buffers"]}
     if any(l["stride"] == 0 or not l["leaves"] for l in layouts.values()):
         result.update(status="skipped", reason="unsupported argument: buffer element has no scalar layout")
+        return result
+    try:
+        findings = layout.cross_check(mbuf, layouts, layout.spirv_layouts(spirvio.disassemble(spv), entry, mbuf))
+    except ValueError as e:
+        findings = ["cannot read the buffer layout from mslc's SPIR-V: %s" % e]
+    if findings:
+        result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
     if not any(l["access"] != "read" for l in layouts.values()):
         result.update(status="skipped", reason="no writable buffer to compare")

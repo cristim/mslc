@@ -11,7 +11,91 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "diffcheck"))
 import checks  # noqa: E402
 import directives  # noqa: E402
+import layout  # noqa: E402
 import resources  # noqa: E402
+
+# One entry point `k` with a constant struct {float a; float unread; float b;} at member 0 and a
+# runtime array of float4 at member 1.
+DISASM = """
+OpEntryPoint GLCompute %46 "k" %43
+OpDecorate %10 ArrayStride 16
+OpDecorate %12 Block
+OpMemberDecorate %12 0 Offset 0
+OpDecorate %26 Block
+OpMemberDecorate %26 0 Offset 0
+OpMemberDecorate %26 1 Offset 4
+OpMemberDecorate %26 2 Offset 8
+OpDecorate %38 Block
+OpMemberDecorate %38 0 Offset 0
+OpMemberDecorate %38 1 Offset 8
+OpDecorate %43 DescriptorSet 0
+OpDecorate %43 Binding 0
+%9 = OpTypeFloat 32
+%8 = OpTypeVector %9 4
+%10 = OpTypeRuntimeArray %8
+%12 = OpTypeStruct %10
+%26 = OpTypeStruct %9 %9 %9
+%36 = OpTypePointer PhysicalStorageBuffer %26
+%37 = OpTypePointer PhysicalStorageBuffer %12
+%38 = OpTypeStruct %36 %37
+%42 = OpTypePointer Uniform %38
+%43 = OpVariable %42 Uniform
+"""
+BUFFERS = [{"metal_index": 0, "name": "p", "member": 0, "descriptor": {"set": 0, "binding": 0}},
+           {"metal_index": 1, "name": "out", "member": 1, "descriptor": {"set": 0, "binding": 0}}]
+
+
+def apple(stride, offsets, scalar="float"):
+    return {"stride": stride, "leaves": [{"off": o, "scalar": scalar} for o in offsets]}
+
+
+APPLE = {0: apple(12, [0, 4, 8]), 1: apple(16, [0, 4, 8, 12])}
+
+
+class Layout(unittest.TestCase):
+    def test_reads_offsets_and_stride(self):
+        got = layout.spirv_layouts(DISASM, "k", BUFFERS)
+        self.assertEqual(got[0], {"stride": None, "leaves": [(0, 4, "float"), (4, 4, "float"), (8, 4, "float")]})
+        self.assertEqual(got[1]["stride"], 16)
+        self.assertEqual([l[0] for l in got[1]["leaves"]], [0, 4, 8, 12])
+        self.assertEqual(layout.cross_check(BUFFERS, APPLE, got), [])
+
+    def test_moved_member_is_a_finding(self):
+        # Moving the unread member: the outputs would not change, the layout does.
+        got = layout.spirv_layouts(DISASM.replace("1 Offset 4", "1 Offset 12"), "k", BUFFERS)
+        findings = layout.cross_check(BUFFERS, APPLE, got)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("buffer(0) p", findings[0])
+
+    def test_stride_is_a_finding(self):
+        got = layout.spirv_layouts(DISASM.replace("ArrayStride 16", "ArrayStride 32"), "k", BUFFERS)
+        self.assertIn("stride is 32", layout.cross_check(BUFFERS, APPLE, got)[0])
+
+    def test_kind_and_size_matter(self):
+        got = layout.spirv_layouts(DISASM, "k", BUFFERS)
+        wrong = {**APPLE, 0: apple(12, [0, 4, 8], "int")}
+        self.assertTrue(layout.cross_check(BUFFERS, wrong, got))
+
+    def test_bare_scalar_buffer(self):
+        # `constant float &scale`: the pointer's pointee is the scalar itself, not a struct.
+        text = DISASM.replace("%36 = OpTypePointer PhysicalStorageBuffer %26", "%36 = OpTypePointer PhysicalStorageBuffer %9")
+        got = layout.spirv_layouts(text, "k", BUFFERS)
+        self.assertEqual(got[0], {"stride": None, "leaves": [(0, 4, "float")]})
+
+    def test_matrix_stride_of_a_runtime_array(self):
+        # constant matrix_float2x2 *m: the block's member 0 carries MatrixStride, the array only ArrayStride.
+        text = DISASM.replace("OpDecorate %10 ArrayStride 16", "OpDecorate %10 ArrayStride 32\nOpMemberDecorate %12 0 MatrixStride 16"
+                              ).replace("%10 = OpTypeRuntimeArray %8", "%7 = OpTypeMatrix %8 2\n%10 = OpTypeRuntimeArray %7")
+        got = layout.spirv_layouts(text, "k", BUFFERS)
+        self.assertEqual(got[1]["stride"], 32)
+        self.assertEqual([l[0] for l in got[1]["leaves"]], [0, 4, 8, 12, 16, 20, 24, 28])
+
+    def test_unreadable_layout_raises(self):
+        with self.assertRaises(ValueError):
+            layout.spirv_layouts(DISASM.replace("OpMemberDecorate %26 2 Offset 8\n", ""), "k", BUFFERS)
+        with self.assertRaises(ValueError):
+            layout.spirv_layouts(DISASM, "nope", BUFFERS)
+
 
 class Resources(unittest.TestCase):
     def test_seed_is_deterministic_and_binds_by_reflection(self):

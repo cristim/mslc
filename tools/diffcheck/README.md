@@ -176,6 +176,16 @@ file declares `// DIFFCHECK-UNUSED: <name> <reason>`. Probes are in `tests/diffc
 miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
 between bindings, an unswapped sample coordinate. Each is reported as a mismatch while the baselines match.
 
+## Layout cross-check
+
+mslc's reflection JSON has no layout and a run reads only the bytes under Apple's leaf offsets on
+both sides, so a layout difference in padding, or in a member the kernel never reads, was invisible.
+`layout.py` reads the `Offset`, `ArrayStride` and `MatrixStride` decorations of mslc's SPIR-V and
+compares the offset, size and kind (float or integer) of every scalar of one element, and the element
+stride of a runtime array, with Apple's reflection. A difference, or a layout that cannot be read, is
+a `reflection-mismatch`. Not covered: the total size of a `constant T &` struct (SPIR-V does not
+carry it), a bool inside a buffer (reported as unreadable).
+
 ## Reading a mismatch: what is not an mslc bug
 
 Triage of the corpus sweeps (2,754 probe kernels at 64 threads, local size 8: 1,187 compared, 1,071
