@@ -71,14 +71,19 @@ def written_nonzero(layouts, before, after):
     return False
 
 
-def verdict(cases, nonzero, writes_zero):
+def verdict(cases, nonzero, writes_zero, unused=()):
     """(status, reason) for the cases of one kernel. A control that did not fire outranks a
-    match, because a comparison that cannot fail proves nothing."""
+    match, because a comparison that cannot fail proves nothing. `unused` names the textures the
+    output does not depend on and the file did not declare."""
     if any(not c["negative_control"] for c in cases):
         return "control-failed", "the perturbed copy compared equal to Apple's output, or nothing could be perturbed"
     first = next((c for c in cases if c["diff_count"]), None)
     if first:
         return "mismatched", "first difference: %s" % json.dumps(first["diffs"][0])
+    if unused:
+        return "unused-texture", ("changing the texels of %s left every compared output the same on Apple's side, so "
+                                  "the texture binding is untested (declare `// DIFFCHECK-UNUSED: <name> <reason>` "
+                                  "if the kernel ignores it)" % ", ".join(unused))
     if not nonzero and not writes_zero:
         return "zero-output", ("no output leaf was written to a non-zero value on either backend "
                                "(declare `// DIFFCHECK: writes-zero` if that is right)")

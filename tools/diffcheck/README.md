@@ -152,8 +152,29 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   That does not make the module safe on every driver: mslc emits no `NoContraction` and no
   `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
   (#368, a real divergence, see below).
-- Not supported yet in kernel mode, skipped with the reason: textures, samplers, threadgroup memory,
-  argument buffers, atomics. Graphics pairs have their own mode, below.
+- `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
+- Not supported yet in kernel mode, skipped with the reason: threadgroup memory arguments
+  (`[[threadgroup(n)]]`: mslc rejects the attribute, #373), argument buffers, atomics (#374), writable
+  textures, non-2D or non-float textures, embedded (`constexpr`) samplers (all #374). Graphics pairs have their
+  own mode, below.
+
+## Kernel textures and samplers
+
+A kernel with `texture2d<float>` arguments (access `sample` or `read`) and runtime `sampler`
+arguments is run like any other: each case seeds one 4x4 RGBA32Float texture per binding from the
+case's generator (profile and seed as for buffers, so NaN and infinity texels appear in the `edge`
+case) and gives both sides the same bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
+Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index
+and name. A sampler is nearest, clamp-to-edge, normalised, no mips (the code is shared with graphics
+mode in `resources.py`), so sample at texel centres. Consequence: every runtime sampler is the same,
+so a wrong sampler binding cannot change a result and is not detected.
+
+Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
+change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the
+file declares `// DIFFCHECK-UNUSED: <name> <reason>`. Probes are in `tests/diffcheck/kernel`
+(`diffcheck/kernel/<name>`, run at grid 64, local 16) and `diffcheck/kernel-driver` plants planted
+miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
+between bindings, an unswapped sample coordinate. Each is reported as a mismatch while the baselines match.
 
 ## Reading a mismatch: what is not an mslc bug
 

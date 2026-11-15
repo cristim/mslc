@@ -28,6 +28,7 @@ import hostenv
 import hosts
 import inputs
 import outputs
+import resources
 import spirvio
 
 # (host format name, scalar of the attachment) per fragment output scalar.
@@ -45,7 +46,6 @@ DEPTH_EPS = 1e-6
 SUBPIXEL = 256  # vertex positions must sit on this grid, in pixels
 SLOT_TOP = 30  # attribute at location n is vertex buffer slot 30 - n, away from [[buffer(n)]] arguments
 MAX_COLOR = 8
-TEXTURE_SIZE = 4
 DEFAULT_SIZE, DEFAULT_ELEMS = 32, 64
 # Pixel coordinates of 32x32. Three shapes; no edge passes through a pixel centre (checked by
 # hand: the slopes 1/2, 13/18 and 3/26 never meet k + 0.5), so top-left fill rules cannot
@@ -119,11 +119,6 @@ def vertex_data(attributes, points, position, width, height, rng, profile):
     return data
 
 
-def texture_data(rng, profile):
-    return bytearray(b"".join(inputs.leaf_bits(rng, "float", profile).to_bytes(4, "little")
-                              for _ in range(4 * TEXTURE_SIZE * TEXTURE_SIZE)))
-
-
 def split_leaves(layout, apple, primitives):
     """(exact, smooth) leaves of one attachment. A float component whose Apple values take more
     distinct values than there are primitives (plus the clear value) varies across a primitive,
@@ -172,9 +167,7 @@ def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_o
     if depth_out:
         lines.append("depth %r %s" % (DEPTH_CLEAR, depth_out))
     lines += ["gbuffer %s %d %d %d %d %s" % b for b in buffers]
-    lines += ["texture %d %d %d %d %d %s" % (i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f) for i, s, b, f in textures]
-    lines += ["sampler %d %d %d" % s for s in samplers]
-    return lines
+    return lines + resources.lines(textures, samplers)
 
 
 def _skipped(res, reason):
@@ -263,11 +256,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
         bufs = [b for b in ep["bindings"] if b["kind"] == "Buffer"]
         findings += ["%s: %s" % (stage, f) for f in checks.cross_check(bufs, a)]
-        for kind, key in (("Texture", "textures"), ("Sampler", "samplers")):
-            mine = sorted((b["metal_index"], b["name"]) for b in ep["bindings"] if b["kind"] == kind)
-            if mine != sorted((t["index"], t["name"]) for t in a[key]):
-                findings.append("%s: %s bindings differ: mslc %s, Apple %s" % (stage, kind.lower(), mine,
-                                sorted((t["index"], t["name"]) for t in a[key])))
+        findings += resources.cross_check(ep["bindings"], a, stage + ": ")
         if any(t["type"] != "2d" or t["data"] != "float" for t in a["textures"]):
             return None, _skipped(res, "unsupported %s texture: only 2D float textures" % stage)
         layouts[stage] = {l["index"]: l for l in a["buffers"]}
@@ -320,13 +309,9 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                 path = base + "%s-buf%d.bin" % (stage, b["metal_index"])
                 hostenv.write_bytes(path, data)
                 buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))
-            for b in ep["bindings"]:
-                if b["kind"] == "Texture":
-                    path = base + "tex%d.bin" % b["metal_index"]
-                    hostenv.write_bytes(path, texture_data(rng, profile))
-                    textures.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"], path))
-                elif b["kind"] == "Sampler":
-                    samplers.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"]))
+            stage_textures, stage_samplers = resources.seed(ep["bindings"], rng, profile, base + stage + "-")
+            textures += stage_textures
+            samplers += stage_samplers
         outs = {}
         for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
             color_outs = {i: base + "%s-color%d.bin" % (backend, i) for i in plan["colors"]}

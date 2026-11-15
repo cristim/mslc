@@ -1,6 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 kernel void k(texture2d<float, access::read> t [[texture(0)]], device float4* o [[buffer(0)]],
-	uint2 g [[thread_position_in_grid]]) {
-	o[g.x] = t.read(g);
+	uint g [[thread_position_in_grid]]) {
+	o[g] = t.read(uint2(g % 4, g / 4 % 4));
 }
