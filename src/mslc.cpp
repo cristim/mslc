@@ -110,6 +110,7 @@ namespace {
 		moduleOptions.localSizeY = effective.localSizeY ? effective.localSizeY : 1;
 		moduleOptions.localSizeZ = effective.localSizeZ ? effective.localSizeZ : 1;
 		moduleOptions.separateImageSet = effective.imageSetPolicy == MSLC_SET_IMAGES;
+		moduleOptions.maskGridSize = effective.maskGridSize != 0;
 		reflection = mslc::emitModule(builder, unit, entryPoints, moduleOptions);
 		if (!builder.finalize(module)) {
 			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
@@ -194,6 +195,7 @@ void mslc_default_options(MslcOptions* options) {
 	options->sourcePath = nullptr;
 	options->includeDirs = nullptr;
 	options->includeDirCount = 0;
+	options->maskGridSize = 0;
 }
 
 int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* options,

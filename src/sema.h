@@ -277,6 +277,8 @@ struct ModuleOptions {
 	uint32_t localSizeY = 1;
 	uint32_t localSizeZ = 1;
 	bool separateImageSet = false;
+	// Kernels without a barrier skip the threads outside a grid size given through specialization constants
+	bool maskGridSize = false;
 };
 
 // The reflection's embedded_samplers entries carry the whole of indium's

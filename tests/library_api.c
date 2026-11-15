@@ -10,11 +10,12 @@ struct LegacyOptions {
 	const char* sourcePath;
 	const char* const* includeDirs;
 	size_t includeDirCount;
+	uint32_t maskGridSize;
 };
 #define OFFSET(field) _Static_assert(offsetof(MslcOptions, field) == offsetof(struct LegacyOptions, field), #field)
 _Static_assert(sizeof(MslcOptions) == sizeof(struct LegacyOptions), "options ABI size");
 OFFSET(stage); OFFSET(localSizeX); OFFSET(localSizeY); OFFSET(localSizeZ);
-OFFSET(imageSetPolicy); OFFSET(sourcePath); OFFSET(includeDirs); OFFSET(includeDirCount);
+OFFSET(imageSetPolicy); OFFSET(sourcePath); OFFSET(includeDirs); OFFSET(includeDirCount); OFFSET(maskGridSize);
 
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "line %d: %s\n", __LINE__, #condition); exit(1); } } while (0)
 
