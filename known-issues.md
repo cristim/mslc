@@ -31,6 +31,15 @@ the front end can see (not across statements, where Apple does not fuse). `tools
 compiles the Apple side with `contract(off)` to compare like with like. Not scheduled: no
 corpus kernel depends on the last bit.
 
+Also open, tracked in #371:
+
+- indium (`src/indium/indium.cpp`) never queries `VkPhysicalDeviceFloatControlsProperties`. The
+  execution modes need `shaderSignedZeroInfNanPreserveFloat32` (VUID 06294) and, for mode 16,
+  `shaderSignedZeroInfNanPreserveFloat16` (VUID 06293). Mode 16 is module-wide: every entry point
+  gets it once any code declares half.
+- `OpFDiv`, `OpFNegate`, `OpFRem`, `OpDot`, `OpMatrixTimes*` and the GLSL.std.450 ext insts (FMix,
+  Smoothstep, ...) are not decorated `NoContraction`.
+
 ## lavapipe cannot execute any mslc module on this machine (RESOLVED, stale)
 
 **Status:** resolved/stale as of 2026-10-13; kept for history, not current guidance.
