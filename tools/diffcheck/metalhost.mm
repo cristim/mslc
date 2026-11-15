@@ -6,6 +6,10 @@
 //   std <2.4|3.0|3.1|3.2>     local X Y Z       groups X Y Z       reflection <out.json>
 //   contract on|off           (source mode; default off, see below)
 //   buffer <metal index> <bytes> <input file> <output file>          (run mode)
+//   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>
+//                                                    (run mode; storage: mslc's read-access image; set and binding are
+//   sampler <metal index> <set> <binding>                              vkhost's, ignored here)
+// A texture is 2D RGBA32Float, shader read; a sampler is nearest, clamp-to-edge, normalised.
 // Graphics: mode reflect-gfx|draw, see drawMain; reflect-gfx writes {vertex, fragment} binding
 // lists (buffers with layouts, textures, samplers) of the render pipeline.
 // The source is compiled with newLibraryWithSource and MTLMathModeSafe, the way Blender
@@ -75,21 +79,23 @@ static void addLeaves(NSMutableArray *out, NSUInteger base, MTLDataType t, MTLSt
     }
 }
 
-// Buffers with their element layout; with `graphics`, textures and samplers are listed as
-// supported ({index, name, type, data}) instead of being "unsupported".
-static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphics) {
+// Buffers with their element layout; with `resources`, textures and samplers are listed as
+// supported ({index, name, type, data, access}) instead of being "unsupported"; `graphics` also
+// drops the vertex descriptor's own buffers.
+static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphics, BOOL resources) {
     g_unsupported = [NSMutableArray array];
     NSMutableArray *buffers = [NSMutableArray array], *textures = [NSMutableArray array], *samplers = [NSMutableArray array];
     for (id<MTLBinding> b in list) {
         if (graphics && [b.name hasPrefix:@"vertexBuffer."]) continue;  // the vertex descriptor's own buffers
-        if (graphics && b.type == MTLBindingTypeTexture) {
+        if (resources && b.type == MTLBindingTypeTexture) {
             id<MTLTextureBinding> tb = (id<MTLTextureBinding>)b;
             [textures addObject:@{@"index": @(b.index), @"name": b.name,
                 @"type": tb.textureType == MTLTextureType2D ? @"2d" : @"other",
-                @"data": tb.textureDataType == MTLDataTypeFloat ? @"float" : @"other"}];
+                @"data": tb.textureDataType == MTLDataTypeFloat ? @"float" : @"other",
+                @"access": @[@"read", @"readwrite", @"write"][b.access]}];
             continue;
         }
-        if (graphics && b.type == MTLBindingTypeSampler) {
+        if (resources && b.type == MTLBindingTypeSampler) {
             [samplers addObject:@{@"index": @(b.index), @"name": b.name}];
             continue;
         }
@@ -188,6 +194,27 @@ static id<MTLTexture> target(id<MTLDevice> device, MTLPixelFormat f, NSUInteger 
     return [device newTextureWithDescriptor:td];
 }
 
+// The texture of a `texture` manifest line (INDEX SET BINDING W H FILE) and the one sampler every
+// runtime sampler gets.
+static id<MTLTexture> sourceTexture(id<MTLDevice> device, NSArray *w) {
+    NSUInteger tw = [w[4] integerValue], th = [w[5] integerValue];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:tw height:th mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [device newTextureWithDescriptor:td];
+    NSData *texels = slurp(w[6], tw * th * 16);
+    [t replaceRegion:MTLRegionMake2D(0, 0, tw, th) mipmapLevel:0 withBytes:texels.bytes bytesPerRow:tw * 16];
+    return t;
+}
+
+static id<MTLSamplerState> nearestSampler(id<MTLDevice> device) {
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    return [device newSamplerStateWithDescriptor:sd];
+}
+
 // Reflects the render pipeline (draw == NO) or draws and writes every attachment to its file.
 // Manifest lines: vertex, fragment, target W H, draw V I, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
 // depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture INDEX SET BINDING W H FILE,
@@ -221,8 +248,8 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo reflection:&refl error:&err];
     if (!pso) die([@"pipeline failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
     if (!draw) {
-        NSDictionary *doc = @{@"device": device.name, @"vertex": reflectBindings(refl.vertexBindings, YES),
-            @"fragment": reflectBindings(refl.fragmentBindings, YES)};
+        NSDictionary *doc = @{@"device": device.name, @"vertex": reflectBindings(refl.vertexBindings, YES, YES),
+            @"fragment": reflectBindings(refl.fragmentBindings, YES, YES)};
         NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
         if (!m[@"reflection"] || ![j writeToFile:m[@"reflection"][0] atomically:YES]) die(@"cannot write the reflection");
         return 0;
@@ -275,23 +302,11 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         [keep addObject:b];
     }
     for (NSArray *w in lists[@"texture"]) {
-        NSUInteger tw = [w[4] integerValue], th = [w[5] integerValue];
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:tw height:th mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModeShared;
-        id<MTLTexture> t = [device newTextureWithDescriptor:td];
-        NSData *texels = slurp(w[6], tw * th * 16);
-        [t replaceRegion:MTLRegionMake2D(0, 0, tw, th) mipmapLevel:0 withBytes:texels.bytes bytesPerRow:tw * 16];
+        id<MTLTexture> t = sourceTexture(device, w);
         [enc setFragmentTexture:t atIndex:[w[1] integerValue]];
         [keep addObject:t];
     }
-    for (NSArray *w in lists[@"sampler"]) {
-        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
-        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
-        sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
-        sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
-        [enc setFragmentSamplerState:[device newSamplerStateWithDescriptor:sd] atIndex:[w[1] integerValue]];
-    }
+    for (NSArray *w in lists[@"sampler"]) [enc setFragmentSamplerState:nearestSampler(device) atIndex:[w[1] integerValue]];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices instanceCount:instances];
     [enc endEncoding];
 
@@ -330,7 +345,7 @@ int main(int argc, char **argv) {
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         NSMutableArray *bufSpecs = [NSMutableArray array];
         NSMutableDictionary<NSString *, NSMutableArray *> *lists = [NSMutableDictionary dictionary];
-        NSSet *multi = [NSSet setWithArray:@[@"attr", @"color", @"gbuffer", @"texture", @"sampler"]];
+        NSSet *multi = [NSSet setWithArray:@[@"attr", @"color", @"gbuffer", @"texture", @"storagetexture", @"sampler"]];
         NSString *text = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:nil];
         if (!text) die(@"cannot read manifest");
         for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
@@ -364,9 +379,10 @@ int main(int argc, char **argv) {
             options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo reflection:&refl error:&err];
         if (!pso) die([@"pipeline failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
 
-        NSDictionary *bindings = reflectBindings(refl.bindings, NO);
+        NSDictionary *bindings = reflectBindings(refl.bindings, NO, YES);
         NSArray *buffers = bindings[@"buffers"];
-        NSDictionary *doc = @{@"device": device.name, @"buffers": buffers, @"unsupported": bindings[@"unsupported"],
+        NSDictionary *doc = @{@"device": device.name, @"buffers": buffers, @"textures": bindings[@"textures"], @"samplers": bindings[@"samplers"],
+            @"unsupported": bindings[@"unsupported"],
             @"max_threads": @(pso.maxTotalThreadsPerThreadgroup), @"execution_width": @(pso.threadExecutionWidth)};
         if (m[@"reflection"]) {
             NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
@@ -381,6 +397,13 @@ int main(int argc, char **argv) {
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:pso];
         NSMutableArray<id<MTLBuffer>> *bufs = [NSMutableArray array];
+        NSMutableArray *keep = [NSMutableArray array];
+        for (NSArray *w in [(lists[@"texture"] ?: @[]) arrayByAddingObjectsFromArray:(lists[@"storagetexture"] ?: @[])]) {
+            id<MTLTexture> t = sourceTexture(device, w);
+            [enc setTexture:t atIndex:[w[1] integerValue]];
+            [keep addObject:t];
+        }
+        for (NSArray *w in lists[@"sampler"]) [enc setSamplerState:nearestSampler(device) atIndex:[w[1] integerValue]];
         for (NSArray *w in bufSpecs) {
             NSUInteger idx = [w[1] integerValue], n = [w[2] integerValue];
             NSData *d = [NSData dataWithContentsOfFile:w[3]];
