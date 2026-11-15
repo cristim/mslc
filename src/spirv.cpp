@@ -120,6 +120,13 @@ Id Builder::emit(uint16_t opcode, std::vector<uint32_t> operands) {
 	return _nextId++;
 }
 
+void Builder::emitNoResult(uint16_t opcode, std::vector<uint32_t> operands) {
+	Instruction instruction;
+	instruction.opcode = opcode;
+	instruction.words = std::move(operands);
+	_sections[pickSection(opcode)].push_back(std::move(instruction));
+}
+
 Id Builder::emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands) {
 	// A value-producing instruction is laid out as
 	// [result type, result id, operands...]. Both leading words are needed:

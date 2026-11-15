@@ -7,13 +7,13 @@
 // DISASM: DepthLess
 // DISASM: DepthGreater
 // DISASM-NOT: SampleRateShading
-// DISASM-ENTRY-MODES: fa OriginUpperLeft
-// DISASM-ENTRY-MODES: fb OriginUpperLeft
-// DISASM-ENTRY-MODES: fl OriginUpperLeft, DepthReplacing, DepthLess
-// DISASM-ENTRY-MODES: fg OriginUpperLeft, DepthReplacing, DepthGreater
-// DISASM-ENTRY-MODES: fd OriginUpperLeft, DepthReplacing
-// DISASM-ENTRY-MODES: fc OriginUpperLeft
-// DISASM-ENTRY-MODES: v
+// DISASM-ENTRY-MODES: fa OriginUpperLeft, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: fb OriginUpperLeft, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: fl OriginUpperLeft, DepthReplacing, DepthLess, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: fg OriginUpperLeft, DepthReplacing, DepthGreater, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: fd OriginUpperLeft, DepthReplacing, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: fc OriginUpperLeft, SignedZeroInfNanPreserve 32
+// DISASM-ENTRY-MODES: v SignedZeroInfNanPreserve 32
 // DISASM-ENTRY-BUILTINS: fa SampleMask
 // DISASM-ENTRY-BUILTINS: fb SampleMask
 // DISASM-ENTRY-BUILTINS: fl FragDepth, SampleMask

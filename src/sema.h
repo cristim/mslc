@@ -140,6 +140,8 @@ public:
 	std::optional<spirv::StorageClassValue> storageClassOf(spirv::Id pointerType) const;
 
 	bool isFloat(spirv::Id type) const;
+	// Whether a half has been declared, which is when the module needs Float16 behaviour pinned.
+	bool declaresHalf() const { return _scalars.count(static_cast<uint32_t>(ScalarKind::Half)) != 0; }
 	bool isBool(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;

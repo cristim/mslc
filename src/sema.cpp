@@ -2269,6 +2269,8 @@ namespace {
 		Id _voidType = InvalidId;
 		Id _functionId = InvalidId;
 		Id _entryPointId = InvalidId;
+		std::vector<Id> _entryPointIds;
+		bool _floatControlsDeclared = false;
 		spirv::Id _glslSet = InvalidId;
 
 		// Set once the current block has its terminator, so nothing more may be
@@ -13405,7 +13407,20 @@ namespace {
 			_builder.emit(spirv::OpEntryPoint, operands);
 		}
 
+		// mslc models Metal's safe math (__METAL_FAST_MATH__ is 0), so signed zeros,
+		// infinities and NaNs must survive. Without this a NIR driver folds x * 0 and
+		// x + (-x). The capability is core from SPIR-V 1.4; Vulkan needs
+		// shaderSignedZeroInfNanPreserveFloat32. The 16-bit mode is added in run()
+		// once it is known whether the module uses half.
+		if (!_floatControlsDeclared) {
+			_builder.emitNoResult(spirv::OpCapability,
+				{ static_cast<uint32_t>(spirv::Capability::SignedZeroInfNanPreserve) });
+			_floatControlsDeclared = true;
+		}
 		_builder.setSection(spirv::Section::ExecutionModes);
+		_builder.emitNoResult(spirv::OpExecutionMode, { _entryPointId,
+			static_cast<uint32_t>(spirv::ExecutionMode::SignedZeroInfNanPreserve), 32u });
+		_entryPointIds.push_back(_entryPointId);
 		if (_entryPoint->stage == Stage::Kernel) {
 			// The workgroup size is a spec constant rather than a literal, so
 			// indium can supply Metal's threadsPerThreadgroup through
@@ -13763,6 +13778,14 @@ namespace {
 		}
 
 		document += "\t]\n}\n";
+
+		if (_types.declaresHalf()) {
+			_builder.setSection(spirv::Section::ExecutionModes);
+			for (const Id entry: _entryPointIds) {
+				_builder.emitNoResult(spirv::OpExecutionMode, { entry,
+					static_cast<uint32_t>(spirv::ExecutionMode::SignedZeroInfNanPreserve), 16u });
+			}
+		}
 
 		if (_options.linkageObject) {
 			emitLibraryHelpers();
