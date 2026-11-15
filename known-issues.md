@@ -18,6 +18,19 @@ parse". Trade-off, a decision recorded for the owner to override:
   initialiser there already was. `for (auto v(float(a)); ...)` is refused as a function declaration;
   `for (auto v(a); ...)` is a variable, in mslc as in Apple.
 
+## Apple fuses a * b + c inside one expression; mslc emits a separate multiply and add (#368)
+
+**Status:** open, deliberate. Found 2026-11-15 while fixing #368.
+
+mslc decorates `OpFMul`/`OpFAdd`/`OpFSub` and the float conversions `NoContraction`, which
+forbids a driver from fusing `a * b + c` into an fma. Apple's compiler does fuse within one
+expression (`llvm.fmuladd`) even in safe math mode, so a result under cancellation can differ by
+a ULP or more. mslc matches the strict IEEE result, which is the only one that is the same on
+every Vulkan driver; matching Apple would need an explicit `OpExtInst Fma` at each `a * b + c`
+the front end can see (not across statements, where Apple does not fuse). `tools/diffcheck`
+compiles the Apple side with `contract(off)` to compare like with like. Not scheduled: no
+corpus kernel depends on the last bit.
+
 ## lavapipe cannot execute any mslc module on this machine (RESOLVED, stale)
 
 **Status:** resolved/stale as of 2026-10-13; kept for history, not current guidance.

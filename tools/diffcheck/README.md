@@ -149,9 +149,10 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   a separate multiply and add, and the results differ by a ULP or more under cancellation. Fusing
   inside one expression is permitted, so the Apple side compiles with `#pragma clang fp contract(off)`
   to give a deterministic reference; `--apple-contract` restores what an app's build does.
-  That does not make the module safe on every driver: mslc emits no `NoContraction` and no
-  `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
-  (#368, a real divergence, see below).
+  mslc decorates every float conversion, `OpFAdd`, `OpFSub` and `OpFMul` `NoContraction` and sets
+  `SignedZeroInfNanPreserve` (32, and 16 when half is used) on each entry point (#368), so a NIR
+  driver no longer folds, re-associates or drops -0, inf and NaN, and it does not fuse a separate
+  multiply and add either. Apple's in-expression fusion stays out of scope (known-issues.md).
 - Not supported yet in kernel mode, skipped with the reason: textures, samplers, threadgroup memory,
   argument buffers, atomics. Graphics pairs have their own mode, below.
 
@@ -229,20 +230,11 @@ Not in the list, and why:
 - Lavapipe rejects some valid modules (an empty struct passed by value: `vkCreateComputePipelines` -13, #376).
 - Apple flushes denormal floats in a float compare and in a float to bool conversion (#377); the
   edge profile contains denormals, so a probe that compares or converts float inputs can mismatch there.
-- **Not a harness artifact, #368 (open; origin/master emits neither decoration):** lavapipe folds
-  `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`, `x * 0` to `0`, and re-associates
-  `(x + 1) - 1`, so a half or a negative fraction held in a register, a signed zero, or a cancellation
-  differs from Apple. NIR does that to every float instruction that is not `exact`; mslc's SPIR-V has no
-  `NoContraction` and no `SignedZeroInfNanPreserve`, so RADV, ANV and the other NIR drivers behave the
-  same. These mismatches are mslc results, not harness noise.
+- **Fixed, #368:** lavapipe used to fold `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`,
+  `x * 0` to `0` and `(x + 1) - 1` to `x`, because mslc's SPIR-V carried no `NoContraction` and no
+  `SignedZeroInfNanPreserve`. The `safe_math_*` probes pin each case; a mismatch of that shape now is a new bug.
 
-Whether to compare through a buffer store by default: not yet. A store forces the rounding only for the
-value that is stored, so it hides exactly the register-held cases above (the reason to look at them),
-and it does not help the other two limits (the `<metal_stdlib>` pre-include and uninitialised reads
-are Apple-side, not folded values). Until #368 lands, keep comparing as written: where a probe's
-mismatch is the #368 fold, exclude the buffer with a reason that names #368. Re-measured with the
-#368 branch (not on master yet): the 12 fold probes listed above all match, so nothing more is needed
-and no buffer-store mode should be added. Repeat it once #368 is on master.
+A buffer-store comparison mode is not needed: re-measure the corpus on this fix and add one only if fold mismatches remain.
 
 ## Tests and CI
 
