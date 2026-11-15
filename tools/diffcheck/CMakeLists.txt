@@ -62,6 +62,11 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 	endfunction()
 	diffcheck_probe_tests(${CMAKE_SOURCE_DIR}/tests/probes probe)
 	diffcheck_probe_tests(${DIFFCHECK_TESTS}/diffcheck/graphics graphics)
+	diffcheck_probe_tests(${DIFFCHECK_TESTS}/diffcheck/kernel kernel)
+
+	add_test(NAME diffcheck/kernel-driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_kernel_driver_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/kernel-driver PROPERTIES SKIP_RETURN_CODE 77)
 
 	add_test(NAME diffcheck/graphics-driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_graphics_driver_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
