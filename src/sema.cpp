@@ -13779,16 +13779,17 @@ namespace {
 
 		document += "\t]\n}\n";
 
+		if (_options.linkageObject) {
+			emitLibraryHelpers();
+		}
+
+		// After the library helpers, which can be the only code that declares half.
 		if (_types.declaresHalf()) {
 			_builder.setSection(spirv::Section::ExecutionModes);
 			for (const Id entry: _entryPointIds) {
 				_builder.emitNoResult(spirv::OpExecutionMode, { entry,
 					static_cast<uint32_t>(spirv::ExecutionMode::SignedZeroInfNanPreserve), 16u });
 			}
-		}
-
-		if (_options.linkageObject) {
-			emitLibraryHelpers();
 		}
 
 		// After every entry point, so a diagnostic about one function's own

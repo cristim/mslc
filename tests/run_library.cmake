@@ -307,6 +307,18 @@ expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float3)\" Export" 
 expect_contains("${overloads_dis}" "LinkageAttributes \"mixed(float,thread const int&)\" Export" "overloaded helpers")
 expect_contains("${overloads_dis}" "LinkageAttributes \"solo\" Export" "overloaded helpers")
 
+# A kernel plus an exported helper that is the only user of half: Float16 is declared
+# while the helper is emitted, after the entry point, and the entry point still gets
+# SignedZeroInfNanPreserve 16 as well as 32 (#368).
+set(half_helper_spv "${OUT_DIR}/kernel_with_half_helper.spv")
+file(REMOVE "${half_helper_spv}")
+run_mslc(output 0 --compile-library -o "${half_helper_spv}" "${TEST_DIR}/library/kernel_with_half_helper.metal")
+validate_file("${half_helper_spv}" spv1.5 TRUE "--compile-library on a kernel and a half helper")
+disassemble("${half_helper_spv}" half_helper_dis)
+expect_contains("${half_helper_dis}" "OpCapability Float16" "half helper")
+expect_contains("${half_helper_dis}" "SignedZeroInfNanPreserve 16" "half helper")
+expect_contains("${half_helper_dis}" "SignedZeroInfNanPreserve 32" "half helper")
+
 # Importing one overload of an overloaded name is refused (#266).
 run_mslc(output 1 --compile-library -o "${OUT_DIR}/overload_import.spv" "${TEST_DIR}/library/overload_import.metal")
 expect_contains("${output}" "importing one overload of a name is not lowered yet" "overload import")
