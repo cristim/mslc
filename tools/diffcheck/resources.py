@@ -1,8 +1,8 @@
 """Textures and samplers as both modes feed them: the same seeded texels on both sides, bound by
 Apple's index and by the set and binding of mslc's reflection.
 
-A texture is 2D, RGBA32Float, shader-read; a sampler is nearest, clamp-to-edge, normalised, no
-mips. Probes should sample at a texel centre (an edge or a filter is where the backends may
+A texture is 2D, RGBA32Float, shader-read; a sampler is nearest, normalised, no mips, with an
+address mode picked by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored repeat). Probes should sample at a texel centre (an edge or a filter is where the backends may
 legitimately differ). Anything else is reported by `unsupported` and the file is skipped.
 """
 

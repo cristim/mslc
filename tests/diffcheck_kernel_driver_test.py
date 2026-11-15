@@ -43,7 +43,7 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "layout_unread_member", "ulp_per_buffer")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
@@ -52,8 +52,15 @@ MUTANTS = [
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
     ("texture_sample_two", [[r"(OpVectorShuffle %v2float %\d+ %\d+) 1 0", r"\1 0 1"]], "mismatched"),
+    # sampler: two samplers (clamp and repeat) swap bindings
+    ("sampler_modes", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]], "mismatched"),
     # layout: a member the kernel never reads moves; no output changes, only the layout does
     ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4", r"\1 12"]], "reflection-mismatch"),
+    # layout: two unread members exchange offsets (the set of offsets is unchanged)
+    ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4$", r"\1 99"], [r"(OpMemberDecorate %\w+ 2 Offset) 8$", r"\1 4"],
+                              [r"(OpMemberDecorate %\w+ 1 Offset) 99$", r"\1 8"]], "reflection-mismatch"),
+    # layout: an unread square matrix is row major, with the same offsets
+    ("layout_unread_member", [[r"ColMajor$", "RowMajor"]], "reflection-mismatch"),
     # layout: the element stride of an array of vectors
     ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
     # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
@@ -86,6 +93,8 @@ with tempfile.TemporaryDirectory() as d:
 # A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texture_stale_unused"))
+assert rc == 2 and data["status"] == "error" and "used" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_write_kernel"))
 assert rc == 3 and "access Write" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_kernel"))

@@ -179,6 +179,10 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     declared = dict(params["unused"])
     undeclared = sorted(set(unused) - set(declared))
     result["status"], result["reason"] = checks.verdict(result["cases"], nonzero, params["writes_zero"], undeclared)
+    stale = sorted(set(declared) - set(unused))
+    if stale and result["status"] == "matched":
+        result["status"], result["reason"] = "error", ("DIFFCHECK-UNUSED names %s, but changing its texels changes Apple's "
+                                                       "output: the texture is used, remove the directive" % ", ".join(stale))
     if excluded:
         result["excluded"] = excluded
     if declared:

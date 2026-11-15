@@ -6,7 +6,9 @@ on both sides, so a difference that lands in padding or in a member the kernel n
 invisible in the outputs. Here the offsets of every scalar of one element, and the stride of a
 runtime array, are compared directly.
 
-A leaf is (byte offset, size, kind) with kind "float" or "int" (bool and integers alike).
+A leaf is (byte offset, size, kind) with kind "float" or "int" (bool and integers alike). Leaves are
+compared in flattening order (members in declaration order, array elements, matrix columns), not as
+a set, so two members that swap offsets are a difference.
 """
 
 import re
@@ -19,7 +21,7 @@ def _kind(scalar):
 
 
 def apple_leaves(layout):
-    return sorted((l["off"], compare.SCALARS[l["scalar"]][0], _kind(l["scalar"])) for l in layout["leaves"])
+    return [(l["off"], compare.SCALARS[l["scalar"]][0], _kind(l["scalar"])) for l in layout["leaves"]]
 
 
 class Module:
@@ -27,7 +29,7 @@ class Module:
 
     def __init__(self, text):
         self.types, self.consts, self.arraystride, self.offset, self.matrixstride = {}, {}, {}, {}, {}
-        self.binding, self.variables, self.interfaces = {}, {}, {}
+        self.binding, self.variables, self.interfaces, self.major = {}, {}, {}, {}
         for line in text.splitlines():
             line = line.strip()
             if m := re.match(r'OpEntryPoint \w+ %\d+ "([^"]*)"\s*(.*)$', line):
@@ -38,6 +40,8 @@ class Module:
                 self.offset[(m.group(1), int(m.group(2)))] = int(m.group(3))
             elif m := re.match(r"OpMemberDecorate %(\d+) (\d+) MatrixStride (\d+)$", line):
                 self.matrixstride[(m.group(1), int(m.group(2)))] = int(m.group(3))
+            elif m := re.match(r"OpMemberDecorate %(\d+) (\d+) (RowMajor|ColMajor)$", line):
+                self.major[(m.group(1), int(m.group(2)))] = m.group(3)
             elif m := re.match(r"OpDecorate %(\d+) (DescriptorSet|Binding) (\d+)$", line):
                 self.binding.setdefault(m.group(1), {})[m.group(2)] = int(m.group(3))
             elif m := re.match(r"%(\d+) = OpConstant %\d+ (\d+)$", line):
@@ -67,8 +71,8 @@ class Module:
             size, kind = self.size_kind(args[0][1:])
             return [(base + i * size, size, kind) for i in range(int(args[1]))]
         if op == "OpTypeMatrix":
-            if matrix_stride is None:
-                raise ValueError("a matrix without MatrixStride")
+            if not isinstance(matrix_stride, int):
+                raise ValueError("a %s" % (matrix_stride or "matrix without MatrixStride"))
             return [l for c in range(int(args[1])) for l in self.leaves(args[0][1:], base + c * matrix_stride)]
         if op == "OpTypeArray":
             stride = self.arraystride.get(ty)
@@ -81,9 +85,17 @@ class Module:
             for i, member in enumerate(args):
                 if (ty, i) not in self.offset:
                     raise ValueError("a struct member without Offset")
-                out += self.leaves(member[1:], base + self.offset[(ty, i)], self.matrixstride.get((ty, i)))
+                out += self.leaves(member[1:], base + self.offset[(ty, i)], self.matrix_stride(ty, i))
             return out
         raise ValueError("%s has no buffer layout" % op)
+
+    def matrix_stride(self, struct, member):
+        """The MatrixStride of a struct member, or an error for a layout Metal does not use: Metal
+        matrices are column major, so RowMajor (or no majorness) is a layout difference."""
+        major = self.major.get((struct, member))
+        if major != "ColMajor":
+            return "%s matrix member" % (major or "undecorated")
+        return self.matrixstride.get((struct, member))
 
     def pointee(self, ty):
         op, args = self.types[ty]
@@ -118,9 +130,9 @@ def spirv_layouts(text, entry, buffers):
             element = mod.types[array][1][0][1:]
             # A matrix element's MatrixStride is decorated on the block's one member, not on the array.
             result[b["metal_index"]] = {"stride": mod.arraystride.get(array),
-                                        "leaves": sorted(mod.leaves(element, 0, mod.matrixstride.get((block_ty, 0))))}
+                                        "leaves": (mod.leaves(element, 0, mod.matrix_stride(block_ty, 0)))}
         else:
-            result[b["metal_index"]] = {"stride": None, "leaves": sorted(mod.leaves(block_ty))}
+            result[b["metal_index"]] = {"stride": None, "leaves": mod.leaves(block_ty)}
     return result
 
 

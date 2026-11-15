@@ -13,8 +13,8 @@
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>   (at most 4)
 //   sampler <metal index> <set> <binding>                               (at most 4)
 // A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
-// what mslc declares for access::read) and a sampler is nearest, clamp-to-edge, normalised, as in
-// metalhost; the Metal index is ignored here. Exit 0 on success, 2 on any Vulkan or file error (never a mismatch: this host
+// what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
+// 2 mirrored repeat), as in metalhost. Exit 0 on success, 2 on any Vulkan or file error (never a mismatch: this host
 // compares nothing). The device name goes to stdout as "device: ...".
 //
 // Details taken from the audited PR #148 harness: the address block's memory is sized
@@ -125,10 +125,14 @@ static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, V
                                        VkAccessFlags src, VkAccessFlags dst);
 static void fillBuf(Buf b, const void *data, size_t n);
 
-static VkSampler makeNearestSampler(void) {
+// Nearest, normalised; the address mode is picked by the Metal sampler index, as in metalhost, so a
+// swapped sampler binding changes what a coordinate outside [0, 1] reads: 0 clamp to edge,
+// 1 repeat, 2 mirrored repeat.
+static VkSampler makeNearestSampler(unsigned index) {
     VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = index % 3 == 0 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+        : index % 3 == 1 ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     VkSampler sampler; CHK(vkCreateSampler(dev, &sci, NULL, &sampler));
     return sampler;
 }
@@ -170,7 +174,7 @@ int main(int argc, char **argv) {
     char spv[1024] = "", entry[256] = "main", in[MAXBUF][1024], out[MAXBUF][1024];
     unsigned local[3] = {1, 1, 1}, groups[3] = {1, 1, 1}, set = 0, member[MAXBUF], nbuf = 0;
     unsigned long long bytes[MAXBUF];
-    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], ns = 0;
+    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0;
     char tfile[MAXTEX][1024]; int tstore[MAXTEX];
     FILE *mf = fopen(argv[1], "r");
     if (!mf) die("cannot open %s", argv[1]);
@@ -183,7 +187,7 @@ int main(int argc, char **argv) {
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
         if (nt < MAXTEX && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 0; continue; }
         if (nt < MAXTEX && sscanf(line, "storagetexture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 1; continue; }
-        if (ns < MAXTEX && sscanf(line, "sampler %*u %u %u", &sset[ns], &sbind[ns]) == 2) { ns++; continue; }
+        if (ns < MAXTEX && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { ns++; continue; }
         if (line[0] != '\n') die("bad manifest line: %s", line);
     }
     fclose(mf);
@@ -243,7 +247,6 @@ int main(int argc, char **argv) {
             wr[nw].dstSet = dset[set]; wr[nw].descriptorCount = 1; wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             wr[nw++].pBufferInfo = &dbi;
         }
-        VkSampler sampler = ns ? makeNearestSampler() : VK_NULL_HANDLE;
         for (unsigned i = 0; i < nt; i++) {
             tex[i] = loadTexture(tfile[i], tw[i], th[i], tstore[i], &stage[i]);
             ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view, tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -252,7 +255,7 @@ int main(int argc, char **argv) {
             wr[nw].descriptorType = tstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[nw++].pImageInfo = &ii[i];
         }
         for (unsigned i = 0; i < ns; i++) {
-            si[i] = (VkDescriptorImageInfo){sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            si[i] = (VkDescriptorImageInfo){makeNearestSampler(sidx[i]), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
             wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[nw].dstSet = dset[sset[i]]; wr[nw].dstBinding = sbind[i]; wr[nw].descriptorCount = 1;
             wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[nw++].pImageInfo = &si[i];
@@ -393,7 +396,7 @@ static int drawMain(const char *manifest) {
     double dclear = 1; char dout[1024] = "";
     char gstage[MAXG][16], gfile[MAXG][1024]; unsigned gidx[MAXG], gset[MAXG], gmember[MAXG]; unsigned long long gbytes[MAXG];
     unsigned tset[4], tbind[4], tw[4], th[4]; char tfile[4][1024];
-    unsigned sset[4], sbind[4];
+    unsigned sset[4], sbind[4], sidx[4];
     FILE *mf = fopen(manifest, "r");
     if (!mf) die("cannot open %s", manifest);
     char line[4096], word[32];
@@ -412,7 +415,7 @@ static int drawMain(const char *manifest) {
         } else if (ng < MAXG && sscanf(line, "gbuffer %15s %u %u %u %llu %1023s", gstage[ng], &gidx[ng], &gset[ng], &gmember[ng],
                        &gbytes[ng], gfile[ng]) == 6) { ng++;
         } else if (nt < 4 && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { nt++;
-        } else if (ns < 4 && sscanf(line, "sampler %*u %u %u", &sset[ns], &sbind[ns]) == 2) { ns++;
+        } else if (ns < 4 && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { ns++;
         } else die("bad manifest line: %s", line);
     }
     fclose(mf);
@@ -482,7 +485,6 @@ static int drawMain(const char *manifest) {
         wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wr[nw++].pBufferInfo = &bi[st];
     }
     Img tex[MAXTEX]; Buf stage[MAXTEX];
-    VkSampler sampler = makeNearestSampler();
     for (unsigned i = 0; i < nt; i++) {
         tex[i] = loadTexture(tfile[i], tw[i], th[i], 0, &stage[i]);
         ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -491,7 +493,7 @@ static int drawMain(const char *manifest) {
         wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[nw++].pImageInfo = &ii[i];
     }
     for (unsigned i = 0; i < ns; i++) {
-        si[i] = (VkDescriptorImageInfo){sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        si[i] = (VkDescriptorImageInfo){makeNearestSampler(sidx[i]), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[nw].dstSet = dset[sset[i]]; wr[nw].dstBinding = sbind[i]; wr[nw].descriptorCount = 1;
         wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[nw++].pImageInfo = &si[i];

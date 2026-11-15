@@ -9,7 +9,7 @@
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>
 //                                                    (run mode; storage: mslc's read-access image; set and binding are
 //   sampler <metal index> <set> <binding>                              vkhost's, ignored here)
-// A texture is 2D RGBA32Float, shader read; a sampler is nearest, clamp-to-edge, normalised.
+// A texture is 2D RGBA32Float, shader read; a sampler is nearest and normalised.
 // Graphics: mode reflect-gfx|draw, see drawMain; reflect-gfx writes {vertex, fragment} binding
 // lists (buffers with layouts, textures, samplers) of the render pipeline.
 // The source is compiled with newLibraryWithSource and MTLMathModeSafe, the way Blender
@@ -207,11 +207,14 @@ static id<MTLTexture> sourceTexture(id<MTLDevice> device, NSArray *w) {
     return t;
 }
 
-static id<MTLSamplerState> nearestSampler(id<MTLDevice> device) {
+// The address mode follows the sampler index (0 clamp to edge, 1 repeat, 2 mirrored repeat), so a
+// swapped sampler binding changes what a coordinate outside [0, 1] reads; vkhost does the same.
+static id<MTLSamplerState> nearestSampler(id<MTLDevice> device, NSUInteger index) {
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
     sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
-    sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = index % 3 == 0 ? MTLSamplerAddressModeClampToEdge
+        : index % 3 == 1 ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeMirrorRepeat;
     return [device newSamplerStateWithDescriptor:sd];
 }
 
@@ -306,7 +309,7 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         [enc setFragmentTexture:t atIndex:[w[1] integerValue]];
         [keep addObject:t];
     }
-    for (NSArray *w in lists[@"sampler"]) [enc setFragmentSamplerState:nearestSampler(device) atIndex:[w[1] integerValue]];
+    for (NSArray *w in lists[@"sampler"]) [enc setFragmentSamplerState:nearestSampler(device, [w[1] integerValue]) atIndex:[w[1] integerValue]];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices instanceCount:instances];
     [enc endEncoding];
 
@@ -403,7 +406,7 @@ int main(int argc, char **argv) {
             [enc setTexture:t atIndex:[w[1] integerValue]];
             [keep addObject:t];
         }
-        for (NSArray *w in lists[@"sampler"]) [enc setSamplerState:nearestSampler(device) atIndex:[w[1] integerValue]];
+        for (NSArray *w in lists[@"sampler"]) [enc setSamplerState:nearestSampler(device, [w[1] integerValue]) atIndex:[w[1] integerValue]];
         for (NSArray *w in bufSpecs) {
             NSUInteger idx = [w[1] integerValue], n = [w[2] integerValue];
             NSData *d = [NSData dataWithContentsOfFile:w[3]];

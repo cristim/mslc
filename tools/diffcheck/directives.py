@@ -86,8 +86,10 @@ def parse(source):
                 raise ValueError("DIFFCHECK-FLOAT-RANGE %s: %d > %d" % (m.group(1), lo, hi))
             result["float_range"][m.group(1)] = (lo, hi)
             continue
-        m = re.match(r"\s*//\s*DIFFCHECK-ULP:\s*(\S+)\s+(\d+)\s*$", line)
-        if m:
+        if re.match(r"\s*//\s*DIFFCHECK-ULP:", line):
+            m = re.match(r"\s*//\s*DIFFCHECK-ULP:\s*(\S+)\s+(\d+)\s*$", line)
+            if not m:
+                raise ValueError("bad DIFFCHECK-ULP line %r (want <buffer> <whole number>)" % line.strip())
             result["ulp"][m.group(1)] = int(m.group(2))
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-UNUSED:\s*(\S+)\s*(.*)$", line)

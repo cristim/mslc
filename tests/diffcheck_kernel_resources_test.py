@@ -67,6 +67,12 @@ class Layout(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn("buffer(0) p", findings[0])
 
+    def test_swapped_members_are_a_finding(self):
+        # Two members exchange offsets: the set of offsets is unchanged, the layout is not.
+        text = DISASM.replace("1 Offset 4", "1 Offset 99").replace("2 Offset 8", "2 Offset 4").replace("1 Offset 99", "1 Offset 8")
+        findings = layout.cross_check(BUFFERS, APPLE, layout.spirv_layouts(text, "k", BUFFERS))
+        self.assertEqual(len(findings), 1)
+
     def test_stride_is_a_finding(self):
         got = layout.spirv_layouts(DISASM.replace("ArrayStride 16", "ArrayStride 32"), "k", BUFFERS)
         self.assertIn("stride is 32", layout.cross_check(BUFFERS, APPLE, got)[0])
@@ -84,11 +90,15 @@ class Layout(unittest.TestCase):
 
     def test_matrix_stride_of_a_runtime_array(self):
         # constant matrix_float2x2 *m: the block's member 0 carries MatrixStride, the array only ArrayStride.
-        text = DISASM.replace("OpDecorate %10 ArrayStride 16", "OpDecorate %10 ArrayStride 32\nOpMemberDecorate %12 0 MatrixStride 16"
+        text = DISASM.replace("OpDecorate %10 ArrayStride 16", "OpDecorate %10 ArrayStride 32\nOpMemberDecorate %12 0 MatrixStride 16\nOpMemberDecorate %12 0 ColMajor"
                               ).replace("%10 = OpTypeRuntimeArray %8", "%7 = OpTypeMatrix %8 2\n%10 = OpTypeRuntimeArray %7")
         got = layout.spirv_layouts(text, "k", BUFFERS)
         self.assertEqual(got[1]["stride"], 32)
         self.assertEqual([l[0] for l in got[1]["leaves"]], [0, 4, 8, 12, 16, 20, 24, 28])
+        with self.assertRaises(ValueError):  # a square matrix read row major has the same offsets
+            layout.spirv_layouts(text.replace("ColMajor", "RowMajor"), "k", BUFFERS)
+        with self.assertRaises(ValueError):
+            layout.spirv_layouts(text.replace("OpMemberDecorate %12 0 ColMajor", ""), "k", BUFFERS)
 
     def test_unreadable_layout_raises(self):
         with self.assertRaises(ValueError):
@@ -145,6 +155,9 @@ class Directives(unittest.TestCase):
         self.assertEqual(d["unused"], {"t": "never read"})
         with self.assertRaises(ValueError):
             directives.parse("// DIFFCHECK-UNUSED: t\n")
+        for bad in ("// DIFFCHECK-ULP: exact 0.5\n", "// DIFFCHECK-ULP: exact\n", "// DIFFCHECK-ULP: 3\n"):
+            with self.assertRaises(ValueError, msg=bad):
+                directives.parse(bad)
 
 
 class Verdict(unittest.TestCase):

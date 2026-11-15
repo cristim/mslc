@@ -87,7 +87,7 @@ Inputs: the `DIFFCHECK-POSITION` field is filled from the geometry (w = 1); ever
 field is seeded per vertex, one tightly packed vertex buffer per attribute (Metal slot
 `30 - location`, so a `[[buffer(n)]]` argument must not use those); `[[buffer]]` arguments are
 seeded like kernel buffers, in both stages; a 2D float texture is 4x4 RGBA32F and a runtime
-sampler is nearest, clamp-to-edge, normalised, no mips. Probes should sample at a texel centre.
+sampler is nearest, normalised, no mips, clamp-to-edge for `sampler(0)` (the only index graphics probes use). Probes should sample at a texel centre.
 Graphics defaults to the `moderate` profile and two cases: `wide` values interpolate to magnitudes
 where any tolerance is meaningless.
 
@@ -168,26 +168,31 @@ arguments is run like any other: each case seeds one 4x4 RGBA32Float texture per
 case's generator (profile and seed as for buffers, so NaN and infinity texels appear in the `edge`
 case) and gives both sides the same bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
 Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index
-and name. A sampler is nearest, clamp-to-edge, normalised, no mips (the code is shared with graphics
-mode in `resources.py`), so sample at texel centres. Consequence: every runtime sampler is the same,
-so a wrong sampler binding cannot change a result and is not detected.
+and name. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
+edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample at texel centres.
+Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
+binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
+unit square; the filter is always nearest, so a wrong filter state is not detected (#374).
 
 Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
 change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the
-file declares `// DIFFCHECK-UNUSED: <name> <reason>`. Probes are in `tests/diffcheck/kernel`
+file declares `// DIFFCHECK-UNUSED: <name> <reason>`. A declaration for a texture that is in fact used
+is an `error`, so a stale directive cannot hide a texture. Probes are in `tests/diffcheck/kernel`
 (`diffcheck/kernel/<name>`, run at grid 64, local 16) and `diffcheck/kernel-driver` plants planted
 miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
-between bindings, an unswapped sample coordinate. Each is reported as a mismatch while the baselines match.
+between bindings, an unswapped sample coordinate, two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
 
 ## Layout cross-check
 
 mslc's reflection JSON has no layout and a run reads only the bytes under Apple's leaf offsets on
 both sides, so a layout difference in padding, or in a member the kernel never reads, was invisible.
 `layout.py` reads the `Offset`, `ArrayStride` and `MatrixStride` decorations of mslc's SPIR-V and
-compares the offset, size and kind (float or integer) of every scalar of one element, and the element
-stride of a runtime array, with Apple's reflection. A difference, or a layout that cannot be read, is
-a `reflection-mismatch`. Not covered: the total size of a `constant T &` struct (SPIR-V does not
-carry it), a bool inside a buffer (reported as unreadable).
+compares the offset, size and kind (float or integer) of every scalar of one element, in member
+order (so two members that swap offsets differ), and the element stride of a runtime array, with
+Apple's reflection. Matrices must be `ColMajor`: a `RowMajor` one, which has the same offsets when
+square, is a difference. A difference, or a layout that cannot be read, is a `reflection-mismatch`.
+Not covered: the total size of a `constant T &` struct (SPIR-V does not carry it). A bool in a buffer
+is stored by mslc as a byte, and read and compared like a uchar.
 
 ## Reading a mismatch: what is not an mslc bug
 
