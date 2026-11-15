@@ -7,6 +7,9 @@
   // DIFFCHECK-FLOAT-RANGE: <buffer> <lo> <hi>       float leaves of that buffer are drawn from the integers lo..hi,
                                                      for a buffer whose value the kernel converts to an index or
                                                      a loop bound (so the conversion is defined)
+  // DIFFCHECK-ULP: <buffer> <n>                    ULP bound for that buffer's float leaves, replacing the one chosen
+                                                     from the builtins the source calls (0 = bit-exact); an attachment
+                                                     name in graphics. Tightens a buffer a loose neighbour would hide.
   // DIFFCHECK-UNUSED: <texture> <reason>            the kernel legitimately ignores this texture (otherwise a
                                                      texture the output does not depend on is a failure)
   // DIFFCHECK-EXCLUDE: <buffer> <reason>            skip a buffer's comparison; the reason
@@ -38,7 +41,7 @@ def _point(token):
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "unused": {}, "geometry": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "unused": {}, "geometry": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -82,6 +85,10 @@ def parse(source):
             if lo > hi:
                 raise ValueError("DIFFCHECK-FLOAT-RANGE %s: %d > %d" % (m.group(1), lo, hi))
             result["float_range"][m.group(1)] = (lo, hi)
+            continue
+        m = re.match(r"\s*//\s*DIFFCHECK-ULP:\s*(\S+)\s+(\d+)\s*$", line)
+        if m:
+            result["ulp"][m.group(1)] = int(m.group(2))
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-UNUSED:\s*(\S+)\s*(.*)$", line)
         if m:

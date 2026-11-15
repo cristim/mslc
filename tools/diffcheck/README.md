@@ -152,6 +152,9 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   That does not make the module safe on every driver: mslc emits no `NoContraction` and no
   `SignedZeroInfNanPreserve`, so a NIR driver may fuse, re-associate or drop -0, inf and NaN
   (#368, a real divergence, see below).
+- `// DIFFCHECK-ULP: <buffer> <n>` replaces the file-wide ULP bound for one buffer (0 = bit-exact),
+  so a buffer that must be exact is not loosened by a neighbour fed by `exp` (a graphics attachment
+  is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: threadgroup memory arguments
   (`[[threadgroup(n)]]`: mslc rejects the attribute, #373), argument buffers, atomics (#374), writable

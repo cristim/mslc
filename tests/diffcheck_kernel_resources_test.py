@@ -139,8 +139,9 @@ class Resources(unittest.TestCase):
 
 
 class Directives(unittest.TestCase):
-    def test_unused(self):
-        d = directives.parse("// DIFFCHECK-UNUSED: t never read\n")
+    def test_ulp_and_unused(self):
+        d = directives.parse("// DIFFCHECK-ULP: exact 0\n// DIFFCHECK-ULP: loose 8\n// DIFFCHECK-UNUSED: t never read\n")
+        self.assertEqual(d["ulp"], {"exact": 0, "loose": 8})
         self.assertEqual(d["unused"], {"t": "never read"})
         with self.assertRaises(ValueError):
             directives.parse("// DIFFCHECK-UNUSED: t\n")

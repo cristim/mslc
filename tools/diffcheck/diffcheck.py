@@ -160,7 +160,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         for i, lay in sorted(layouts.items()):
             if lay["name"] in excluded:
                 continue
-            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], ulp):
+            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp)):
                 case_diffs.append(d.to_json())
         nonzero = nonzero or checks.written_nonzero(compared, data, outs["apple"]) or checks.written_nonzero(compared, data, outs["mslc"])
         # Negative control: a copy of the mslc result with one leaf of a compared buffer changed
@@ -194,7 +194,8 @@ def unknown_directives(opts, d, results):
     errors = []
     if known:
         named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], known),
-                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], known), "DIFFCHECK-UNUSED": (d["unused"], textures)}
+                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], known), "DIFFCHECK-UNUSED": (d["unused"], textures),
+                 "DIFFCHECK-ULP": (d["ulp"], known)}
         if not opts.corpus:
             named["--range"] = (opts.ranges, known)
         for directive, (table, names) in named.items():
@@ -212,7 +213,7 @@ def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
               "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
-              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"]}
+              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"], "ulp": d["ulp"]}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
     results = [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
@@ -250,7 +251,7 @@ def check_file(opts, path, std=None):
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
                 "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
                 "float_range": d["float_range"],
-                "unused": d["unused"],
+                "unused": d["unused"], "ulp": d["ulp"],
             }
             sub = os.path.join(work, e["name"])
             os.makedirs(sub)

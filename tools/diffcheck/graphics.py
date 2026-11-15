@@ -337,7 +337,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         diffs = []
         for i, layout in sorted(compared.items()):
             exact, smooth = split_leaves(layout, outs["apple"][i], primitives)
-            for leaves, (u, e) in ((exact, (ulp, 0.0)), (smooth, tolerance(ulp, True, "float"))):
+            bound = params["ulp"].get(layout["name"], ulp)
+            for leaves, (u, e) in ((exact, (bound, 0.0)), (smooth, tolerance(bound, True, "float"))):
                 if leaves:
                     sub = dict(layout, leaves=leaves)
                     diffs += [d.to_json() for d in compare.compare(sub, outs["apple"][i], outs["mslc"][i], u, eps=DEPTH_EPS if i == DEPTH_INDEX else e)]

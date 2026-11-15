@@ -43,7 +43,7 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "layout_unread_member")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "layout_unread_member", "ulp_per_buffer")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
@@ -56,6 +56,8 @@ MUTANTS = [
     ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4", r"\1 12"]], "reflection-mismatch"),
     # layout: the element stride of an array of vectors
     ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
+    # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
+    ("ulp_per_buffer", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
 ]
 
 rc, out, data = run(probe("texture_read"))
@@ -72,6 +74,14 @@ assert run(probe("texture_unused"))[2]["unused"].keys() == {"ignored"}
 for name, edits, status in MUTANTS:
     rc, out, data = mutated(probe(name), edits)
     assert rc == 1 and data["status"] == status, ("mutant not detected", name, edits, rc, out)
+
+# Without the directive the file-wide 4 ULP bound hides the one ULP error: the directive is what catches it.
+with tempfile.TemporaryDirectory() as d:
+    loose = os.path.join(d, "ulp_loose.metal")
+    with open(probe("ulp_per_buffer")) as src, open(loose, "w") as dst:
+        dst.write("".join(l for l in src if "DIFFCHECK-ULP" not in l))
+    rc, out, data = mutated(loose, MUTANTS[-1][1])
+    assert rc == 0 and data["status"] == "matched", ("the bound is no longer file-wide", rc, out)
 
 # A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))

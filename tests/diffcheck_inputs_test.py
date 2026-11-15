@@ -105,7 +105,7 @@ class Directives(unittest.TestCase):
                              "// DIFFCHECK-EXCLUDE: scratch reads uninitialised memory\nkernel void k() {}\n")
         self.assertEqual(d, {"run": {"grid": 64, "seed": 2}, "writes_zero": True,
                              "exclude": {"scratch": "reads uninitialised memory"},
-                             "range": {"which": (0, 3)}, "float_range": {}, "unused": {}, "geometry": None, "position": None, "depth": False})
+                             "range": {"which": (0, 3)}, "float_range": {}, "ulp": {}, "unused": {}, "geometry": None, "position": None, "depth": False})
 
     def test_float_range(self):
         self.assertEqual(directives.parse("// DIFFCHECK-FLOAT-RANGE: in 0 1\n")["float_range"], {"in": (0, 1)})
