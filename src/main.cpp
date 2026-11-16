@@ -74,6 +74,7 @@ namespace {
 			"      --local-size <x> <y> <z>  workgroup size for a kernel (default 1 1 1)\n"
 			"  -V, --validate        run spirv-val on the result\n"
 			"  -I <dir>              also search <dir> for a quoted #include (repeatable)\n"
+			"  -D <name>[=<value>]   define a macro before the source (repeatable); a name alone is 1\n"
 			"  -E                    print the preprocessed source and exit\n"
 			"      --dump-tokens   print the token stream and exit\n"
 			"      --compile-library\n"
@@ -117,6 +118,8 @@ int main(int argc, char** argv) {
 	bool stageGiven = false;
 	bool localSizeGiven = false;
 	std::vector<std::string> includeDirs;
+	std::vector<std::string> macroNames;
+	std::vector<std::string> macroValues;
 
 	for (int i = 1; i < argc; ++i) {
 		const std::string argument = argv[i];
@@ -151,6 +154,18 @@ int main(int argc, char** argv) {
 			includeDirs.push_back(argv[i]);
 		} else if (argument.size() > 2 && argument.compare(0, 2, "-I") == 0) {
 			includeDirs.push_back(argument.substr(2));
+		} else if (argument == "-D" || (argument.size() > 2 && argument.compare(0, 2, "-D") == 0)) {
+			// -D name, -D name=value, -Dname, -Dname=value; a name alone is 1 as for a C compiler
+			std::string definition;
+			if (argument == "-D") {
+				if (++i >= argc) { usage(); return 2; }
+				definition = argv[i];
+			} else {
+				definition = argument.substr(2);
+			}
+			const size_t equals = definition.find('=');
+			macroNames.push_back(definition.substr(0, equals));
+			macroValues.push_back(equals == std::string::npos ? "1" : definition.substr(equals + 1));
 		} else if (argument == "-E") {
 			preprocessOnly = true;
 		} else if (argument == "--dump-tokens") {
@@ -225,11 +240,24 @@ int main(int argc, char** argv) {
 	options.includeDirs = includeDirPointers.empty() ? nullptr : includeDirPointers.data();
 	options.includeDirCount = includeDirPointers.size();
 
+	std::vector<const char*> macroNamePointers;
+	std::vector<const char*> macroValuePointers;
+	for (size_t i = 0; i < macroNames.size(); ++i) {
+		macroNamePointers.push_back(macroNames[i].c_str());
+		macroValuePointers.push_back(macroValues[i].c_str());
+	}
+	options.macroNames = macroNamePointers.empty() ? nullptr : macroNamePointers.data();
+	options.macroValues = macroValuePointers.empty() ? nullptr : macroValuePointers.data();
+	options.macroCount = macroNamePointers.size();
+
 	if (preprocessOnly) {
 		try {
 			mslc::PreprocessOptions preprocessOptions;
 			preprocessOptions.sourcePath = input;
 			preprocessOptions.includeDirs = includeDirs;
+			for (size_t i = 0; i < macroNames.size(); ++i) {
+				preprocessOptions.macros.emplace_back(macroNames[i], macroValues[i]);
+			}
 			const mslc::PreprocessedSource result = mslc::preprocess(
 				std::string_view(source.data(), source.size()), preprocessOptions);
 			const std::string text = mslc::renderTokens(result.tokens);

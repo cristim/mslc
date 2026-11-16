@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mslc {
@@ -19,6 +20,10 @@ struct PreprocessOptions {
 	// Searched, in order, after the including file's own directory. These and
 	// the source's directory are the only places an #include may resolve to.
 	std::vector<std::string> includeDirs;
+
+	// Macros defined before the source, as -D name=value does: each name with the text it expands to.
+	// The source may define one again, which replaces it, instead of being an error.
+	std::vector<std::pair<std::string, std::string>> macros;
 };
 
 // Where a token came from in the files the user wrote: for a token a macro produced,

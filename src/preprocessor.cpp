@@ -214,6 +214,9 @@ typedef float4x4 simd_float4x4;
 		std::vector<std::string> params;
 		std::vector<BodyItem> body;
 		Loc definedAt;
+		// defined by PreprocessOptions::macros rather than by the source: a #define of the same name in
+		// the source replaces it, as it does on a compiler's command line, instead of conflicting
+		bool predefined = false;
 	};
 
 	enum class Builtin { Line, File, BaseFile, IncludeLevel, Counter };
@@ -514,6 +517,8 @@ private:
 	std::vector<fs::path> _roots;
 	std::vector<Loc> _includes;
 	std::string _basePath;
+	// set while the macros of PreprocessOptions::macros are being defined
+	bool _definingPredefined = false;
 	size_t _counter = 0;
 	size_t _includeCount = 0;
 	size_t _expanded = 0;
@@ -1333,12 +1338,26 @@ void Preprocessor::defineMacro(Cursor& cursor, const std::vector<Token>& line, c
 				&& (a.kind != BodyKind::Token || a.tok.text == b.tok.text);
 		}
 		if (!same) {
-			fail(nameLoc, "\"" + name + "\" redefined differently (first defined at "
-				+ describe(old.definedAt) + ")");
+			// QUIRK: a #define in the source of a name given through the options replaces the option's
+			// value instead of conflicting with it. The compiler of the Metal toolchain accepts that with
+			// only a "macro redefined" warning (a -D on its command line, redefined in the source, keeps the
+			// source's value from there on); two #defines in the source remain an error here.
+			// Evidence: black-box observation of `xcrun metal -c -DFOO=1` on a source that has
+			// "#define FOO 2", macOS 26.7.3, Apple metal 32023.883 (tier 2). Not documented.
+			// Test: probe/pp_predefined_macro_redefined_by_source and the "a predefined macro the source
+			// defines again" check in tests/preprocess_api.cpp.
+			if (!old.predefined) {
+				fail(nameLoc, "\"" + name + "\" redefined differently (first defined at "
+					+ describe(old.definedAt) + ")");
+			}
+			macro->predefined = _definingPredefined;
+			existing->second = std::move(macro);
+			return;
 		}
 		return;
 	}
 
+	macro->predefined = _definingPredefined;
 	_macros[name] = std::move(macro);
 }
 
@@ -2183,6 +2202,29 @@ void Preprocessor::run(std::string_view source) {
 		SourceFile& predefined = loadText("<built-in>", "",
 			std::string(kPredefinedMacros) + kImplicitImportMacros);
 		processFile(predefined, internName("<built-in>"));
+		_output.clear();
+	}
+
+	// Macros from the caller, defined by the same code a #define in the source goes through, so a name
+	// or a value that is not valid fails the way the same text in the source would.
+	if (!_options.macros.empty()) {
+		std::string lines;
+		for (const auto& [name, value]: _options.macros) {
+			if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_')
+				|| std::any_of(name.begin(), name.end(), [](char c) {
+					return !(std::isalnum(static_cast<unsigned char>(c)) || c == '_');
+				})) {
+				throw CompileError("macro name \"" + name + "\" is not an identifier");
+			}
+			if (value.find_first_of("\r\n") != std::string::npos) {
+				throw CompileError("the value of macro \"" + name + "\" contains a line break");
+			}
+			lines += "#define " + name + (value.empty() ? "" : " ") + value + "\n";
+		}
+		SourceFile& commandLine = loadText("<command line>", "", lines);
+		_definingPredefined = true;
+		processFile(commandLine, internName("<command line>"));
+		_definingPredefined = false;
 		_output.clear();
 	}
 
