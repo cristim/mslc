@@ -33,6 +33,7 @@
 #                              says a break goes to the merge block and not, say,
 #                              the continue block. It does not say which loop the
 #                              break leaves.
+#   // FLAG: <flag>               passes the flag to mslc, e.g. --mask-grid-size
 #   // DEFINE: NAME[=VALUE]       predefines the macro, as -D does (a name alone is 1)
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
@@ -73,8 +74,16 @@ foreach(line IN LISTS defineLines)
 	list(APPEND defineArguments "-D${definition}")
 endforeach()
 
+# A probe can pass flags to mslc, one per line: "// FLAG: --mask-grid-size"
+file(STRINGS "${PROBE}" flagLines REGEX "^// FLAG: ")
+set(flagArguments)
+foreach(line IN LISTS flagLines)
+	string(REGEX REPLACE "^// FLAG: " "" flag "${line}")
+	list(APPEND flagArguments "${flag}")
+endforeach()
+
 execute_process(
-	COMMAND "${MSLC}" ${defineArguments} -o "${spv}" --reflect "${reflection}" "${PROBE}"
+	COMMAND "${MSLC}" ${defineArguments} ${flagArguments} -o "${spv}" --reflect "${reflection}" "${PROBE}"
 	RESULT_VARIABLE status
 	OUTPUT_VARIABLE output
 	ERROR_VARIABLE output

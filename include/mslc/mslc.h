@@ -78,6 +78,15 @@ typedef struct {
 	const char* const* macroNames;
 	const char* const* macroValues;
 	size_t macroCount;
+
+	/* Non-zero makes every kernel without a threadgroup or simdgroup barrier (in its body or in any
+	 * function of the source) skip the threads whose position in the grid is outside the grid size that
+	 * the specialization constants at the ids named by the reflection's "grid_size_spec_ids" give. The
+	 * constants default to 0xFFFFFFFF, so a dispatch that does not set them runs every thread, and a
+	 * dispatch of a grid that is not a multiple of the threadgroup size sets them to the grid size
+	 * (Metal's dispatchThreads:). A kernel with a barrier has no such ids in its reflection: a thread that
+	 * returns before a barrier leaves the others waiting for it in Vulkan. */
+	uint32_t maskGridSize;
 } MslcOptions;
 
 /* Fills options with the defaults: stage inferred, local size 1/1/1, combined

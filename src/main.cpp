@@ -72,6 +72,8 @@ namespace {
 			"      --reflect <path>  write the reflection JSON here\n"
 			"      --stage <stage>   kernel, vertex or fragment; inferred when omitted\n"
 			"      --local-size <x> <y> <z>  workgroup size for a kernel (default 1 1 1)\n"
+			"      --mask-grid-size  kernels without barriers skip threads outside a grid size set by\n"
+			"                        specialization constants (for non-uniform dispatches)\n"
 			"  -V, --validate        run spirv-val on the result\n"
 			"  -I <dir>              also search <dir> for a quoted #include (repeatable)\n"
 			"  -D <name>[=<value>]   define a macro before the source (repeatable); a name alone is 1\n"
@@ -145,6 +147,8 @@ int main(int argc, char** argv) {
 			options.localSizeY = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 			options.localSizeZ = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 			localSizeGiven = true;
+		} else if (argument == "--mask-grid-size") {
+			options.maskGridSize = 1;
 		} else if (argument == "--compile-library") {
 			compileLibrary = true;
 		} else if (argument == "-V" || argument == "--validate") {

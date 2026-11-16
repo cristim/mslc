@@ -13,12 +13,13 @@ struct LegacyOptions {
 	const char* const* macroNames;
 	const char* const* macroValues;
 	size_t macroCount;
+	uint32_t maskGridSize;
 };
 #define OFFSET(field) _Static_assert(offsetof(MslcOptions, field) == offsetof(struct LegacyOptions, field), #field)
 _Static_assert(sizeof(MslcOptions) == sizeof(struct LegacyOptions), "options ABI size");
 OFFSET(stage); OFFSET(localSizeX); OFFSET(localSizeY); OFFSET(localSizeZ);
 OFFSET(imageSetPolicy); OFFSET(sourcePath); OFFSET(includeDirs); OFFSET(includeDirCount);
-OFFSET(macroNames); OFFSET(macroValues); OFFSET(macroCount);
+OFFSET(macroNames); OFFSET(macroValues); OFFSET(macroCount); OFFSET(maskGridSize);
 
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "line %d: %s\n", __LINE__, #condition); exit(1); } } while (0)
 

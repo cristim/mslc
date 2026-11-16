@@ -488,6 +488,11 @@ namespace {
 	// an image fetch both carry.
 	constexpr uint32_t kImageOperandsLod = 0x2;
 
+	// The first of the three SpecIds that hold the grid size of a kernel that skips the threads outside it.
+	// SpecIds 0 to 2 are the workgroup size and indium numbers function constants from 3 up to 131075, so
+	// these start beyond that.
+	constexpr uint32_t kGridSizeSpecializationID = 0x40000;
+
 	// Every name an expression or statement refers to. A constexpr sampler nothing
 	// refers to has no state in Apple's AIR, so it gets no binding either.
 	void collectIdentifiers(const Expression& expression, std::set<std::string>& names) {
@@ -534,6 +539,58 @@ namespace {
 		for (const StatementPtr& child: statement.switchPreamble) {
 			collectIdentifiers(*child, names);
 		}
+	}
+
+	// Whether a threadgroup or simdgroup barrier is called anywhere in an expression or statement. The callee
+	// is not among the names collectIdentifiers returns, so it is looked for here.
+	bool callsBarrier(const Expression& expression) {
+		if (expression.kind == ExpressionKind::Call && expression.left
+			&& expression.left->kind == ExpressionKind::Identifier) {
+			std::string name = expression.left->name;
+			if (name.compare(0, 7, "metal::") == 0) {
+				name.erase(0, 7);
+			}
+			if (name == "threadgroup_barrier" || name == "simdgroup_barrier") {
+				return true;
+			}
+		}
+		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
+			if (child && callsBarrier(*child)) return true;
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			if (callsBarrier(*argument)) return true;
+		}
+		for (const InitializerElement& element: expression.elements) {
+			if (callsBarrier(*element.value)) return true;
+		}
+		return false;
+	}
+
+	bool callsBarrier(const Statement& statement) {
+		for (const Expression* expression: { statement.expression.get(), statement.forCondition.get(),
+			statement.forIncrement.get(), statement.whileCondition.get() }) {
+			if (expression && callsBarrier(*expression)) return true;
+		}
+		for (const std::optional<VariableDeclaration>* declaration: { &statement.declaration, &statement.forInitializer }) {
+			if (*declaration && (*declaration)->initializer && callsBarrier(*(*declaration)->initializer)) return true;
+		}
+		for (const StatementPtr& child: statement.children) {
+			if (callsBarrier(*child)) return true;
+		}
+		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
+			statement.forBody.get(), statement.whileBody.get() }) {
+			if (nested && callsBarrier(*nested)) return true;
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			if (kase.value && callsBarrier(*kase.value)) return true;
+			for (const StatementPtr& child: kase.body) {
+				if (callsBarrier(*child)) return true;
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			if (callsBarrier(*child)) return true;
+		}
+		return false;
 	}
 
 	// The identifiers a body names where no parameter or local of that name is in
@@ -2107,6 +2164,12 @@ namespace {
 		// that hold the workgroup size it reads.
 		const Parameter* _threadsPerThreadgroup = nullptr;
 		Id _localSize[3] = { InvalidId, InvalidId, InvalidId };
+		// The grid size of a kernel that skips the threads outside it (ModuleOptions::maskGridSize): three
+		// spec constants shared by the module, and the Input variable of the thread position in the grid
+		// the guard reads, which is the kernel's own [[thread_position_in_grid]] when it has one.
+		Id _gridSize[3] = { InvalidId, InvalidId, InvalidId };
+		Id _globalInvocationVariable = InvalidId;
+		bool _masksGridSize = false;
 		std::vector<StageVariable> _stageInputs;
 		// At most one BuiltIn FragCoord Input variable per fragment entry point,
 		// whether it comes from a stage-struct [[position]] field or a direct
@@ -2156,6 +2219,8 @@ namespace {
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
 		void loadThreadsPerThreadgroup();
+		void declareGridMaskInput();
+		void emitGridMask();
 		// The address of a packed vector's storage, viewed as a pointer to the
 		// vector itself, which is what a load or store wants.
 		Id packedVectorAddress(Id storageAddress, Id vectorType);
@@ -6912,6 +6977,9 @@ namespace {
 				binding.readOnly = parameter.type.isConst;
 				_bindings[parameter.name] = binding;
 				_interface.push_back(id);
+				if (spvBuiltin == spirv::BuiltIn::GlobalInvocationId) {
+					_globalInvocationVariable = id;
+				}
 				continue;
 			}
 
@@ -7066,6 +7134,63 @@ namespace {
 		_threadgroupLocals.clear();
 		reserveThreadgroupLocals(*_entryPoint->body);
 		reserveFileScopeSamplers();
+		declareGridMaskInput();
+	}
+
+	// A kernel that skips the threads outside the grid reads the thread position in the grid, which has to
+	// be an Input variable in the entry point's interface, so it is declared with the parameters. A kernel
+	// that has a barrier anywhere cannot skip threads (a thread that returns before a barrier leaves
+	// the rest of its workgroup waiting), and neither can one in a module with no mask requested.
+	void Emitter::declareGridMaskInput() {
+		_masksGridSize = false;
+		if (!_options.maskGridSize || _entryPoint->stage != Stage::Kernel) {
+			return;
+		}
+		if (callsBarrier(*_entryPoint->body)) {
+			return;
+		}
+		for (const FunctionDecl& helper: _unit.helpers) {
+			if (helper.body && callsBarrier(*helper.body)) {
+				return;
+			}
+		}
+		_masksGridSize = true;
+
+		if (_globalInvocationVariable == InvalidId) {
+			_builder.setSection(spirv::Section::TypesGlobals);
+			const Id vectorType = _types.vector(ScalarKind::UInt, 3);
+			_globalInvocationVariable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(spirv::StorageClass::Input, vectorType),
+				{ static_cast<uint32_t>(spirv::StorageClass::Input) });
+			_builder.setSection(spirv::Section::Annotations);
+			_builder.emit(spirv::OpDecorate, { _globalInvocationVariable,
+				static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+				static_cast<uint32_t>(spirv::BuiltIn::GlobalInvocationId) });
+			_interface.push_back(_globalInvocationVariable);
+		}
+	}
+
+	// if (any(position_in_grid >= grid_size)) return; at the start of the kernel.
+	void Emitter::emitGridMask() {
+		if (!_masksGridSize) {
+			return;
+		}
+		const Id vectorType = _types.vector(ScalarKind::UInt, 3);
+		const Id position = _builder.emitTyped(spirv::OpLoad, vectorType, { _globalInvocationVariable });
+		Id outside = InvalidId;
+		for (uint32_t i = 0; i < 3; ++i) {
+			const Id component = _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { position, i });
+			const Id past = _builder.emitTyped(spirv::OpUGreaterThanEqual, _boolType, { component, _gridSize[i] });
+			outside = outside == InvalidId ? past
+				: _builder.emitTyped(spirv::OpLogicalOr, _boolType, { outside, past });
+		}
+		const Id exitLabel = _builder.nextId();
+		const Id bodyLabel = _builder.nextId();
+		_builder.emit(spirv::OpSelectionMerge, { bodyLabel, kSelectionControlNone });
+		terminate(spirv::OpBranchConditional, { outside, exitLabel, bodyLabel });
+		beginBlock(exitLabel);
+		terminate(spirv::OpReturn, { });
+		beginBlock(bodyLabel);
 	}
 
 	// One entry per binding goes in the reflection. The separator goes before the
@@ -10015,6 +10140,17 @@ namespace {
 					static_cast<uint32_t>(spirv::Decoration::SpecId), 2u });
 			}
 
+			// The grid size of the threads a masked kernel keeps, also one set for the module. Their default is
+			// the largest value, which keeps every thread, so a dispatch that does not know about them is not
+			// changed. The ids are far from the ones a function constant takes (indium numbers those from 3).
+			if (_masksGridSize && _gridSize[0] == InvalidId) {
+				for (uint32_t i = 0; i < 3; ++i) {
+					_gridSize[i] = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 0xFFFFFFFFu });
+					_builder.emit(spirv::OpDecorate, { _gridSize[i],
+						static_cast<uint32_t>(spirv::Decoration::SpecId), kGridSizeSpecializationID + i });
+				}
+			}
+
 			// OpExecutionModeId, not OpExecutionMode: a mode whose extra operands
 			// are ids has its own instruction, and OpExecutionMode rejects id
 			// operands outright.
@@ -10059,6 +10195,7 @@ namespace {
 		preloadBufferBases();
 		loadStageInputs();
 		loadThreadsPerThreadgroup();
+		emitGridMask();
 		emitFunctionBody(*_entryPoint->body);
 		if (!_terminated) {
 			terminate(spirv::OpReturn, { });
@@ -10154,6 +10291,8 @@ namespace {
 			_outputs.clear();
 			_stageIn = nullptr;
 			_threadsPerThreadgroup = nullptr;
+			_globalInvocationVariable = InvalidId;
+			_masksGridSize = false;
 			_stageInputs.clear();
 			_hasFragCoordInput = false;
 			_terminated = false;
@@ -10169,6 +10308,11 @@ namespace {
 			document += "\t\t\t\"local_size\": [" + std::to_string(_options.localSizeX) + ", "
 				+ std::to_string(_options.localSizeY) + ", "
 				+ std::to_string(_options.localSizeZ) + "],\n";
+			if (_masksGridSize) {
+				document += "\t\t\t\"grid_size_spec_ids\": [" + std::to_string(kGridSizeSpecializationID) + ", "
+					+ std::to_string(kGridSizeSpecializationID + 1) + ", "
+					+ std::to_string(kGridSizeSpecializationID + 2) + "],\n";
+			}
 			document += "\t\t\t\"bindings\": [\n";
 			document += _reflection;
 			document += "\t\t\t],\n";
