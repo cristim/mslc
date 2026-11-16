@@ -68,6 +68,17 @@ typedef struct {
 	const char* const* includeDirs;
 	size_t includeDirCount;
 
+	/* Macros defined before the source is read, as if each were given as -D name=value on a
+	 * compiler's command line. macroNames and macroValues hold macroCount entries each; a NULL
+	 * macroValues, or a NULL entry in it, defines the macro as 1, and an empty value defines it with
+	 * an empty expansion. A name must be an identifier and a value may not contain a line break,
+	 * otherwise the translation fails with a diagnostic. The source may define a macro of the same
+	 * name again, which replaces the value from here (it does not fail as defining a macro twice in
+	 * the source does), or #undef it. A name mslc provides as a builtin cannot be defined. */
+	const char* const* macroNames;
+	const char* const* macroValues;
+	size_t macroCount;
+
 	/* Non-zero makes every kernel without a threadgroup or simdgroup barrier (in its body or in any
 	 * function of the source) skip the threads whose position in the grid is outside the grid size that
 	 * the specialization constants at the ids named by the reflection's "grid_size_spec_ids" give. The
@@ -79,7 +90,7 @@ typedef struct {
 } MslcOptions;
 
 /* Fills options with the defaults: stage inferred, local size 1/1/1, combined
- * descriptor set, no source path and no include directories. */
+ * descriptor set, no source path, no include directories and no predefined macros. */
 void mslc_default_options(MslcOptions* options);
 
 /* Translates MSL source to a SPIR-V module.

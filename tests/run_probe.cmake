@@ -34,6 +34,7 @@
 #                              the continue block. It does not say which loop the
 #                              break leaves.
 #   // FLAG: <flag>               passes the flag to mslc, e.g. --mask-grid-size
+#   // DEFINE: NAME[=VALUE]       predefines the macro, as -D does (a name alone is 1)
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
 #
@@ -64,6 +65,15 @@ file(REMOVE "${spv}")
 set(reflection "${OUT_DIR}/${name}.json")
 file(REMOVE "${reflection}")
 
+# A probe can predefine macros as a compiler's -D would, one per line: "// DEFINE: NAME" or
+# "// DEFINE: NAME=VALUE"
+file(STRINGS "${PROBE}" defineLines REGEX "^// DEFINE: ")
+set(defineArguments)
+foreach(line IN LISTS defineLines)
+	string(REGEX REPLACE "^// DEFINE: " "" definition "${line}")
+	list(APPEND defineArguments "-D${definition}")
+endforeach()
+
 # A probe can pass flags to mslc, one per line: "// FLAG: --mask-grid-size"
 file(STRINGS "${PROBE}" flagLines REGEX "^// FLAG: ")
 set(flagArguments)
@@ -73,7 +83,7 @@ foreach(line IN LISTS flagLines)
 endforeach()
 
 execute_process(
-	COMMAND "${MSLC}" ${flagArguments} -o "${spv}" --reflect "${reflection}" "${PROBE}"
+	COMMAND "${MSLC}" ${defineArguments} ${flagArguments} -o "${spv}" --reflect "${reflection}" "${PROBE}"
 	RESULT_VARIABLE status
 	OUTPUT_VARIABLE output
 	ERROR_VARIABLE output
