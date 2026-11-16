@@ -842,7 +842,8 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 	} else if (const auto it = _structSizes.find(elementType); it != _structSizes.end()) {
 		// Metal rounds a struct's size up to its own alignment, and structMembersFor
 		// has already done that, so this is the size and not a guess at it.
-		stride = it->second;
+		// An empty struct is size 0 here and 1 in Metal; a zero stride is invalid.
+		stride = std::max<uint32_t>(it->second, 1);
 	}
 
 	// A runtime array has no length, which is what lets the descriptor cover a
@@ -1504,6 +1505,13 @@ Id TypeTable::valueStruct(const std::string& name) {
 		fieldTypes.push_back(fieldType);
 	}
 
+	// A value of a struct with no members is not representable to Mesa's SPIR-V
+	// front end (a parameter, a call argument, a constructed value), so a value
+	// struct keeps one placeholder member no source member names. The buffer
+	// forms keep the empty struct, so layout and reflection are unchanged.
+	if (fieldTypes.empty()) {
+		fieldTypes.push_back(scalar(ScalarKind::UInt));
+	}
 	const Id id = _builder.emitDecl(spirv::OpTypeStruct, fieldTypes);
 
 	// Value structs need no buffer layout decorations.
@@ -2770,6 +2778,8 @@ namespace {
 		Id convert(Id value, Id fromType, Id toType);
 		Id convertArray(Id value, Id fromType, Id toType);
 		Id convertStruct(Id value, const TypeTable::StructForm& from, const TypeTable::StructForm& to, Id toType);
+		Id composeStruct(Id type, const std::vector<uint32_t>& parts);
+		Id constantStruct(Id type, const std::vector<uint32_t>& parts);
 		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
 		Id broadcast(Id value, Id vectorType);
@@ -2989,7 +2999,19 @@ namespace {
 			members.push_back(member);
 		}
 
-		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, members);
+		return composeStruct(toType, members);
+	}
+
+	// The constant form of composeStruct.
+	Id Emitter::constantStruct(Id type, const std::vector<uint32_t>& parts) {
+		return parts.empty() ? _builder.emitDeclTyped(spirv::OpConstantNull, type, { })
+			: _builder.emitDeclTyped(spirv::OpConstantComposite, type, parts);
+	}
+
+	// An empty struct has no constituents to construct from, so it is its null value.
+	Id Emitter::composeStruct(Id type, const std::vector<uint32_t>& parts) {
+		return parts.empty() ? _builder.emitDeclTyped(spirv::OpConstantNull, type, { })
+			: _builder.emitTyped(spirv::OpCompositeConstruct, type, parts);
 	}
 
 	Id Emitter::convert(Id value, Id fromType, Id toType) {
@@ -4561,7 +4583,7 @@ namespace {
 			const InitSlot& slot = plan.slots[i];
 			fields.push_back(slot.element || slot.group ? emitInitSlot(field, slot, values) : emitInitListValue(field, empty));
 		}
-		return _builder.emitTyped(spirv::OpCompositeConstruct, declaredTypeOf(target), fields);
+		return composeStruct(declaredTypeOf(target), fields);
 	}
 
 	Id Emitter::emitStructElements(const Type& target, const StructDecl& decl,
@@ -8109,7 +8131,7 @@ namespace {
 	// constants making it up.
 	Id Emitter::emitConstant(const FoldedConstant& folded) {
 		if (folded.isComposite) {
-			return _builder.emitDeclTyped(spirv::OpConstantComposite, folded.type, folded.parts);
+			return constantStruct(folded.type, folded.parts);
 		}
 
 		if (folded.scalar == ScalarKind::Bool) {
@@ -9165,7 +9187,7 @@ namespace {
 			return emitConstant(folded);
 		};
 		leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
-			return _builder.emitDeclTyped(spirv::OpConstantComposite, composite, parts);
+			return constantStruct(composite, parts);
 		};
 		size_t consumed = 0;
 		const Id initial = emitArrayInit(type, declaration.initializer->elements, consumed, true, leaves);
@@ -12288,7 +12310,7 @@ namespace {
 				: convertImplicit(value, declaredTypeOf(leaf));
 		};
 		leaves.compose = [&](Id composite, const std::vector<uint32_t>& parts) {
-			return _builder.emitTyped(spirv::OpCompositeConstruct, composite, parts);
+			return composeStruct(composite, parts);
 		};
 		size_t position = 0;
 		return emitArrayInit(type, list.elements, position, true, leaves);

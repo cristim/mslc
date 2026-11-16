@@ -554,3 +554,12 @@ for a size mslc cannot give with certainty. Apple accepts, and mslc refuses:
 - A call to a function declared but never defined, inside sizeof (Apple does not need the body).
 - A constant expression where the unsigned sizeof would wrap: `-sizeof(int) + 8`, `sizeof(int) - 8`
   (Apple rejects the latter), a negative operand beside it, or a cast that truncates it.
+
+## Empty structs (#376)
+
+An empty struct as a value (parameter, argument, return, local, member, array element, program-scope
+constant) is lowered with one placeholder `uint` member so Mesa's SPIR-V front end accepts it; sizeof
+and buffer layout keep Metal's size 1, and a runtime array of them has ArrayStride 1. Not covered:
+inheritance from an empty base, a class template and `return {};` are refused by the parser, a struct
+with a struct member inside a buffer is refused, and a buffer of empty structs is only validated with
+spirv-val, not run (diffcheck has no scalar layout for it).
