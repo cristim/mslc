@@ -1718,6 +1718,10 @@ namespace {
 		// True when id is the address of an element or a member rather than a
 		// variable, as for a reference local bound to one.
 		bool isAddress = false;
+		// True when id is already the buffer's own pointer, as for a helper's
+		// device or constant pointer parameter, rather than a member of the
+		// entry point's binding-0 address block that has to be loaded first.
+		bool ownAddress = false;
 		// True for a const local of integral type whose initialiser is a constant
 		// expression: C++ lets it stand in a constant expression.
 		bool constantValue = false;
@@ -2419,6 +2423,10 @@ namespace {
 	}
 		Id bufferBase(const Binding& binding);
 		void preloadBufferBases();
+		// The laid-out element type of a device or constant pointer's pointee, and
+		// the { T runtime_array[] } struct the pointer is to: what an entry point's
+		// own buffer parameter binds and what such a helper parameter takes.
+		std::pair<Id, Id> bufferParamTypes(const Type& type);
 		void loadThreadsPerThreadgroup();
 		// The address of a packed vector's storage, viewed as a pointer to the
 		// vector itself, which is what a load or store wants.
@@ -2758,6 +2766,10 @@ namespace {
 			size_t first) const;
 		HelperFunction& pointerSpecialisation(const Expression& call, HelperFunction& generic,
 			size_t first, std::vector<Id>& arrays);
+		// The pointer value a device or constant pointer argument passes: the whole
+		// buffer its name binds, checked against the parameter's address space.
+		Id bufferPointerArgument(const Expression& argument, const Parameter& parameter,
+			const std::string& what);
 		Id referenceArgument(const Expression& argument, const Parameter& parameter,
 			const std::string& function, size_t position, std::vector<std::pair<Id, Id>>& copyOuts);
 		Id resourceArgument(const Expression& argument, const Parameter& parameter,
@@ -2975,12 +2987,31 @@ namespace {
 	// Loaded once per parameter: the load is what turns the address indium wrote
 	// into a pointer the access chain can walk.
 	Id Emitter::bufferBase(const Binding& binding) {
+		// A helper's device or constant pointer parameter holds the pointer as
+		// its own parameter value; there is no address-block member to load.
+		if (binding.ownAddress) {
+			return binding.id;
+		}
 		const auto cached = _bufferBases.find(binding.memberIndex);
 		if (cached == _bufferBases.end()) {
 			throw CompileError("no address was loaded for this buffer, so it cannot be used");
 		}
 
 		return cached->second;
+	}
+
+	// The laid-out element type of a device or constant pointer's pointee, and the
+	// { T runtime_array[] } struct the pointer is to. A named struct element is the
+	// laid-out array-element form, not the value struct, exactly as an entry
+	// point's own buffer parameter is bound.
+	std::pair<Id, Id> Emitter::bufferParamTypes(const Type& type) {
+		const Id pointee = type.namedType.empty()
+			? declaredTypeOf(type)
+			: _types.arrayElementStruct(type.namedType);
+		if (pointee == InvalidId) {
+			throw CompileError("undeclared type \"" + type.namedType + "\"");
+		}
+		return { pointee, _types.blockStructFor(pointee, type.isPacked) };
 	}
 
 	// A struct is declared once as a value and once as a buffer's laid-out
@@ -6970,12 +7001,19 @@ namespace {
 			std::vector<Id> signature { helper.returnType };
 			for (size_t i = 0; i < definition.parameters.size(); ++i) {
 				const Parameter& parameter = definition.parameters[i];
-				helper.parameterTypes.push_back(parameter.type.isPointer
-					? _types.pointer(spirv::StorageClass::Function,
-						arrayTypeOf(boundArray(parameter.type, helper.arrayLengths[i])))
-					: parameter.isMutableReference()
-					? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
-					: helperParameterType(parameter.type));
+				if (parameter.type.isPointer
+					&& (parameter.type.addressSpace == AddressSpace::Device
+						|| parameter.type.addressSpace == AddressSpace::Constant)) {
+					helper.parameterTypes.push_back(
+						_types.bufferPointer(bufferParamTypes(parameter.type).second));
+				} else {
+					helper.parameterTypes.push_back(parameter.type.isPointer
+						? _types.pointer(spirv::StorageClass::Function,
+							arrayTypeOf(boundArray(parameter.type, helper.arrayLengths[i])))
+						: parameter.isMutableReference()
+						? _types.pointer(spirv::StorageClass::Function, declaredTypeOf(parameter.type))
+						: helperParameterType(parameter.type));
+				}
 				signature.push_back(helper.parameterTypes.back());
 			}
 
@@ -7116,6 +7154,50 @@ namespace {
 		return result;
 	}
 
+	// A device or constant pointer argument names a whole buffer: an entry point's
+	// own buffer parameter, or the pointer parameter of the calling helper. Apple
+	// also takes &b[i] and b + n, pointers into the middle of one, and pointer
+	// values copied or compared; none of those is a name the helper's parameter
+	// can hold, so each is refused.
+	Id Emitter::bufferPointerArgument(const Expression& argument, const Parameter& parameter,
+		const std::string& what) {
+		const std::string space = addressSpaceName(parameter.type.addressSpace);
+		if (argument.kind != ExpressionKind::Identifier) {
+			throw CompileError(what + " has to name a whole buffer, because parameter \"" + parameter.name
+				+ "\" is a pointer in the " + space + " address space, and &b[i] and other pointers "
+				"into the middle of one are not lowered yet");
+		}
+		const auto binding = _bindings.find(argument.name);
+		if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.isBuffer
+			|| binding->second.bufferPointeeType == InvalidId) {
+			throw CompileError(what + " is \"" + argument.name + "\", which is not a buffer; parameter \""
+				+ parameter.name + "\" is a pointer in the " + space + " address space and takes one");
+		}
+		if (binding->second.pointeeMsl.addressSpace != parameter.type.addressSpace) {
+			throw CompileError(what + " is in the "
+				+ addressSpaceName(binding->second.pointeeMsl.addressSpace) + " address space, but "
+				+ "parameter \"" + parameter.name + "\" takes a pointer in the " + space
+				+ " one, and Metal does not convert between address spaces");
+		}
+		// The pointee has to be the type the parameter names: a float3 buffer and a
+		// packed_float3 one share a vector type but stride 16 and 12, so their block
+		// structs differ and the pointer the argument carries has the wrong type.
+		if (binding->second.bufferPointeeType != bufferParamTypes(parameter.type).second) {
+			throw CompileError(what + " is a buffer of " + typeName(binding->second.pointeeMsl)
+				+ ", and parameter \"" + parameter.name + "\" points at " + typeName(parameter.type)
+				+ ", which is not the same element type");
+		}
+		// A constant-space pointer can never write, so a read-only buffer binds it;
+		// only a device pointer that is not const could change a const buffer.
+		const bool canWrite = parameter.type.addressSpace == AddressSpace::Device
+			&& !parameter.type.isConst;
+		if (binding->second.readOnly && canWrite) {
+			throw CompileError(what + " is const, and parameter \"" + parameter.name
+				+ "\" is a pointer that can change it");
+		}
+		return bufferBase(binding->second);
+	}
+
 	// A thread pointer parameter takes a local array of its element type. Vulkan
 	// without VariablePointers cannot index a pointer to an element by a run-time
 	// value, so the helper is emitted once per list of array lengths and its
@@ -7138,6 +7220,15 @@ namespace {
 			const std::string what = "argument " + std::to_string(i + 1) + " of the call to \""
 				+ definition.name + "\"";
 			const Expression& argument = *call.arguments[i];
+
+			// A device or constant pointer takes a whole buffer: an entry point's
+			// own buffer parameter, or the pointer parameter of the calling helper.
+			if (parameter.type.addressSpace == AddressSpace::Device
+				|| parameter.type.addressSpace == AddressSpace::Constant) {
+				arrays[first + i] = bufferPointerArgument(argument, parameter, what);
+				continue;
+			}
+
 			const auto binding = argument.kind == ExpressionKind::Identifier
 				? _bindings.find(argument.name) : _bindings.end();
 			if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.pointeeMsl.arrayLength
@@ -7946,6 +8037,29 @@ namespace {
 			}
 
 			if (parameter.type.isPointer) {
+				if (parameter.type.addressSpace == AddressSpace::Device
+					|| parameter.type.addressSpace == AddressSpace::Constant) {
+					// A whole buffer, passed as the pointer value the argument gave:
+					// p[i], *p and p->field walk it like an entry point's buffer.
+					const auto [pointee, block] = bufferParamTypes(parameter.type);
+					Binding bound;
+					bound.id = values[i];
+					bound.isPointer = true;
+					bound.pointeeType = pointee;
+					bound.bufferPointeeType = block;
+					bound.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
+					bound.structType = parameter.type.namedType.empty()
+						? nullptr : _unit.findStruct(parameter.type.namedType);
+					bound.isBuffer = true;
+					bound.ownAddress = true;
+					bound.readOnly = parameter.type.isConst
+						|| parameter.type.addressSpace == AddressSpace::Constant;
+					bound.pointeeMsl = parameter.type;
+					bound.pointeeMsl.isPointer = false;
+					bound.pointeeMsl.isConst = false;
+					_bindings[parameter.name] = bound;
+					continue;
+				}
 				const Type array = boundArray(parameter.type, helper.arrayLengths[i]);
 				bindLocal(parameter.name, values[i], arrayTypeOf(array), array);
 				continue;

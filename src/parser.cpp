@@ -4559,10 +4559,17 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		const bool threadPointer = param.type.isPointer && !param.isReference
 			&& param.type.addressSpace == AddressSpace::Thread && param.type.resource == ResourceKind::None
 			&& !param.type.isAtomic;
-		if (param.type.isPointer && !threadPointer) {
-			throw CompileError(what + "is a pointer outside the thread address space or to an atomic or "
-				"a resource, which a helper function does not take yet; it takes scalar, vector, matrix "
-				"and struct values and a thread pointer to a local array");
+		// A pointer to a buffer in device or constant memory; the emitter passes the
+		// whole buffer the argument names.
+		const bool bufferPointer = param.type.isPointer && !param.isReference
+			&& param.type.resource == ResourceKind::None && !param.type.isAtomic
+			&& (param.type.addressSpace == AddressSpace::Device
+				|| param.type.addressSpace == AddressSpace::Constant);
+		if (param.type.isPointer && !threadPointer && !bufferPointer) {
+			throw CompileError(what + "is a pointer outside the thread, device and constant address "
+				"spaces or to an atomic or a resource, which a helper function does not take yet; it "
+				"takes scalar, vector, matrix and struct values, a thread pointer to a local array, and "
+				"a device or constant pointer to a buffer");
 		}
 		if (param.type.arrayLength && !param.type.isStdArray) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
@@ -4576,7 +4583,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		if (constantReference) {
 			param.type.isConst = true;
 		}
-		if (param.type.addressSpace != AddressSpace::None && !constantReference
+		if (param.type.addressSpace != AddressSpace::None && !constantReference && !bufferPointer
 			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
