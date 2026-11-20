@@ -1,4 +1,4 @@
-// EXPECT: error found by argument-dependent lookup where the instance is made
+// EXPECT: error is declared after the class template
 // Refs #341: clang makes the instance at the end of the file, so N::h(S, int) below the kernel is the one Apple calls (2.0).
 #include <metal_stdlib>
 using namespace metal;

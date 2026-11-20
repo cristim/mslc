@@ -1,4 +1,4 @@
-// EXPECT: error found by argument-dependent lookup where the instance is made
+// EXPECT: error is declared after the class template
 // Refs #341: Apple picks N::h(S, int) (declared below the template) for h(v, 1); mslc does not model that lookup.
 #include <metal_stdlib>
 using namespace metal;

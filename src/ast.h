@@ -3,6 +3,7 @@
 #include "lexer.h"
 
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -602,6 +603,8 @@ struct ClassTemplate {
 	size_t usingsBefore = 0;
 	// Every identifier its tokens and defaults spell: a using declaration of any other name cannot change a read.
 	std::set<std::string> mentioned;
+	// How many using declarations of each such name exist, in every scope, where the template is declared.
+	std::map<std::string, size_t> usingDeclarationsBefore;
 };
 
 struct FunctionDecl {

@@ -429,17 +429,30 @@ TranslationUnit Parser::parse() {
 		parseDeclaration();
 	}
 
+	// clang makes an instance at the end of the file, and an unqualified call in it finds, by argument-dependent
+	// lookup, what is declared below the template. Which argument types reach the call is not modelled, so a
+	// later function, function template or using declaration of the name refuses the instance (false refusals
+	// for an unrelated function of that name in another namespace are the cost).
 	for (const AdlCheck& check: _adlChecks) {
+		const auto refuse = [&](const std::string& what) {
+			throw CompileError("the " + what + " \"" + check.call + "\" is declared after the class template \""
+				+ check.templateName + "\", which calls \"" + check.call + "\": clang finds it by argument-dependent "
+				"lookup where the instance is made (at the end of the file), which mslc does not model; declare it "
+				"above the template");
+		};
 		for (const FunctionDecl& later: _unit.helpers) {
-			const size_t tail = later.name.rfind("::");
-			const std::string scope = tail == std::string::npos ? std::string() : later.name.substr(0, tail);
 			if (later.order > check.order && later.name.find('<') == std::string::npos
-				&& unqualifiedName(later.name) == check.call && check.namespaces.count(scope)) {
-				throw CompileError("the function \"" + later.name + "\" is declared after the class template \""
-					+ check.templateName + "\", which calls \"" + check.call + "\" with a struct argument: it is found "
-					"by argument-dependent lookup where the instance is made (clang makes it at the end of the file), "
-					"which mslc does not model; declare it above the template");
+				&& unqualifiedName(later.name) == check.call) {
+				refuse("function");
 			}
+		}
+		for (const FunctionTemplate& later: _unit.templates) {
+			if (later.order > check.order && unqualifiedName(later.name) == check.call) {
+				refuse("function template");
+			}
+		}
+		if (usingDeclarationsOf(check.call) > _classTemplates.at(check.templateName)->usingDeclarationsBefore.at(check.call)) {
+			refuse("using declaration of");
 		}
 	}
 	if (!_unit.templates.empty()) {
@@ -1573,6 +1586,17 @@ size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<s
 	return count;
 }
 
+size_t Parser::usingDeclarationsOf(const std::string& name) const {
+	size_t count = 0;
+	for (const auto& scope: _scopes) {
+		if (const auto found = scope.second.declarations.find(name); found != scope.second.declarations.end()) {
+			count += found->second.size();
+		}
+		count += scope.second.stdlibDeclarations.count(name);
+	}
+	return count;
+}
+
 void Parser::swapContext(Context& other) {
 	std::swap(_tokens, other.tokens);
 	std::swap(_position, other.position);
@@ -1645,6 +1669,9 @@ void Parser::parseClassTemplate(ClassTemplate& declaration) {
 		}
 	}
 	declaration.usingsBefore = usingCount(_namespacePath, declaration.mentioned);
+	for (const std::string& name: declaration.mentioned) {
+		declaration.usingDeclarationsBefore[name] = usingDeclarationsOf(name);
+	}
 	declareName(declaration.name, "class template");
 	const std::string name = declaration.name;
 	_classTemplates[name] = std::make_shared<const ClassTemplate>(std::move(declaration));
@@ -1833,41 +1860,14 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		throw ClassTemplateError("a using declaration or directive is made after " + quoted + " in a scope it reads "
 			"names from; write it above the template");
 	}
-	if (std::any_of(arguments.begin(), arguments.end(), [](const TemplateArgument& argument) {
-			return argument.isType && !argument.type.namedType.empty();
-		})) {
-		// The namespaces the struct arguments name (and those their own arguments name): what argument-dependent
-		// lookup searches.
-		std::set<std::string> namespaces;
-		for (const TemplateArgument& argument: arguments) {
-			if (!argument.isType || argument.type.namedType.empty()) {
-				continue;
-			}
-			std::string text = argument.type.namedType;
-			for (size_t at = text.find('$'); at != std::string::npos; at = text.find('$', at + 1)) {
-				text.replace(at, 1, "::");
-			}
-			for (size_t i = 0; i < text.size();) {
-				if (!std::isalnum(static_cast<unsigned char>(text[i])) && text[i] != '_') {
-					++i;
-					continue;
-				}
-				size_t end = i;
-				while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_'
-						|| (text[end] == ':' && end + 1 < text.size() && text[end + 1] == ':')
-						|| (text[end] == ':' && end > 0 && text[end - 1] == ':'))) {
-					++end;
-				}
-				const std::string chain = text.substr(i, end - i);
-				const size_t tail = chain.rfind("::");
-				namespaces.insert(tail == std::string::npos ? std::string() : chain.substr(0, tail));
-				i = end;
-			}
-		}
-		// Only an unqualified call that is not a member call, and only a name the file declares a function of
-		// above the template (a library function is not found this way).
+	{
+		// An unqualified call that is not a member call or a declarator (a member of this is one too) of a name the file declares
+		// a function of above the template (a library function is not found this way). Whether anything of that
+		// name comes later is known only at the end of the file.
 		for (size_t i = 0; i + 1 < declaration.tokens.size(); ++i) {
 			if (declaration.tokens[i].kind != TokenKind::Identifier || declaration.tokens[i + 1].kind != TokenKind::LParen
+				|| (i > 0 && declaration.tokens[i - 1].kind == TokenKind::Identifier
+					&& !std::set<std::string_view>{ "return", "else", "case", "do", "throw", "sizeof", "new" }.count(declaration.tokens[i - 1].text))
 				|| (i > 0 && (declaration.tokens[i - 1].kind == TokenKind::Dot || declaration.tokens[i - 1].kind == TokenKind::Arrow
 					|| declaration.tokens[i - 1].kind == TokenKind::ColonColon))) {
 				continue;
@@ -1880,7 +1880,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 					&& unqualifiedName(key) == call);
 			}
 			if (declaredAbove) {
-				_adlChecks.push_back({ declaration.name, declaration.order, call, namespaces });
+				_adlChecks.push_back({ declaration.name, declaration.order, call });
 			}
 		}
 	}

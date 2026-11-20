@@ -1,7 +1,6 @@
-// EXPECT: valid
-// DISASM: OpConvertFToS
-// Refs #341: a dependent call in a member binds what is declared above the template (g(int), the float converting),
-// not g(float) written below it; Apple does the same for a fundamental type, which has no argument-dependent lookup.
+// EXPECT: error is declared after the class template
+// Refs #341: a call in a member whose name has a later declaration is refused: Apple binds g(int) here (a fundamental
+// type has no argument-dependent lookup), but the rule cannot tell that from a struct argument, so it refuses both.
 #include <metal_stdlib>
 using namespace metal;
 float g(int x) { return 1.0f; }

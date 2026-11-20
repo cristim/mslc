@@ -286,8 +286,8 @@ private:
 		std::string templateName;
 		size_t order = 0;
 		std::string call;
-		std::set<std::string> namespaces;
 	};
+	size_t usingDeclarationsOf(const std::string& name) const;
 	std::vector<AdlCheck> _adlChecks;
 	void parseClassTemplate(ClassTemplate& declaration);
 	// The class template a name spelled by parts names, or null; a local of the name hides it.
