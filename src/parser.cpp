@@ -429,6 +429,19 @@ TranslationUnit Parser::parse() {
 		parseDeclaration();
 	}
 
+	for (const AdlCheck& check: _adlChecks) {
+		for (const FunctionDecl& later: _unit.helpers) {
+			const size_t tail = later.name.rfind("::");
+			const std::string scope = tail == std::string::npos ? std::string() : later.name.substr(0, tail);
+			if (later.order > check.order && later.name.find('<') == std::string::npos
+				&& unqualifiedName(later.name) == check.call && check.namespaces.count(scope)) {
+				throw CompileError("the function \"" + later.name + "\" is declared after the class template \""
+					+ check.templateName + "\", which calls \"" + check.call + "\" with a struct argument: it is found "
+					"by argument-dependent lookup where the instance is made (clang makes it at the end of the file), "
+					"which mslc does not model; declare it above the template");
+			}
+		}
+	}
 	if (!_unit.templates.empty()) {
 		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
 		for (FunctionTemplate& declaration: _unit.templates) {
@@ -1513,28 +1526,48 @@ void Parser::reserveSplits(std::vector<Token>& tokens) {
 		[](const Token& token) { return token.kind == TokenKind::ShiftRight; }));
 }
 
-size_t Parser::usingCount(const std::vector<std::string>& path) const {
+size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<std::string>& mentioned) const {
 	size_t count = 0;
+	std::vector<std::string> work;
+	std::set<std::string> seen;
 	std::string scope;
 	for (size_t i = 0; i <= path.size(); ++i) {
 		if (i > 0) {
 			scope += (scope.empty() ? "" : "::") + path[i - 1];
 		}
-		if (const auto entry = _scopes.find(scope); entry != _scopes.end()) {
-			// A directive that names one of the template's own namespaces brings in nothing it cannot already see.
-			for (const std::string& directive: entry->second.directives) {
-				std::string prefix;
-				bool own = false;
-				for (size_t n = 0; n < path.size() && !own; ++n) {
-					prefix += (prefix.empty() ? "" : "::") + path[n];
-					own = directive == prefix;
-				}
-				count += own ? 0 : 1;
+		work.push_back(scope);
+	}
+	// The scopes the template's own chain reads from, and every one those nominate by a directive, transitively.
+	while (!work.empty()) {
+		const std::string current = work.back();
+		work.pop_back();
+		if (!seen.insert(current).second) {
+			continue;
+		}
+		const auto entry = _scopes.find(current);
+		if (entry == _scopes.end()) {
+			continue;
+		}
+		for (const std::string& directive: entry->second.directives) {
+			bool own = false;
+			std::string prefix;
+			for (size_t n = 0; n < path.size() && !own; ++n) {
+				prefix += (prefix.empty() ? "" : "::") + path[n];
+				own = directive == prefix;
 			}
-			count += entry->second.stdlibDeclarations.size();
-			for (const auto& declaration: entry->second.declarations) {
-				count += declaration.second.size();
-			}
+			count += own ? 0 : 1;
+			work.push_back(directive);
+			// A directive may be written relative to the scope it is in.
+			work.push_back(current.empty() ? directive : current + "::" + directive);
+		}
+		for (const std::string& inner: entry->second.inlines) {
+			work.push_back(inner);
+		}
+		for (const std::string& name: entry->second.stdlibDeclarations) {
+			count += mentioned.count(name) ? 1 : 0;
+		}
+		for (const auto& declaration: entry->second.declarations) {
+			count += mentioned.count(declaration.first) ? declaration.second.size() : 0;
 		}
 	}
 	return count;
@@ -1599,7 +1632,19 @@ void Parser::parseClassTemplate(ClassTemplate& declaration) {
 		declaration.declaredBefore.insert(entry.first);
 	}
 	declaration.declaredBefore.insert(declaration.name);
-	declaration.usingsBefore = usingCount(_namespacePath);
+	for (const Token& token: declaration.tokens) {
+		if (token.kind == TokenKind::Identifier) {
+			declaration.mentioned.insert(std::string(token.text));
+		}
+	}
+	for (const TemplateParameter& parameter: declaration.parameters) {
+		for (const Token& token: parameter.defaultTokens) {
+			if (token.kind == TokenKind::Identifier) {
+				declaration.mentioned.insert(std::string(token.text));
+			}
+		}
+	}
+	declaration.usingsBefore = usingCount(_namespacePath, declaration.mentioned);
 	declareName(declaration.name, "class template");
 	const std::string name = declaration.name;
 	_classTemplates[name] = std::make_shared<const ClassTemplate>(std::move(declaration));
@@ -1784,24 +1829,58 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	// clang reads a name from the definition, and a function again by argument-dependent lookup where the
 	// instance is made. Neither is modelled for what was declared after the template, so a program that
 	// could tell the two apart is refused rather than given another function's or constant's value.
-	if (usingCount(declaration.namespacePath) != declaration.usingsBefore) {
+	if (usingCount(declaration.namespacePath, declaration.mentioned) != declaration.usingsBefore) {
 		throw ClassTemplateError("a using declaration or directive is made after " + quoted + " in a scope it reads "
 			"names from; write it above the template");
 	}
 	if (std::any_of(arguments.begin(), arguments.end(), [](const TemplateArgument& argument) {
 			return argument.isType && !argument.type.namedType.empty();
 		})) {
-		for (size_t i = 0; i + 1 < declaration.tokens.size(); ++i) {
-			if (declaration.tokens[i].kind != TokenKind::Identifier || declaration.tokens[i + 1].kind != TokenKind::LParen) {
+		// The namespaces the struct arguments name (and those their own arguments name): what argument-dependent
+		// lookup searches.
+		std::set<std::string> namespaces;
+		for (const TemplateArgument& argument: arguments) {
+			if (!argument.isType || argument.type.namedType.empty()) {
 				continue;
 			}
-			for (const FunctionDecl& later: _unit.helpers) {
-				if (later.order > declaration.order && later.name.find('<') == std::string::npos
-					&& unqualifiedName(later.name) == declaration.tokens[i].text) {
-					throw ClassTemplateError("the function \"" + later.name + "\" is declared after " + quoted
-						+ ", and a call to it with a struct argument is found by argument-dependent lookup where "
-						"the instance is made, which mslc does not model; declare it above the template");
+			std::string text = argument.type.namedType;
+			for (size_t at = text.find('$'); at != std::string::npos; at = text.find('$', at + 1)) {
+				text.replace(at, 1, "::");
+			}
+			for (size_t i = 0; i < text.size();) {
+				if (!std::isalnum(static_cast<unsigned char>(text[i])) && text[i] != '_') {
+					++i;
+					continue;
 				}
+				size_t end = i;
+				while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_'
+						|| (text[end] == ':' && end + 1 < text.size() && text[end + 1] == ':')
+						|| (text[end] == ':' && end > 0 && text[end - 1] == ':'))) {
+					++end;
+				}
+				const std::string chain = text.substr(i, end - i);
+				const size_t tail = chain.rfind("::");
+				namespaces.insert(tail == std::string::npos ? std::string() : chain.substr(0, tail));
+				i = end;
+			}
+		}
+		// Only an unqualified call that is not a member call, and only a name the file declares a function of
+		// above the template (a library function is not found this way).
+		for (size_t i = 0; i + 1 < declaration.tokens.size(); ++i) {
+			if (declaration.tokens[i].kind != TokenKind::Identifier || declaration.tokens[i + 1].kind != TokenKind::LParen
+				|| (i > 0 && (declaration.tokens[i - 1].kind == TokenKind::Dot || declaration.tokens[i - 1].kind == TokenKind::Arrow
+					|| declaration.tokens[i - 1].kind == TokenKind::ColonColon))) {
+				continue;
+			}
+			const std::string call(declaration.tokens[i].text);
+			bool declaredAbove = false;
+			for (const std::string& key: declaration.declaredBefore) {
+				const auto kind = _declared.find(key);
+				declaredAbove = declaredAbove || (kind != _declared.end() && kind->second == "function"
+					&& unqualifiedName(key) == call);
+			}
+			if (declaredAbove) {
+				_adlChecks.push_back({ declaration.name, declaration.order, call, namespaces });
 			}
 		}
 	}

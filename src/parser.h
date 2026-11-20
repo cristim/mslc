@@ -279,7 +279,16 @@ private:
 	// the tokens a caller holds a reference to.
 	static void reserveSplits(std::vector<Token>& tokens);
 	// The using directives and declarations in the scopes a name in a template of this namespace path is read from.
-	size_t usingCount(const std::vector<std::string>& path) const;
+	size_t usingCount(const std::vector<std::string>& path, const std::set<std::string>& mentioned) const;
+	// A call in a class template that argument-dependent lookup could send to a function declared below it,
+	// checked once the whole file is read (clang instantiates at the end of the file).
+	struct AdlCheck {
+		std::string templateName;
+		size_t order = 0;
+		std::string call;
+		std::set<std::string> namespaces;
+	};
+	std::vector<AdlCheck> _adlChecks;
 	void parseClassTemplate(ClassTemplate& declaration);
 	// The class template a name spelled by parts names, or null; a local of the name hides it.
 	const ClassTemplate* classTemplateNamed(const std::vector<std::string>& parts, bool global) const;

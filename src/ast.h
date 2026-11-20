@@ -600,6 +600,8 @@ struct ClassTemplate {
 	std::set<std::string> declaredBefore;
 	// How many using directives and declarations the template's namespaces hold where it is declared.
 	size_t usingsBefore = 0;
+	// Every identifier its tokens and defaults spell: a using declaration of any other name cannot change a read.
+	std::set<std::string> mentioned;
 };
 
 struct FunctionDecl {

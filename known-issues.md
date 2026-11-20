@@ -636,8 +636,16 @@ below the template that rebinds a name, and a later overload found by argument-d
   the template calls is refused when an instance has a struct template argument (Apple finds it by
   argument-dependent lookup where the instance is made). Not covered: a struct that reaches the call another
   way (a member's own struct type, a parameter), where the older order rule still applies and can pick a
-  different overload than Apple. A using declaration or directive made after the template in a scope it reads
-  from is refused.
+  different overload than Apple. A using declaration of a name the template spells, or any using directive
+  not naming the template's own namespaces, made after it in a scope it reads from (including namespaces those
+  nominate, transitively) is refused. A late `using` that Apple would not let change the result (a same-namespace
+  `using X::K;` below a template reading K, `using metal::precise::sqrt;`) is refused too: false refusals.
+  The argument-dependent lookup check also runs at the end of the file, since clang instantiates there.
+- Not covered, silent wrong overload (Apple 2.0, mslc 1.0):
+  `namespace N { struct S { float a; }; float h(S, float) { return 1.0f; } }
+  template <typename T> struct P { N::S s; T v; float f() const { return h(s, 1); } };
+  namespace N { float h(S, int) { return 2.0f; } }` with `P<float>`: the struct reaches the call through a member
+  type, not a template argument, so the check does not run. Declare every overload above the template.
 - A name an instance reads (typedef, constant, struct, default argument) that is declared after the template is
   refused ("is declared after the class template that uses it"): clang reads it from the definition, so using
   the later one would change the value (a shadowing `N::K`) and Apple rejects the plain case.
