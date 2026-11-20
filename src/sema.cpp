@@ -7167,6 +7167,14 @@ namespace {
 				+ "\" is a pointer in the " + space + " address space, and &b[i] and other pointers "
 				"into the middle of one are not lowered yet");
 		}
+		if (argument.fileScope) {
+			// A file-scope object is a constant, a sampler or a struct, never a buffer; without
+			// this a "::data" spelled past a kernel buffer of the same name would silently bind
+			// the buffer, because this path never calls emitExpression's file-scope correction.
+			throw CompileError(what + " is \"" + argument.name + "\", which names a file-scope object, "
+				+ "and a file-scope object is not a buffer; parameter \"" + parameter.name + "\" is a "
+				+ "pointer in the " + space + " address space and takes one");
+		}
 		const auto binding = _bindings.find(argument.name);
 		if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.isBuffer
 			|| binding->second.bufferPointeeType == InvalidId) {
@@ -7179,12 +7187,17 @@ namespace {
 				+ "parameter \"" + parameter.name + "\" takes a pointer in the " + space
 				+ " one, and Metal does not convert between address spaces");
 		}
-		// The pointee has to be the type the parameter names: a float3 buffer and a
-		// packed_float3 one share a vector type but stride 16 and 12, so their block
-		// structs differ and the pointer the argument carries has the wrong type.
-		if (binding->second.bufferPointeeType != bufferParamTypes(parameter.type).second) {
-			throw CompileError(what + " is a buffer of " + typeName(binding->second.pointeeMsl)
-				+ ", and parameter \"" + parameter.name + "\" points at " + typeName(parameter.type)
+		// The pointee has to be the type the parameter names, as the source spells it and
+		// as it is laid out: an atomic_uint buffer and a uint one share a block struct, an
+		// enum and its underlying type share the scalar, and a float3 buffer and a
+		// packed_float3 one share a vector type but stride 16 and 12. Ordinary loads and
+		// stores through the parameter would read or write the wrong thing, so only a
+		// difference in const qualification is allowed.
+		const Type& given = binding->second.pointeeMsl;
+		if (given.isAtomic != parameter.type.isAtomic || given.enumName != parameter.type.enumName
+			|| binding->second.bufferPointeeType != bufferParamTypes(parameter.type).second) {
+			throw CompileError(what + " is a buffer of " + typeName(given) + ", and parameter \""
+				+ parameter.name + "\" points at " + typeName(parameter.type)
 				+ ", which is not the same element type");
 		}
 		// A constant-space pointer can never write, so a read-only buffer binds it;
