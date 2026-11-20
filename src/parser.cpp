@@ -1513,6 +1513,33 @@ void Parser::reserveSplits(std::vector<Token>& tokens) {
 		[](const Token& token) { return token.kind == TokenKind::ShiftRight; }));
 }
 
+size_t Parser::usingCount(const std::vector<std::string>& path) const {
+	size_t count = 0;
+	std::string scope;
+	for (size_t i = 0; i <= path.size(); ++i) {
+		if (i > 0) {
+			scope += (scope.empty() ? "" : "::") + path[i - 1];
+		}
+		if (const auto entry = _scopes.find(scope); entry != _scopes.end()) {
+			// A directive that names one of the template's own namespaces brings in nothing it cannot already see.
+			for (const std::string& directive: entry->second.directives) {
+				std::string prefix;
+				bool own = false;
+				for (size_t n = 0; n < path.size() && !own; ++n) {
+					prefix += (prefix.empty() ? "" : "::") + path[n];
+					own = directive == prefix;
+				}
+				count += own ? 0 : 1;
+			}
+			count += entry->second.stdlibDeclarations.size();
+			for (const auto& declaration: entry->second.declarations) {
+				count += declaration.second.size();
+			}
+		}
+	}
+	return count;
+}
+
 void Parser::swapContext(Context& other) {
 	std::swap(_tokens, other.tokens);
 	std::swap(_position, other.position);
@@ -1572,6 +1599,7 @@ void Parser::parseClassTemplate(ClassTemplate& declaration) {
 		declaration.declaredBefore.insert(entry.first);
 	}
 	declaration.declaredBefore.insert(declaration.name);
+	declaration.usingsBefore = usingCount(_namespacePath);
 	declareName(declaration.name, "class template");
 	const std::string name = declaration.name;
 	_classTemplates[name] = std::make_shared<const ClassTemplate>(std::move(declaration));
@@ -1752,6 +1780,30 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	if (_frozenClasses) {
 		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " is first named inside a function "
 			"template, which is not lowered yet; name it once outside the template");
+	}
+	// clang reads a name from the definition, and a function again by argument-dependent lookup where the
+	// instance is made. Neither is modelled for what was declared after the template, so a program that
+	// could tell the two apart is refused rather than given another function's or constant's value.
+	if (usingCount(declaration.namespacePath) != declaration.usingsBefore) {
+		throw ClassTemplateError("a using declaration or directive is made after " + quoted + " in a scope it reads "
+			"names from; write it above the template");
+	}
+	if (std::any_of(arguments.begin(), arguments.end(), [](const TemplateArgument& argument) {
+			return argument.isType && !argument.type.namedType.empty();
+		})) {
+		for (size_t i = 0; i + 1 < declaration.tokens.size(); ++i) {
+			if (declaration.tokens[i].kind != TokenKind::Identifier || declaration.tokens[i + 1].kind != TokenKind::LParen) {
+				continue;
+			}
+			for (const FunctionDecl& later: _unit.helpers) {
+				if (later.order > declaration.order && later.name.find('<') == std::string::npos
+					&& unqualifiedName(later.name) == declaration.tokens[i].text) {
+					throw ClassTemplateError("the function \"" + later.name + "\" is declared after " + quoted
+						+ ", and a call to it with a struct argument is found by argument-dependent lookup where "
+						"the instance is made, which mslc does not model; declare it above the template");
+				}
+			}
+		}
 	}
 	// Apple stops at 1024.
 	if (_classDepth >= 64) {

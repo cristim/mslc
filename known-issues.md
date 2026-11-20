@@ -620,7 +620,8 @@ A `template <...> struct S { ... };` is kept as tokens and re-read, with its arg
 `S<args>` is named; the instance is an ordinary struct called `S<args>` with its member functions and
 constructor as helpers. Checked against Apple by execution on about 900 of 2,100 generated programs that both compilers accept
 (member and free-function choice, non-type and default arguments, nested instances, buffer layout and `sizeof`):
-no value differed.
+no value differed in those, but two shapes found by review differed and are now refused (a using declaration
+below the template that rebinds a name, and a later overload found by argument-dependent lookup).
 
 - Refused, with a diagnostic naming the template and the arguments: partial and explicit specialisation,
   `class` and `union` templates, a base list, a forward declaration, static data members (also refused in a
@@ -631,10 +632,12 @@ no value differed.
   inside it.
 - Every member function of an instance is read when the instance is made, so an unused member whose body does
   not compile for that argument is an error here and not in Apple. Apple reads a member only when it is used.
-- Member functions count as declared where the template is: a function written after the template is not found
-  from a member body. A dependent call that Apple resolves by argument-dependent lookup at the instantiation
-  point (a struct argument whose namespace declares the function below the template) is therefore refused, not
-  resolved.
+- Member functions count as declared where the template is. A function written after the template whose name
+  the template calls is refused when an instance has a struct template argument (Apple finds it by
+  argument-dependent lookup where the instance is made). Not covered: a struct that reaches the call another
+  way (a member's own struct type, a parameter), where the older order rule still applies and can pick a
+  different overload than Apple. A using declaration or directive made after the template in a scope it reads
+  from is refused.
 - A name an instance reads (typedef, constant, struct, default argument) that is declared after the template is
   refused ("is declared after the class template that uses it"): clang reads it from the definition, so using
   the later one would change the value (a shadowing `N::K`) and Apple rejects the plain case.
@@ -646,6 +649,8 @@ no value differed.
   Apple reports `unknown type name`.
 - `S<args>` as written is canonicalised: `S<float>` and `S<F>` for `typedef float F` are one struct, `S<const
   float>` another; a struct argument's namespace is spelled `$` in the instance's name (never shown).
+- Older gap (master, not templates): calling a non-device member function on a `device const` object is accepted
+  where Apple rejects it.
 - A struct that contains an instance by value inherits the older gap that a struct field of struct type is not
   represented in a buffer struct.
 

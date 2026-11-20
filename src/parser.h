@@ -278,6 +278,8 @@ private:
 	// Room for every ">>" to become two tokens, so that splitting one while a name is peeked never moves
 	// the tokens a caller holds a reference to.
 	static void reserveSplits(std::vector<Token>& tokens);
+	// The using directives and declarations in the scopes a name in a template of this namespace path is read from.
+	size_t usingCount(const std::vector<std::string>& path) const;
 	void parseClassTemplate(ClassTemplate& declaration);
 	// The class template a name spelled by parts names, or null; a local of the name hides it.
 	const ClassTemplate* classTemplateNamed(const std::vector<std::string>& parts, bool global) const;

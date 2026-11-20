@@ -598,6 +598,8 @@ struct ClassTemplate {
 	// The file-scope names declared above the template: a name its instances resolve to that is not here
 	// was declared after it, which clang does not find from the definition.
 	std::set<std::string> declaredBefore;
+	// How many using directives and declarations the template's namespaces hold where it is declared.
+	size_t usingsBefore = 0;
 };
 
 struct FunctionDecl {
