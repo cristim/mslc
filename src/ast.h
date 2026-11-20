@@ -557,6 +557,17 @@ struct TemplateParameter {
 
 struct ClassTemplate;
 
+// An instance of a class template that a function template's body names and no earlier code did. A
+// function template's instance is read by a parser that cannot declare a struct, so it asks for the
+// instance (NeedClassInstance); the file is then parsed again with the instance made where its class
+// template and argument types are first all declared.
+struct ClassInstanceSeed {
+	std::string className;
+	std::vector<TemplateArgument> arguments;
+	// The instance's struct name, as a use spells it.
+	std::string instance;
+};
+
 // A function template, kept as tokens and the parser's name state where it was declared, so
 // that each instantiation re-parses it with its arguments bound (see instantiateTemplate).
 struct FunctionTemplate {
@@ -581,6 +592,8 @@ struct FunctionTemplate {
 	std::shared_ptr<const std::vector<Token>> file;
 	size_t endAt = 0;
 	mutable std::shared_ptr<const void> names;
+	// The instances the file was parsed with, which the name state rebuilt at endAt has to make too.
+	std::shared_ptr<const std::vector<ClassInstanceSeed>> seeds;
 
 	// A member function template of a struct: its name (the struct's), the fields and member functions
 	// the struct has (a bare name in the body means this.field or this.f(...)), and, for a member of a

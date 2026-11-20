@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -36,6 +37,15 @@ FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
 // The default of template parameter "index", read under the arguments bound before it.
 TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t index,
 	const std::vector<TemplateArgument>& bound);
+
+// A function template's instance names an instance of a class template that the file has not made. The
+// parser that reads the instance cannot declare it, so compile parses again with the seed made up front.
+class NeedClassInstance: public std::exception {
+public:
+	explicit NeedClassInstance(ClassInstanceSeed seed): seed(std::move(seed)) {}
+	const char* what() const noexcept override { return "a class template instance is needed"; }
+	ClassInstanceSeed seed;
+};
 
 // Parses an MSL token stream into a translation unit.
 //
@@ -142,6 +152,10 @@ public:
 
 	TranslationUnit parse();
 
+	// Class template instances to make before the first declaration that can see their class template and
+	// argument types, in order (an argument may be an earlier seed).
+	void setSeeds(std::vector<ClassInstanceSeed> seeds);
+
 	// Index of the token the parser is at, which is the one a failure is about.
 	size_t position() const { return _position; }
 
@@ -222,6 +236,7 @@ private:
 		std::map<std::string, ConstantInt> constantInts;
 		std::map<std::string, ConstructorInfo> constructors;
 		std::set<std::string> memberTemplateNames;
+		std::set<std::string> seedKeys;
 	};
 	std::shared_ptr<const Names> captureNames() const;
 	void restoreNames(const Names& names);
@@ -256,6 +271,16 @@ private:
 	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
 	// the emitter reads, so an instance it needs has to exist already.
 	bool _frozenClasses = false;
+	// The seeds this parse was given, which are made once their class template and arguments exist.
+	std::vector<ClassInstanceSeed> _seeds;
+	std::vector<bool> _seeded;
+	std::set<std::string> _seedKeys;
+	std::shared_ptr<const std::vector<ClassInstanceSeed>> _seedList;
+	void makeSeeds();
+	void parseTopLevel() {
+		makeSeeds();
+		parseDeclaration();
+	}
 	// The spelling of an instance's name, which the tokens that carry it point into.
 	std::shared_ptr<std::deque<std::string>> _spellings = std::make_shared<std::deque<std::string>>();
 	// The parts of the parser's position that belong to what is being read, which an instance reads over

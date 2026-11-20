@@ -413,9 +413,12 @@ std::shared_ptr<const Parser::Names> Parser::namesAt(const FunctionTemplate& dec
 	if (!declaration.names) {
 		Parser replay(*declaration.file);
 		replay._stopAt = declaration.endAt;
+		if (declaration.seeds) {
+			replay.setSeeds(*declaration.seeds);
+		}
 		try {
 			while (!replay.at(TokenKind::EndOfFile)) {
-				replay.parseDeclaration();
+				replay.parseTopLevel();
 			}
 		} catch (const StopParsing&) {
 		}
@@ -424,15 +427,58 @@ std::shared_ptr<const Parser::Names> Parser::namesAt(const FunctionTemplate& dec
 	return std::static_pointer_cast<const Names>(declaration.names);
 }
 
+void Parser::setSeeds(std::vector<ClassInstanceSeed> seeds) {
+	_seeds = std::move(seeds);
+	_seeded.assign(_seeds.size(), false);
+	_seedKeys.clear();
+	for (const ClassInstanceSeed& seed: _seeds) {
+		_seedKeys.insert(seed.instance);
+	}
+	_seedList = std::make_shared<const std::vector<ClassInstanceSeed>>(_seeds);
+}
+
 TranslationUnit Parser::parse() {
 	while (!at(TokenKind::EndOfFile)) {
-		parseDeclaration();
+		parseTopLevel();
 	}
 
 	// clang makes an instance at the end of the file, and an unqualified call in it finds, by argument-dependent
 	// lookup, what is declared below the template. Which argument types reach the call is not modelled, so a
 	// later function, function template or using declaration of the name refuses the instance (false refusals
 	// for an unrelated function of that name in another namespace are the cost).
+	// A seeded instance was made where its class template and arguments first exist, which is above the code that
+	// needs it, so a name declared between the two is not seen by the lookup that refuses a late name. clang reads
+	// names from the class template's definition, so a file-scope name declared after the template that the
+	// template spells (as other than a member, or one of its parameters) is refused whenever it is declared.
+	for (size_t i = 0; i < _seeds.size(); ++i) {
+		if (!_seeded[i]) {
+			continue;
+		}
+		const ClassTemplate& declaration = *_classTemplates.at(_seeds[i].className);
+		if (usingCount(declaration.namespacePath, declaration.mentioned, declaration.aliasTargets) != declaration.usingsBefore) {
+			throw CompileError("a using declaration or directive is made after the class template \"" + declaration.name
+				+ "\" in a scope it reads names from, and a function template names its instance \""
+				+ _seeds[i].instance + "\"; write it above the template");
+		}
+		std::set<std::string> spelled;
+		for (size_t t = 0; t < declaration.tokens.size(); ++t) {
+			if (declaration.tokens[t].kind == TokenKind::Identifier
+				&& (t == 0 || (declaration.tokens[t - 1].kind != TokenKind::Dot && declaration.tokens[t - 1].kind != TokenKind::Arrow))) {
+				spelled.insert(std::string(declaration.tokens[t].text));
+			}
+		}
+		for (const TemplateParameter& parameter: declaration.parameters) {
+			spelled.erase(parameter.name);
+		}
+		for (const auto& [key, kind]: _declared) {
+			if (kind != "function" && key.find('<') == std::string::npos && !declaration.declaredBefore.count(key)
+				&& spelled.count(unqualifiedName(key))) {
+				throw CompileError("the name \"" + key + "\" is declared after the class template \""
+					+ declaration.name + "\", whose instance \"" + _seeds[i].instance + "\" a function template "
+					"names, and the template spells that name; declare it above the template");
+			}
+		}
+	}
 	for (const AdlCheck& check: _adlChecks) {
 		const auto refuse = [&](const std::string& what) {
 			throw CompileError("the " + what + " \"" + check.call + "\" is declared after the class template \""
@@ -459,6 +505,7 @@ TranslationUnit Parser::parse() {
 		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
 		for (FunctionTemplate& declaration: _unit.templates) {
 			declaration.file = file;
+			declaration.seeds = _seedList;
 		}
 	}
 	return std::move(_unit);
@@ -651,7 +698,7 @@ void Parser::parseNamespace(bool isInline) {
 
 	expect(TokenKind::LBrace, "to open a namespace body");
 	while (!at(TokenKind::RBrace) && !at(TokenKind::EndOfFile)) {
-		parseDeclaration();
+		parseTopLevel();
 	}
 	expect(TokenKind::RBrace, "to close a namespace body");
 	_namespacePath.resize(outer);
@@ -902,6 +949,7 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
 	names->memberTemplateNames = _memberTemplateNames;
+	names->seedKeys = _seedKeys;
 	return names;
 }
 
@@ -922,6 +970,7 @@ void Parser::restoreNames(const Names& names) {
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
 	_memberTemplateNames = names.memberTemplateNames;
+	_seedKeys = names.seedKeys;
 	_frozenClasses = true;
 }
 
@@ -1787,6 +1836,37 @@ std::vector<TemplateArgument> Parser::parseClassTemplateArguments(const ClassTem
 	return arguments;
 }
 
+// Makes each seed whose class template and argument structs exist and that is not made yet, in order, at the
+// start of a declaration. The instance is read as if the program had spelled it here: the same order and
+// the same refusals of a name or a using declaration the class template did not see.
+void Parser::makeSeeds() {
+	for (size_t i = 0; i < _seeds.size(); ++i) {
+		if (_seeded[i]) {
+			continue;
+		}
+		const ClassInstanceSeed& seed = _seeds[i];
+		const auto found = _classTemplates.find(seed.className);
+		if (found == _classTemplates.end()) {
+			break;
+		}
+		bool known = true;
+		for (const TemplateArgument& argument: seed.arguments) {
+			known = known && (argument.isType ? argument.type.namedType.empty() || _unit.findStruct(argument.type.namedType)
+				: true);
+		}
+		if (!known) {
+			break;
+		}
+		_seeded[i] = true;
+		try {
+			instantiateClass(*found->second, seed.arguments);
+		} catch (const CompileError& error) {
+			throw ClassTemplateError(std::string("the instance \"") + seed.instance + "\", named by a function "
+				"template: " + error.what());
+		}
+	}
+}
+
 // The struct "Name<arguments>", declared as the template's tokens read with the arguments bound. It is
 // an ordinary struct once declared: its fields and its member functions and constructors, which become
 // helpers named after it, are read where the template is used, and each distinct argument list is one
@@ -1918,8 +1998,11 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		return instance;
 	}
 	if (_frozenClasses) {
-		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " is first named inside a function "
-			"template, which is not lowered yet; name it once outside the template");
+		if (_seedKeys.count(instance)) {
+			throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " is named inside a function "
+				"template, but its argument types are declared after the template; declare them above it");
+		}
+		throw NeedClassInstance({ declaration.name, arguments, instance });
 	}
 	// clang reads a name from the definition, and a function again by argument-dependent lookup where the
 	// instance is made. Neither is modelled for what was declared after the template, so a program that

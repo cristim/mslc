@@ -627,9 +627,17 @@ below the template that rebinds a name, and a later overload found by argument-d
   `class` and `union` templates, a base list, a forward declaration, static data members (also refused in a
   plain struct), overloaded constructors (also refused in a plain struct),
   instantiation deeper than 64 (Apple: 1024), and any error inside the instance.
-- An instance first named inside a function template, or built from its parameters (`template <class T> float
-  f(Box<T> b)`), is refused (slice 5d). An instance named at file scope above the function template is usable
-  inside it.
+- An instance first named inside a function template or a member function template (`Box<T> b;` with T the
+  template's parameter, `Box<float>`, `Box<Box<T>>`, `Vn<float, N>`) works (slice 5d). The throwaway parser that
+  reads a function template's instance cannot declare a struct, so it asks for the instance and the file is
+  parsed again with it made where its class template and argument types are first declared (one more parse per
+  distinct instance, at most 64: more is refused). Refused: an argument type declared after the function template;
+  a deduced `Box<T>` in a parameter (`T unbox(Box<T>)`) or a return type (`Box<T> make(T)`), where T is still being
+  deduced (the explicit form `unbox<float>(b)` works); a file-scope name the class template spells that is declared
+  anywhere after it (a loud false refusal when it is unrelated); and a using declaration or directive after the
+  class template in a scope it reads from, checked at the end of the file. Explicit instantiation of an entry point
+  (`template [[host_name("kf")]] kernel void k<float>(...)`, accepted by Apple) is not class-instance work and is
+  still refused.
 - Every member function of an instance is read when the instance is made, so an unused member whose body does
   not compile for that argument is an error here and not in Apple. Apple reads a member only when it is used.
 - Member functions count as declared where the template is. Clang instantiates at the end of the file, where an
@@ -687,7 +695,7 @@ receiver, and `Box<T>` members: no value differed.
 - The result type of `v.f(x)` is known only once the arguments are deduced, so `v.f(x).field` is refused when the
   template returns its own parameter (it reads as a swizzle), as for a function template. A result that does not
   name a template parameter (`P f(U) const`) is a struct value as usual.
-- An instance of another class template that names the member template's parameter (`Box<U>` inside it) is slice 5d.
+- An instance of another class template that names the member template's parameter (`Box<U>` inside it) works (slice 5d, see above).
 - Overload resolution among member templates is the function templates': partial ordering is not modelled, so
   `f(U, U)` beside `f(U, int)` called with two ints is reported ambiguous where Apple prefers the second.
 - A member template of a class template instance is subject to the class template's late-declaration rules (see

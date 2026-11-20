@@ -43,8 +43,9 @@ namespace {
 
 	enum class ArtifactKind { VulkanExecutable, LinkageObject };
 
-	void compile(const char* source, size_t sourceLength, const MslcOptions& effective,
-		ArtifactKind kind, std::vector<uint8_t>& module, std::string& reflection) {
+	void compileWith(const char* source, size_t sourceLength, const MslcOptions& effective,
+		ArtifactKind kind, const std::vector<mslc::ClassInstanceSeed>& seeds, std::vector<uint8_t>& module,
+		std::string& reflection) {
 		mslc::PreprocessOptions preprocessOptions;
 		if (effective.sourcePath) {
 			preprocessOptions.sourcePath = effective.sourcePath;
@@ -62,6 +63,7 @@ namespace {
 		const mslc::PreprocessedSource preprocessed = mslc::preprocess(
 			std::string_view(source, sourceLength), preprocessOptions);
 		mslc::Parser parser(preprocessed.tokens);
+		parser.setSeeds(seeds);
 		const mslc::TranslationUnit unit = [&]() {
 			try {
 				return parser.parse();
@@ -127,6 +129,27 @@ namespace {
 		}
 		if (!builder.finalize(module)) {
 			throw mslc::CompileError("emitted no entry point, so the module is not loadable");
+		}
+	}
+
+	// A function template's instance can name an instance of a class template that nothing made before (see
+	// NeedClassInstance): the file is compiled again with that instance made up front. Each round adds one,
+	// and a repeat is an error in the parser, so the rounds end.
+	void compile(const char* source, size_t sourceLength, const MslcOptions& effective,
+		ArtifactKind kind, std::vector<uint8_t>& module, std::string& reflection) {
+		constexpr size_t kMaxSeedRounds = 64;
+		std::vector<mslc::ClassInstanceSeed> seeds;
+		for (;;) {
+			try {
+				compileWith(source, sourceLength, effective, kind, seeds, module, reflection);
+				return;
+			} catch (const mslc::NeedClassInstance& need) {
+				if (seeds.size() >= kMaxSeedRounds) {
+					throw mslc::CompileError("function templates name more than " + std::to_string(kMaxSeedRounds)
+						+ " class template instances that nothing else names (at \"" + need.seed.instance + "\")");
+				}
+				seeds.push_back(need.seed);
+			}
 		}
 	}
 
