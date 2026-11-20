@@ -1,5 +1,5 @@
-// EXPECT: error a class template is not lowered
-// Refs #341
+// EXPECT: valid
+// Refs #341: a class template nobody names is compile-time only and never reaches SPIR-V (as in clang).
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> struct Box { T v; };

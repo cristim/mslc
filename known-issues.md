@@ -614,6 +614,37 @@ Each of these is a diagnostic, not a silent pick, except where it says "approxim
   The length it takes is the right one, so this accepts invalid source and miscompiles nothing.
 
 
+## Class template instantiation: what is refused or approximated (#341, slice 5)
+
+A `template <...> struct S { ... };` is kept as tokens and re-read, with its arguments bound, the first time
+`S<args>` is named; the instance is an ordinary struct called `S<args>` with its member functions and
+constructor as helpers. Checked against Apple by execution on about 900 of 2,100 generated programs that both compilers accept
+(member and free-function choice, non-type and default arguments, nested instances, buffer layout and `sizeof`):
+no value differed.
+
+- Refused, with a diagnostic naming the template and the arguments: partial and explicit specialisation,
+  `class` and `union` templates, a base list, a forward declaration, static data members (also refused in a
+  plain struct), a member template (slice 5c), overloaded constructors (also refused in a plain struct),
+  instantiation deeper than 64 (Apple: 1024), and any error inside the instance.
+- An instance first named inside a function template, or built from its parameters (`template <class T> float
+  f(Box<T> b)`), is refused (slice 5d). An instance named at file scope above the function template is usable
+  inside it.
+- Every member function of an instance is read when the instance is made, so an unused member whose body does
+  not compile for that argument is an error here and not in Apple. Apple reads a member only when it is used.
+- Member functions count as declared where the template is: a function written after the template is not found
+  from a member body. A dependent call that Apple resolves by argument-dependent lookup at the instantiation
+  point (a struct argument whose namespace declares the function below the template) is therefore refused, not
+  resolved.
+- Other names are read where the instance is made, not where the template is declared (clang reads
+  non-dependent names at the definition). Only a declaration between the template and its first use that
+  shadows an outer one of the same name through a namespace or a using directive can differ; not modelled.
+- An unused template is accepted without being read, so an undeclared type in its body is accepted where
+  Apple reports `unknown type name`.
+- `S<args>` as written is canonicalised: `S<float>` and `S<F>` for `typedef float F` are one struct, `S<const
+  float>` another; a struct argument's namespace is spelled `$` in the instance's name (never shown).
+- A struct that contains an instance by value inherits the older gap that a struct field of struct type is not
+  represented in a buffer struct.
+
 ## Library namespace lookup: leftovers found while fixing #344, #345 and #357
 
 All of these predate those fixes; counts are from generated differentials against Apple.
