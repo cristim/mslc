@@ -635,9 +635,13 @@ no value differed.
   from a member body. A dependent call that Apple resolves by argument-dependent lookup at the instantiation
   point (a struct argument whose namespace declares the function below the template) is therefore refused, not
   resolved.
-- Other names are read where the instance is made, not where the template is declared (clang reads
-  non-dependent names at the definition). Only a declaration between the template and its first use that
-  shadows an outer one of the same name through a namespace or a using directive can differ; not modelled.
+- A name an instance reads (typedef, constant, struct, default argument) that is declared after the template is
+  refused ("is declared after the class template that uses it"): clang reads it from the definition, so using
+  the later one would change the value (a shadowing `N::K`) and Apple rejects the plain case.
+- False refusals: `A<(8>>1)>` (a `>>` inside parentheses in an argument), a using directive that makes a member's
+  constant look ambiguous where Apple binds the file-scope one, and `BH::f()` through a typedef of an instance.
+- The restore of a parameter binding that was absent before an instance (erase afterwards) cannot be observed
+  from source: the block that names it is gone, so no probe pins it.
 - An unused template is accepted without being read, so an undeclared type in its body is accepted where
   Apple reports `unknown type name`.
 - `S<args>` as written is canonicalised: `S<float>` and `S<F>` for `typedef float F` are one struct, `S<const

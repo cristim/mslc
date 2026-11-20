@@ -1568,6 +1568,10 @@ void Parser::parseClassTemplate(ClassTemplate& declaration) {
 	declaration.namespacePath = _namespacePath;
 	declaration.order = _functionOrder++;
 	declaration.globalsBefore = _unit.globals.size();
+	for (const auto& entry: _declared) {
+		declaration.declaredBefore.insert(entry.first);
+	}
+	declaration.declaredBefore.insert(declaration.name);
 	declareName(declaration.name, "class template");
 	const std::string name = declaration.name;
 	_classTemplates[name] = std::make_shared<const ClassTemplate>(std::move(declaration));
@@ -1579,6 +1583,9 @@ const ClassTemplate* Parser::classTemplateNamed(const std::vector<std::string>& 
 	}
 	std::string resolved;
 	if (parts.size() == 1 && !global) {
+		if (memberHidesName(parts[0])) {
+			return nullptr;
+		}
 		if (const std::string* bound = blockName(parts[0]); bound && bound->empty()) {
 			return nullptr;
 		} else if (bound) {
@@ -1668,6 +1675,14 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		~Guard() { parser.swapContext(saved); }
 	};
 
+	struct Defined {
+		Parser& parser;
+		const std::set<std::string>* saved;
+		Defined(Parser& owner, const std::set<std::string>* names): parser(owner), saved(owner._definedNames) {
+			parser._definedNames = names;
+		}
+		~Defined() { parser._definedNames = saved; }
+	};
 	const auto fresh = [&](std::vector<Token> tokens) {
 		Context next;
 		next.tokens = std::move(tokens);
@@ -1686,6 +1701,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 			}
 			// Only the parameters before this one are in scope.
 			const Bindings bindings(*this, parameters);
+			const Defined defined(*this, &declaration.declaredBefore);
 			const Guard guard(*this, fresh(parameter.defaultTokens));
 			bindParameters(declaration.name, std::vector<TemplateParameter>(parameters.begin(), parameters.begin() + index),
 				arguments);
@@ -1721,7 +1737,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	std::string key;
 	for (size_t i = 0; i < arguments.size(); ++i) {
 		const TemplateArgument& argument = arguments[i];
-		std::string text = argument.isType ? (argument.type.isConst ? "const " : "") + typeName(argument.type)
+		std::string text = argument.isType ? typeName(argument.type)
 			: std::to_string(argument.value);
 		for (size_t at = text.find("::"); at != std::string::npos; at = text.find("::", at + 1)) {
 			text.replace(at, 2, "$");
@@ -1771,6 +1787,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	} done { *this, instance };
 	try {
 		const Bindings bindings(*this, parameters);
+		const Defined defined(*this, &declaration.declaredBefore);
 		const Guard guard(*this, fresh(std::move(tokens)));
 		bindParameters(declaration.name, parameters, arguments);
 		parseDeclaration();
@@ -3404,6 +3421,21 @@ std::string Parser::namespaceOf(const QualifiedName& name, size_t count, Namespa
 }
 
 std::string Parser::resolveName(const QualifiedName& name, std::vector<std::string>* alternatives) const {
+	std::string resolved = resolveNameUnchecked(name, alternatives);
+	// A name an instance finds that was declared after its template (a typedef, a constant, a struct) is not
+	// what clang finds from the definition; reading it would give another value, so it is refused. Instances
+	// and their members (spelled with "<") and functions (ordered by their own rule) are exempt.
+	if (_definedNames && resolved.find('<') == std::string::npos) {
+		if (const auto declared = _declared.find(resolved);
+			declared != _declared.end() && declared->second != "function" && !_definedNames->count(resolved)) {
+			throw ClassTemplateError("the name \"" + resolved + "\" is declared after the class template that uses it; "
+				"declare it above the template");
+		}
+	}
+	return resolved;
+}
+
+std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<std::string>* alternatives) const {
 	const auto pick = [&](const std::set<std::string>& found, const std::string& spelled) {
 		// [over.match]: functions that lookup finds in several scopes (using directives and
 		// declarations) are one overload set, which the emitter chooses from by the arguments.

@@ -595,6 +595,9 @@ struct ClassTemplate {
 	// a function written after it is not one a name in its body can find at the definition.
 	size_t order = 0;
 	size_t globalsBefore = 0;
+	// The file-scope names declared above the template: a name its instances resolve to that is not here
+	// was declared after it, which clang does not find from the definition.
+	std::set<std::string> declaredBefore;
 };
 
 struct FunctionDecl {

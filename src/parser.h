@@ -378,6 +378,9 @@ private:
 	// With "alternatives", a name that finds several functions is their overload set, not an
 	// ambiguity: they are returned there and the first is the result.
 	std::string resolveName(const QualifiedName& name, std::vector<std::string>* alternatives = nullptr) const;
+	std::string resolveNameUnchecked(const QualifiedName& name, std::vector<std::string>* alternatives) const;
+	// While an instance of a class template is read: the names its template was declared above.
+	const std::set<std::string>* _definedNames = nullptr;
 	// The declarations an unqualified name finds at the innermost namespace level that has
 	// any, without reporting several as ambiguous (a declaration site is not a use). With
 	// "besideStdlib", also whether the standard library's names are visible there or nearer:
