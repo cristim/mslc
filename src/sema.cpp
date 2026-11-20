@@ -8019,8 +8019,18 @@ namespace {
 			{ kFunctionControlNone, helper.type });
 
 		std::vector<Id> values;
-		for (const Id type: helper.parameterTypes) {
-			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, type, { }));
+		for (size_t i = 0; i < helper.parameterTypes.size(); ++i) {
+			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, helper.parameterTypes[i], { }));
+
+			// SPV_KHR_physical_storage_buffer wants exactly one of Aliased or Restrict on a
+			// pointer parameter. Metal pointers may alias (f(out, out) is legal), so a
+			// driver must not assume otherwise.
+			const Parameter& parameter = definition.parameters[i];
+			if (parameter.type.isPointer
+				&& (parameter.type.addressSpace == AddressSpace::Device
+					|| parameter.type.addressSpace == AddressSpace::Constant)) {
+				_builder.emit(spirv::OpDecorate, { values.back(), static_cast<uint32_t>(spirv::Decoration::Aliased) });
+			}
 		}
 
 		// A declaration is a function with no blocks, resolved when the module is linked.
