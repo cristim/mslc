@@ -249,6 +249,8 @@ private:
 	// Instances being read, so that a member naming its own instance finds it.
 	std::set<std::string> _classInProgress;
 	size_t _classDepth = 0;
+	// Indices into _unit.helpers already stamped by a class instance, so an enclosing instance leaves them.
+	std::set<size_t> _instanceHelpers;
 	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
 	// the emitter reads, so an instance it needs has to exist already.
 	bool _frozenClasses = false;

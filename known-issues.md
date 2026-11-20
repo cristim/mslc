@@ -646,6 +646,10 @@ below the template that rebinds a name, and a later overload found by argument-d
 - A name an instance reads (typedef, constant, struct, default argument) that is declared after the template is
   refused ("is declared after the class template that uses it"): clang reads it from the definition, so using
   the later one would change the value (a shadowing `N::K`) and Apple rejects the plain case.
+- Nested instances keep the order of their own template (#383): a member of `In<T>` read while `Out<T>` is made
+  binds what was declared above `In`, not above `Out`. A namespace the template names in a qualified call
+  (`N::h(v)`) counts as a scope it reads from, so a using declaration or directive made in it below the template
+  is refused (Apple keeps the earlier `N::h`; a false refusal where the later one would not be picked).
 - False refusals: `A<(8>>1)>` (a `>>` inside parentheses in an argument), a using directive that makes a member's
   constant look ambiguous where Apple binds the file-scope one, and `BH::f()` through a typedef of an instance.
 - The restore of a parameter binding that was absent before an instance (erase afterwards) cannot be observed

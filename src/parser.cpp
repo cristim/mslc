@@ -1595,6 +1595,15 @@ size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<s
 		}
 		work.push_back(scope);
 	}
+	// A qualified call "N::h(v)" reads N, which may be written anywhere: a namespace the template names is a scope
+	// it reads from, so a using declaration made in it later is counted (and refused) too.
+	for (const auto& scope: _scopes) {
+		const std::string& key = scope.first;
+		const size_t cut = key.rfind("::");
+		if (!key.empty() && mentioned.count(cut == std::string::npos ? key : key.substr(cut + 2))) {
+			work.push_back(key);
+		}
+	}
 	// The scopes the template's own chain reads from, and every one those nominate by a directive, transitively.
 	while (!work.empty()) {
 		const std::string current = work.back();
@@ -1981,6 +1990,10 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " did not declare a struct");
 	}
 	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
+		// A nested instance's helpers were stamped with their own template's order when it was made.
+		if (!_instanceHelpers.insert(i).second) {
+			continue;
+		}
 		FunctionDecl& member = _unit.helpers[i];
 		member.isLocal = true;
 		member.order = declaration.order;
