@@ -847,3 +847,10 @@ Accepted though Apple rejects or reports them differently: an unqualified `array
 
 mslc zero-fills `array<T,N> a;` where Apple leaves it uninitialised; a read before a write differs only where
 Apple's value is undefined.
+
+## Class template instances named from a function template (#341 slice 5d)
+
+- A member template of a seeded instance that names another instance (`Outer<T>::m` naming `Box<U>`, with
+  `Outer<float>` made before `Box<float>`) is refused with "argument types are declared after the template".
+  Apple accepts it. The seeds are made in request order and a member template captures its names when the
+  struct ends. The message is wrong for this case; the refusal is loud.
