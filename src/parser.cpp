@@ -1010,7 +1010,11 @@ void Parser::parseTemplateDeclaration() {
 	parseTemplateHeader(declaration);
 
 	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
-		throw CompileError("a class template is not lowered");
+		ClassTemplate classDeclaration;
+		classDeclaration.line = declaration.line;
+		classDeclaration.parameters = std::move(declaration.parameters);
+		parseClassTemplate(classDeclaration);
+		return;
 	}
 	if (atKeyword("using") || atKeyword("template")) {
 		throw CompileError("an alias template is not lowered");
@@ -1493,6 +1497,17 @@ void Parser::closeAngle(const char* what) {
 	expect(TokenKind::Greater, what);
 }
 
+namespace {
+
+// A failure to read a class template instance. It is not swallowed where the parser backtracks, since
+// reading on past it would leave a half-declared struct behind.
+class ClassTemplateError: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
+}
+
 void Parser::reserveSplits(std::vector<Token>& tokens) {
 	tokens.reserve(tokens.size() + std::count_if(tokens.begin(), tokens.end(),
 		[](const Token& token) { return token.kind == TokenKind::ShiftRight; }));
@@ -1516,6 +1531,267 @@ void Parser::swapContext(Context& other) {
 	std::swap(_dependentCondition, other.dependentCondition);
 	std::swap(_stopAt, other.stopAt);
 	std::swap(_namespacePath, other.namespacePath);
+}
+
+// "template <...> struct Name { ... };" at file scope. The body is kept as tokens: nothing in it means
+// anything until the parameters are bound, so a template that is never named costs nothing, as in clang.
+void Parser::parseClassTemplate(ClassTemplate& declaration) {
+	if (!atKeyword("struct")) {
+		throw CompileError("a class or union template is not lowered; write it as a struct");
+	}
+	const size_t first = _position;
+	advance();
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected the name of a class template, found " + std::string(tokenKindName(kind())));
+	}
+	declaration.spelled = std::string(advance().text);
+	const std::string quoted = "the class template \"" + declaration.spelled + "\"";
+	if (at(TokenKind::Less)) {
+		throw CompileError("a partial or explicit specialization of " + quoted + " is not lowered; Apple accepts "
+			"it, and mslc refuses it so that the primary template is never silently used in its place");
+	}
+	if (at(TokenKind::Semicolon)) {
+		throw CompileError("a declaration of " + quoted + " without its definition is not lowered");
+	}
+	if (!at(TokenKind::LBrace)) {
+		throw CompileError("expected the body of " + quoted + "; a base list is not lowered");
+	}
+	skipBalanced(TokenKind::LBrace, TokenKind::RBrace);
+	if (!at(TokenKind::Semicolon)) {
+		throw CompileError("a declarator after the body of " + quoted + " is not lowered");
+	}
+	advance();
+	declaration.tokens.assign(_tokens.begin() + first, _tokens.begin() + _position);
+	declaration.tokens.emplace_back();
+
+	declaration.name = qualify(declaration.spelled);
+	declaration.namespacePath = _namespacePath;
+	declaration.order = _functionOrder++;
+	declaration.globalsBefore = _unit.globals.size();
+	declareName(declaration.name, "class template");
+	const std::string name = declaration.name;
+	_classTemplates[name] = std::make_shared<const ClassTemplate>(std::move(declaration));
+}
+
+const ClassTemplate* Parser::classTemplateNamed(const std::vector<std::string>& parts, bool global) const {
+	if (_classTemplates.empty()) {
+		return nullptr;
+	}
+	std::string resolved;
+	if (parts.size() == 1 && !global) {
+		if (const std::string* bound = blockName(parts[0]); bound && bound->empty()) {
+			return nullptr;
+		} else if (bound) {
+			resolved = *bound;
+		}
+	}
+	if (resolved.empty()) {
+		QualifiedName name;
+		name.parts = parts;
+		name.global = global;
+		try {
+			resolved = resolveName(name);
+		} catch (const CompileError&) {
+			return nullptr;
+		}
+	}
+	const auto found = _classTemplates.find(resolved);
+	return found == _classTemplates.end() ? nullptr : found->second.get();
+}
+
+// "<" arguments ">" after the name of a class template, the "<" being the current token.
+std::vector<TemplateArgument> Parser::parseClassTemplateArguments(const ClassTemplate& declaration) {
+	expect(TokenKind::Less, "to open template arguments");
+	std::vector<TemplateArgument> arguments;
+	if (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight)) {
+		do {
+			arguments.push_back(parseTemplateArgument());
+		} while (match(TokenKind::Comma));
+	}
+	closeAngle(("to close the template arguments of \"" + declaration.name + "\"").c_str());
+	return arguments;
+}
+
+// The struct "Name<arguments>", declared as the template's tokens read with the arguments bound. It is
+// an ordinary struct once declared: its fields and its member functions and constructors, which become
+// helpers named after it, are read where the template is used, and each distinct argument list is one
+// struct. A member function sees what the template's declaration sees: it counts as declared where the
+// template is, so a function written after the template is not one it can call.
+std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments) {
+	const std::string quoted = "the class template \"" + declaration.name + "\"";
+	const std::vector<TemplateParameter>& parameters = declaration.parameters;
+	if (arguments.size() > parameters.size()) {
+		throw ClassTemplateError(quoted + " takes " + std::to_string(parameters.size()) + " arguments, and "
+			+ std::to_string(arguments.size()) + " are given");
+	}
+	for (const TemplateArgument& argument: arguments) {
+		if (argument.unbound || (argument.isType && isDeductionMarker(argument.type))) {
+			throw ClassTemplateError("an instance of " + quoted + " that depends on the parameters of a function "
+				"template is not lowered yet");
+		}
+	}
+
+	// Saves what the binding of a parameter replaces, and puts it back.
+	struct Bindings {
+		Parser& parser;
+		struct Saved {
+			std::string key;
+			std::optional<Type> type;
+			std::optional<EnumConstant> constant;
+		};
+		std::vector<Saved> saved;
+		Bindings(Parser& owner, const std::vector<TemplateParameter>& parameters): parser(owner) {
+			for (const TemplateParameter& parameter: parameters) {
+				Saved entry;
+				entry.key = "<template " + parameter.name + ">";
+				if (const auto type = parser._typedefs.find(entry.key); type != parser._typedefs.end()) {
+					entry.type = type->second;
+				}
+				if (const auto constant = parser._enumConstants.find(entry.key); constant != parser._enumConstants.end()) {
+					entry.constant = constant->second;
+				}
+				saved.push_back(std::move(entry));
+			}
+		}
+		~Bindings() {
+			for (const Saved& entry: saved) {
+				entry.type ? void(parser._typedefs[entry.key] = *entry.type) : void(parser._typedefs.erase(entry.key));
+				entry.constant ? void(parser._enumConstants[entry.key] = *entry.constant)
+					: void(parser._enumConstants.erase(entry.key));
+			}
+		}
+	};
+	struct Guard {
+		Parser& parser;
+		Context saved;
+		Guard(Parser& owner, Context&& next): parser(owner), saved(std::move(next)) { parser.swapContext(saved); }
+		~Guard() { parser.swapContext(saved); }
+	};
+
+	const auto fresh = [&](std::vector<Token> tokens) {
+		Context next;
+		next.tokens = std::move(tokens);
+		reserveSplits(next.tokens);
+		next.namespacePath = declaration.namespacePath;
+		next.blocks.emplace_back();
+		return next;
+	};
+
+	try {
+		for (size_t index = arguments.size(); index < parameters.size(); ++index) {
+			const TemplateParameter& parameter = parameters[index];
+			if (!parameter.hasDefault) {
+				throw CompileError("too few template arguments for " + quoted + ": \"" + parameter.name
+					+ "\" has no default");
+			}
+			// Only the parameters before this one are in scope.
+			const Bindings bindings(*this, parameters);
+			const Guard guard(*this, fresh(parameter.defaultTokens));
+			bindParameters(declaration.name, std::vector<TemplateParameter>(parameters.begin(), parameters.begin() + index),
+				arguments);
+			TemplateArgument argument;
+			argument.isType = parameter.isType;
+			if (parameter.isType) {
+				argument.type = parseType();
+				if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
+					|| !argument.type.enumName.empty() || argument.type.addressSpace != AddressSpace::None
+					|| argument.type.isVolatile) {
+					throw CompileError("a default that is a pointer, an array, a resource, an enum, volatile or in "
+						"an address space is not lowered");
+				}
+			} else {
+				const ExpressionPtr value = parseAssignment();
+				argument.value = value->kind == ExpressionKind::BoolLiteral ? (value->boolValue ? 1 : 0)
+					: evaluateConstant(*value, false);
+			}
+			if (!at(TokenKind::EndOfFile)) {
+				throw CompileError("unexpected \"" + std::string(current().text) + "\" in a default argument");
+			}
+			if (argument.isType && isDeductionMarker(argument.type)) {
+				throw CompileError("a default that depends on a function template parameter is not lowered yet");
+			}
+			arguments.push_back(std::move(argument));
+		}
+	} catch (const CompileError& error) {
+		throw ClassTemplateError("in " + quoted + " (declared at line " + std::to_string(declaration.line) + "): "
+			+ error.what());
+	}
+
+	// "::" separates a struct's namespace from its members everywhere, so an argument's own is not spelled.
+	std::string key;
+	for (size_t i = 0; i < arguments.size(); ++i) {
+		const TemplateArgument& argument = arguments[i];
+		std::string text = argument.isType ? (argument.type.isConst ? "const " : "") + typeName(argument.type)
+			: std::to_string(argument.value);
+		for (size_t at = text.find("::"); at != std::string::npos; at = text.find("::", at + 1)) {
+			text.replace(at, 2, "$");
+		}
+		key += (i ? "," : "") + text;
+	}
+	const std::string spelled = declaration.spelled + "<" + key + ">";
+	const std::string instance = declaration.name.substr(0, declaration.name.size() - declaration.spelled.size()) + spelled;
+	if (_unit.findStruct(instance) || _classInProgress.count(instance)) {
+		return instance;
+	}
+	if (_frozenClasses) {
+		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " is first named inside a function "
+			"template, which is not lowered yet; name it once outside the template");
+	}
+	// Apple stops at 1024.
+	if (_classDepth >= 64) {
+		throw ClassTemplateError("the instantiation of " + quoted + " nests deeper than 64 levels, at \"" + instance + "\"");
+	}
+
+	_spellings.push_back(spelled);
+	const std::string_view view = _spellings.back();
+	std::vector<Token> tokens = declaration.tokens;
+	tokens[1].text = view;
+	// The name inside the body means the instance (the injected class name), and is what a constructor is
+	// declared by.
+	for (size_t i = 2; i + 1 < tokens.size(); ++i) {
+		const TokenKind before = tokens[i - 1].kind;
+		if (tokens[i].kind == TokenKind::Identifier && tokens[i].text == declaration.spelled
+			&& before != TokenKind::Dot && before != TokenKind::Arrow && before != TokenKind::ColonColon
+			&& tokens[i + 1].kind != TokenKind::Less) {
+			tokens[i].text = view;
+		}
+	}
+
+	const size_t helpersBefore = _unit.helpers.size();
+	const size_t orderBefore = _functionOrder;
+	_classInProgress.insert(instance);
+	++_classDepth;
+	struct Done {
+		Parser& parser;
+		const std::string& instance;
+		~Done() {
+			--parser._classDepth;
+			parser._classInProgress.erase(instance);
+		}
+	} done { *this, instance };
+	try {
+		const Bindings bindings(*this, parameters);
+		const Guard guard(*this, fresh(std::move(tokens)));
+		bindParameters(declaration.name, parameters, arguments);
+		parseDeclaration();
+		if (!at(TokenKind::EndOfFile)) {
+			throw CompileError("unexpected \"" + std::string(current().text) + "\" after the template's struct");
+		}
+	} catch (const CompileError& error) {
+		throw ClassTemplateError("in " + quoted + " (declared at line " + std::to_string(declaration.line)
+			+ "), instantiated as \"" + spelled + "\": " + error.what());
+	}
+	_functionOrder = orderBefore;
+	if (!_unit.findStruct(instance)) {
+		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " did not declare a struct");
+	}
+	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
+		FunctionDecl& member = _unit.helpers[i];
+		member.isLocal = true;
+		member.order = declaration.order;
+		member.globalsBefore = declaration.globalsBefore;
+	}
+	return instance;
 }
 
 // The name in the standard library's namespace that a resolved name denotes, or none when the
@@ -1725,6 +2001,8 @@ bool Parser::tryParseHelperFunction() {
 			_position = start;
 			return false;
 		}
+	} catch (const ClassTemplateError&) {
+		throw;
 	} catch (const CompileError&) {
 		_position = start;
 		return false;
@@ -2060,6 +2338,8 @@ bool Parser::parseStructFunction(StructDecl& decl) {
 				functionName = std::string(advance().text);
 				isFunction = at(TokenKind::LParen);
 			}
+		} catch (const ClassTemplateError&) {
+			throw;
 		} catch (const CompileError& error) {
 			if (std::string_view(error.what()).find("operator overload") != std::string_view::npos) {
 				throw;
@@ -2642,6 +2922,27 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 	while (lookahead(at).kind == TokenKind::Identifier) {
 		out.parts.emplace_back(lookahead(at).text);
 		++at;
+		// "Name<arguments>": the name of a class template instance, which the first use declares.
+		if (!_classTemplates.empty() && lookahead(at).kind == TokenKind::Less) {
+			if (const ClassTemplate* declaration = classTemplateNamed(out.parts, out.global)) {
+				Parser& self = const_cast<Parser&>(*this);
+				const size_t saved = _position;
+				self._position = saved + at;
+				try {
+					std::vector<TemplateArgument> arguments = self.parseClassTemplateArguments(*declaration);
+					at = self._position - saved;
+					const std::string instance = self.instantiateClass(*declaration, std::move(arguments));
+					out.parts.back() = instance.substr(declaration->name.size() - declaration->spelled.size());
+				} catch (const ClassTemplateError&) {
+					self._position = saved;
+					throw;
+				} catch (const CompileError& error) {
+					self._position = saved;
+					throw ClassTemplateError(std::string("in the template arguments of \"") + declaration->name + "\": " + error.what());
+				}
+				self._position = saved;
+			}
+		}
 		// A qualifier or address space is a keyword, not a namespace: in "constexpr ::metal::sampler"
 		// the "::" begins the next name.
 		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0]))) {

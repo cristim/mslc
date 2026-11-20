@@ -245,9 +245,14 @@ private:
 	// Class templates, by qualified name. A use that spells "Name<arguments>" is read as one name, that of the
 	// instance, which declares the struct the first time it is met (see instantiateClass).
 	std::map<std::string, std::shared_ptr<const ClassTemplate>> _classTemplates;
+	// Instances being read, so that a member naming its own instance finds it.
+	std::set<std::string> _classInProgress;
+	size_t _classDepth = 0;
 	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
 	// the emitter reads, so an instance it needs has to exist already.
 	bool _frozenClasses = false;
+	// The spelling of an instance's name, which the tokens that carry it point into.
+	std::deque<std::string> _spellings;
 	// The parts of the parser's position that belong to what is being read, which an instance reads over
 	// (swapContext), so that a name in one never sees a local of the place that named it.
 	struct Context {
@@ -273,6 +278,12 @@ private:
 	// Room for every ">>" to become two tokens, so that splitting one while a name is peeked never moves
 	// the tokens a caller holds a reference to.
 	static void reserveSplits(std::vector<Token>& tokens);
+	void parseClassTemplate(ClassTemplate& declaration);
+	// The class template a name spelled by parts names, or null; a local of the name hides it.
+	const ClassTemplate* classTemplateNamed(const std::vector<std::string>& parts, bool global) const;
+	std::vector<TemplateArgument> parseClassTemplateArguments(const ClassTemplate& declaration);
+	// The qualified name of the instance, declared if it is new.
+	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
 	std::vector<size_t> _pendingMembers;
