@@ -1222,6 +1222,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	bool withBody) {
 	restoreNames(*namesAt(declaration));
 	const LocalScope templateScope(*this);
+	_inInstance = true;
 	const bool member = !declaration.memberOf.empty();
 	if (member) {
 		_memberFields = &declaration.memberFields;
@@ -7242,6 +7243,12 @@ ExpressionPtr Parser::parsePostfix() {
 		// emitter is the same member access the pointer itself would give.
 		if (at(TokenKind::Dot) || at(TokenKind::Arrow)) {
 			const std::string op(advance().text);
+			// "x.template f<int>(a)" names a member template; C++ requires the keyword when x depends on a
+			// template parameter, and Apple takes it anywhere the name is one.
+			const bool keyword = atKeyword("template") && lookahead().kind == TokenKind::Identifier;
+			if (keyword) {
+				advance();
+			}
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a member name after '" + op + "'");
 			}
@@ -7251,7 +7258,7 @@ ExpressionPtr Parser::parsePostfix() {
 			member->line = expression->line;
 			member->left = std::move(expression);
 			member->memberName = std::string(advance().text);
-			parseMemberTemplateArguments(*member);
+			parseMemberTemplateArguments(*member, keyword);
 			measure(*member);
 			expression = std::move(member);
 			continue;
@@ -7280,11 +7287,16 @@ ExpressionPtr Parser::parsePostfix() {
 // "<float, 3>" after the name of a member function template, in a call: the "<" is the current token. Only a
 // name some struct declares as a member template is tried, and only a list closed by ">(" is taken, so a
 // comparison of a field of that name is left alone.
-void Parser::parseMemberTemplateArguments(Expression& member) {
+void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
+	if (keyword && (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName))) {
+		throw CompileError("\"" + member.memberName + "\" follows the 'template' keyword, and no struct declares a "
+			"member function template of that name, called with explicit arguments");
+	}
 	if (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName)) {
 		return;
 	}
 	const size_t saved = _position;
+	bool taken = false;
 	try {
 		advance();
 		std::vector<TemplateArgument> arguments;
@@ -7297,11 +7309,26 @@ void Parser::parseMemberTemplateArguments(Expression& member) {
 		if (at(TokenKind::Greater) && lookahead().kind == TokenKind::LParen) {
 			advance();
 			member.templateArguments = std::move(arguments);
-			return;
+			taken = true;
 		}
 	} catch (const ClassTemplateError&) {
 		throw;
 	} catch (const CompileError&) {
+	}
+	// Inside a template body Apple rejects "x.f<int>(a)" unless x is known not to depend on a parameter, and mslc
+	// does not track that, so the keyword is required (never for "this", which is the instance itself).
+	if (taken && !keyword && (_classDepth > 0 || _inInstance)
+		&& !(member.left->kind == ExpressionKind::Identifier && member.left->name == "this")) {
+		throw CompileError("explicit template arguments on \"" + member.memberName + "\" inside a template need the "
+			"keyword: write \".template " + member.memberName + "<...>(...)\" (Apple requires it when the receiver "
+			"depends on a template parameter, and mslc does not tell which receivers do)");
+	}
+	if (taken) {
+		return;
+	}
+	if (keyword) {
+		throw CompileError("\"template " + member.memberName + "\" is not followed by a list of explicit template "
+			"arguments closed by \">(\"");
 	}
 	_position = saved;
 }

@@ -5987,6 +5987,10 @@ namespace {
 				receiver = member.left.get();
 				return resolveOverload(call, {}, templates, {}, prepared, receiver);
 			}
+			if (found != _helpers.end() && !member.templateArguments.empty()) {
+				throw CompileError("\"" + found->first + "\" is not a template, and the call gives it explicit template "
+					"arguments, which Apple rejects (another struct declares a member template of that name)");
+			}
 			if (found == _helpers.end()) {
 				throw CompileError("the receiver of \"." + member.memberName + "\" is not a struct with a "
 					"member function of that name");

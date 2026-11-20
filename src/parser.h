@@ -249,6 +249,8 @@ private:
 	// Instances being read, so that a member naming its own instance finds it.
 	std::set<std::string> _classInProgress;
 	size_t _classDepth = 0;
+	// This parser reads a function template's instance (parseInstance); each instance has its own parser.
+	bool _inInstance = false;
 	// Indices into _unit.helpers already stamped by a class instance, so an enclosing instance leaves them.
 	std::set<size_t> _instanceHelpers;
 	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
@@ -542,7 +544,7 @@ private:
 	ExpressionPtr parseExpression();
 
 	// "<float, 3>" after the name of a member function template in a call, read into member's template arguments.
-	void parseMemberTemplateArguments(Expression& member);
+	void parseMemberTemplateArguments(Expression& member, bool keyword = false);
 	// The comma-separated list inside a pair of parentheses, up to and including
 	// the closing one. A call and a constructor differ in what they are called,
 	// not in how their arguments are separated.
