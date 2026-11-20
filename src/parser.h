@@ -3,6 +3,7 @@
 #include "ast.h"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -137,7 +138,7 @@ public:
 	// nesting is capped by kMaxNestingDepth.
 	static constexpr uint32_t kMaxExpressionHeight = 4000;
 
-	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) {}
+	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); }
 
 	TranslationUnit parse();
 
@@ -215,8 +216,10 @@ private:
 		std::set<std::string> namespaces;
 		std::map<std::string, std::string> namespaceAliases;
 		std::map<std::string, NamespaceScope> scopes;
-		std::vector<StructDecl> structs;
+		std::deque<StructDecl> structs;
 		std::set<std::string> functionTemplates;
+		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
+		std::map<std::string, ConstantInt> constantInts;
 		std::map<std::string, ConstructorInfo> constructors;
 	};
 	std::shared_ptr<const Names> captureNames() const;
@@ -236,6 +239,40 @@ private:
 	// Binds the parameters of a template in an outermost block: a type as a typedef, a constant
 	// as an enumerator-like constant, each under a key no source spelling can reach.
 	void bindTemplateArguments(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments);
+	void bindParameters(const std::string& owner, const std::vector<TemplateParameter>& parameters,
+		const std::vector<TemplateArgument>& arguments);
+
+	// Class templates, by qualified name. A use that spells "Name<arguments>" is read as one name, that of the
+	// instance, which declares the struct the first time it is met (see instantiateClass).
+	std::map<std::string, std::shared_ptr<const ClassTemplate>> _classTemplates;
+	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
+	// the emitter reads, so an instance it needs has to exist already.
+	bool _frozenClasses = false;
+	// The parts of the parser's position that belong to what is being read, which an instance reads over
+	// (swapContext), so that a name in one never sees a local of the place that named it.
+	struct Context {
+		std::vector<Token> tokens;
+		size_t position = 0;
+		std::vector<BlockScope> blocks;
+		const StructDecl* structBody = nullptr;
+		std::vector<size_t> pendingMembers;
+		const std::set<std::string>* memberFields = nullptr;
+		std::map<std::string, bool> memberFunctions;
+		std::string memberStruct;
+		size_t parameterBlock = SIZE_MAX;
+		std::set<std::string> dependentParameters;
+		int switchDepth = 0;
+		std::vector<StatementPtr> declaratorTail;
+		bool noGreater = false;
+		bool inEnableIf = false;
+		bool dependentCondition = false;
+		size_t stopAt = SIZE_MAX;
+		std::vector<std::string> namespacePath;
+	};
+	void swapContext(Context& other);
+	// Room for every ">>" to become two tokens, so that splitting one while a name is peeked never moves
+	// the tokens a caller holds a reference to.
+	static void reserveSplits(std::vector<Token>& tokens);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
 	std::vector<size_t> _pendingMembers;

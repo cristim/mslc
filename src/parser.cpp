@@ -873,6 +873,8 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->structs = _unit.structs;
 	names->functionTemplates = _unit.functionTemplates;
 	names->constructors = _constructors;
+	names->classTemplates = _classTemplates;
+	names->constantInts = _constantInts;
 	return names;
 }
 
@@ -890,6 +892,9 @@ void Parser::restoreNames(const Names& names) {
 	_unit.structs = names.structs;
 	_unit.functionTemplates = names.functionTemplates;
 	_constructors = names.constructors;
+	_classTemplates = names.classTemplates;
+	_constantInts = names.constantInts;
+	_frozenClasses = true;
 }
 
 // The parameters of a template, from the "<" to the ">" that closes them.
@@ -1143,15 +1148,20 @@ void Parser::parseTemplateDeclaration() {
 // parameter's own name is mapped to it as a using declaration is, so a local of that name in a
 // nested block still hides it.
 void Parser::bindTemplateArguments(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments) {
-	if (arguments.size() != declaration.parameters.size()) {
-		throw CompileError("the template \"" + declaration.name + "\" takes " + std::to_string(declaration.parameters.size())
+	bindParameters(declaration.name, declaration.parameters, arguments);
+}
+
+void Parser::bindParameters(const std::string& owner, const std::vector<TemplateParameter>& parameters,
+	const std::vector<TemplateArgument>& arguments) {
+	if (arguments.size() != parameters.size()) {
+		throw CompileError("the template \"" + owner + "\" takes " + std::to_string(parameters.size())
 			+ " arguments, and " + std::to_string(arguments.size()) + " are bound");
 	}
 	for (size_t i = 0; i < arguments.size(); ++i) {
-		const TemplateParameter& parameter = declaration.parameters[i];
+		const TemplateParameter& parameter = parameters[i];
 		const TemplateArgument& argument = arguments[i];
 		if (argument.isType != parameter.isType) {
-			throw CompileError("the template argument for \"" + parameter.name + "\" of \"" + declaration.name
+			throw CompileError("the template argument for \"" + parameter.name + "\" of \"" + owner
 				+ "\" has to be " + (parameter.isType ? "a type" : "a constant"));
 		}
 		if (parameter.name.empty()) {
@@ -1481,6 +1491,31 @@ void Parser::closeAngle(const char* what) {
 		_tokens.insert(_tokens.begin() + _position, _tokens[_position]);
 	}
 	expect(TokenKind::Greater, what);
+}
+
+void Parser::reserveSplits(std::vector<Token>& tokens) {
+	tokens.reserve(tokens.size() + std::count_if(tokens.begin(), tokens.end(),
+		[](const Token& token) { return token.kind == TokenKind::ShiftRight; }));
+}
+
+void Parser::swapContext(Context& other) {
+	std::swap(_tokens, other.tokens);
+	std::swap(_position, other.position);
+	std::swap(_blocks, other.blocks);
+	std::swap(_structBody, other.structBody);
+	std::swap(_pendingMembers, other.pendingMembers);
+	std::swap(_memberFields, other.memberFields);
+	std::swap(_memberFunctions, other.memberFunctions);
+	std::swap(_memberStruct, other.memberStruct);
+	std::swap(_parameterBlock, other.parameterBlock);
+	std::swap(_dependentParameters, other.dependentParameters);
+	std::swap(_switchDepth, other.switchDepth);
+	std::swap(_declaratorTail, other.declaratorTail);
+	std::swap(_noGreater, other.noGreater);
+	std::swap(_inEnableIf, other.inEnableIf);
+	std::swap(_dependentCondition, other.dependentCondition);
+	std::swap(_stopAt, other.stopAt);
+	std::swap(_namespacePath, other.namespacePath);
 }
 
 // The name in the standard library's namespace that a resolved name denotes, or none when the

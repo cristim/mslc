@@ -2,6 +2,7 @@
 
 #include "lexer.h"
 
+#include <deque>
 #include <memory>
 #include <optional>
 #include <set>
@@ -579,6 +580,23 @@ struct FunctionTemplate {
 	mutable std::shared_ptr<const void> names;
 };
 
+// A class template: "template <...> struct Name { ... };" kept as tokens, from the "struct" keyword to the
+// ";", and an end-of-file token. A use that names it with arguments has the tokens re-parsed in place with the
+// arguments bound, which declares an ordinary struct under the instance's name ("Name<float,4>").
+struct ClassTemplate {
+	// Qualified, and the name as written.
+	std::string name;
+	std::string spelled;
+	std::vector<std::string> namespacePath;
+	std::vector<TemplateParameter> parameters;
+	std::vector<Token> tokens;
+	size_t line = 0;
+	// What the member functions of every instance count as declared above: where the template is, since
+	// a function written after it is not one a name in its body can find at the definition.
+	size_t order = 0;
+	size_t globalsBefore = 0;
+};
+
 struct FunctionDecl {
 	Stage stage = Stage::None;
 	Type returnType;
@@ -615,7 +633,8 @@ std::string parameterSignature(const Parameter& parameter);
 std::string parameterSignature(const FunctionDecl& function);
 
 struct TranslationUnit {
-	std::vector<StructDecl> structs;
+	// A deque: a class template instance is added while a struct above it is still being read.
+	std::deque<StructDecl> structs;
 	std::vector<FunctionDecl> functions;
 
 	// The file's helper functions, prototypes and definitions, in source order.
