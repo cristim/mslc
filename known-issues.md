@@ -625,7 +625,7 @@ below the template that rebinds a name, and a later overload found by argument-d
 
 - Refused, with a diagnostic naming the template and the arguments: partial and explicit specialisation,
   `class` and `union` templates, a base list, a forward declaration, static data members (also refused in a
-  plain struct), a member template (slice 5c), overloaded constructors (also refused in a plain struct),
+  plain struct), overloaded constructors (also refused in a plain struct),
   instantiation deeper than 64 (Apple: 1024), and any error inside the instance.
 - An instance first named inside a function template, or built from its parameters (`template <class T> float
   f(Box<T> b)`), is refused (slice 5d). An instance named at file scope above the function template is usable
@@ -658,6 +658,36 @@ below the template that rebinds a name, and a later overload found by argument-d
   where Apple rejects it.
 - A struct that contains an instance by value inherits the older gap that a struct field of struct type is not
   represented in a buffer struct.
+
+## Member function templates: what is refused or approximated (#341, slice 5c)
+
+`template <...> R f(...) const {...}` in a struct or in a class template is read once per call with its arguments, as
+a function template whose first parameter is the object (`this`). Checked against Apple by execution: 591 generated
+programs that both compilers accept (of 780; the rest are refused by both compilers or by mslc for a reason listed here)
+and 26 hand-written ones, covering deduction from values, references, vectors, structs and local arrays, explicit
+and default arguments, non-type parameters, overload sets by arity, mutable references, a template calling other
+members and templates, helpers, function template instances, namespaces, a call result or a conditional as the
+receiver, and `Box<T>` members: no value differed.
+
+- Refused, loudly: a member template beside a member function of the same name (Apple takes one overload set), a
+  static one, a constructor template, `explicit`, `virtual` and `friend`, a non-const one (as every non-const
+  member), an explicit specialisation or instantiation, an out-of-line definition (refused where it is written), a
+  template parameter named like one of the class template's, a member template of an unnamed struct, and a call on
+  an object in device, constant or threadgroup memory (Apple rejects that too).
+- The result type of `v.f(x)` is known only once the arguments are deduced, so `v.f(x).field` is refused when the
+  template returns its own parameter (it reads as a swizzle), as for a function template. A result that does not
+  name a template parameter (`P f(U) const`) is a struct value as usual.
+- An instance of another class template that names the member template's parameter (`Box<U>` inside it) is slice 5d.
+- Overload resolution among member templates is the function templates': partial ordering is not modelled, so
+  `f(U, U)` beside `f(U, int)` called with two ints is reported ambiguous where Apple prefers the second.
+- A member template of a class template instance is subject to the class template's late-declaration rules (see
+  above), so a function or constant declared below the class template that its body names is refused.
+- `v.f<float>(x)` is read as template arguments only when some struct declares a member template `f` and a `>(` closes
+  the list; a comparison written that way is left alone.
+- A member template that is never called is read at no point, so an error in its body is not reported (Apple reports
+  only the non-dependent ones).
+- Older gap, unchanged: a non-template member function called on a device object is accepted.
+- `mk().f(x)` and `(c ? a : b).f(x)` evaluate the receiver once, as a member function does.
 
 ## Library namespace lookup: leftovers found while fixing #344, #345 and #357
 
