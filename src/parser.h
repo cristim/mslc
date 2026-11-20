@@ -221,6 +221,7 @@ private:
 		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
 		std::map<std::string, ConstantInt> constantInts;
 		std::map<std::string, ConstructorInfo> constructors;
+		std::set<std::string> memberTemplateNames;
 	};
 	std::shared_ptr<const Names> captureNames() const;
 	void restoreNames(const Names& names);
@@ -252,7 +253,7 @@ private:
 	// the emitter reads, so an instance it needs has to exist already.
 	bool _frozenClasses = false;
 	// The spelling of an instance's name, which the tokens that carry it point into.
-	std::deque<std::string> _spellings;
+	std::shared_ptr<std::deque<std::string>> _spellings = std::make_shared<std::deque<std::string>>();
 	// The parts of the parser's position that belong to what is being read, which an instance reads over
 	// (swapContext), so that a name in one never sees a local of the place that named it.
 	struct Context {
@@ -261,6 +262,7 @@ private:
 		std::vector<BlockScope> blocks;
 		const StructDecl* structBody = nullptr;
 		std::vector<size_t> pendingMembers;
+		std::vector<FunctionTemplate> pendingMemberTemplates;
 		const std::set<std::string>* memberFields = nullptr;
 		std::map<std::string, bool> memberFunctions;
 		std::string memberStruct;
@@ -297,6 +299,13 @@ private:
 	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
+	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
+	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
+	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
+	void parseMemberTemplate(const StructDecl& decl);
+	std::vector<FunctionTemplate> _pendingMemberTemplates;
+	// The names of the member function templates declared so far, so that "v.f<float>(x)" reads its arguments.
+	std::set<std::string> _memberTemplateNames;
 	std::vector<size_t> _pendingMembers;
 	// The fields of the struct whose member function is being parsed: a bare use of
 	// one means this.field.
@@ -530,6 +539,8 @@ private:
 	// Expressions, by precedence level.
 	ExpressionPtr parseExpression();
 
+	// "<float, 3>" after the name of a member function template in a call, read into member's template arguments.
+	void parseMemberTemplateArguments(Expression& member);
 	// The comma-separated list inside a pair of parentheses, up to and including
 	// the closing one. A call and a constructor differ in what they are called,
 	// not in how their arguments are separated.

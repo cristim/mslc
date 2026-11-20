@@ -555,6 +555,8 @@ struct TemplateParameter {
 	std::vector<Token> defaultTokens;
 };
 
+struct ClassTemplate;
+
 // A function template, kept as tokens and the parser's name state where it was declared, so
 // that each instantiation re-parses it with its arguments bound (see instantiateTemplate).
 struct FunctionTemplate {
@@ -579,6 +581,18 @@ struct FunctionTemplate {
 	std::shared_ptr<const std::vector<Token>> file;
 	size_t endAt = 0;
 	mutable std::shared_ptr<const void> names;
+
+	// A member function template of a struct: its name (the struct's), the fields and member functions
+	// the struct has (a bare name in the body means this.field or this.f(...)), and, for a member of a
+	// class template's instance, that template and the arguments its parameters stand for. The name
+	// state it is read in is the struct's end, kept in names.
+	std::string memberOf;
+	std::set<std::string> memberFields;
+	std::map<std::string, bool> memberFunctions;
+	std::shared_ptr<const ClassTemplate> ownerTemplate;
+	std::vector<TemplateArgument> ownerArguments;
+	// Holds the spelling the tokens of an instance's name point into.
+	std::shared_ptr<const void> spellings;
 };
 
 // A class template: "template <...> struct Name { ... };" kept as tokens, from the "struct" keyword to the

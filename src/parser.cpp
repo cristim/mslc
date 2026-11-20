@@ -901,6 +901,7 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->constructors = _constructors;
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
+	names->memberTemplateNames = _memberTemplateNames;
 	return names;
 }
 
@@ -920,6 +921,7 @@ void Parser::restoreNames(const Names& names) {
 	_constructors = names.constructors;
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
+	_memberTemplateNames = names.memberTemplateNames;
 	_frozenClasses = true;
 }
 
@@ -1015,37 +1017,10 @@ void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
 	}
 }
 
-// "template" at file scope: a function template. It is parsed far enough to know its parameters,
-// its name and where it ends; the tokens and the name state are kept, and a call that selects it
-// has it re-parsed with its arguments bound (instantiateTemplate). A body is only meaningful with
-// arguments (a dependent name has no type until then), so one that is never instantiated needs
-// nothing more, as in clang.
-void Parser::parseTemplateDeclaration() {
-	advance();
-	if (!at(TokenKind::Less)) {
-		throw CompileError("an explicit template instantiation is not lowered");
-	}
-	if (lookahead().kind == TokenKind::Greater) {
-		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "
-			"mslc refuses it so that the primary template is never silently used in its place");
-	}
-
-	FunctionTemplate declaration;
-	declaration.line = line();
-	const size_t headerStart = _position;
-	parseTemplateHeader(declaration);
-
-	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
-		ClassTemplate classDeclaration;
-		classDeclaration.line = declaration.line;
-		classDeclaration.parameters = std::move(declaration.parameters);
-		parseClassTemplate(classDeclaration);
-		return;
-	}
-	if (atKeyword("using") || atKeyword("template")) {
-		throw CompileError("an alias template is not lowered");
-	}
-
+// The declarator of a function template, after its header, to the end of its body or ';': fills the
+// tokens, the signature and whether it has a body, and returns the name. A member also takes "const" after
+// its parameters.
+std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member) {
 	// The declarator, up to the parameter list. The name is the identifier right before
 	// the first "(" outside angle brackets, and only a group that is followed by what a
 	// function can have after its parameters is taken as the list. Attributes are
@@ -1105,7 +1080,7 @@ void Parser::parseTemplateDeclaration() {
 
 	skipBalanced(TokenKind::LParen, TokenKind::RParen);
 	if (!(at(TokenKind::EndOfFile) || at(TokenKind::LBrace) || at(TokenKind::Semicolon) || at(TokenKind::Assign)
-		|| at(TokenKind::Arrow) || atKeyword("__attribute__"))) {
+		|| at(TokenKind::Arrow) || atKeyword("__attribute__") || (member && atKeyword("const")))) {
 		throw notNameable();
 	}
 	// To the body or ';'. A real parameter list is never followed by a second group
@@ -1142,6 +1117,41 @@ void Parser::parseTemplateDeclaration() {
 	}
 	declaration.tokens.assign(_tokens.begin() + declaratorStart, _tokens.begin() + _position);
 	declaration.tokens.emplace_back();
+	return name;
+}
+
+// "template" at file scope: a function template. It is parsed far enough to know its parameters,
+// its name and where it ends; the tokens and the name state are kept, and a call that selects it
+// has it re-parsed with its arguments bound (instantiateTemplate). A body is only meaningful with
+// arguments (a dependent name has no type until then), so one that is never instantiated needs
+// nothing more, as in clang.
+void Parser::parseTemplateDeclaration() {
+	advance();
+	if (!at(TokenKind::Less)) {
+		throw CompileError("an explicit template instantiation is not lowered");
+	}
+	if (lookahead().kind == TokenKind::Greater) {
+		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "
+			"mslc refuses it so that the primary template is never silently used in its place");
+	}
+
+	FunctionTemplate declaration;
+	declaration.line = line();
+	const size_t headerStart = _position;
+	parseTemplateHeader(declaration);
+
+	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
+		ClassTemplate classDeclaration;
+		classDeclaration.line = declaration.line;
+		classDeclaration.parameters = std::move(declaration.parameters);
+		parseClassTemplate(classDeclaration);
+		return;
+	}
+	if (atKeyword("using") || atKeyword("template")) {
+		throw CompileError("an alias template is not lowered");
+	}
+
+	const std::string name = readTemplateFunction(declaration, headerStart, false);
 
 	const std::string qualified = qualify(name);
 	declaration.name = qualified;
@@ -1212,6 +1222,24 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	bool withBody) {
 	restoreNames(*namesAt(declaration));
 	const LocalScope templateScope(*this);
+	const bool member = !declaration.memberOf.empty();
+	if (member) {
+		_memberFields = &declaration.memberFields;
+		_memberFunctions = declaration.memberFunctions;
+		_memberStruct = declaration.memberOf;
+		if (const ClassTemplate* owner = declaration.ownerTemplate.get()) {
+			_definedNames = &owner->declaredBefore;
+			bindParameters(owner->name, owner->parameters, declaration.ownerArguments);
+			for (const TemplateParameter& parameter: declaration.parameters) {
+				for (const TemplateParameter& outer: owner->parameters) {
+					if (!parameter.name.empty() && parameter.name == outer.name) {
+						throw CompileError("the template parameter \"" + parameter.name + "\" of the member template \""
+							+ declaration.name + "\" shadows a parameter of its class template");
+					}
+				}
+			}
+		}
+	}
 	bindTemplateArguments(declaration, arguments);
 
 	const auto skipAttributes = [&] {
@@ -1256,6 +1284,15 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 
 	const LocalScope parameters(*this);
 	_parameterBlock = _blocks.size() - 1;
+	// The object is a first parameter, as in a member function.
+	const size_t objectParameters = member ? 1 : 0;
+	if (member) {
+		declareLocal("this");
+		Parameter object;
+		object.type.namedType = declaration.memberOf;
+		object.name = "this";
+		decl.parameters.push_back(std::move(object));
+	}
 	const size_t parametersFrom = _position;
 	parseHelperParameters(decl, quoted);
 	// A parameter is dependent when the tokens that declare it name a template parameter.
@@ -1271,8 +1308,8 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 				--depth;
 			}
 			if (token.kind == TokenKind::Comma && depth == 0) {
-				if (dependent && index < decl.parameters.size()) {
-					_dependentParameters.insert(decl.parameters[index].name);
+				if (dependent && index + objectParameters < decl.parameters.size()) {
+					_dependentParameters.insert(decl.parameters[index + objectParameters].name);
 				}
 				++index;
 				dependent = false;
@@ -1282,9 +1319,13 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 				}
 			}
 		}
-		if (dependent && index < decl.parameters.size()) {
-			_dependentParameters.insert(decl.parameters[index].name);
+		if (dependent && index + objectParameters < decl.parameters.size()) {
+			_dependentParameters.insert(decl.parameters[index + objectParameters].name);
 		}
+	}
+	if (member && !matchIdentifier("const")) {
+		throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function that "
+			"could write it is not lowered (mark it const)");
 	}
 	// A struct the template's own tokens name has to be declared above it; one an argument brings is not
 	// looked up here (sema sees every struct, so it cannot tell the two apart).
@@ -1344,6 +1385,10 @@ TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t ind
 	Parser parser(parameter.defaultTokens);
 	parser.restoreNames(*Parser::namesAt(declaration));
 	const Parser::LocalScope scope(parser);
+	if (const ClassTemplate* owner = declaration.ownerTemplate.get()) {
+		parser._definedNames = &owner->declaredBefore;
+		parser.bindParameters(owner->name, owner->parameters, declaration.ownerArguments);
+	}
 	// Only the parameters before this one are in scope.
 	FunctionTemplate earlier;
 	earlier.name = declaration.name;
@@ -1603,6 +1648,7 @@ void Parser::swapContext(Context& other) {
 	std::swap(_blocks, other.blocks);
 	std::swap(_structBody, other.structBody);
 	std::swap(_pendingMembers, other.pendingMembers);
+	std::swap(_pendingMemberTemplates, other.pendingMemberTemplates);
 	std::swap(_memberFields, other.memberFields);
 	std::swap(_memberFunctions, other.memberFunctions);
 	std::swap(_memberStruct, other.memberStruct);
@@ -1889,8 +1935,8 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		throw ClassTemplateError("the instantiation of " + quoted + " nests deeper than 64 levels, at \"" + instance + "\"");
 	}
 
-	_spellings.push_back(spelled);
-	const std::string_view view = _spellings.back();
+	_spellings->push_back(spelled);
+	const std::string_view view = _spellings->back();
 	std::vector<Token> tokens = declaration.tokens;
 	tokens[1].text = view;
 	// The name inside the body means the instance (the injected class name), and is what a constructor is
@@ -1905,6 +1951,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	}
 
 	const size_t helpersBefore = _unit.helpers.size();
+	const size_t templatesBefore = _unit.templates.size();
 	const size_t orderBefore = _functionOrder;
 	_classInProgress.insert(instance);
 	++_classDepth;
@@ -1938,6 +1985,17 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		member.isLocal = true;
 		member.order = declaration.order;
 		member.globalsBefore = declaration.globalsBefore;
+	}
+	// A member function template of the instance is declared where the class template is, and reads the
+	// class template's parameters as the instance bound them.
+	for (size_t i = templatesBefore; i < _unit.templates.size(); ++i) {
+		FunctionTemplate& member = _unit.templates[i];
+		if (member.memberOf == instance) {
+			member.order = member.bodyOrder = declaration.order;
+			member.globalsBefore = declaration.globalsBefore;
+			member.ownerTemplate = _classTemplates.at(declaration.name);
+			member.ownerArguments = arguments;
+		}
 	}
 	return instance;
 }
@@ -2445,6 +2503,56 @@ void Parser::parseStructBody(StructDecl& decl) {
 	expect(TokenKind::RBrace, "to close a struct body");
 }
 
+// "template <...> R f(...) const {...}" in a struct body. Like a member function it is read once the struct
+// is complete, but as a function template: its tokens are kept, and a call that selects it has it read with
+// its arguments bound, the object being a first parameter called this (see parseInstance).
+void Parser::parseMemberTemplate(const StructDecl& decl) {
+	const std::string quoted = "\"" + decl.name + "\"";
+	if (unqualifiedName(decl.name).empty()) {
+		throw CompileError("a member function template of an unnamed struct is not lowered");
+	}
+	advance();
+	if (!at(TokenKind::Less)) {
+		throw CompileError("an explicit instantiation of a member template is not lowered (in " + quoted + ")");
+	}
+	if (lookahead().kind == TokenKind::Greater) {
+		throw CompileError("an explicit specialization of a member template is not lowered (in " + quoted + ")");
+	}
+	FunctionTemplate declaration;
+	declaration.line = line();
+	const size_t headerStart = _position;
+	parseTemplateHeader(declaration);
+	if (atKeyword("template") || atKeyword("using") || atKeyword("struct") || atKeyword("class")
+		|| atKeyword("union") || atKeyword("typedef") || atKeyword("enum")) {
+		throw CompileError("a member template that is not a function is not lowered (in " + quoted + ")");
+	}
+	size_t ahead = 0;
+	for (; lookahead(ahead).kind == TokenKind::Identifier; ++ahead) {
+		const std::string_view word = lookahead(ahead).text;
+		if (word == "static") {
+			throw CompileError("a static member function template is not lowered (in " + quoted + ")");
+		}
+		if (word == "explicit" || word == "virtual" || word == "friend") {
+			throw CompileError("a member template declared " + std::string(word) + " is not lowered (in " + quoted + ")");
+		}
+		if (word != "inline" && word != "constexpr") {
+			break;
+		}
+	}
+	if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == unqualifiedName(decl.name)
+		&& lookahead(ahead + 1).kind == TokenKind::LParen) {
+		throw CompileError("a constructor template is not lowered (in " + quoted + ")");
+	}
+	const std::string name = readTemplateFunction(declaration, headerStart, true);
+	declaration.name = decl.name + "::" + name;
+	declaration.memberOf = decl.name;
+	declaration.order = declaration.bodyOrder = _functionOrder++;
+	declaration.globalsBefore = _unit.globals.size();
+	_memberFunctions[name] = false;
+	_memberTemplateNames.insert(name);
+	_pendingMemberTemplates.push_back(std::move(declaration));
+}
+
 // A member that is not a field: a constructor, a member function or a member
 // that cannot be lowered. False, with nothing consumed, when the member is a
 // field. A function is skipped here and parsed once the struct is complete, since
@@ -2452,7 +2560,8 @@ void Parser::parseStructBody(StructDecl& decl) {
 bool Parser::parseStructFunction(StructDecl& decl) {
 	const std::string quoted = "\"" + decl.name + "\"";
 	if (atKeyword("template")) {
-		throw CompileError("a member template is not lowered (in " + quoted + ")");
+		parseMemberTemplate(decl);
+		return true;
 	}
 	if (at(TokenKind::Tilde)) {
 		throw CompileError("a destructor is not supported (in " + quoted + ")");
@@ -2540,7 +2649,9 @@ std::string Parser::unqualifiedName(const std::string& name) {
 void Parser::finishStructFunctions(const StructDecl& decl) {
 	const std::vector<size_t> starts = std::move(_pendingMembers);
 	_pendingMembers.clear();
-	if (starts.empty()) {
+	std::vector<FunctionTemplate> templates = std::move(_pendingMemberTemplates);
+	_pendingMemberTemplates.clear();
+	if (starts.empty() && templates.empty()) {
 		return;
 	}
 
@@ -2556,6 +2667,17 @@ void Parser::finishStructFunctions(const StructDecl& decl) {
 		parseStructMember(decl, start);
 	}
 	_memberFields = nullptr;
+	// A member template is read where the struct ends, with every member it can name in hand.
+	if (!templates.empty()) {
+		const std::shared_ptr<const void> names = captureNames();
+		for (FunctionTemplate& member: templates) {
+			member.names = names;
+			member.memberFields = fields;
+			member.memberFunctions = _memberFunctions;
+			member.spellings = _spellings;
+			_unit.templates.push_back(std::move(member));
+		}
+	}
 	_memberFunctions.clear();
 	_position = resume;
 }
@@ -7116,6 +7238,7 @@ ExpressionPtr Parser::parsePostfix() {
 			member->line = expression->line;
 			member->left = std::move(expression);
 			member->memberName = std::string(advance().text);
+			parseMemberTemplateArguments(*member);
 			measure(*member);
 			expression = std::move(member);
 			continue;
@@ -7139,6 +7262,35 @@ ExpressionPtr Parser::parsePostfix() {
 
 		return expression;
 	}
+}
+
+// "<float, 3>" after the name of a member function template, in a call: the "<" is the current token. Only a
+// name some struct declares as a member template is tried, and only a list closed by ">(" is taken, so a
+// comparison of a field of that name is left alone.
+void Parser::parseMemberTemplateArguments(Expression& member) {
+	if (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName)) {
+		return;
+	}
+	const size_t saved = _position;
+	try {
+		advance();
+		std::vector<TemplateArgument> arguments;
+		while (!at(TokenKind::Greater)) {
+			arguments.push_back(parseTemplateArgument());
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+		if (at(TokenKind::Greater) && lookahead().kind == TokenKind::LParen) {
+			advance();
+			member.templateArguments = std::move(arguments);
+			return;
+		}
+	} catch (const ClassTemplateError&) {
+		throw;
+	} catch (const CompileError&) {
+	}
+	_position = saved;
 }
 
 std::vector<ExpressionPtr> Parser::parseArgumentList(const char* closing) {
@@ -7343,7 +7495,8 @@ ExpressionPtr Parser::parsePrimary() {
 		// A member function named bare calls that function on this, or the static
 		// one of the struct.
 		if (_memberFields && kind() == TokenKind::Identifier && !blockName(std::string(current().text))
-			&& lookahead().kind == TokenKind::LParen) {
+			&& (lookahead().kind == TokenKind::LParen
+				|| (lookahead().kind == TokenKind::Less && _memberTemplateNames.count(std::string(current().text))))) {
 			const auto function = _memberFunctions.find(std::string(current().text));
 			if (function != _memberFunctions.end()) {
 				const size_t atLine = line();
@@ -7351,7 +7504,9 @@ ExpressionPtr Parser::parsePrimary() {
 				if (function->second) {
 					return makeIdentifier(_memberStruct + "::" + name, atLine);
 				}
-				return makeThisMember(name, atLine);
+				ExpressionPtr member = makeThisMember(name, atLine);
+				parseMemberTemplateArguments(*member);
+				return member;
 			}
 		}
 		// A local hides a namespace's name only where it is not followed by "::".
