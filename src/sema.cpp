@@ -2408,6 +2408,9 @@ namespace {
 			_options(options), _types(types) {
 			for (const FunctionTemplate& declaration: unit.templates) {
 				_templatesByName[declaration.name].push_back(&declaration);
+				if (!declaration.memberOf.empty()) {
+					_memberTemplateNames.insert(declaration.name.substr(declaration.name.rfind("::") + 2));
+				}
 			}
 		}
 
@@ -2708,9 +2711,13 @@ namespace {
 		// What a call can denote before its arguments are known: every function of every name the
 		// parser found for it (not the ones argument-dependent lookup adds).
 		std::vector<HelperFunction*> helpersCalled(const Expression& call);
+		// A member call's receiver is the argument of the first parameter, "this", and is already evaluated.
 		HelperFunction* resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
 			const std::vector<const FunctionTemplate*>& templates, const std::set<std::string>& adl,
-			std::vector<Id>& prepared);
+			std::vector<Id>& prepared, const Expression* receiver = nullptr);
+		// The member function templates of a struct that a call through "." names, or none.
+		std::vector<const FunctionTemplate*> memberTemplatesOf(const std::string& owner, const std::string& member) const;
+		std::set<std::string> _memberTemplateNames;
 		const Type* returningType(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
 		void noteCall(const FunctionDecl& callee);
@@ -3800,6 +3807,8 @@ namespace {
 	}
 
 	// Distinguish struct members from vector swizzles before emitting the left side.
+	static bool isTemplateMarker(const Type& type);
+
 	const StructDecl* Emitter::structOf(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: {
@@ -3854,6 +3863,25 @@ namespace {
 					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName)
 						: _helpers.end();
 					returnedType = found == _helpers.end() ? nullptr : &found->second.definition->returnType;
+					if (owner && found == _helpers.end()) {
+						// A member function template returns a struct known once its arguments are.
+						for (const FunctionTemplate* declaration:
+							memberTemplatesOf(owner->name, expression.left->memberName)) {
+							std::vector<TemplateArgument> arguments;
+							const FunctionDecl* pattern = templatePattern(*declaration, expression.left->templateArguments, arguments);
+							if (!pattern || pattern->parameters.size() != expression.arguments.size() + 1) {
+								continue;
+							}
+							// A result that is a template parameter is no struct here until deduced, as for a
+							// function template (f(s).field is refused there too).
+							if (returnedType && returnedType->namedType != pattern->returnType.namedType) {
+								throw CompileError("the overloads of the member function template \"" + declaration->name
+									+ "\" differ in the struct they return, and which one the call chooses is not known "
+									"before its arguments are evaluated; assign the call to a variable first");
+							}
+							returnedType = &pattern->returnType;
+						}
+					}
 				}
 				if (!returnedType) {
 					return nullptr;
@@ -5918,8 +5946,16 @@ namespace {
 			};
 			const auto texture = member.left->kind == ExpressionKind::Identifier
 				? _bindings.find(member.left->name) : _bindings.end();
+			// A name only a member template has is looked up through the receiver's struct, which structOf
+			// reads without emitting anything, so a call such as a texture's own method is left alone.
+			const bool templateNamed = _memberTemplateNames.count(member.memberName)
+				&& std::none_of(_helpers.begin(), _helpers.end(), isMember)
+				&& [&] {
+					const StructDecl* owner = structOf(*member.left);
+					return owner && !memberTemplatesOf(owner->name, member.memberName).empty();
+				}();
 			if ((texture != _bindings.end() && texture->second.pointeeMsl.isTexture())
-				|| std::none_of(_helpers.begin(), _helpers.end(), isMember)) {
+				|| (std::none_of(_helpers.begin(), _helpers.end(), isMember) && !templateNamed)) {
 				return nullptr;
 			}
 
@@ -5935,6 +5971,22 @@ namespace {
 				}
 			}
 			const auto found = ownerName.empty() ? _helpers.end() : _helpers.find(ownerName + suffix);
+			if (const std::vector<const FunctionTemplate*> templates = memberTemplatesOf(ownerName, member.memberName);
+				!templates.empty()) {
+				if (found != _helpers.end()) {
+					throw CompileError("\"" + ownerName + suffix + "\" is both a member function and a member function "
+						"template, which Apple takes as one overload set and mslc does not lower yet");
+				}
+				// Apple takes a member function on a device or constant object only when it is qualified so.
+				if (const OverloadArgument object = classifyArgument(*member.left);
+					object.kind == OverloadArgument::Kind::Variable && !object.inThread) {
+					throw CompileError("the member function template \"" + ownerName + suffix + "\" is called on an object "
+						"in device, constant or threadgroup memory, which Apple rejects (a member function is for a "
+						"thread object); copy the object to a local first");
+				}
+				receiver = member.left.get();
+				return resolveOverload(call, {}, templates, {}, prepared, receiver);
+			}
 			if (found == _helpers.end()) {
 				throw CompileError("the receiver of \"." + member.memberName + "\" is not a struct with a "
 					"member function of that name");
@@ -6134,6 +6186,10 @@ namespace {
 		return found == _helpers.end() ? std::vector<HelperFunction*>() : std::vector<HelperFunction*> { &found->second };
 	}
 
+	std::vector<const FunctionTemplate*> Emitter::memberTemplatesOf(const std::string& owner, const std::string& member) const {
+		return owner.empty() ? std::vector<const FunctionTemplate*>() : templatesNamed(owner + "::" + member);
+	}
+
 	std::vector<const FunctionTemplate*> Emitter::templatesNamed(const std::string& name) const {
 		const auto found = _templatesByName.find(name);
 		return found == _templatesByName.end() ? std::vector<const FunctionTemplate*>() : found->second;
@@ -6215,11 +6271,14 @@ namespace {
 	// does not evaluate them again.
 	Emitter::HelperFunction* Emitter::resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
 		const std::vector<const FunctionTemplate*>& templates, const std::set<std::string>& adl,
-		std::vector<Id>& prepared) {
+		std::vector<Id>& prepared, const Expression* receiver) {
 		// As written: Apple names the function as the call spells it.
 		const size_t tail = call.left->name.rfind("::");
-		const std::string name = call.left->unqualifiedCall && tail != std::string::npos
+		const std::string name = receiver ? call.left->memberName
+			: call.left->unqualifiedCall && tail != std::string::npos
 			? call.left->name.substr(tail + 2) : call.left->name;
+		// The receiver is the first argument of the template's signature, which is not in call.arguments.
+		const size_t objects = receiver ? 1 : 0;
 		const auto describe = [&](const std::vector<HelperFunction*>& entries) {
 			std::string list;
 			for (const HelperFunction* entry: entries) {
@@ -6243,7 +6302,7 @@ namespace {
 				continue;
 			}
 			visible.push_back(entry);
-			if (entry->definition->parameters.size() == call.arguments.size()) {
+			if (entry->definition->parameters.size() == call.arguments.size() + objects) {
 				candidates.push_back(entry);
 			}
 		}
@@ -6263,7 +6322,7 @@ namespace {
 				continue;
 			}
 			templateList += (templateList.empty() ? "" : ", ") + describeTemplate(*declaration, *candidate.pattern);
-			if (candidate.pattern->parameters.size() == call.arguments.size()) {
+			if (candidate.pattern->parameters.size() == call.arguments.size() + objects) {
 				patterns.push_back(std::move(candidate));
 			}
 		}
@@ -6302,6 +6361,12 @@ namespace {
 			}
 		}
 		std::vector<OverloadArgument> arguments;
+		if (receiver) {
+			OverloadArgument object;
+			object.expression = receiver;
+			object.value = _pendingObject;
+			arguments.push_back(std::move(object));
+		}
 		for (const ExpressionPtr& argument: call.arguments) {
 			arguments.push_back(classifyArgument(*argument));
 		}
@@ -6323,7 +6388,7 @@ namespace {
 				}
 			}
 		}
-		for (size_t i = 0; i < arguments.size(); ++i) {
+		for (size_t i = objects; i < arguments.size(); ++i) {
 			OverloadArgument& argument = arguments[i];
 			if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
 				|| argument.pointerLike) {
@@ -6355,10 +6420,10 @@ namespace {
 			prepared.push_back(argument.value);
 		}
 		// Positions that are not evaluated keep their place, so prepared[i] is argument i.
-		if (!prepared.empty() && prepared.size() != arguments.size()) {
+		if (!prepared.empty() && prepared.size() != arguments.size() - objects) {
 			prepared.clear();
-			for (const OverloadArgument& argument: arguments) {
-				prepared.push_back(argument.value);
+			for (size_t i = objects; i < arguments.size(); ++i) {
+				prepared.push_back(arguments[i].value);
 			}
 		}
 
@@ -6379,7 +6444,9 @@ namespace {
 		for (HelperFunction* entry: candidates) {
 			std::vector<ConversionCost> costs;
 			for (size_t i = 0; i < arguments.size(); ++i) {
-				costs.push_back(conversionCost(arguments[i], entry->definition->parameters[i]));
+				// Every candidate takes the one receiver, so it cannot rank them.
+				costs.push_back(i < objects ? ConversionCost { kExact, -1 }
+					: conversionCost(arguments[i], entry->definition->parameters[i]));
 			}
 			if (std::none_of(costs.begin(), costs.end(), [](const ConversionCost& cost) { return cost.rank == kNoConversion; })) {
 				viable.emplace_back(entry, std::move(costs));
