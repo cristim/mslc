@@ -615,6 +615,7 @@ struct ClassTemplate {
 	std::set<std::string> declaredBefore;
 	// How many using directives and declarations the template's namespaces hold where it is declared.
 	size_t usingsBefore = 0;
+	std::vector<std::string> aliasTargets;
 	// Every identifier its tokens and defaults spell: a using declaration of any other name cannot change a read.
 	std::set<std::string> mentioned;
 	// How many using declarations of each such name exist, in every scope, where the template is declared.

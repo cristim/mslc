@@ -1585,7 +1585,8 @@ void Parser::reserveSplits(std::vector<Token>& tokens) {
 		[](const Token& token) { return token.kind == TokenKind::ShiftRight; }));
 }
 
-size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<std::string>& mentioned) const {
+size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<std::string>& mentioned,
+	const std::vector<std::string>& aliasTargets) const {
 	size_t count = 0;
 	std::vector<std::string> work;
 	std::set<std::string> seen;
@@ -1605,6 +1606,7 @@ size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<s
 			work.push_back(key);
 		}
 	}
+	work.insert(work.end(), aliasTargets.begin(), aliasTargets.end());
 	// The scopes the template's own chain reads from, and every one those nominate by a directive, transitively.
 	while (!work.empty()) {
 		const std::string current = work.back();
@@ -1724,7 +1726,17 @@ void Parser::parseClassTemplate(ClassTemplate& declaration) {
 			}
 		}
 	}
-	declaration.usingsBefore = usingCount(_namespacePath, declaration.mentioned);
+	// A namespace alias the template names: "A::h(v)" with "namespace A = N;" reads N. Which alias a qualified or
+	// directive-reached spelling means is not resolved, so every alias that exists at the definition under a name
+	// the template mentions counts (one declared below the template cannot be named by it). A same-named alias in
+	// an unrelated namespace is refused too (a documented over-refusal).
+	for (const auto& alias: _namespaceAliases) {
+		const size_t cut = alias.first.rfind("::");
+		if (declaration.mentioned.count(cut == std::string::npos ? alias.first : alias.first.substr(cut + 2))) {
+			declaration.aliasTargets.push_back(alias.second);
+		}
+	}
+	declaration.usingsBefore = usingCount(_namespacePath, declaration.mentioned, declaration.aliasTargets);
 	for (const std::string& name: declaration.mentioned) {
 		declaration.usingDeclarationsBefore[name] = usingDeclarationsOf(name);
 	}
@@ -1912,7 +1924,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	// clang reads a name from the definition, and a function again by argument-dependent lookup where the
 	// instance is made. Neither is modelled for what was declared after the template, so a program that
 	// could tell the two apart is refused rather than given another function's or constant's value.
-	if (usingCount(declaration.namespacePath, declaration.mentioned) != declaration.usingsBefore) {
+	if (usingCount(declaration.namespacePath, declaration.mentioned, declaration.aliasTargets) != declaration.usingsBefore) {
 		throw ClassTemplateError("a using declaration or directive is made after " + quoted + " in a scope it reads "
 			"names from; write it above the template");
 	}

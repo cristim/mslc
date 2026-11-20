@@ -650,6 +650,12 @@ below the template that rebinds a name, and a later overload found by argument-d
   binds what was declared above `In`, not above `Out`. A namespace the template names in a qualified call
   (`N::h(v)`) counts as a scope it reads from, so a using declaration or directive made in it below the template
   is refused (Apple keeps the earlier `N::h`; a false refusal where the later one would not be picked).
+  A namespace alias named in the template (`A::h(v)`, `namespace A = N;`, also an alias of an alias or of a nested
+  namespace) counts as its target (#385). Which alias a qualified, directive-reached or inline-namespace spelling
+  means is not resolved: every alias that exists at the definition under a name the template mentions counts, so
+  the same late using in its target is refused. That over-refuses a same-named alias in an unrelated namespace
+  (`namespace Q { namespace A = N; }` while a real `A::h` is called; Apple gives the earlier value), and a late
+  using directive there, where Apple also gives the earlier value.
 - False refusals: `A<(8>>1)>` (a `>>` inside parentheses in an argument), a using directive that makes a member's
   constant look ambiguous where Apple binds the file-scope one, and `BH::f()` through a typedef of an instance.
 - The restore of a parameter binding that was absent before an instance (erase afterwards) cannot be observed
