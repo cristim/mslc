@@ -6610,8 +6610,69 @@ namespace {
 				+ std::to_string(position + 1) + ", " + why + "; that is not lowered yet");
 		};
 		std::vector<bool> known(deduced.size(), false);
+		const auto bind = [&](size_t index, const Type& value) {
+			if (known[index]) {
+				return sameValueType(deduced[index].type, value) && deduced[index].type.isConst == value.isConst;
+			}
+			known[index] = true;
+			deduced[index].type = value;
+			return true;
+		};
+		// A struct is an instance of the class template a parameter names, with arguments that agree: each
+		// type parameter in it takes the instance's argument. A class template never converts to another, so
+		// a mismatch is no candidate, as in C++.
+		const auto matchInstance = [&](const auto& self, const std::string& marker, const std::string& structName) -> bool {
+			const DependentInstance& expected = pattern.dependentInstances.at(marker);
+			const StructDecl* made = structName.empty() ? nullptr : _unit.findStruct(structName);
+			if (!made || made->classTemplate != expected.classTemplate
+				|| made->classArguments.size() != expected.arguments.size()) {
+				return false;
+			}
+			for (size_t k = 0; k < expected.arguments.size(); ++k) {
+				const TemplateArgument& want = expected.arguments[k];
+				const TemplateArgument& got = made->classArguments[k];
+				if (want.isType != got.isType) {
+					return false;
+				}
+				if (!want.isType) {
+					if (want.value != got.value) {
+						return false;
+					}
+				} else if (isTemplateMarker(want.type)) {
+					if (!pattern.dependentInstances.count(want.type.namedType)) {
+						const size_t slot = parameterIndex(want.type);
+						if (slot == declaration.parameters.size()) {
+							throw CompileError("the signature of \"" + declaration.name + "\" names a type parameter "
+								"that is neither deduced nor given; that is not lowered yet");
+						}
+						if (!bind(slot, got.type)) {
+							return false;
+						}
+					} else if (!self(self, want.type.namedType, got.type.isPointer || got.type.arrayLength
+							? std::string() : got.type.namedType)) {
+						return false;
+					}
+				} else if (!sameValueType(want.type, got.type) || want.type.isConst != got.type.isConst) {
+					return false;
+				}
+			}
+			return true;
+		};
 		for (size_t i = 0; i < pattern.parameters.size(); ++i) {
 			const Parameter& parameter = pattern.parameters[i];
+			if (pattern.dependentInstances.count(parameter.type.namedType)) {
+				if (parameter.type.isPointer || parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
+					throw refuse(i, "to a parameter that is an array or a pointer to an instance of a class template");
+				}
+				const OverloadArgument& argument = arguments[i];
+				TypeTable::StructForm form;
+				if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
+					|| argument.pointerLike || !_types.structForm(_builder.typeOf(argument.value), form)
+					|| !matchInstance(matchInstance, parameter.type.namedType, form.name)) {
+					return false;
+				}
+				continue;
+			}
 			const size_t index = parameterIndex(parameter.type);
 			if (index == declaration.parameters.size()) {
 				continue;

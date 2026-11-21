@@ -1385,7 +1385,8 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		bound.insert(argument.type.namedType);
 	}
 	const auto declared = [&](const Type& type) {
-		if (!type.namedType.empty() && !_unit.findStruct(type.namedType) && !bound.count(type.namedType)) {
+		if (!type.namedType.empty() && !_unit.findStruct(type.namedType) && !bound.count(type.namedType)
+			&& !_dependentInstances.count(type.namedType)) {
 			throw CompileError("unknown type name \"" + type.namedType + "\" in the declaration of " + quoted);
 		}
 	};
@@ -1393,6 +1394,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	for (const Parameter& parameter: decl.parameters) {
 		declared(parameter.type);
 	}
+	decl.dependentInstances = _dependentInstances;
 	skipAttributes();
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("attributes on " + quoted + " are not lowered yet");
@@ -1880,11 +1882,17 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		throw ClassTemplateError(quoted + " takes " + std::to_string(parameters.size()) + " arguments, and "
 			+ std::to_string(arguments.size()) + " are given");
 	}
+	bool dependent = false;
 	for (const TemplateArgument& argument: arguments) {
-		if (argument.unbound || (argument.isType && isDeductionMarker(argument.type))) {
-			throw ClassTemplateError("an instance of " + quoted + " that depends on the parameters of a function "
-				"template is not lowered yet");
+		if (argument.unbound) {
+			throw ClassTemplateError("an instance of " + quoted + " that depends on a constant template parameter of a "
+				"function template is not lowered yet");
 		}
+		dependent = dependent || (argument.isType && isDeductionMarker(argument.type));
+	}
+	if (dependent && arguments.size() < parameters.size()) {
+		throw ClassTemplateError("an instance of " + quoted + " that depends on the parameters of a function "
+			"template and leaves an argument to its default is not lowered yet");
 	}
 
 	// Saves what the binding of a parameter replaces, and puts it back.
@@ -1995,6 +2003,17 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	}
 	const std::string spelled = declaration.spelled + "<" + key + ">";
 	const std::string instance = declaration.name.substr(0, declaration.name.size() - declaration.spelled.size()) + spelled;
+	if (dependent) {
+		// While a function template's signature is read to deduce its parameters, an instance over one of them
+		// is a marker type, like the parameter itself; deduction matches an argument's struct against what it
+		// records. No struct is made.
+		Type marker;
+		marker.namedType = "<" + instance + ">";
+		_typedefs[instance] = marker;
+		_declared[instance] = "typedef";
+		_dependentInstances[marker.namedType] = DependentInstance { declaration.name, arguments };
+		return instance;
+	}
 	if (_unit.findStruct(instance) || _classInProgress.count(instance)) {
 		return instance;
 	}
@@ -2085,6 +2104,12 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	_functionOrder = orderBefore;
 	if (!_unit.findStruct(instance)) {
 		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " did not declare a struct");
+	}
+	for (StructDecl& made: _unit.structs) {
+		if (made.name == instance) {
+			made.classTemplate = declaration.name;
+			made.classArguments = arguments;
+		}
 	}
 	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
 		// A nested instance's helpers were stamped with their own template's order when it was made.

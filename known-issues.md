@@ -632,12 +632,19 @@ below the template that rebinds a name, and a later overload found by argument-d
   reads a function template's instance cannot declare a struct, so it asks for the instance and the file is
   parsed again with it made where its class template and argument types are first declared (one more parse per
   distinct instance, at most 64: more is refused). Refused: an argument type declared after the function template;
-  a deduced `Box<T>` in a parameter (`T unbox(Box<T>)`) or a return type (`Box<T> make(T)`), where T is still being
-  deduced (the explicit form `unbox<float>(b)` works); a file-scope name the class template spells that is declared
+  a file-scope name the class template spells that is declared
   anywhere after it (a loud false refusal when it is unrelated); and a using declaration or directive after the
   class template in a scope it reads from, checked at the end of the file. Explicit instantiation of an entry point
   (`template [[host_name("kf")]] kernel void k<float>(...)`, accepted by Apple) is not class-instance work and is
   still refused.
+- A deduced instance in a function template's signature (`T unbox(Box<T>)`, `Box<Box<T>>`, `Pair<A, int>`, `Box<T>
+  make(T)`) works (slice 5e): the instance is a marker type while T is being deduced, and an argument that is an
+  instance of the same class template gives T its argument (one T named twice must agree, also with a plain `T x`).
+  Refused: `Box<T>*` or an array of instances as a parameter; a constant parameter deduced through an instance
+  (`Vn<T, N>`, which Apple accepts); an instance that leaves an argument to its default while a parameter is still
+  to be deduced (`D<T>` for `D<T, U = int>`); an instance over a deduced parameter in a return type used as
+  `make(x).field` (`f(x).field` is refused for every template). `f(Box<T>)` beside `f(T)` is an ambiguity here and
+  Apple picks the first by partial ordering (not modelled).
 - Every member function of an instance is read when the instance is made, so an unused member whose body does
   not compile for that argument is an error here and not in Apple. Apple reads a member only when it is used.
 - Member functions count as declared where the template is. Clang instantiates at the end of the file, where an

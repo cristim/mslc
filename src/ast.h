@@ -546,6 +546,10 @@ struct StructDecl {
 	bool hasConstructors = false;
 	std::string name;
 	std::vector<StructField> fields;
+	// The class template this is an instance of and the arguments it was made with; empty for a plain
+	// struct. A function template's parameter "Box<T>" deduces T from these.
+	std::string classTemplate;
+	std::vector<TemplateArgument> classArguments;
 };
 
 // A template parameter: a type, or an integer constant of the given type.
@@ -638,6 +642,15 @@ struct ClassTemplate {
 	std::map<std::string, size_t> usingDeclarationsBefore;
 };
 
+// An instance of a class template over the type parameters of a function template ("Box<T>"), as the
+// function's signature names it while those parameters are still to be deduced: the type is spelled
+// "<Box<<T>>>" (a marker, as a bare "<T>" is), and this says what it stands for. A type argument is
+// a marker itself, a concrete type, or another such instance.
+struct DependentInstance {
+	std::string classTemplate;
+	std::vector<TemplateArgument> arguments;
+};
+
 struct FunctionDecl {
 	Stage stage = Stage::None;
 	Type returnType;
@@ -655,6 +668,10 @@ struct FunctionDecl {
 	// points and helpers alike, since a function can only be called from below its
 	// first declaration.
 	size_t order = 0;
+
+	// The class template instances over a template parameter that the signature names, by the marker
+	// spelling of their type; only a signature read to deduce has any.
+	std::map<std::string, DependentInstance> dependentInstances;
 
 	// Declared static, inline or constexpr (implicitly inline), or a member defined in its struct: internal to the
 	// translation unit, so a Linkage object keeps it local instead of exporting it.

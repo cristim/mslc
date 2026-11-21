@@ -250,6 +250,8 @@ private:
 	// names a template parameter.
 	size_t _parameterBlock = SIZE_MAX;
 	std::set<std::string> _dependentParameters;
+	// Class template instances over a template parameter that the signature being read names, by marker type.
+	std::map<std::string, DependentInstance> _dependentInstances;
 	bool namesDependentParameter(const std::string& name) const;
 	// Whether the type spelled by the tokens from "from" to the current one names no template parameter, no
 	// block-scope name and no auto; set by the local declarations, read by noteLocal.
