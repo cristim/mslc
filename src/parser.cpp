@@ -3394,8 +3394,12 @@ bool Parser::receiverIndependent(const Expression& receiver) const {
 	case ExpressionKind::Member:
 		return receiver.left->kind == ExpressionKind::Identifier && receiver.left->name == "this" ? !classContext()
 			: receiverIndependent(*receiver.left);
-	case ExpressionKind::Index:
-		return receiverIndependent(*receiver.left);
+	case ExpressionKind::Index: {
+		// A dependent index makes the element dependent, as a dependent call argument does.
+		const ExpressionKind k = receiver.arguments.front()->kind;
+		return receiverIndependent(*receiver.left) && (k == ExpressionKind::IntLiteral
+			|| receiverIndependent(*receiver.arguments.front()));
+	}
 	// A call has a type that depends on nothing only when the function is a plain one, and its arguments are
 	// literals or independent themselves (a dependent argument makes the call dependent through lookup).
 	case ExpressionKind::Call: {
