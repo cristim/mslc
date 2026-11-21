@@ -702,6 +702,13 @@ receiver, and `Box<T>` members: no value differed.
   above), so a function or constant declared below the class template that its body names is refused.
 - `v.f<float>(x)` is read as template arguments only when some struct declares a member template `f` and a `>(` closes
   the list; a comparison written that way is left alone.
+- Inside a template, `x.f<float>(a)` without the `template` keyword is taken only when `x` is `this` or a local or
+  parameter of a function template or of a member template of a non-template struct whose declared type names no
+  template parameter (and no `auto`). Apple also takes a field (`inner.f<float>(a)`), an element or a call result of a
+  non-dependent type; mslc refuses those loudly and asks for `.template`. Inside a class template (or a member
+  template of one) every bare call except on `this` is refused, as class-scope typedefs are not tracked. `x.template f(a)`
+  (deduced arguments) is accepted when some struct declares a member template `f`; Apple rejects it when `x`'s own `f`
+  is a plain member, which mslc diagnoses at the call. No wrong value comes of any of these.
 - A member template that is never called is read at no point, so an error in its body is not reported (Apple reports
   only the non-dependent ones).
 - Older gap, unchanged: a non-template member function called on a device object is accepted.

@@ -1278,6 +1278,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		_memberFunctions = declaration.memberFunctions;
 		_memberStruct = declaration.memberOf;
 		if (const ClassTemplate* owner = declaration.ownerTemplate.get()) {
+			_classMemberInstance = true;
 			_definedNames = &owner->declaredBefore;
 			bindParameters(owner->name, owner->parameters, declaration.ownerArguments);
 			for (const TemplateParameter& parameter: declaration.parameters) {
@@ -3273,6 +3274,44 @@ bool Parser::namesDependentParameter(const std::string& name) const {
 	for (size_t i = _blocks.size(); i-- > 0;) {
 		if (_blocks[i].names.count(name)) {
 			return i == _parameterBlock && _dependentParameters.count(name);
+		}
+	}
+	return false;
+}
+
+bool Parser::typeTokensIndependent(size_t from) const {
+	for (size_t i = from; i < _position; ++i) {
+		if (_tokens[i].kind != TokenKind::Identifier) {
+			continue;
+		}
+		const std::string text(_tokens[i].text);
+		if (text == "auto" || text == "decltype" || text == "typeof" || text == "__typeof__" || blockName(text)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void Parser::noteLocal(const std::string& name) {
+	if (_localIndependent && !_blocks.empty()) {
+		_blocks.back().independent.insert(name);
+	}
+}
+
+bool Parser::receiverIndependent(const Expression& receiver) const {
+	if (receiver.kind != ExpressionKind::Identifier) {
+		return false;
+	}
+	if (receiver.name == "this") {
+		return true;
+	}
+	if (_classMemberInstance || _classDepth > 0) {
+		return false;
+	}
+	for (size_t i = _blocks.size(); i-- > 0;) {
+		if (_blocks[i].names.count(receiver.name)) {
+			return i == _parameterBlock ? !_dependentParameters.count(receiver.name)
+				: _blocks[i].independent.count(receiver.name) != 0;
 		}
 	}
 	return false;
@@ -5965,7 +6004,9 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			Type base;
+			const size_t typeFrom = _position;
 			declaration.type = parseType(true, true, &base);
+			_localIndependent = typeTokensIndependent(typeFrom);
 			if (declaration.type.arrayLength && !declaration.type.isStdArray) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
@@ -5987,6 +6028,7 @@ StatementPtr Parser::parseStatement() {
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+			noteLocal(declaration.name);
 
 			// "float a[4]" and "float a[] = {...}": the length follows the name.
 			bool deduceLength = false;
@@ -6070,6 +6112,7 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 	}
 	another.name = std::string(advance().text);
 	declareLocal(another.name);
+	noteLocal(another.name);
 
 	bool deduceLength = false;
 	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
@@ -6404,7 +6447,9 @@ StatementPtr Parser::parseForStatement() {
 		if (looksLikeType) {
 			VariableDeclaration declaration;
 			Type base;
+			const size_t typeFrom = _position;
 			declaration.type = parseType(false, true, &base);
+			_localIndependent = typeTokensIndependent(typeFrom);
 			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (declaration.type.isAuto && (declaration.type.isPointer || declaration.type.arrayLength)) {
 				throw CompileError("a pointer or an array declared with auto is not lowered yet");
@@ -6414,6 +6459,7 @@ StatementPtr Parser::parseForStatement() {
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+			noteLocal(declaration.name);
 			if (declaration.type.isAuto) {
 				rejectParameterListInitializer(declaration);
 				parseAutoInitializer(declaration);
@@ -7383,10 +7429,12 @@ ExpressionPtr Parser::parsePostfix() {
 // name some struct declares as a member template is tried, and only a list closed by ">(" is taken, so a
 // comparison of a field of that name is left alone.
 void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
-	if (keyword && (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName))) {
+	member.templateKeyword = keyword;
+	if (keyword && !_memberTemplateNames.count(member.memberName)) {
 		throw CompileError("\"" + member.memberName + "\" follows the 'template' keyword, and no struct declares a "
-			"member function template of that name, called with explicit arguments");
+			"member function template of that name");
 	}
+	// "x.template f(a)" leaves the arguments to deduction: with no "<" the call below is read as any other.
 	if (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName)) {
 		return;
 	}
@@ -7410,20 +7458,24 @@ void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
 		throw;
 	} catch (const CompileError&) {
 	}
-	// Inside a template body Apple rejects "x.f<int>(a)" unless x is known not to depend on a parameter, and mslc
-	// does not track that, so the keyword is required (never for "this", which is the instance itself).
-	if (taken && !keyword && (_classDepth > 0 || _inInstance)
-		&& !(member.left->kind == ExpressionKind::Identifier && member.left->name == "this")) {
+	// Inside a template body Apple rejects "x.f<int>(a)" when x depends on a template parameter, and takes it when
+	// x does not. mslc takes it for "this" and for a local or parameter whose declared type names no template
+	// parameter; any other receiver (a field, a call, an element, a local of auto or class-template scope) is
+	// taken as dependent, which over-refuses a few valid sources loudly.
+	if (taken && !keyword && (_classDepth > 0 || _inInstance) && !receiverIndependent(*member.left)) {
 		throw CompileError("explicit template arguments on \"" + member.memberName + "\" inside a template need the "
-			"keyword: write \".template " + member.memberName + "<...>(...)\" (Apple requires it when the receiver "
-			"depends on a template parameter, and mslc does not tell which receivers do)");
+			"keyword unless the receiver is known not to depend on a template parameter: write \".template "
+			+ member.memberName + "<...>(...)\" (Apple requires it when the receiver depends on one; mslc takes the "
+			"bare form only for \"this\" and for a local or parameter whose declared type names no template "
+			"parameter, so a field, an element, a call result, an auto local or a receiver inside a class template "
+			"needs the keyword)");
 	}
 	if (taken) {
 		return;
 	}
 	if (keyword) {
-		throw CompileError("\"template " + member.memberName + "\" is not followed by a list of explicit template "
-			"arguments closed by \">(\"");
+		throw CompileError("\"template " + member.memberName + "\" is followed by \"<\", which is not a list of "
+			"explicit template arguments closed by \">(\"");
 	}
 	_position = saved;
 }
