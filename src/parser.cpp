@@ -3352,17 +3352,6 @@ bool Parser::typeTokensIndependent(size_t from, size_t to) const {
 		if (const std::string* bound = blockName(text); bound && (bound->empty() || bound->front() == '<')) {
 			return false;
 		}
-		// Inside a class template the injected class name is the current instantiation, which is dependent.
-		if (classContext() && (text == unqualifiedName(_memberStruct) || [&] {
-				for (const std::string& building: _classInProgress) {
-					if (text == unqualifiedName(building)) {
-						return true;
-					}
-				}
-				return false;
-			}())) {
-			return false;
-		}
 	}
 	return true;
 }
