@@ -712,9 +712,10 @@ receiver, and `Box<T>` members: no value differed.
 - More over-refusals of the bare call inside a template, all loud, found in review of #386: a receiver declared through
   a using-declaration of a block-scope type (`using ns::D; D d{2.0f}; d.f<float>(t);`, the type name is a block name, so
   it counts as dependent); `auto a = B{1.0f};` with a concrete initializer (every auto is dependent); a concrete local
-  `B b` in a non-template member of a class template (every bare call but on `this` is refused there); a program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member template
-  at the declaration ("the declarator of the template "f" is not a shape mslc can name the function in"); Apple
-  accepts it. Run by the reviewer of #386, not re-run by me.
+  `B b` in a non-template member of a class template (every bare call but on `this` is refused there);
+  a program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member
+  template at the declaration ("the declarator of the template "f" is not a shape mslc can name the function in");
+  Apple accepts it. Reproduced with att/e01 in review of #386.
 - `x.f < 3 > (y)` on an int field, where some struct declares a member template `f`, is refused with the misleading
   "not a texture parameter" message; Apple accepts it as a comparison. This also fails outside templates, so it predates
   #386.
