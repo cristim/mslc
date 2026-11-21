@@ -80,6 +80,14 @@ class Parser {
 		ScalarKind kind;
 	};
 	std::map<std::string, ConstantInt> _constantInts;
+	// A const or constexpr one-dimensional array of integers whose elements all folded, so a
+	// constant expression may index it (an attribute index written xlt_remap[0]). Kept like
+	// _constantInts: file-scope ones here, local ones in the block that declares them.
+	struct ConstantIntArray {
+		std::vector<int64_t> values;
+		ScalarKind kind;
+	};
+	std::map<std::string, ConstantIntArray> _constantIntArrays;
 	// The struct whose body is being parsed, so an array length can tell a member from a constant.
 	const StructDecl* _structBody = nullptr;
 	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type
@@ -121,6 +129,7 @@ class Parser {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
 		std::map<std::string, ConstantInt> constants;
+		std::map<std::string, ConstantIntArray> constantArrays;
 		// The declared type of each object whose type is final and sizeof can use; a name this block
 		// declares without an entry here is one whose type is not known (auto, a resource).
 		std::map<std::string, Type> objectTypes;
@@ -234,6 +243,7 @@ private:
 		std::set<std::string> functionTemplates;
 		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
 		std::map<std::string, ConstantInt> constantInts;
+		std::map<std::string, ConstantIntArray> constantIntArrays;
 		std::map<std::string, ConstructorInfo> constructors;
 		std::set<std::string> memberTemplateNames;
 		std::set<std::string> seedKeys;
@@ -469,6 +479,8 @@ private:
 	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
 	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
 	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	int64_t constantArrayElement(const Expression& index, bool nested, bool attribute) const;
+	void recordConstantArray(const VariableDeclaration& declaration, bool local);
 	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
 	// current block's, otherwise the file's.
 	void recordConstant(const VariableDeclaration& declaration, bool local);
