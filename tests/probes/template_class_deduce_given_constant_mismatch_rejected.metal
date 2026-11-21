@@ -1,4 +1,4 @@
-// EXPECT: error no matching function for call to "sum"
+// EXPECT: error no matching function for call to "sum"; candidates: ; templates: template
 // Refs #341: slice 5e: Vn<T, 3> given Vn<float, 4>; Apple rejects it.
 #include <metal_stdlib>
 using namespace metal;

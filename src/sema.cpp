@@ -3931,7 +3931,16 @@ namespace {
 	// the order named, from one of the two letter sets Metal allows.
 	Id Emitter::emitSwizzle(const Expression& expression) {
 		const std::string& name = expression.memberName;
-		const std::vector<uint32_t> indices = swizzleLanes(name);
+		std::vector<uint32_t> indices;
+		try {
+			indices = swizzleLanes(name);
+		} catch (const CompileError&) {
+			if (expression.left->kind == ExpressionKind::Call && callsDependentTemplate(*expression.left)) {
+				throw CompileError("\"." + name + "\" is read from the result of a function template call whose type "
+					"is known only once it is deduced; assign the call to a variable first");
+			}
+			throw;
+		}
 
 		const Id vector = emitExpression(*expression.left);
 		const Id type = _builder.typeOf(vector);
@@ -6645,10 +6654,18 @@ namespace {
 							throw CompileError("the signature of \"" + declaration.name + "\" names a type parameter "
 								"that is neither deduced nor given; that is not lowered yet");
 						}
-						if (!bind(slot, got.type)) {
+						// A qualifier the pattern spells has to be the argument's, and is not part of T.
+						Type bound = got.type;
+						if (want.type.isConst) {
+							if (!got.type.isConst) {
+								return false;
+							}
+							bound.isConst = false;
+						}
+						if (!bind(slot, bound)) {
 							return false;
 						}
-					} else if (!self(self, want.type.namedType, got.type.isPointer || got.type.arrayLength
+					} else if ((want.type.isConst && !got.type.isConst) || !self(self, want.type.namedType, got.type.isPointer || got.type.arrayLength
 							? std::string() : got.type.namedType)) {
 						return false;
 					}

@@ -1,4 +1,4 @@
-// EXPECT: error no matching function for call to "g"
+// EXPECT: error no matching function for call to "g"; candidates: ; templates: template
 // Refs #341: slice 5e: Pair<T, int> given Pair<float, uint>; Apple rejects it.
 #include <metal_stdlib>
 using namespace metal;

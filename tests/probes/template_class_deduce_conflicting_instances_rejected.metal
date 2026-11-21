@@ -1,4 +1,4 @@
-// EXPECT: error no matching function for call to "add"
+// EXPECT: error no matching function for call to "add"; candidates: ; templates: template
 // Refs #341: slice 5e: two Box<T> parameters given Box<float> and Box<int> deduce T twice; Apple rejects it.
 #include <metal_stdlib>
 using namespace metal;

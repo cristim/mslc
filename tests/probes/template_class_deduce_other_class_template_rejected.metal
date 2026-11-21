@@ -1,4 +1,4 @@
-// EXPECT: error no matching function for call to "z"
+// EXPECT: error no matching function for call to "z"; candidates: ; templates: template
 // Refs #341: slice 5e: an instance of another class template does not match Tag<T>; Apple rejects it.
 #include <metal_stdlib>
 using namespace metal;
