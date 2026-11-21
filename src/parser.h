@@ -128,6 +128,9 @@ class Parser {
 		// Set on the outermost block of a function body or a for body, whose names share a C++
 		// scope with the enclosing parameters or init declaration.
 		bool sharesEnclosingScope = false;
+		// The locals whose declared type names no template parameter, no block name and no auto, so a
+		// member call on one is not dependent. A local not listed here is taken as dependent.
+		std::set<std::string> independent;
 	};
 	std::vector<BlockScope> _blocks;
 
@@ -248,6 +251,16 @@ private:
 	size_t _parameterBlock = SIZE_MAX;
 	std::set<std::string> _dependentParameters;
 	bool namesDependentParameter(const std::string& name) const;
+	// Whether the type spelled by the tokens from "from" to the current one names no template parameter, no
+	// block-scope name and no auto; set by the local declarations, read by noteLocal.
+	bool typeTokensIndependent(size_t from) const;
+	bool _localIndependent = false;
+	void noteLocal(const std::string& name);
+	// A receiver of a member call that is a local or parameter of a template instance whose type does not depend on
+	// a template parameter, and "this".
+	bool receiverIndependent(const Expression& receiver) const;
+	// An instance of a class template, or of a member template of one, is read: its class names are not tracked.
+	bool _classMemberInstance = false;
 	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
 	friend TemplateArgument templateDefault(const FunctionTemplate&, size_t, const std::vector<TemplateArgument>&);
 	FunctionDecl parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
