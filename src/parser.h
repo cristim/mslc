@@ -263,6 +263,7 @@ private:
 	bool namesInjectedClass(size_t from, size_t to = SIZE_MAX) const;
 	bool _localInjected = false;
 	bool injectedLocal(const std::string& name) const;
+	bool injectedBase(const Expression& chain) const;
 	void noteLocal(const std::string& name);
 	// A receiver of a member call that is a local or parameter of a template instance whose type does not depend on
 	// a template parameter, and "this".

@@ -3433,6 +3433,16 @@ bool Parser::injectedLocal(const std::string& name) const {
 	return false;
 }
 
+// A member reached through an injected-name local, directly or through elements, has a type built from the class's
+// own parameters.
+bool Parser::injectedBase(const Expression& chain) const {
+	const Expression* base = &chain;
+	while (base->kind == ExpressionKind::Member || base->kind == ExpressionKind::Index) {
+		base = base->left.get();
+	}
+	return classContext() && base->kind == ExpressionKind::Identifier && injectedLocal(base->name);
+}
+
 bool Parser::receiverIndependent(const Expression& receiver) const {
 	switch (receiver.kind) {
 	case ExpressionKind::Identifier:
@@ -3450,7 +3460,7 @@ bool Parser::receiverIndependent(const Expression& receiver) const {
 	// A field of an object, or an element of an array or a pointer, of a type naming no parameter is as well.
 	case ExpressionKind::Member:
 		return receiver.left->kind == ExpressionKind::Identifier && receiver.left->name == "this" ? !classContext()
-			: receiver.left->kind == ExpressionKind::Identifier && classContext() && injectedLocal(receiver.left->name) ? false
+			: injectedBase(*receiver.left) ? false
 			: receiverIndependent(*receiver.left);
 	case ExpressionKind::Index: {
 		// A dependent index makes the element dependent, as a dependent call argument does.

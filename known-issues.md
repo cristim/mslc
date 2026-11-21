@@ -714,7 +714,7 @@ receiver, and `Box<T>` members: no value differed.
   whose declared type names no template parameter (and no `auto`, no local), a field of `this` of a non-template struct, a
   field or element of such a receiver, the result of a plain (non-template) function called with literals or such
   receivers, or `auto a = B{...}` with `B` a plain struct. A block-scope using-declared type counts as concrete. Inside
-  a class template the receiver may be a concrete local (a `W<float>` local and a `W w = *this;` local of the injected name are concrete, as the member belongs to the current instantiation; a field or element of the injected-name local is dependent), never a parameter, a field
+  a class template the receiver may be a concrete local (a `W<float>` local and a `W w = *this;` local of the injected name are concrete, as the member belongs to the current instantiation; a field of the injected-name local, or of one of its elements, is dependent), never a parameter, a field
   or a call: those are refused loudly and ask for `.template`, as class-scope typedefs are not tracked. Other
   concrete receivers Apple accepts (a call result of a function with other arguments, `B{...}.f<float>()`, an
   element indexed by an expression such as `loc[int(x)]`) are also refused loudly. An element needs a literal or independent index,
