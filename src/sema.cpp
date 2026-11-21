@@ -4887,8 +4887,12 @@ namespace {
 		}
 
 		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
-			throw CompileError("a unary operator on a bool is not lowered yet; "
-				"convert the bool to an int first");
+			if (_types.vectorWidth(type) > 1) {
+				throw CompileError("a unary operator on a bool vector is not lowered yet; "
+					"convert the bool vector to an int vector first");
+			}
+			const Id promoted = promotedTo(1);
+			return emitUnaryOperation(expression.unaryOperator, convert(operand, type, promoted), promoted);
 		}
 
 		// The integer promotion: + - ~ on a scalar narrower than int give an int (! gives a bool; a
@@ -5310,12 +5314,15 @@ namespace {
 				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
 		}
 
-		// Apple promotes a bool operand to int. mslc has no such promotion, and
-		// OpIAdd on a bool is a module spirv-val rejects.
-		if (_types.isBool(leftType) || _types.isBool(_builder.typeOf(right))) {
-			throw CompileError("an arithmetic, bitwise or comparison operator on a bool is not lowered yet; "
-				"convert the bool to an int first");
+		// Apple promotes a scalar bool operand to int; a bool vector is still refused.
+		const Id rightType = _builder.typeOf(right);
+		if ((_types.isBool(leftType) && _types.vectorWidth(leftType) > 1)
+			|| (_types.isBool(rightType) && _types.vectorWidth(rightType) > 1)) {
+			throw CompileError("an arithmetic, bitwise or comparison operator on a bool vector is not lowered yet; "
+				"convert the bool vector to an int vector first");
 		}
+		if (_types.isBool(leftType)) { left = convert(left, leftType, promotedTo(1)); }
+		if (_types.isBool(rightType)) { right = convert(right, rightType, promotedTo(1)); }
 
 		return emitArithmetic(op, left, right);
 	}
@@ -5521,6 +5528,10 @@ namespace {
 	// converts the sum back to int.
 	Id Emitter::emitCompoundOperation(BinaryOperator op, Id current, Id value) {
 		const Id targetType = _builder.typeOf(current);
+		// A scalar bool value promotes to int; a bool target is still refused below.
+		if (_builder.typeOf(value) == _boolType && targetType != _boolType) {
+			value = convert(value, _boolType, promotedTo(1));
+		}
 		const Id valueType = _builder.typeOf(value);
 		const std::string spelled = std::string(binaryOperatorSpelling(op)) + "=";
 
@@ -8855,8 +8866,10 @@ namespace {
 			throw CompileError("this unary operator is recognised but not folded yet");
 		}
 
+		// The integer promotion: a bool operand of + - ~ is an int.
 		if (isBool) {
-			throw CompileError("a unary operator on a bool is not folded; convert the bool to an int first");
+			operand.scalar = ScalarKind::Int;
+			operand.integer = operand.boolean ? 1 : 0;
 		}
 
 		if (isFloat) {
@@ -8950,8 +8963,8 @@ namespace {
 			return folded;
 		}
 
-		const FoldedConstant left = foldExpression(*expression.left);
-		const FoldedConstant right = foldExpression(*expression.right);
+		FoldedConstant left = foldExpression(*expression.left);
+		FoldedConstant right = foldExpression(*expression.right);
 
 		if (left.isComposite || right.isComposite) {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
@@ -8963,9 +8976,12 @@ namespace {
 			return foldComparison(op, left, right);
 		}
 
-		if (left.scalar == ScalarKind::Bool || right.scalar == ScalarKind::Bool) {
-			throw CompileError("an arithmetic or bitwise operator on a bool is not folded; "
-				"convert the bool to an int first");
+		// The integer promotion: a bool operand is an int.
+		for (FoldedConstant* operand: { &left, &right }) {
+			if (operand->scalar == ScalarKind::Bool) {
+				operand->scalar = ScalarKind::Int;
+				operand->integer = operand->boolean ? 1 : 0;
+			}
 		}
 
 		if (isFloatKind(left.scalar) || isFloatKind(right.scalar)) {

@@ -455,10 +455,12 @@ them on master as well), so neither is a regression.
 - Narrowing in dead code after `return;` is not checked: `return; constexpr int n = 300; char x{n};`
   is accepted, Apple rejects it.
 
+Arithmetic on a scalar bool promotes it to int, in code and in a constant (`float x{true + 1}`, `-flag`,
+`i += flag`). Still refused as "not lowered yet": arithmetic or a unary `+ - ~` on a bool vector (Apple
+accepts it), and a compound assignment whose target is a bool (`b &= c`, `b += 1`; Apple accepts it).
+
 Forms Apple accepts that the validity proof still leaves as the unsupported-proof diagnostic:
-char literals such as `'a'` in a constant (parser limit), arithmetic on a bool
-(`float x{true + 1}`; every arithmetic or bitwise operator on a bool is refused as "not lowered yet", so
-this is a lowering gap and not a proof gap), a float-to-integer cast inside a vector constructor of a constexpr list
+char literals such as `'a'` in a constant (parser limit), a float-to-integer cast inside a vector constructor of a constexpr list
 (`constexpr int3 v{int3(1.5f)}`), and a file-scope `constant` initialised with a float division by
 zero that is then narrowed to half. A file-scope `constant int g = true ? 1 : 5 / 0;` (an unchosen arm that
 does not fold, outside a function) is refused with "not known outside a function"; Apple accepts it.
