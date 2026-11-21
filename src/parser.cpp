@@ -948,6 +948,7 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->constructors = _constructors;
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
+	names->constantIntArrays = _constantIntArrays;
 	names->memberTemplateNames = _memberTemplateNames;
 	names->seedKeys = _seedKeys;
 	return names;
@@ -969,6 +970,7 @@ void Parser::restoreNames(const Names& names) {
 	_constructors = names.constructors;
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
+	_constantIntArrays = names.constantIntArrays;
 	_memberTemplateNames = names.memberTemplateNames;
 	_seedKeys = names.seedKeys;
 	_frozenClasses = true;
@@ -4396,6 +4398,8 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			return expression.boolValue ? 1 : 0;
 		case ExpressionKind::Identifier:
 			return namedConstantValue(expression, nested, attribute);
+		case ExpressionKind::Index:
+			return constantArrayElement(expression, nested, attribute);
 		case ExpressionKind::Unary: {
 			const int64_t operand = evaluateConstant(*expression.left, true, attribute);
 			if ((expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::BitNot)
@@ -4545,12 +4549,119 @@ int64_t Parser::namedConstantValue(const Expression& identifier, bool nested, bo
 	return found->value;
 }
 
+// An element of a constant integer array, `table[2]`: the array is a const or constexpr one-dimensional
+// array of integers with a brace initialiser that folded (recordConstantArray), and the index is itself
+// a constant expression inside the array's bounds. The name is looked up the way namedConstantValue
+// looks up an integer constant, so a local or a member that hides the array is not one.
+int64_t Parser::constantArrayElement(const Expression& element, bool nested, bool attribute) const {
+	if (element.isDereference || !element.left || element.left->kind != ExpressionKind::Identifier
+		|| element.arguments.size() != 1) {
+		throw CompileError("not an integer constant expression");
+	}
+	const Expression& identifier = *element.left;
+	const std::string& name = identifier.name;
+	const ConstantIntArray* found = nullptr;
+	if (_structBody && !identifier.fileScope) {
+		for (const StructField& field: _structBody->fields) {
+			if (field.name == name) {
+				throw CompileError("\"" + name + "\" is a non-static data member, not a constant");
+			}
+		}
+	}
+	if (!identifier.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			if (!scope->names.count(name)) {
+				continue;
+			}
+			const auto array = scope->constantArrays.find(name);
+			if (array == scope->constantArrays.end()) {
+				throw CompileError("\"" + name + "\" is not a constant integer array: only a const or constexpr "
+					"array of integers with a constant brace initialiser is");
+			}
+			found = &array->second;
+			break;
+		}
+	}
+	if (!found) {
+		const auto array = _constantIntArrays.find(name);
+		if (array == _constantIntArrays.end()) {
+			throw CompileError("\"" + name + "\" is not a constant integer array this source declares before "
+				"this one (a const or constexpr array of integers with a constant brace initialiser is)");
+		}
+		found = &array->second;
+	}
+
+	const int64_t index = evaluateConstant(*element.arguments.front(), true, false);
+	if (index < 0 || static_cast<uint64_t>(index) >= found->values.size()) {
+		throw CompileError("the index " + std::to_string(index) + " is outside the array \"" + name
+			+ "\" of " + std::to_string(found->values.size()) + " elements");
+	}
+	if (attribute && (found->kind == ScalarKind::Long || found->kind == ScalarKind::ULong)) {
+		throw CompileError("a long is not an index; use an int or a uint");
+	}
+	const bool intSized = found->kind != ScalarKind::UInt && found->kind != ScalarKind::Long
+		&& found->kind != ScalarKind::ULong;
+	if (nested && !intSized) {
+		throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+	}
+	return found->values[static_cast<size_t>(index)];
+}
+
+// A const or constexpr array of integers, one dimension, initialised by a brace list whose elements all
+// fold: the elements are kept so a constant expression can index the array. Elements the list leaves out
+// are zero, as C++ says. Anything else (a designator, a nested list, a value its type cannot hold, a list
+// longer than the array) leaves the array unrecorded, so indexing it in a constant expression is refused.
+void Parser::recordConstantArray(const VariableDeclaration& declaration, bool local) {
+	const Type& type = declaration.type;
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || type.arrayRank() != 1
+		|| type.vectorWidth != 0 || !declaration.initializer
+		|| declaration.initializer->kind != ExpressionKind::InitList) {
+		return;
+	}
+	int64_t low = 0;
+	int64_t high = 0;
+	if (!integerRange(type.scalar, low, high)) {
+		return;
+	}
+	const std::vector<InitializerElement>& elements = declaration.initializer->elements;
+	if (elements.size() > *type.arrayLength) {
+		return;
+	}
+	ConstantIntArray array;
+	array.kind = type.scalar;
+	array.values.assign(*type.arrayLength, 0);
+	for (size_t i = 0; i < elements.size(); ++i) {
+		if (!elements[i].fieldName.empty() || !elements[i].value) {
+			return;
+		}
+		int64_t value = 0;
+		try {
+			value = evaluateConstant(*elements[i].value, false);
+		} catch (const CompileError&) {
+			return;
+		}
+		if (value < low || value > high) {
+			return;
+		}
+		array.values[i] = value;
+	}
+	if (local) {
+		_blocks.back().constantArrays[declaration.name] = std::move(array);
+	} else {
+		_constantIntArrays[declaration.name] = std::move(array);
+	}
+}
+
 // An integer declared const or constexpr (a file-scope one is a constant by its address space) and
 // initialised by a constant expression is one a later array length may name. A value its own type
 // cannot hold is not recorded, because Apple would convert it and evaluateConstant would not.
 void Parser::recordConstant(const VariableDeclaration& declaration, bool local) {
 	const Type& type = declaration.type;
-	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || type.arrayLength
+	if (type.arrayLength) {
+		recordConstantArray(declaration, local);
+		return;
+	}
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer
 		|| type.vectorWidth != 0 || !declaration.initializer) {
 		return;
 	}
@@ -7089,9 +7200,9 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 }
 
 // `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
-// enum or a struct, is the functional cast T(operand). A type name cannot begin a
-// parenthesised expression, so "(" followed by one is always a cast. Returns null
-// when the parenthesis opens an expression.
+// enum or a struct, is the functional cast T(operand). Returns null when the
+// parenthesis opens an expression, which includes one that starts with a functional
+// cast, "(int(x) * 2)": a type name followed by anything but ")" is not a C-style cast.
 ExpressionPtr Parser::parseCast() {
 	const Token& first = lookahead(1);
 	if (first.kind != TokenKind::Identifier && first.kind != TokenKind::ColonColon) {
@@ -7107,11 +7218,18 @@ ExpressionPtr Parser::parseCast() {
 			++skip;
 		}
 		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
+			const size_t open = _position;
 			advance();
 			Type type;
 			parseSpecifierRun(type);
 			if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
+			}
+			// "(int(x) * 2)": the type name starts a functional cast inside a parenthesised
+			// expression, not a C-style cast, so the parenthesis opens an expression.
+			if (!at(TokenKind::RParen)) {
+				_position = open;
+				return nullptr;
 			}
 			expect(TokenKind::RParen, "to close a cast");
 			auto expression = std::make_unique<Expression>();

@@ -288,6 +288,9 @@ namespace {
 		// As VectorToScalar, but a core opcode rather than GLSL.std.450.
 		Dot,
 		Fwidth,
+		// The screen-space partial derivative along x or along y.
+		Dfdx,
+		Dfdy,
 		// Two vectors of one type and a scalar eta.
 		Refract,
 		// Two three-component vectors.
@@ -362,6 +365,8 @@ namespace {
 		{ "refract", 3, MathShape::Refract, 72, kNoInstruction, kNoInstruction },
 		{ "dot", 2, MathShape::Dot, kNoInstruction, kNoInstruction, kNoInstruction },
 		{ "fwidth", 1, MathShape::Fwidth, kNoInstruction, kNoInstruction, kNoInstruction },
+		{ "dfdx", 1, MathShape::Dfdx, kNoInstruction, kNoInstruction, kNoInstruction },
+		{ "dfdy", 1, MathShape::Dfdy, kNoInstruction, kNoInstruction, kNoInstruction },
 	};
 
 	// A construct whose type is void: the cast (void)e.
@@ -8293,8 +8298,10 @@ namespace {
 				+ std::to_string(arguments.size()));
 		}
 
-		if (builtin.shape == MathShape::Fwidth && _entryPoint->stage != Stage::Fragment) {
-			throw StageError("fwidth is only available in fragment functions");
+		const bool isDerivative = builtin.shape == MathShape::Fwidth || builtin.shape == MathShape::Dfdx
+			|| builtin.shape == MathShape::Dfdy;
+		if (isDerivative && _entryPoint->stage != Stage::Fragment) {
+			throw StageError(name + " is only available in fragment functions");
 		}
 
 		std::vector<Id> values;
@@ -8311,20 +8318,22 @@ namespace {
 			values.push_back(value);
 		}
 
-		if (builtin.shape == MathShape::Fwidth) {
+		if (isDerivative) {
+			const spirv::Opcode opcode = builtin.shape == MathShape::Dfdx ? spirv::OpDPdx
+				: builtin.shape == MathShape::Dfdy ? spirv::OpDPdy : spirv::OpFwidth;
 			const Id type = _builder.typeOf(values[0]);
 			if (!_types.isFloat(type)) {
-				throw CompileError("fwidth takes float or half scalars or vectors");
+				throw CompileError(name + " takes float or half scalars or vectors");
 			}
 
 			if (_types.bitWidth(type) == 16) {
 				const Id float32Type = _types.vector(ScalarKind::Float, _types.vectorWidth(type));
 				const Id widened = convert(values[0], type, float32Type);
-				const Id result = _builder.emitTyped(spirv::OpFwidth, float32Type, { widened });
+				const Id result = _builder.emitTyped(opcode, float32Type, { widened });
 				return convert(result, float32Type, type);
 			}
 
-			return _builder.emitTyped(spirv::OpFwidth, type, { values[0] });
+			return _builder.emitTyped(opcode, type, { values[0] });
 		}
 
 		// refract's eta is a scalar of its own, so only the first two of its
