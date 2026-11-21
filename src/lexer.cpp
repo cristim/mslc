@@ -250,6 +250,17 @@ std::vector<Token> tokenize(std::string_view source, bool lenient) {
 	while (i < size) {
 		const char c = source[i];
 
+		// A NUL character is skipped like whitespace: the compilers this one stands in for (clang-based) ignore it
+		// with a warning, and an application can hand over a buffer whose length counts a terminating NUL.
+		// Observed with the macOS 26.7.3 Metal compiler front end, which compiles a source that has a NUL after
+		// the last token or between two tokens.
+		// Test: library_api (a NUL after the last token, and between tokens)
+		if (c == '\0') {
+			spaceBefore = true;
+			++i;
+			continue;
+		}
+
 		// whitespace
 		if (std::isspace(static_cast<unsigned char>(c))) {
 			if (c == '\n') {

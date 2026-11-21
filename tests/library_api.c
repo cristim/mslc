@@ -95,6 +95,17 @@ int main(int argc, char** argv) {
 		CHECK(bytes != NULL && size >= 56 && error == NULL);
 		mslc_free(bytes);
 	}
+	/* NUL characters are ignored, as clang does: after the last token (a length that counts the
+	 * terminator), between two tokens and inside a comment. */
+	{
+		static const char withNul[] = "float helper() { return\0 1; }\n// a\0b\n\0";
+		uint8_t* bytes = NULL;
+		size_t size = 0;
+		char* error = NULL;
+		CHECK(mslc_compile_library(withNul, sizeof(withNul), NULL, &bytes, &size, &error) == 0);
+		CHECK(bytes != NULL && size >= 56 && error == NULL);
+		mslc_free(bytes);
+	}
 	rejected(NULL, NULL, "no source given");
 	rejected("typedef Missing Alias;", NULL, NULL);
 	rejected("using namespace metal", NULL, NULL);
