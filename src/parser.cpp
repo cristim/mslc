@@ -784,6 +784,31 @@ void Parser::parseUsing() {
 		return;
 	}
 
+	// "using T = type;" is "typedef type T;".
+	if (at(TokenKind::Identifier) && lookahead().kind == TokenKind::Assign) {
+		if (!_blocks.empty()) {
+			throw CompileError("\"using\" of a type alias inside a function is not supported; declare it at file scope");
+		}
+		const std::string alias = qualify(std::string(advance().text));
+		advance();
+		const Type target = parseType();
+		if (target.isPointer) {
+			throw CompileError("a type alias of a pointer type is not supported");
+		}
+		if (target.arrayLength && !target.isStdArray) {
+			throw CompileError("a type alias of an array type is not supported");
+		}
+		if (target.addressSpace != AddressSpace::None) {
+			throw CompileError("a type alias of a type with an address space is not supported");
+		}
+		if (!target.namedType.empty() && !_unit.findStruct(target.namedType)) {
+			throw CompileError("unknown type name \"" + target.namedType + "\" in a type alias");
+		}
+		expect(TokenKind::Semicolon, "after a type alias");
+		registerTypedef(alias, target);
+		return;
+	}
+
 	QualifiedName name;
 	if (!peekQualifiedName(name) || name.parts.size() < 2) {
 		throw CompileError("a using declaration has to name a member of a namespace, as \"using N::x;\"");
@@ -4342,8 +4367,12 @@ void Parser::parseTypedef() {
 		}
 	}
 
-	// A typedef under the name of the struct it names is the same type, but the
-	// name is then a typedef as well, which is what another declaration collides with.
+	registerTypedef(name, target);
+}
+
+// The name is a typedef of target. A typedef under the name of the struct it names is the same
+// type, but the name is then a typedef as well, which is what another declaration collides with.
+void Parser::registerTypedef(const std::string& name, const Type& target) {
 	if (name == target.namedType) {
 		_declared[name] = "typedef";
 		return;

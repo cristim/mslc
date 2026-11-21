@@ -361,6 +361,7 @@ private:
 	std::map<std::string, bool> _memberFunctions;
 	std::string _memberStruct;
 	void parseTypedef();
+	void registerTypedef(const std::string& name, const Type& target);
 
 	// "enum Tag { A, B = 2 }" up to and including the closing brace, or just
 	// "enum Tag" when there is no brace, which says so in hadBody. Returns the
