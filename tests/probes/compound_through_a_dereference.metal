@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpIAdd %int %[0-9]+ %int_5
 //
 // *p += 5 is p[0] += 5.

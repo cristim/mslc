@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 //
 // A left-leaning chain of 3999 operands is a tree 3999 nodes tall, the tallest
 // mslc accepts. It is not nested in the source, so Apple's bracket limit does not

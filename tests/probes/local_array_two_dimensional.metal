@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpTypeArray %_arr_float_uint_3 %uint_2
 // DISASM-MATCH: OpAccessChain %_ptr_Function_float %[0-9]+ %[0-9]+ %[0-9]+
 // Nested braces, a dynamic row and column, and a store through the same chain. Lavapipe readback

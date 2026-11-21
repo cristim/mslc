@@ -1,4 +1,4 @@
-// EXPECT: error a member or an index has to start at a name
+// EXPECT: error expression is not assignable
 // Apple: "expression is not assignable": a returned struct is a temporary.
 struct S { float x; };
 S mk() { S s; s.x = 1.0; return s; }

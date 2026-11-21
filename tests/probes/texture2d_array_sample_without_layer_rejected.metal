@@ -1,4 +1,4 @@
-// EXPECT: error sample takes a sampler, a coordinate, an array index and optionally level(lod)
+// EXPECT: error sample takes a sampler, a coordinate, an array index and optionally an option
 #include <metal_stdlib>
 using namespace metal;
 fragment float4 f(texture2d_array<float> t [[texture(0)]], sampler s [[sampler(0)]]) {

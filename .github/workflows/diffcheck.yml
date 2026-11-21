@@ -1,0 +1,54 @@
+name: diffcheck
+
+# Advisory. tools/diffcheck compares Apple's compiler with mslc by running both on a GPU, so it
+# needs a Metal device. Whether GitHub-hosted macOS runners expose one is not known: the
+# "Probe for Metal" step records it in the log, and every later step is skipped when there is
+# none. The job never fails the workflow (continue-on-error) until a run shows it executes the
+# comparison; then drop continue-on-error and make it required. Unverified until the first run:
+# GitHub may still show a red check on the commit for a failed continue-on-error job.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diffcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diffcheck:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Probe for Metal
+        id: metal
+        run: tools/diffcheck/ci-probe-metal.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        if: steps.metal.outputs.metal == 'yes'
+        run: brew install spirv-tools mesa vulkan-loader
+
+      - name: Configure
+        if: steps.metal.outputs.metal == 'yes'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DMSLC_DIFFCHECK=ON
+
+      - name: Build
+        if: steps.metal.outputs.metal == 'yes'
+        run: cmake --build build --parallel
+
+      - name: Self-tests and probes
+        if: steps.metal.outputs.metal == 'yes'
+        run: ctest --test-dir build -R diffcheck --output-on-failure
+
+      - name: Probe corpus
+        if: steps.metal.outputs.metal == 'yes'
+        run: |
+          python3 tools/diffcheck/diffcheck.py --corpus tests/probe-run.txt --jobs 3 \
+            --mslc build/mslc --metalhost build/tools/diffcheck/diffcheck-metalhost \
+            --vkhost build/tools/diffcheck/diffcheck-vkhost --min-compared 1105

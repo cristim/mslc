@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpReturnValue %int_11
 // DISASM: OpReturnValue %int_12
 // DISASM-NO-MATCH: OpReturnValue %int_77

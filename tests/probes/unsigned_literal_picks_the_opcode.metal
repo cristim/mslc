@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpUDiv
 // DISASM: OpUMod
 // DISASM: OpShiftRightLogical

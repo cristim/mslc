@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""End-to-end test of diffcheck's kernel resources (textures, samplers), the SPIR-V layout
+cross-check and per-buffer ULP bounds: Apple's GPU against mslc's SPIR-V on lavapipe. Baselines
+must match; each planted miscompile (an edit to the SPIR-V of the real mslc output, made by
+diffcheck_mutate_mslc.py) must be reported; the vacuity guards must fire. Exits 77 (ctest SKIP)
+when either side is unavailable.
+
+usage: diffcheck_kernel_driver_test.py <mslc> <metalhost> <vkhost>
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+mslc, metalhost, vkhost = sys.argv[1:4]
+DRIVER = os.path.join(HERE, "..", "tools", "diffcheck", "diffcheck.py")
+MUTATE = os.path.join(HERE, "diffcheck_mutate_mslc.py")
+
+
+def run(path, *extra, mslc_cmd=None, vk=None, metal=None, env=None):
+    with tempfile.TemporaryDirectory() as d:
+        report = os.path.join(d, "r.json")
+        r = subprocess.run([sys.executable, DRIVER, path, "--mslc", mslc_cmd or mslc, "--metalhost", metal or metalhost,
+                            "--vkhost", vk or vkhost, "--report", report, *extra], capture_output=True, text=True,
+                           env=dict(os.environ, **(env or {})))
+        data = json.load(open(report))["results"][0] if os.path.exists(report) else None
+    return r.returncode, r.stdout + r.stderr, data
+
+
+def probe(name):
+    return os.path.join(HERE, "diffcheck", "kernel", name + ".metal")
+
+
+def fixture(name):
+    return os.path.join(HERE, "diffcheck", name + ".metal")
+
+
+def mutated(path, edits):
+    env = {"MSLC_REAL": mslc, "MUT": json.dumps(edits)}
+    return run(path, mslc_cmd=MUTATE, env=env)
+
+
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer", "threadgroup_argument",
+             "texel_buffer_read", "texel_buffer_write", "texel_buffer_read_write", "texel_buffer_unused",
+             "texel_buffer_r_read", "texel_buffer_rg_read", "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
+# (probe, edits, expected status): each is a change a real compiler bug could make.
+MUTANTS = [
+    # texture: the x and y of a texel fetch swapped
+    ("texture_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture: the two textures change bindings
+    ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # texture: the swapped coordinates of the second sample are no longer swapped
+    ("texture_sample_two", [[r"(OpVectorShuffle %v2float %\d+ %\d+) 1 0", r"\1 0 1"]], "mismatched"),
+    # sampler: two samplers (clamp and repeat) swap bindings
+    ("sampler_modes", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]], "mismatched"),
+    # layout: a member the kernel never reads moves; no output changes, only the layout does
+    ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4", r"\1 12"]], "reflection-mismatch"),
+    # layout: two unread members exchange offsets (the set of offsets is unchanged)
+    ("layout_unread_member", [[r"(OpMemberDecorate %\w+ 1 Offset) 4$", r"\1 99"], [r"(OpMemberDecorate %\w+ 2 Offset) 8$", r"\1 4"],
+                              [r"(OpMemberDecorate %\w+ 1 Offset) 99$", r"\1 8"]], "reflection-mismatch"),
+    # layout: an unread square matrix is row major, with the same offsets
+    ("layout_unread_member", [[r"ColMajor$", "RowMajor"]], "reflection-mismatch"),
+    # layout: the element stride of an array of vectors
+    ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
+    # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
+    ("ulp_per_buffer", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
+    # threadgroup argument: the spec constant that sizes the first argument's array is no longer the id the reflection names
+    ("threadgroup_argument", [[r"SpecId 3$", "SpecId 9"]], "mismatched"),
+    # threadgroup argument: a thread reads the wrong neighbour's slot
+    ("threadgroup_argument", [[r"(OpIAdd %uint %\d+) %uint_1$", r"\1 %uint_3"]], "mismatched"),
+    # threadgroup argument: the memory is per invocation (Private) and not shared by the group
+    ("threadgroup_argument", [[r"(OpTypePointer) Workgroup", r"\1 Private"], [r"(OpVariable %\S+) Workgroup", r"\1 Private"]], "mismatched"),
+    # texel buffer, read: the first fetch's texel index is off by one
+    ("texel_buffer_read", [[r"OpBitcast %uint %int_1$", "OpBitcast %uint %int_2"]], "mismatched"),
+    # texel buffer, read: the float and the half buffer change bindings
+    ("texel_buffer_read", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # texel buffer, read: get_width is folded to the constant 256 (the texel counts differ per buffer and case)
+    ("texel_buffer_read", [[r"OpImageQuerySize %uint %\d+$", "OpBitcast %uint %int_256"]], "mismatched"),
+    # texel buffer, read: the width that sizes the indices is the one of the half buffer, not of the float one
+    ("texel_buffer_read", [[r"(%149 = OpLoad %83 )%85$", r"\1%88"]], "mismatched"),
+    # texel buffer, write: every write lands two texels away from where it should
+    ("texel_buffer_write", [[r"OpBitcast %uint %int_5$", "OpBitcast %uint %int_7"]], "mismatched"),
+    # texel buffer, write: two components of an int4 swapped
+    ("texel_buffer_write", [[r"(OpCompositeConstruct %v4int) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texel buffer, write: the int and the uint buffer change bindings
+    ("texel_buffer_write", [["Binding 3$", "Binding 9"], ["Binding 4$", "Binding 3"], ["Binding 9$", "Binding 4"]], "mismatched"),
+    # texel buffer, read_write: the two float buffers change bindings
+    ("texel_buffer_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # texel buffer, read_write: the mirrored read of the read-only buffer is one texel lower
+    ("texel_buffer_read_write", [[r"OpBitcast %uint %int_1$", "OpBitcast %uint %int_2"]], "mismatched"),
+    # R texel buffer, read: the float fetch returns its first component twice (a read that fills the missing ones from x)
+    ("texel_buffer_r_read", [[r"(OpImageFetch %v4float %\d+ %\d+\n\s+)OpStore (%\d+) (%\d+)( Aligned 16)",
+                              r"\1%9001 = OpVectorShuffle %v4float \3 \3 0 0 2 3\n OpStore \2 %9001\4"]], "mismatched"),
+    # RG texel buffer, read: the uint fetch returns its second component in the third place as well
+    ("texel_buffer_rg_read", [[r"(OpImageFetch %v4uint %\d+ %\d+\n\s+)OpStore (%\d+) (%\d+)( Aligned 16)",
+                               r"\1%9001 = OpVectorShuffle %v4uint \3 \3 0 1 1 3\n OpStore \2 %9001\4"]], "mismatched"),
+    # R texel buffer, write: the float4 stored into the float buffer has its x and y swapped, and only x is kept
+    ("texel_buffer_r_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # RG texel buffer, write: the uint4 stored has its y and z swapped, and x and y are kept
+    ("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+) (%\d+) (%\d+) (%\d+)", r"\1 \3 \2 \4"]], "mismatched"),
+    # R and RG texel buffers, read_write: the R float and the RG float buffer change bindings
+    ("texel_buffer_narrow_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+]
+
+# Equivalent mutant: components past the texel format are not stored, so swapping z and w of a write to an RG buffer
+# changes no byte on either side, and the harness must not call it a mismatch (else the format is not what is compared).
+# Likewise y and z of a write to an R buffer: if the R directive silently fell back to RGBA, this would change bytes.
+EQUIVALENT = [("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+ %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]]),
+              ("texel_buffer_r_write", [[r"(OpCompositeConstruct %v4float %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]])]
+
+rc, out, data = run(probe("texture_read"))
+if rc == 77:
+    print(out)
+    sys.exit(77)
+
+for name in BASELINES:
+    rc, out, data = run(probe(name))
+    assert rc == 0 and data["status"] == "matched", (name, rc, out)
+    assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
+assert run(probe("texture_unused"))[2]["unused"].keys() == {"ignored"}
+
+for name, edits, status in MUTANTS:
+    rc, out, data = mutated(probe(name), edits)
+    assert rc == 1 and data["status"] == status, ("mutant not detected", name, edits, rc, out)
+
+for name, edits in EQUIVALENT:
+    rc, out, data = mutated(probe(name), edits)
+    assert rc == 0 and data["status"] == "matched", ("equivalent mutant reported", name, rc, out)
+
+# DIFFCHECK-TEXEL on a name that is no texture_buffer is a typo, not a silent no-op.
+with tempfile.TemporaryDirectory() as d:
+    typo = os.path.join(d, "texel_typo.metal")
+    with open(probe("texel_buffer_r_read")) as src, open(typo, "w") as dst:
+        dst.write(src.read().replace("TEXEL: f 1", "TEXEL: ff 1"))
+    rc, out, data = run(typo)
+    assert rc == 2 and "ff" in out, (rc, out)
+
+# Without the directive the file-wide 4 ULP bound hides the one ULP error: the directive is what catches it.
+with tempfile.TemporaryDirectory() as d:
+    loose = os.path.join(d, "ulp_loose.metal")
+    with open(probe("ulp_per_buffer")) as src, open(loose, "w") as dst:
+        dst.write("".join(l for l in src if "DIFFCHECK-ULP" not in l))
+    rc, out, data = mutated(loose, next(edits for name, edits, _ in MUTANTS if name == "ulp_per_buffer"))
+    assert rc == 0 and data["status"] == "matched", ("the bound is no longer file-wide", rc, out)
+
+# A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
+rc, out, data = run(fixture("texture_unused_undeclared"))
+assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texture_stale_unused"))
+assert rc == 2 and data["status"] == "error" and "used" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texture_write_kernel"))
+assert rc == 3 and "access Write" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texel_buffer_unused_undeclared"))
+assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texel_buffer_unused_read_write"))
+assert rc == 1 and data["status"] == "unused-texture" and "w" in data["reason"], (rc, out)
+# A read-only texel buffer swapped for a read_write one has a different descriptor type: the harness must not
+# call that a match or a mismatch (lavapipe currently crashes on it, which is an error).
+rc, out, data = mutated(probe("texel_buffer_read_write"), [["Binding 1$", "Binding 9"], ["Binding 5$", "Binding 1"], ["Binding 9$", "Binding 5"]])
+assert rc == 2 and data["status"] == "error", (rc, out)
+rc, out, data = run(fixture("texture_kernel"))
+assert rc == 0 and data["status"] == "matched", (rc, out)
+with tempfile.TemporaryDirectory() as d:
+    typo = os.path.join(d, "typo.metal")
+    with open(probe("texture_unused")) as src, open(typo, "w") as dst:
+        dst.write(src.read().replace("UNUSED: ignored", "UNUSED: ignord"))
+    rc, out, data = run(typo)
+    assert rc == 2 and "ignord" in out, (rc, out)
+
+# A host that says it cannot make the texel buffer (a format or feature the device lacks) is a skip with that reason,
+# never a pass.
+with tempfile.TemporaryDirectory() as d:
+    for side, host in (("lavapipe", "vk"), ("Apple", "metal")):
+        stub = os.path.join(d, side)
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\necho 'x: unsupported: no such format' >&2\nexit 2\n".replace("x:", "vkhost:" if host == "vk" else "metalhost:"))
+        os.chmod(stub, 0o755)
+        rc, out, data = run(probe("texel_buffer_read"), **{host: stub})
+        assert rc == 3 and data["status"] == "skipped" and ("unsupported: %s: no such format" % side) in data["reason"], (side, rc, out)
+
+# A host that crashes or hangs on a kernel with textures is an error naming the cause, not a skip or a pass.
+with tempfile.TemporaryDirectory() as d:
+    for name, body, expect in (("crash", "kill -SEGV $$", "exit -11"), ("hang", "exec sleep 60", "timed out")):
+        stub = os.path.join(d, name)
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\n%s\n" % body)
+        os.chmod(stub, 0o755)
+        rc, out, data = run(probe("texture_read"), "--timeout", "20" if name == "crash" else "3", vk=stub)
+        assert rc == 2 and data["status"] == "error" and expect in data["reason"], (name, rc, out)
+print("PASS")

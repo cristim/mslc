@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // #288 (cross-agent review of #264): a helper parameter named like a struct tag, with no
 // namespace or using declaration anywhere, is just the parameter inside the helper's body.
 #include <metal_stdlib>

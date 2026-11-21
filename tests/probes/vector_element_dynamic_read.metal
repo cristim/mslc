@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
+// DIFFCHECK-RANGE: ix 0 3
 // DISASM-MATCH: = OpVectorExtractDynamic %float
 //
 // A run-time index of any integer width, or a bool, selects a lane (#53).

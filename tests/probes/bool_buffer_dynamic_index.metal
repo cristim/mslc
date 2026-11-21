@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: which 0 255
 // DISASM-MATCH: OpAccessChain %_ptr_PhysicalStorageBuffer_uchar %[0-9]+ %uint_0[_0-9]* %[0-9]+
 //
 // A bool buffer indexed by a run-time value is an access chain to the byte.

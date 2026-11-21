@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: ix 0 63
 // DISASM-MATCH: = OpUConvert %uint
 //
 // A 64-bit index is narrowed to the 32 bits an access chain index is.

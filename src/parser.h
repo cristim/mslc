@@ -3,6 +3,8 @@
 #include "ast.h"
 
 #include <cstdint>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -16,6 +18,34 @@ namespace mslc {
 // Exposed because whether such a name is an error depends on scope, which only
 // the emitter knows: a parameter is free to be called "position".
 bool isMSLBuiltinName(std::string_view name);
+
+// A template argument that makes a template's declaration ill-formed (an enable_if that is not
+// satisfied). During overload resolution it removes that template from the candidates, as in C++
+// (SFINAE); anywhere else it is an error like any other.
+class SubstitutionFailure: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
+// One instance of a function template as an ordinary helper: the template's tokens re-parsed
+// with the arguments bound, one per template parameter and in order. With withBody false only
+// the signature is read, so that a call can be ranked before an instance is committed to.
+// A CompileError says what in the template the subset does not lower.
+FunctionDecl instantiateTemplate(const FunctionTemplate& declaration,
+	const std::vector<TemplateArgument>& arguments, bool withBody);
+
+// The default of template parameter "index", read under the arguments bound before it.
+TemplateArgument templateDefault(const FunctionTemplate& declaration, size_t index,
+	const std::vector<TemplateArgument>& bound);
+
+// A function template's instance names an instance of a class template that the file has not made. The
+// parser that reads the instance cannot declare it, so compile parses again with the seed made up front.
+class NeedClassInstance: public std::exception {
+public:
+	explicit NeedClassInstance(ClassInstanceSeed seed): seed(std::move(seed)) {}
+	const char* what() const noexcept override { return "a class template instance is needed"; }
+	ClassInstanceSeed seed;
+};
 
 // Parses an MSL token stream into a translation unit.
 //
@@ -42,6 +72,16 @@ class Parser {
 		std::string owner; // the tag of that enum, or "<anonymous>" when it has none
 	};
 	std::map<std::string, EnumConstant> _enumConstants;
+
+	// A const or constexpr integer whose initialiser folded, so an array length may name it.
+	// File-scope ones are kept by qualified name, local ones in the block that declares them.
+	struct ConstantInt {
+		int64_t value;
+		ScalarKind kind;
+	};
+	std::map<std::string, ConstantInt> _constantInts;
+	// The struct whose body is being parsed, so an array length can tell a member from a constant.
+	const StructDecl* _structBody = nullptr;
 	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type
 	ScalarKind _lastEnumUnderlying = ScalarKind::Int;
 
@@ -59,6 +99,9 @@ class Parser {
 	// namespaces a using directive named and the names a using declaration brought in.
 	struct NamespaceScope {
 		std::vector<std::string> directives;
+		// The inline namespaces declared directly in this one: their members are this
+		// scope's own for every lookup, not only through a directive.
+		std::vector<std::string> inlines;
 		// A name to what using declarations brought in under it: several functions
 		// overload, so a call is resolved (or found ambiguous) where it is made.
 		std::map<std::string, std::set<std::string>> declarations;
@@ -77,7 +120,14 @@ class Parser {
 	struct BlockScope {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
+		std::map<std::string, ConstantInt> constants;
+		// The declared type of each object whose type is final and sizeof can use; a name this block
+		// declares without an entry here is one whose type is not known (auto, a resource).
+		std::map<std::string, Type> objectTypes;
 		std::vector<std::string> directives;
+		// Set on the outermost block of a function body or a for body, whose names share a C++
+		// scope with the enclosing parameters or init declaration.
+		bool sharesEnclosingScope = false;
 	};
 	std::vector<BlockScope> _blocks;
 
@@ -98,9 +148,13 @@ public:
 	// nesting is capped by kMaxNestingDepth.
 	static constexpr uint32_t kMaxExpressionHeight = 4000;
 
-	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) {}
+	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); }
 
 	TranslationUnit parse();
+
+	// Class template instances to make before the first declaration that can see their class template and
+	// argument types, in order (an argument may be an earlier seed).
+	void setSeeds(std::vector<ClassInstanceSeed> seeds);
 
 	// Index of the token the parser is at, which is the one a failure is about.
 	size_t position() const { return _position; }
@@ -121,7 +175,7 @@ private:
 
 	// The body of an if, else, for or while: a block counts itself, anything else
 	// counts here.
-	StatementPtr parseBody();
+	StatementPtr parseBody(bool sharesEnclosingScope = false);
 
 	const Token& current() const { return _tokens[_position]; }
 	const Token& lookahead(size_t offset = 1) const;
@@ -162,6 +216,126 @@ private:
 		bool hasDefault = false;
 	};
 	std::map<std::string, ConstructorInfo> _constructors;
+
+	// Everything a name lookup reads, copied where a function template is declared, so that
+	// each instance of it is parsed as if at that point of the file.
+	struct Names {
+		std::map<std::string, Type> typedefs;
+		std::map<std::string, std::string> enumTypes;
+		std::map<std::string, EnumConstant> enumConstants;
+		std::map<std::string, ScalarKind> enumUnderlying;
+		std::map<std::string, std::string> declared;
+		std::map<std::string, std::string> declaredBesideTag;
+		std::vector<std::string> namespacePath;
+		std::set<std::string> namespaces;
+		std::map<std::string, std::string> namespaceAliases;
+		std::map<std::string, NamespaceScope> scopes;
+		std::deque<StructDecl> structs;
+		std::set<std::string> functionTemplates;
+		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
+		std::map<std::string, ConstantInt> constantInts;
+		std::map<std::string, ConstructorInfo> constructors;
+		std::set<std::string> memberTemplateNames;
+		std::set<std::string> seedKeys;
+	};
+	std::shared_ptr<const Names> captureNames() const;
+	void restoreNames(const Names& names);
+	// The name state where a template's declaration ends, read from the file once and kept.
+	static std::shared_ptr<const Names> namesAt(const FunctionTemplate& declaration);
+	size_t _stopAt = SIZE_MAX;
+	// An instance being read: the block that holds its parameters, and the parameters whose declared type
+	// names a template parameter.
+	size_t _parameterBlock = SIZE_MAX;
+	std::set<std::string> _dependentParameters;
+	bool namesDependentParameter(const std::string& name) const;
+	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
+	friend TemplateArgument templateDefault(const FunctionTemplate&, size_t, const std::vector<TemplateArgument>&);
+	FunctionDecl parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
+		bool withBody);
+	// Binds the parameters of a template in an outermost block: a type as a typedef, a constant
+	// as an enumerator-like constant, each under a key no source spelling can reach.
+	void bindTemplateArguments(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments);
+	void bindParameters(const std::string& owner, const std::vector<TemplateParameter>& parameters,
+		const std::vector<TemplateArgument>& arguments);
+
+	// Class templates, by qualified name. A use that spells "Name<arguments>" is read as one name, that of the
+	// instance, which declares the struct the first time it is met (see instantiateClass).
+	std::map<std::string, std::shared_ptr<const ClassTemplate>> _classTemplates;
+	// Instances being read, so that a member naming its own instance finds it.
+	std::set<std::string> _classInProgress;
+	size_t _classDepth = 0;
+	// This parser reads a function template's instance (parseInstance); each instance has its own parser.
+	bool _inInstance = false;
+	// Indices into _unit.helpers already stamped by a class instance, so an enclosing instance leaves them.
+	std::set<size_t> _instanceHelpers;
+	// A parser that reads a function template instance declares no struct: the unit it fills is not the one
+	// the emitter reads, so an instance it needs has to exist already.
+	bool _frozenClasses = false;
+	// The seeds this parse was given, which are made once their class template and arguments exist.
+	std::vector<ClassInstanceSeed> _seeds;
+	std::vector<bool> _seeded;
+	std::set<std::string> _seedKeys;
+	std::shared_ptr<const std::vector<ClassInstanceSeed>> _seedList;
+	void makeSeeds();
+	void parseTopLevel() {
+		makeSeeds();
+		parseDeclaration();
+	}
+	// The spelling of an instance's name, which the tokens that carry it point into.
+	std::shared_ptr<std::deque<std::string>> _spellings = std::make_shared<std::deque<std::string>>();
+	// The parts of the parser's position that belong to what is being read, which an instance reads over
+	// (swapContext), so that a name in one never sees a local of the place that named it.
+	struct Context {
+		std::vector<Token> tokens;
+		size_t position = 0;
+		std::vector<BlockScope> blocks;
+		const StructDecl* structBody = nullptr;
+		std::vector<size_t> pendingMembers;
+		std::vector<FunctionTemplate> pendingMemberTemplates;
+		const std::set<std::string>* memberFields = nullptr;
+		std::map<std::string, bool> memberFunctions;
+		std::string memberStruct;
+		size_t parameterBlock = SIZE_MAX;
+		std::set<std::string> dependentParameters;
+		int switchDepth = 0;
+		std::vector<StatementPtr> declaratorTail;
+		bool noGreater = false;
+		bool inEnableIf = false;
+		bool dependentCondition = false;
+		size_t stopAt = SIZE_MAX;
+		std::vector<std::string> namespacePath;
+	};
+	void swapContext(Context& other);
+	// Room for every ">>" to become two tokens, so that splitting one while a name is peeked never moves
+	// the tokens a caller holds a reference to.
+	static void reserveSplits(std::vector<Token>& tokens);
+	// The using directives and declarations in the scopes a name in a template of this namespace path is read from.
+	size_t usingCount(const std::vector<std::string>& path, const std::set<std::string>& mentioned,
+		const std::vector<std::string>& aliasTargets) const;
+	// A call in a class template that argument-dependent lookup could send to a function declared below it,
+	// checked once the whole file is read (clang instantiates at the end of the file).
+	struct AdlCheck {
+		std::string templateName;
+		size_t order = 0;
+		std::string call;
+	};
+	size_t usingDeclarationsOf(const std::string& name) const;
+	std::vector<AdlCheck> _adlChecks;
+	void parseClassTemplate(ClassTemplate& declaration);
+	// The class template a name spelled by parts names, or null; a local of the name hides it.
+	const ClassTemplate* classTemplateNamed(const std::vector<std::string>& parts, bool global) const;
+	std::vector<TemplateArgument> parseClassTemplateArguments(const ClassTemplate& declaration);
+	// The qualified name of the instance, declared if it is new.
+	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
+	TemplateArgument parseTemplateArgument();
+	void parseTemplateHeader(FunctionTemplate& declaration);
+	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
+	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
+	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
+	void parseMemberTemplate(const StructDecl& decl);
+	std::vector<FunctionTemplate> _pendingMemberTemplates;
+	// The names of the member function templates declared so far, so that "v.f<float>(x)" reads its arguments.
+	std::set<std::string> _memberTemplateNames;
 	std::vector<size_t> _pendingMembers;
 	// The fields of the struct whose member function is being parsed: a bare use of
 	// one means this.field.
@@ -224,8 +398,25 @@ private:
 	// The one namespace "part" names inside "scope" ("" if none); several is ambiguous.
 	std::string childNamespace(const std::string& scope, const std::string& part, bool qualified, NamespaceLookup mode) const;
 
-	void parseNamespace();
+	void parseNamespace(bool isInline = false);
 	void parseNamespaceAlias();
+	std::vector<std::string> inlineClosure(const std::string& scope) const;
+	// Whether "path" is a namespace: one the file declares, or the library's metal.
+	bool isNamespacePath(const std::string& path) const;
+	// How many leading parts of the name ahead spell the library's namespace metal by an
+	// alias (or by a leading "::"), and the tokens they take with the "::" after them; the
+	// plain, nearest "metal::" is the literal branches' and counts as none.
+	size_t libraryPrefixParts(const QualifiedName& name) const;
+	size_t libraryPrefixTokens() const;
+	// Whether the cursor is at metal::array<, spelled with or without the namespace unless the file
+	// declares its own array; nameTokens is how many tokens the name takes.
+	bool atStdArray(size_t& nameTokens) const;
+	// array<T, N> after its qualifiers, folded into type as the array T[N] with isStdArray set.
+	void parseStdArray(Type& type, size_t nameTokens);
+	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
+	bool libraryNominatedFromHere() const;
+	// The library's resource type name that a library prefix qualifies, or 0.
+	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();
 
 	bool peekQualifiedName(QualifiedName& out) const;
@@ -234,14 +425,19 @@ private:
 	// The file-scope name a spelling refers to from here: its qualified name, or the
 	// spelling itself when it names no declaration (a builtin). A qualified spelling
 	// that names nothing is a CompileError.
-	std::string resolveName(const QualifiedName& name) const;
+	// With "alternatives", a name that finds several functions is their overload set, not an
+	// ambiguity: they are returned there and the first is the result.
+	std::string resolveName(const QualifiedName& name, std::vector<std::string>* alternatives = nullptr) const;
+	std::string resolveNameUnchecked(const QualifiedName& name, std::vector<std::string>* alternatives) const;
+	// While an instance of a class template is read: the names its template was declared above.
+	const std::set<std::string>* _definedNames = nullptr;
 	// The declarations an unqualified name finds at the innermost namespace level that has
 	// any, without reporting several as ambiguous (a declaration site is not a use). With
 	// "besideStdlib", also whether the standard library's names are visible there or nearer:
 	// the level is namespace metal, or a using directive or declaration brings them to it.
 	std::set<std::string> unqualifiedFound(const std::string& last, bool* besideStdlib = nullptr) const;
 	// The name at the current token, resolved, and how many tokens spell it.
-	std::string peekResolved(size_t& tokens) const;
+	std::string peekResolved(size_t& tokens, std::vector<std::string>* alternatives = nullptr) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
 	// With "besideStdlib", also whether the walk visited namespace metal or a scope with a
 	// "using metal::name;" of this name, directly or through a directive it follows.
@@ -265,18 +461,47 @@ private:
 
 	// Resolves a scalar, vector, matrix or typedef name to its type.
 	bool resolveTypeName(std::string_view text, Type& out) const;
+	bool objectHidesTag(const std::string& name) const;
+	bool memberHidesName(const std::string& name) const;
 
 	// A constant integer expression: literals, enum constants and the operators
 	// on them. Anything that is not a constant is a CompileError.
-	int64_t evaluateConstant(const Expression& expression, bool nested) const;
+	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
+	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
+	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
+	// current block's, otherwise the file's.
+	void recordConstant(const VariableDeclaration& declaration, bool local);
+	void recordObjectType(const std::string& name, const Type& type);
+	std::optional<Type> declaredObjectType(const Expression& operand) const;
+	// declaredObjectType, and a member of a declared struct value that is itself typed this way.
+	std::optional<Type> declaredPartType(const Expression& operand) const;
+	// The expression an array<T, N> member call is: a constant of the length for size(),
+	// max_size() and empty(), the element at 0 or N - 1 for front() and back(). Null when the
+	// receiver is not a declared array<T, N> or the call is another one; consumes the "()" if it
+	// is one.
+	ExpressionPtr foldStdArrayCall(ExpressionPtr& receiver);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	// A file-scope function that is not an entry point. False, with the position
 	// restored, when the tokens ahead are not a function's return type, name and
 	// opening parenthesis, so a file-scope constant still reaches its own parser.
 	bool tryParseHelperFunction();
+	void parseTemplateDeclaration();
+	void skipBalanced(TokenKind open, TokenKind close);
+	void skipFunctionAttribute();
+	// The <type_traits> subset (is_same, is_floating_point, enable_if, make_scalar ...), folded
+	// where the types are known.
+	void closeAngle(const char* what);
+	std::string libraryName(const std::string& resolved) const;
+	ExpressionPtr tryParseTraitValue();
+	void parseTraitType(const std::string& name, Type& type);
+	bool _noGreater = false;
+	bool _inEnableIf = false;
+	bool _dependentCondition = false;
 	size_t _functionOrder = 0;
-	VariableDeclaration parseGlobalDeclaration();
+	void parseGlobalDeclaration();
+	VariableDeclaration parseGlobalDeclarator(VariableDeclaration declaration);
 
 	// Reads a bare identifier used as a name, such as a struct field's.
 	void expectFieldName(std::string& out);
@@ -290,11 +515,16 @@ private:
 	// allowResource is true where a texture or sampler type may be spelled: an
 	// entry point parameter, and a local declaration, which only a sampler may be.
 	// allowAuto is true only for a local, the one place an auto type is lowered.
-	Type parseType(bool allowResource = false, bool allowAuto = false);
+	// base, when given, receives the type before any star, for the declarators that follow the first.
+	Type parseType(bool allowResource = false, bool allowAuto = false, Type* base = nullptr);
+	void parseDeclaratorStars(Type& type);
 	size_t parseSpecifierRun(Type& type);
 	void parseResourceType(Type& type);
 	bool parseQualifier(Type& type, bool afterPointer);
+	VariableDeclaration parseNextLocalDeclarator(const Type& base);
 	void parseSamplerLocal(VariableDeclaration& declaration);
+	bool parensDeclareFunction();
+	void rejectParameterListInitializer(const VariableDeclaration& declaration);
 	void parseLocalInitializer(VariableDeclaration& declaration);
 	void parseAutoInitializer(VariableDeclaration& declaration);
 	void appendStatement(std::vector<StatementPtr>& out);
@@ -328,16 +558,19 @@ private:
 	// The declarations after the first of "T a, b, c;", which parseStatement leaves
 	// for the list it is appending to.
 	std::vector<StatementPtr> _declaratorTail;
-	StatementPtr parseCompoundStatement();
+	StatementPtr parseCompoundStatement(bool sharesEnclosingScope = false);
 	StatementPtr parseIfStatement();
 	StatementPtr parseForStatement();
 	StatementPtr parseWhileStatement();
+	StatementPtr parseDoWhileStatement();
 	StatementPtr parseSwitchStatement();
 	StatementPtr parseReturnStatement();
 
 	// Expressions, by precedence level.
 	ExpressionPtr parseExpression();
 
+	// "<float, 3>" after the name of a member function template in a call, read into member's template arguments.
+	void parseMemberTemplateArguments(Expression& member, bool keyword = false);
 	// The comma-separated list inside a pair of parentheses, up to and including
 	// the closing one. A call and a constructor differ in what they are called,
 	// not in how their arguments are separated.
@@ -359,6 +592,7 @@ private:
 	ExpressionPtr parseAdditive();
 	ExpressionPtr parseMultiplicative();
 	ExpressionPtr parseUnary();
+	ExpressionPtr parseSizeof();
 	ExpressionPtr parsePostfix();
 	ExpressionPtr parsePrimary();
 

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // REFLECT: "metal_index": 5
 
 //

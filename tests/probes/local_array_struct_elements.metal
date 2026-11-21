@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
+// DIFFCHECK-FLOAT-RANGE: in 0 1
 // A struct element: its fields and a vector field component are read and written through the index.
 struct S { float x; float4 v; };
 kernel void local_array_struct_elements(device float *o [[buffer(0)]], constant float *in [[buffer(1)]]) {

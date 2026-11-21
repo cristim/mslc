@@ -79,12 +79,22 @@ int main(int argc, char** argv) {
 	accepted("");
 	accepted("// comment\n#include <metal_stdlib>\nusing namespace metal;;\n#if 0\nfloat bad;\n#endif\n");
 	accepted("#define U using namespace metal;\nU\n");
-	const char* declarations[] = {"float helper() { return 1; }", "float helper();", "float global;",
+	const char* declarations[] = {"float global;",
 		"typedef float Alias;", "enum E {};", "enum {};", "struct S {};", "namespace N {}",
-		"namespace N = metal;", "using Alias = float;", "using metal::float4;",
-		"fragment float4 entry() { return float4(1); }"};
+		"namespace N = metal;", "using Alias = float;", "using metal::float4;"};
 	for (size_t i = 0; i < sizeof(declarations) / sizeof(*declarations); ++i)
 		rejected(declarations[i], NULL, NULL);
+	/* A unit with functions is a Linkage object with content, not the empty one. */
+	const char* objects[] = {"float helper() { return 1; }", "float helper();",
+		"fragment float4 entry() { return float4(1); }"};
+	for (size_t i = 0; i < sizeof(objects) / sizeof(*objects); ++i) {
+		uint8_t* bytes = NULL;
+		size_t size = 0;
+		char* error = NULL;
+		CHECK(mslc_compile_library(objects[i], strlen(objects[i]), NULL, &bytes, &size, &error) == 0);
+		CHECK(bytes != NULL && size >= 56 && error == NULL);
+		mslc_free(bytes);
+	}
 	rejected(NULL, NULL, "no source given");
 	rejected("typedef Missing Alias;", NULL, NULL);
 	rejected("using namespace metal", NULL, NULL);
@@ -107,12 +117,25 @@ int main(int argc, char** argv) {
 	rejected("", &options, "NULL entry");
 	mslc_default_options(&options);
 	options.sourcePath = "library-api.metal";
-	const char* included[] = {"float global;", "float helper() { return 1; }",
+	const char* included[] = {"float global;",
 		"typedef float Alias;", "enum {};"};
 	for (size_t i = 0; i < sizeof(included) / sizeof(*included); ++i) {
 		FILE* header = fopen("library-api-included.h", "w");
 		CHECK(header != NULL && fputs(included[i], header) >= 0 && fclose(header) == 0);
 		rejected("#include \"library-api-included.h\"\n", &options, "library-api-included.h:1:");
+	}
+	/* A helper in an included header is content too: accepted, where the other
+	 * declarations above are still refused with the header's own position. */
+	{
+		FILE* header = fopen("library-api-included.h", "w");
+		CHECK(header != NULL && fputs("float helper() { return 1; }", header) >= 0 && fclose(header) == 0);
+		const char* include = "#include \"library-api-included.h\"\n";
+		uint8_t* bytes = NULL;
+		size_t size = 0;
+		char* diagnostic = NULL;
+		CHECK(mslc_compile_library(include, strlen(include), &options, &bytes, &size, &diagnostic) == 0);
+		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
+		mslc_free(bytes);
 	}
 	char* error = NULL;
 	CHECK(mslc_translate("", 0, NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);

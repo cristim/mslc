@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -39,6 +40,8 @@ private:
 	std::map<spirv::Id, MatrixInfo> _matrixInfo;
 	std::map<std::pair<spirv::Id, uint32_t>, spirv::Id> _arrays;
 	std::map<spirv::Id, spirv::Id> _arrayElement;
+	std::map<spirv::Id, uint32_t> _arrayLengths;
+	std::map<std::tuple<spirv::Id, uint32_t, uint32_t>, spirv::Id> _laidOutArrays;
 	std::map<std::pair<spirv::StorageClassValue, spirv::Id>, spirv::Id> _pointers;
 	std::map<std::string, spirv::Id> _structs;
 	std::map<std::string, spirv::Id> _valueStructs;
@@ -54,12 +57,14 @@ private:
 	bool _storage8Declared = false;
 
 	spirv::Id _voidType = spirv::InvalidId;
-	std::map<ResourceKind, spirv::Id> _images;
-	std::map<ResourceKind, spirv::Id> _sampledImages;
+	std::map<std::tuple<ResourceKind, ScalarKind, bool, bool>, spirv::Id> _images;
+	std::map<std::tuple<ResourceKind, ScalarKind, bool, bool>, spirv::Id> _sampledImages;
 	spirv::Id _samplerType = spirv::InvalidId;
-	std::map<ScalarKind, spirv::Id> _storageImages;
+	std::map<std::pair<ResourceKind, ScalarKind>, spirv::Id> _storageImages;
+	std::map<ScalarKind, spirv::Id> _subpassImages;
 	bool _storageReadDeclared = false;
 	bool _storageWriteDeclared = false;
+	std::set<uint32_t> _capabilities;
 
 	// A matrix member of a laid-out struct needs ColMajor and MatrixStride, which
 	// SPIR-V only allows on a struct member, so every struct with an Offset on a
@@ -81,8 +86,15 @@ public:
 	spirv::Id matrix(ScalarKind kind, uint32_t columns, uint32_t rows);
 	// A fixed-length array of element, in Function storage, so it carries no stride.
 	spirv::Id array(spirv::Id element, uint32_t length);
+	// An array of element whose length is the given constant id, which may be a specialization
+	// constant. Not cached, and arrayLength() answers 0 for it.
+	spirv::Id arrayOfLengthId(spirv::Id element, spirv::Id lengthId);
 	// The element type of an array this table made, or InvalidId for anything else.
 	spirv::Id arrayElement(spirv::Id type) const;
+	// The length of an array this table made, or 0 for anything else.
+	uint32_t arrayLength(spirv::Id type) const;
+	// An array of element with the given byte stride, as a laid-out struct holds one.
+	spirv::Id laidOutArray(spirv::Id element, uint32_t length, uint32_t stride);
 
 	// The image a texture2d, texturecube, texture3d or texture2d_array of float or
 	// half is declared as: a float sampled type, sampled by a sampler (Sampled 1),
@@ -90,14 +102,20 @@ public:
 	// texture2d_array), which is what Iridium declares (indium
 	// src/iridium/air.cpp:771-785). The component type is not in the image type;
 	// a half texture's samples are narrowed after the lookup.
-	spirv::Id image(ResourceKind kind);
-	// The storage image (Sampled 2, format Unknown) an access::read or access::write
-	// texture2d is declared as, with a uint or a float sampled type; a half texture
+	spirv::Id image(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled);
+	// Declares a capability once, whichever image type first needs it.
+	void requireCapability(spirv::CapabilityValue capability);
+	spirv::Id imageOf(ResourceKind kind, ScalarKind sampledType, uint32_t sampled, bool depth, bool multisampled);
+	// The storage image (Sampled 2, format Unknown) a texture of any access but
+	// sample is declared as, with a uint or a float sampled type; a half texture
 	// is a float image narrowed after the read, as for a sampled one. Iridium
 	// declares every non-sample texture this way (indium src/iridium/air.cpp:772).
-	spirv::Id storageImage(TextureAccess access, ScalarKind element);
+	spirv::Id storageImage(ResourceKind kind, TextureAccess access, ScalarKind element);
+	// An input attachment of the given sampled scalar, which is how Vulkan reads the
+	// framebuffer at the fragment's own pixel.
+	spirv::Id subpassImage(ScalarKind element);
 	spirv::Id samplerType();
-	spirv::Id sampledImage(ResourceKind kind);
+	spirv::Id sampledImage(ResourceKind kind, ScalarKind sampledType, bool depth, bool multisampled);
 
 	// How a packed vector of the given type is stored in a laid-out struct or
 	// buffer: an array of its components, strided by the component's size.
@@ -125,6 +143,8 @@ public:
 	std::optional<spirv::StorageClassValue> storageClassOf(spirv::Id pointerType) const;
 
 	bool isFloat(spirv::Id type) const;
+	// Whether a half has been declared, which is when the module needs Float16 behaviour pinned.
+	bool declaresHalf() const { return _scalars.count(static_cast<uint32_t>(ScalarKind::Half)) != 0; }
 	bool isBool(spirv::Id type) const;
 	bool isSignedInt(spirv::Id type) const;
 	uint32_t vectorWidth(spirv::Id type) const;
@@ -279,13 +299,20 @@ struct ModuleOptions {
 	bool separateImageSet = false;
 	// Kernels without a barrier skip the threads outside a grid size given through specialization constants
 	bool maskGridSize = false;
+	// A Linkage object rather than a Vulkan executable: it may have no entry point,
+	// exports the helpers it defines, and may call a helper it only declares.
+	bool linkageObject = false;
+	// With linkageObject: the defined helpers to export. Set by emitModule once it knows
+	// which ones lower without a stage.
+	std::optional<std::set<std::string>> exportOnly;
 };
 
 // The reflection's embedded_samplers entries carry the whole of indium's
-// EmbeddedSampler. The options that set compare_function, anisotropy,
+// EmbeddedSampler. compare_function is the compare_func option (Never when unset,
+// the names Never, Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual and
+// Always). The options that set anisotropy,
 // border_color and the lod clamp are refused, so those fields hold Apple's
-// defaults for a sampler that does not set them: compare_function Never (8 in
-// Apple's sampler state word), anisotropy 1, border_color TransparentBlack,
+// defaults for a sampler that does not set them: anisotropy 1, border_color TransparentBlack,
 // lod_min 0 and lod_max 65504 (the largest half). A consumer must not zero-fill
 // them: lod_max 0 would restrict the sampler to mip level 0.
 //
@@ -294,6 +321,37 @@ struct ModuleOptions {
 // "name": field }. n is the field's [[attribute(n)]], the key of indium's vertex
 // descriptor attribute, and is also the Location of the Input variable. On this
 // entry metal_index is an attribute index, never a [[buffer(n)]] index.
+// A fragment function's [[color(n)]] parameter or [[stage_in]] field is framebuffer fetch,
+// one binding per attachment, in colour order, after the textures and samplers:
+// { "kind": "InputAttachment", "metal_index": n, "descriptor": { "set": 1, "binding": b },
+// "input_attachment_index": n, "scalar": "float"|"int"|"uint", "name": ... }. metal_index and
+// input_attachment_index are deliberately equal: both are the colour attachment's index n, the
+// first as Metal numbers it (Apple's render_target index) and the second as the subpass's
+// pInputAttachments slot. The binding comes after every texture, sampler and constexpr sampler.
+// The image is always single-sample (MS 0): a multisampled colour attachment would need a
+// different image type, which mslc does not emit.
+// The variable is an OpTypeImage SubpassData with InputAttachmentIndex n, read at the
+// fragment's own pixel. A consumer binds the colour attachment's view as an input
+// attachment descriptor at that binding and maps pInputAttachments[n] to colour attachment n
+// in the subpass. A half4 is a float image; the module converts.
+// A texture_buffer<T, access> parameter is its own kind, never "Texture":
+// { "kind": "TextureBuffer", "metal_index": n, "descriptor": { "set": s, "binding": b },
+// "descriptor_type": "UniformTexelBuffer"|"StorageTexelBuffer", "texture_access": "Read"|"Write"|"ReadWrite",
+// "param_index": i, "name": ... }. The host binds a VkBufferView at that binding, not an image view.
+// access::read is a sampled texel buffer (descriptor VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, buffer
+// usage UNIFORM_TEXEL_BUFFER, format feature UNIFORM_TEXEL_BUFFER), access::write and
+// access::read_write are storage texel buffers (VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, usage and
+// format feature STORAGE_TEXEL_BUFFER, and shaderStorageImage{Read,Write}WithoutFormat as for any
+// storage texture). The shader indexes it with a scalar uint texel index; the texel size comes from
+// the view's format. A consumer that does not know the kind skips the entry, as for any new kind.
+// A kernel's threadgroup memory argument (`threadgroup T *p [[threadgroup(n)]]`) adds
+// { "kind": "ThreadgroupMemory", "metal_index": n, "spec_id": s, "element_size": e,
+// "param_index": i, "name": ... }, in parameter order with the buffers. The variable is a Workgroup
+// array of T whose length is the OpSpecConstant s, which defaults to 1. Metal sets the byte length at
+// encode time (setThreadgroupMemoryLength:atIndex:) and Vulkan fixes it at pipeline creation, so the host
+// writes constantID s = max(1, bytes / e) into VkSpecializationInfo when it creates the pipeline, where e
+// is Metal's element size (a float3 is 16). SpecIds 0 to 2 are the workgroup size; the arguments take
+// 3 upward in declaration order across the module, so two kernels never share one. There is no descriptor.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //

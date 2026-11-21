@@ -1,4 +1,6 @@
 // EXPECT: valid
+// DIFFCHECK-FLOAT-RANGE: out 0 20
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: = OpFUnordNotEqual %bool %[_0-9a-zA-Z]+ %float_0[^_0-9a-zA-Z]
 // DISASM-MATCH: OpLoopMerge
 //

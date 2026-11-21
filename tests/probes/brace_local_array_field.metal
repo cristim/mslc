@@ -1,3 +1,4 @@
-// EXPECT: error an array field in value struct
-struct S { float[2] values; };
+// EXPECT: error an array of structs field in value struct
+struct E { float x; };
+struct S { E values[2]; };
 kernel void k(device float* out [[buffer(0)]]) { S s {}; out[0] = 0; }

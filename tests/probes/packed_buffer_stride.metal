@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: OpDecorate %_runtimearr__arr_float_uint_3 ArrayStride 12
 // DISASM-MATCH: OpDecorate %_arr_float_uint_3 ArrayStride 4
 // DISASM-NO-MATCH: ArrayStride 16

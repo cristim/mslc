@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
+// DIFFCHECK-FLOAT-RANGE: in 0 1
 kernel void local_array_half_bool_int(device float *o [[buffer(0)]], constant float *in [[buffer(1)]]) {
   int idx = int(in[0]);
   half h[2] = {1.5h, 2.5h};

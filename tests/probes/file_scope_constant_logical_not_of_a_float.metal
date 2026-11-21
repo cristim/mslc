@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM: = OpConstantFalse %bool
 
 //

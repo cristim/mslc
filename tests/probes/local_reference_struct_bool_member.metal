@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // A bool member is a byte in the buffer; reading and writing it through a reference
 // to the struct has to use the same byte mapping as the direct access.
 struct S { bool b; float f; };

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: = OpUConvert %uint %[0-9]+
 // DISASM-MATCH: = OpBitcast %int %[0-9]+
 // DISASM-MATCH: = OpShiftLeftLogical %int %[0-9]+ %int_9

@@ -1,0 +1,24 @@
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "f" %mask
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %mask BuiltIn SampleMask
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+        %one = OpConstant %uint 1
+        %arr = OpTypeArray %uint %one
+        %ptr = OpTypePointer Output %arr
+       %mask = OpVariable %ptr Output
+       %true = OpConstantTrue %bool
+       %zero = OpConstant %uint 0
+        %pu = OpTypePointer Output %uint
+          %v = OpConstantComposite %arr %one
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %chain = OpAccessChain %pu %mask %zero
+               OpStore %chain %one
+               OpStore %mask %v
+               OpReturn
+               OpFunctionEnd

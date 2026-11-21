@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: which 0 3
 // DISASM-MATCH: OpAccessChain %_ptr_PhysicalStorageBuffer_uchar
 //
 // One lane of a bool vector in a buffer is a byte of its own.

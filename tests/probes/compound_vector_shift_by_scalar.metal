@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: = OpCompositeConstruct %v4int %int_2 %int_2 %int_2 %int_2
 // DISASM-MATCH: = OpShiftLeftLogical %v4int %[0-9]+ %[0-9]+
 //

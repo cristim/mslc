@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 //
 // Bare "restrict" is not an MSL keyword, so it is a name like any other: Apple
 // reads it as an identifier in a local, a struct member, a parameter and a

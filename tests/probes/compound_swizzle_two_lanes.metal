@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: = OpVectorShuffle %v2float %[0-9]+ %[0-9]+ 3 1
 // DISASM-MATCH: = OpFAdd %v2float %[0-9]+ %[0-9]+
 // DISASM-MATCH: = OpVectorShuffle %v4float %[0-9]+ %[0-9]+ 0 5 2 4

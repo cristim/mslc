@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-NO-MATCH: OpStore %[_0-9a-zA-Z]+ %int_11[_0-9]* Aligned
 // DISASM-NO-MATCH: OpStore %[_0-9a-zA-Z]+ %int_44[_0-9]* Aligned
 // A local named like a name a using directive or declaration brings in hides it (Apple

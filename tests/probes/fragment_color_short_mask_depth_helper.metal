@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: fragment_color_short_mask_depth_helper SampleMask
 // DISASM: OpSConvert
 // DISASM: OpUConvert
 // DISASM: BuiltIn SampleMask

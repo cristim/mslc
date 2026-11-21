@@ -89,6 +89,13 @@ else()
 	set_tests_properties(indium-corpus PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 endif()
 
+add_test(NAME corpus-keep-output-same-basename COMMAND ${CMAKE_COMMAND}
+	-DCORPUS=$<TARGET_FILE:mslc-corpus>
+	-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus_same_basename
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/corpus_same_basename
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_corpus_keep_output.cmake)
+
 add_test(NAME validate-failure-exits-nonzero COMMAND ${CMAKE_COMMAND}
 	-DMSLC=$<TARGET_FILE:mslc-cli>
 	-DFAKE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/failing-spirv-val
@@ -267,6 +274,80 @@ add_test(NAME harness/crash_after_diag COMMAND ${CMAKE_COMMAND}
 set_tests_properties(harness/crash_after_diag PROPERTIES
 	PASS_REGULAR_EXPRESSION "crash_after_diag: mslc crashed")
 
+# A needle without the space after its colon is collected by nothing, so it would
+# pass while checking nothing; the runner has to reject the probe.
+add_test(NAME harness/unspaced_disasm_needle COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DSPIRV_DIS=${SPIRV_DIS}
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/unspaced_disasm_needle.metal
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+set_tests_properties(harness/unspaced_disasm_needle PROPERTIES
+	PASS_REGULAR_EXPRESSION "DISASM-NOT:OpEntryPoint")
+
+# A capture reference to a group no DISASM-CAPTURE line produced, and a CAPTURE
+# regex that matches nothing, must each fail the probe rather than check nothing.
+foreach(case IN ITEMS unmatched_disasm_capture failed_disasm_capture empty_disasm_capture_group)
+	add_test(NAME harness/${case} COMMAND ${CMAKE_COMMAND}
+		-DMSLC=$<TARGET_FILE:mslc-cli>
+		-DSPIRV_VAL=${SPIRV_VAL}
+		-DSPIRV_DIS=${SPIRV_DIS}
+		-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/${case}.metal
+		-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+endforeach()
+set_tests_properties(harness/unmatched_disasm_capture PROPERTIES
+	PASS_REGULAR_EXPRESSION "uses [$]2, but only 1 groups were captured")
+set_tests_properties(harness/failed_disasm_capture PROPERTIES
+	PASS_REGULAR_EXPRESSION "OpNoSuchInstruction")
+set_tests_properties(harness/empty_disasm_capture_group PROPERTIES
+	PASS_REGULAR_EXPRESSION "an optional group cannot be")
+
+# DISASM-ENTRY-STORES-PER-RETURN against hand-assembled SPIR-V, so the directive
+# is shown to fail: a fake compiler assembles the .spvasm beside each fixture.
+# stores_valid must pass; every other fixture must fail with the directive's message
+# (CMake wraps it, hence the [ \n]+).
+find_program(SPIRV_AS spirv-as)
+if(SPIRV_AS)
+	foreach(case IN ITEMS stores_valid stores_duplicated stores_missing stores_nonreturn
+			stores_no_return stores_chain_duplicated stores_kill stores_terminate)
+		add_test(NAME harness/${case} COMMAND ${CMAKE_COMMAND}
+			-DMSLC=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/assemble_sibling.sh
+			-DSPIRV_VAL=${SPIRV_VAL}
+			-DSPIRV_DIS=${SPIRV_DIS}
+			-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/${case}.metal
+			-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+			-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+		set_tests_properties(harness/${case} PROPERTIES ENVIRONMENT "SPIRV_AS=${SPIRV_AS}")
+	endforeach()
+	set_tests_properties(harness/stores_duplicated PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+2[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_missing PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+0[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_nonreturn PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpUnreachable[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+	set_tests_properties(harness/stores_no_return PROPERTIES
+		PASS_REGULAR_EXPRESSION "has[ \n]+no[ \n]+block[ \n]+ending[ \n]+in[ \n]+OpReturn")
+	set_tests_properties(harness/stores_chain_duplicated PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpReturn[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+2[ \n]+times,[ \n]+expected[ \n]+1")
+	set_tests_properties(harness/stores_kill PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpKill[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+	set_tests_properties(harness/stores_terminate PROPERTIES
+		PASS_REGULAR_EXPRESSION "ends[ \n]+in[ \n]+OpTerminateInvocation[ \n]+and[ \n]+stores[ \n]+BuiltIn[ \n]+SampleMask[ \n]+1[ \n]+times,[ \n]+expected[ \n]+0")
+else()
+	message(WARNING "spirv-as not found: the DISASM-ENTRY-STORES-PER-RETURN self-tests are not registered")
+endif()
+
+# $10 must survive the replacement of $1; this one is expected to pass.
+add_test(NAME harness/capture_reference_ten COMMAND ${CMAKE_COMMAND}
+	-DMSLC=$<TARGET_FILE:mslc-cli>
+	-DSPIRV_VAL=${SPIRV_VAL}
+	-DSPIRV_DIS=${SPIRV_DIS}
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/harness/capture_reference_ten.metal
+	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/harness
+	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_probe.cmake)
+
 # The CLI's own paths: argument handling, --dump-tokens, and the exit codes. A
 # probe drives the library, so none of this runs otherwise, and --dump-tokens is
 # what a review reaches for when it has a lexing question.
@@ -286,3 +367,11 @@ add_test(NAME library/empty COMMAND ${CMAKE_COMMAND}
 	-DSPIRV_DIS=${SPIRV_DIS}
 	-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/library
 	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_library.cmake)
+
+# Differential harness: runs a kernel on the Apple GPU and mslc's SPIR-V on lavapipe
+# and compares the outputs. Opt-in, and not part of the default test run: it needs
+# Metal and a Vulkan loader with lavapipe, which a plain build does not.
+option(MSLC_DIFFCHECK "Build tools/diffcheck and register its self-tests" OFF)
+if(MSLC_DIFFCHECK)
+	add_subdirectory(tools/diffcheck)
+endif()

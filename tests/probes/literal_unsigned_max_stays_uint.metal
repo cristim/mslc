@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM: = OpConstant %long 0
 // DISASM-NOT: = OpConstant %long 4294967296
 

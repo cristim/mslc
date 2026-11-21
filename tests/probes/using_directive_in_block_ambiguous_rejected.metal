@@ -1,4 +1,4 @@
-// EXPECT: error reference to "f" is ambiguous
+// EXPECT: error call to "f" is ambiguous
 // A block's using directive puts A::f beside the file's f, so the call is ambiguous (Apple agrees);
 // a using declaration would have hidden the file's f instead.
 #include <metal_stdlib>

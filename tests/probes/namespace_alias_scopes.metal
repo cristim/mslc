@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpIAdd %int %[_0-9a-zA-Z]+ %int_11
 // DISASM: OpReturnValue %int_23
 // DISASM: OpReturnValue %int_21

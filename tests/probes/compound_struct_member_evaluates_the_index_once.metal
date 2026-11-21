@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
+// DIFFCHECK-RANGE: idx 0 30
 // DISASM-MATCH: = OpIAdd %uint %[0-9]+ %uint_1
 // DISASM-NO-MATCH: OpIAdd %uint %[0-9]+ %uint_1.*OpIAdd %uint %[0-9]+ %uint_1
 // DISASM-NO-MATCH: OpAccessChain %_ptr_PhysicalStorageBuffer_int .*OpAccessChain %_ptr_PhysicalStorageBuffer_int 

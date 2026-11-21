@@ -1,0 +1,2 @@
+// EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: f SampleMask

@@ -30,7 +30,30 @@ const char* resourceKindName(ResourceKind kind) {
 		case ResourceKind::TextureCube: return "texturecube";
 		case ResourceKind::Texture3D: return "texture3d";
 		case ResourceKind::Texture2DArray: return "texture2d_array";
+		case ResourceKind::Texture1DArray: return "texture1d_array";
+		case ResourceKind::TextureCubeArray: return "texturecube_array";
+		case ResourceKind::TextureBuffer: return "texture_buffer";
 		case ResourceKind::Sampler: return "sampler";
+	}
+
+	return "unknown";
+}
+
+ScalarKind textureSampledKind(ScalarKind element) {
+	switch (element) {
+		case ScalarKind::Short: return ScalarKind::Int;
+		case ScalarKind::UShort: return ScalarKind::UInt;
+		case ScalarKind::Half: return ScalarKind::Float;
+		default: return element;
+	}
+}
+
+const char* textureAccessName(TextureAccess access) {
+	switch (access) {
+		case TextureAccess::Sample: return "sample";
+		case TextureAccess::Write: return "write";
+		case TextureAccess::Read: return "read";
+		case TextureAccess::ReadWrite: return "read_write";
 	}
 
 	return "unknown";
@@ -41,9 +64,16 @@ std::string typeName(const Type& type) {
 		return "sampler";
 	}
 	if (type.isTexture()) {
-		return std::string(resourceKindName(type.resource)) + "<" + scalarKindName(type.scalar)
-			+ (type.textureAccess == TextureAccess::Write ? ", access::write>"
-				: type.textureAccess == TextureAccess::Read ? ", access::read>" : ">");
+		std::string kindName = !type.isDepth ? std::string(resourceKindName(type.resource))
+			: type.resource == ResourceKind::Texture2D ? "depth2d" : type.resource == ResourceKind::Texture2DArray ? "depth2d_array"
+			: type.resource == ResourceKind::TextureCube ? "depthcube" : "depthcube_array";
+		if (type.isMultisampled) {
+			const size_t array = kindName.find("_array");
+			kindName = array == std::string::npos ? kindName + "_ms" : kindName.substr(0, array) + "_ms_array";
+		}
+		return kindName + "<" + scalarKindName(type.scalar)
+			+ (type.textureAccess == TextureAccess::Sample ? std::string(">")
+				: std::string(", access::") + textureAccessName(type.textureAccess) + ">");
 	}
 
 	std::string name = type.isAuto ? std::string("auto")
@@ -57,6 +87,9 @@ std::string typeName(const Type& type) {
 		if (type.isPacked) {
 			name = "packed_" + name;
 		}
+	}
+	if (type.isAtomic) {
+		name = "atomic_" + name;
 	}
 	if (type.arrayLength) {
 		name += "[" + std::to_string(*type.arrayLength) + "]";
@@ -94,6 +127,31 @@ const char* samplerMipFilterName(SamplerMipFilter filter) {
 		case SamplerMipFilter::None: return "None";
 		case SamplerMipFilter::Nearest: return "Nearest";
 		case SamplerMipFilter::Linear: return "Linear";
+	}
+
+	return "unknown";
+}
+
+const char* samplerCompareName(SamplerCompare compare) {
+	switch (compare) {
+		case SamplerCompare::Never: return "Never";
+		case SamplerCompare::Less: return "Less";
+		case SamplerCompare::LessEqual: return "LessEqual";
+		case SamplerCompare::Greater: return "Greater";
+		case SamplerCompare::GreaterEqual: return "GreaterEqual";
+		case SamplerCompare::Equal: return "Equal";
+		case SamplerCompare::NotEqual: return "NotEqual";
+		case SamplerCompare::Always: return "Always";
+	}
+
+	return "unknown";
+}
+
+const char* samplerBorderName(SamplerBorder border) {
+	switch (border) {
+		case SamplerBorder::TransparentBlack: return "TransparentBlack";
+		case SamplerBorder::OpaqueBlack: return "OpaqueBlack";
+		case SamplerBorder::OpaqueWhite: return "OpaqueWhite";
 	}
 
 	return "unknown";
@@ -173,13 +231,43 @@ bool sameParameterTypes(const FunctionDecl& a, const FunctionDecl& b) {
 			return false;
 		}
 		if (x.scalar != y.scalar || x.vectorWidth != y.vectorWidth || x.matrixColumns != y.matrixColumns
-			|| x.isPacked != y.isPacked || x.namedType != y.namedType
-			|| x.resource != y.resource || x.textureAccess != y.textureAccess) {
+			|| x.isPacked != y.isPacked || x.namedType != y.namedType || x.enumName != y.enumName
+			|| x.isAtomic != y.isAtomic
+			|| x.resource != y.resource || x.textureAccess != y.textureAccess
+			|| x.isDepth != y.isDepth || x.isMultisampled != y.isMultisampled) {
 			return false;
 		}
 	}
 
 	return true;
+}
+
+std::string parameterSignature(const Parameter& parameter) {
+	Type type = parameter.type;
+	const bool pointer = type.isPointer || type.arrayLength.has_value();
+	if (pointer) {
+		type.arrayLength.reset();
+		type.isPointer = true;
+	}
+	if (!pointer && !parameter.isReference) {
+		type.isConst = false;
+	}
+	if (!type.enumName.empty()) {
+		type.namedType = type.enumName;
+	}
+	std::string name = typeName(type);
+	if ((pointer || parameter.isReference) && type.addressSpace != AddressSpace::None) {
+		name = std::string(addressSpaceName(type.addressSpace)) + " " + name;
+	}
+	return parameter.isReference ? name + "&" : name;
+}
+
+std::string parameterSignature(const FunctionDecl& function) {
+	std::string signature;
+	for (const Parameter& parameter: function.parameters) {
+		signature += (signature.empty() ? "" : ",") + parameterSignature(parameter);
+	}
+	return signature;
 }
 
 }

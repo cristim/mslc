@@ -1,4 +1,4 @@
-// EXPECT: error the texture method "gather" is not lowered yet
+// EXPECT: error gather is defined on texture2d
 // Apple has no texture3d::gather either; this pins that mslc does not accept it.
 #include <metal_stdlib>
 using namespace metal;

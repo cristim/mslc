@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpULessThan
 // DISASM: OpULessThanEqual
 // DISASM: OpUGreaterThan

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // A block's using declaration of a stdlib name must still hide a closer declaration
 // of the same name, exactly as a using declaration of a user name does: a struct's
 // own member function here. Apple calls the builtin abs(int), not the member.

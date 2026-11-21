@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: f SampleMask
 // DISASM: BuiltIn SampleMask
 struct O { uint m [[sample_mask]]; };
 fragment O f(device uint* masks [[buffer(0)]]) {

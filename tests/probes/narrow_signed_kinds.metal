@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpCapability Int8
 // DISASM: OpCapability Int16
 // DISASM: OpCapability Int64

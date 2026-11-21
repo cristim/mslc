@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: = OpLogicalNot %v2bool
 // DISASM-MATCH: = OpLogicalAnd %v2bool
 //

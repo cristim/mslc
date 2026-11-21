@@ -6,11 +6,13 @@
 
 #include "mslc/mslc.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -21,8 +23,16 @@ namespace {
 		bool compiled = false;
 		bool valid = false;
 		size_t spirvSize = 0;
+		std::string output;
 		std::string diagnostic;
 	};
+
+	std::string lower(std::string text) {
+		for (char& c: text) {
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+		return text;
+	}
 
 	bool readFile(const std::string& path, std::string& out) {
 		std::ifstream stream(path, std::ios::binary);
@@ -99,7 +109,13 @@ namespace {
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
-		std::fprintf(stderr, "usage: mslc-corpus <manifest> [--root <dir>] [--spirv-val <path>] [--keep-output <dir>]\n");
+		std::fprintf(stderr,
+			"usage: mslc-corpus <manifest> [--root <dir>] [--spirv-val <path>] [--keep-output <dir>]\n"
+			"  Each entry's module is written to <output>/<basename>.spv. An entry whose basename\n"
+			"  was already used earlier in the manifest, ignoring case, gets <basename>.2.spv, .3.spv\n"
+			"  and so on, in manifest order whether or not earlier entries compile. The table shows\n"
+			"  the file each entry went to. The output directory is not cleared between runs, so\n"
+			"  files from an earlier run with different names stay.\n");
 		return 2;
 	}
 
@@ -147,6 +163,7 @@ int main(int argc, char** argv) {
 	}
 
 	std::vector<Result> results;
+	std::set<std::string> usedOutputs;
 	std::string line;
 	while (std::getline(manifest, line)) {
 		if (line.empty() || line[0] == '#') {
@@ -155,6 +172,19 @@ int main(int argc, char** argv) {
 
 		Result result;
 		result.path = resolve(root, line);
+
+		// The output name is fixed by the manifest position alone, before anything
+		// can fail, so which file belongs to which entry does not depend on the
+		// other entries compiling. Entries sharing a basename, or differing only in
+		// case (one file on a case-insensitive filesystem), get a numeric suffix in
+		// manifest order.
+		const size_t slash = line.find_last_of('/');
+		const std::string name = slash == std::string::npos ? line : line.substr(slash + 1);
+		std::string stem = name + ".spv";
+		for (size_t suffix = 2; !usedOutputs.insert(lower(stem)).second; ++suffix) {
+			stem = name + "." + std::to_string(suffix) + ".spv";
+		}
+		result.output = outputDirectory + "/" + stem;
 
 		std::string source;
 		if (!readFile(result.path, source)) {
@@ -188,9 +218,7 @@ int main(int argc, char** argv) {
 
 		// Write the module out so spirv-val can check it, which is a stronger
 		// statement than "the compiler returned success".
-		const size_t slash = line.find_last_of('/');
-		const std::string name = slash == std::string::npos ? line : line.substr(slash + 1);
-		const std::string spvPath = outputDirectory + "/" + name + ".spv";
+		const std::string& spvPath = result.output;
 
 		FILE* out = std::fopen(spvPath.c_str(), "wb");
 		if (out) {
@@ -215,13 +243,14 @@ int main(int argc, char** argv) {
 
 	for (const Result& result: results) {
 		std::printf("%-34s ", result.path.substr(result.path.find_last_of('/') + 1).c_str());
+		const std::string outputName = result.output.substr(result.output.find_last_of('/') + 1);
 
 		if (result.valid) {
-			std::printf("VALID   %6zu bytes\n", result.spirvSize);
+			std::printf("VALID   %6zu bytes  -> %s\n", result.spirvSize, outputName.c_str());
 			++valid;
 			++compiled;
 		} else if (result.compiled) {
-			std::printf("INVALID %6zu bytes  %s\n", result.spirvSize,
+			std::printf("INVALID %6zu bytes  -> %s  %s\n", result.spirvSize, outputName.c_str(),
 				result.diagnostic.empty() ? "" : result.diagnostic.c_str());
 			++compiled;
 		} else {
