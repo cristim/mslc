@@ -478,7 +478,7 @@ Apple accepts the first five, which are refused loudly. It also rejects the last
 
 - `using T = S; T{1,2}`: an alias of a struct, scalar or vector works at file scope. Still refused where Apple accepts:
   an alias of a pointer (`using P = device float*;`), of an array (`using A = float[4];`), with a `struct` keyword
-  (`using T = struct S;`), with an attribute (`using T [[maybe_unused]] = S;`), and any alias inside a function.
+  (`using T = struct S;`, `using F = enum E;`; the enum message reads 'a "enum" keyword' and should read 'an "enum" keyword', not yet fixed), with an attribute (`using T [[maybe_unused]] = S;`), and any alias inside a function.
   `typedef S T; T{1,2}` works, at statement start too.
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
