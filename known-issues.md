@@ -709,6 +709,17 @@ receiver, and `Box<T>` members: no value differed.
   template of one) every bare call except on `this` is refused, as class-scope typedefs are not tracked. `x.template f(a)`
   (deduced arguments) is accepted when some struct declares a member template `f`; Apple rejects it when `x`'s own `f`
   is a plain member, which mslc diagnoses at the call. No wrong value comes of any of these.
+- More over-refusals of the bare call inside a template, all loud, found in review of #386: a receiver declared through
+  a using-declaration of a block-scope type (`using ns::D; D d{2.0f}; d.f<float>(t);`, the type name is a block name, so
+  it counts as dependent); `auto a = B{1.0f};` with a concrete initializer (every auto is dependent); a concrete local
+  `B b` in a non-template member of a class template (every bare call but on `this` is refused there); a receiver
+  at program scope (a global or constant object) is also refused as untracked, which is unverified against Apple and was
+  not run.
+- `x.f < 3 > (y)` on an int field, where some struct declares a member template `f`, is refused with the misleading
+  "not a texture parameter" message; Apple accepts it as a comparison. This also fails outside templates, so it predates
+  #386.
+- The class-instance flag set in `parseInstance` (`_classMemberInstance`) has no probe pinning it, and its purpose is
+  not reachable today.
 - A member template that is never called is read at no point, so an error in its body is not reported (Apple reports
   only the non-dependent ones).
 - Older gap, unchanged: a non-template member function called on a device object is accepted.
