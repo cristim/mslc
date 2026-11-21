@@ -607,6 +607,8 @@ struct FunctionTemplate {
 	// class template's instance, that template and the arguments its parameters stand for. The name
 	// state it is read in is the struct's end, kept in names.
 	std::string memberOf;
+	// A static member template has no object: it is called as S::f<...>(...) and its body reads no this.
+	bool staticMember = false;
 	std::set<std::string> memberFields;
 	std::map<std::string, bool> memberFunctions;
 	std::shared_ptr<const ClassTemplate> ownerTemplate;

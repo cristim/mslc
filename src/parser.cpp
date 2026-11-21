@@ -1367,13 +1367,14 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	const LocalScope parameters(*this);
 	_parameterBlock = _blocks.size() - 1;
 	// The object is a first parameter, as in a member function.
-	const size_t objectParameters = member ? 1 : 0;
-	if (member) {
+	const bool object = member && !declaration.staticMember;
+	const size_t objectParameters = object ? 1 : 0;
+	if (object) {
 		declareLocal("this");
-		Parameter object;
-		object.type.namedType = declaration.memberOf;
-		object.name = "this";
-		decl.parameters.push_back(std::move(object));
+		Parameter self;
+		self.type.namedType = declaration.memberOf;
+		self.name = "this";
+		decl.parameters.push_back(std::move(self));
 	}
 	const size_t parametersFrom = _position;
 	parseHelperParameters(decl, quoted);
@@ -1405,7 +1406,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 			_dependentParameters.insert(decl.parameters[index + objectParameters].name);
 		}
 	}
-	if (member && !matchIdentifier("const")) {
+	if (object && !matchIdentifier("const")) {
 		throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function that "
 			"could write it is not lowered (mark it const)");
 	}
@@ -2696,7 +2697,7 @@ void Parser::parseMemberTemplate(const StructDecl& decl) {
 	for (; lookahead(ahead).kind == TokenKind::Identifier; ++ahead) {
 		const std::string_view word = lookahead(ahead).text;
 		if (word == "static") {
-			throw CompileError("a static member function template is not lowered (in " + quoted + ")");
+			declaration.staticMember = true;
 		}
 		if (word == "explicit" || word == "virtual" || word == "friend") {
 			throw CompileError("a member template declared " + std::string(word) + " is not lowered (in " + quoted + ")");
@@ -2714,7 +2715,14 @@ void Parser::parseMemberTemplate(const StructDecl& decl) {
 	declaration.memberOf = decl.name;
 	declaration.order = declaration.bodyOrder = _functionOrder++;
 	declaration.globalsBefore = _unit.globals.size();
-	_memberFunctions[name] = false;
+	if (const auto earlier = _memberFunctions.find(name);
+		earlier != _memberFunctions.end() && earlier->second != declaration.staticMember) {
+		throw CompileError("\"" + declaration.name + "\" is declared both static and not static, which Apple takes and mslc does not lower");
+	}
+	_memberFunctions[name] = declaration.staticMember;
+	if (declaration.staticMember) {
+		_unit.functionTemplates.insert(declaration.name);
+	}
 	_memberTemplateNames.insert(name);
 	_pendingMemberTemplates.push_back(std::move(declaration));
 }
@@ -7872,7 +7880,20 @@ ExpressionPtr Parser::parsePrimary() {
 				const size_t atLine = line();
 				const std::string name(advance().text);
 				if (function->second) {
-					return makeIdentifier(_memberStruct + "::" + name, atLine);
+					ExpressionPtr staticCall = makeIdentifier(_memberStruct + "::" + name, atLine);
+					if (at(TokenKind::Less)) {
+						advance();
+						staticCall->hasTemplateArguments = true;
+						while (!at(TokenKind::Greater)) {
+							staticCall->templateArguments.push_back(parseTemplateArgument());
+							if (!match(TokenKind::Comma)) {
+								break;
+							}
+						}
+						expect(TokenKind::Greater, "to close the template arguments");
+						staticCall->unqualifiedCall = false;
+					}
+					return staticCall;
 				}
 				ExpressionPtr member = makeThisMember(name, atLine);
 				parseMemberTemplateArguments(*member);

@@ -698,7 +698,8 @@ members and templates, helpers, function template instances, namespaces, a call 
 receiver, and `Box<T>` members: no value differed.
 
 - Refused, loudly: a member template beside a member function of the same name (Apple takes one overload set), a
-  static one, a constructor template, `explicit`, `virtual` and `friend`, a non-const one (as every non-const
+  static member template called through an object (`s.f(x)`; Apple takes it, call it as `S::f(x)`), a static and a
+  non-static member template of one name, a constructor template, `explicit`, `virtual` and `friend`, a non-const one (as every non-const
   member), an explicit specialisation or instantiation, an out-of-line definition (refused where it is written), a
   template parameter named like one of the class template's, a member template of an unnamed struct, and a call on
   an object in device, constant or threadgroup memory (Apple rejects that too).

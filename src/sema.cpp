@@ -5995,6 +5995,12 @@ namespace {
 					throw CompileError("\"" + ownerName + suffix + "\" is both a member function and a member function "
 						"template, which Apple takes as one overload set and mslc does not lower yet");
 				}
+				if (std::any_of(templates.begin(), templates.end(), [](const FunctionTemplate* declaration) {
+						return declaration->staticMember;
+					})) {
+					throw CompileError("the static member function template \"" + ownerName + suffix + "\" is called "
+						"through an object, which is not lowered; call it as " + ownerName + suffix + "<...>(...)");
+				}
 				// Apple takes a member function on a device or constant object only when it is qualified so.
 				if (const OverloadArgument object = classifyArgument(*member.left);
 					object.kind == OverloadArgument::Kind::Variable && !object.inThread) {
