@@ -131,6 +131,9 @@ class Parser {
 		// The locals whose declared type names no template parameter, no block name and no auto, so a
 		// member call on one is not dependent. A local not listed here is taken as dependent.
 		std::set<std::string> independent;
+		// The locals declared with the injected class name of the enclosing class template: the call on one is not
+		// dependent, but its fields have the types of the class's own members, which may be parameters.
+		std::set<std::string> injected;
 	};
 	std::vector<BlockScope> _blocks;
 
@@ -257,6 +260,9 @@ private:
 	// block-scope name and no auto; set by the local declarations, read by noteLocal.
 	bool typeTokensIndependent(size_t from, size_t to = SIZE_MAX) const;
 	bool _localIndependent = false;
+	bool namesInjectedClass(size_t from, size_t to = SIZE_MAX) const;
+	bool _localInjected = false;
+	bool injectedLocal(const std::string& name) const;
 	void noteLocal(const std::string& name);
 	// A receiver of a member call that is a local or parameter of a template instance whose type does not depend on
 	// a template parameter, and "this".

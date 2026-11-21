@@ -714,11 +714,13 @@ receiver, and `Box<T>` members: no value differed.
   whose declared type names no template parameter (and no `auto`, no local), a field of `this` of a non-template struct, a
   field or element of such a receiver, the result of a plain (non-template) function called with literals or such
   receivers, or `auto a = B{...}` with `B` a plain struct. A block-scope using-declared type counts as concrete. Inside
-  a class template the receiver may be a concrete local (a `W<float>` local and a `W w = *this;` local of the injected name are concrete, as the member belongs to the current instantiation; a `W<T>` one is not), never a parameter, a field
+  a class template the receiver may be a concrete local (a `W<float>` local and a `W w = *this;` local of the injected name are concrete, as the member belongs to the current instantiation; a field or element of the injected-name local is dependent), never a parameter, a field
   or a call: those are refused loudly and ask for `.template`, as class-scope typedefs are not tracked. Other
   concrete receivers Apple accepts (a call result of a function with other arguments, `B{...}.f<float>()`, an
   element indexed by an expression such as `loc[int(x)]`) are also refused loudly. An element needs a literal or independent index,
   as Apple treats `loc[x]` with a dependent `x` as dependent.
+  A `W<T> w = *this;` local inside the class template `W` is the current instantiation too and Apple takes `w.f<float>(x)`
+  bare; mslc refuses it loudly and asks for `.template`.
   `x.template f(a)` (deduced arguments) is accepted when some struct declares a member template `f`; Apple rejects it when `x`'s own `f`
   is a plain member, which mslc diagnoses at the call. No wrong value comes of any of these.
 - A program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member

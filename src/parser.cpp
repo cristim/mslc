@@ -3389,11 +3389,48 @@ void Parser::noteAutoConstruction(const std::string& name, size_t from) {
 void Parser::noteLocal(const std::string& name) {
 	if (_localIndependent && !_blocks.empty()) {
 		_blocks.back().independent.insert(name);
+		if (_localInjected) {
+			_blocks.back().injected.insert(name);
+		}
 	}
 }
 
 bool Parser::classContext() const {
 	return _classMemberInstance || _classDepth > 0;
+}
+
+// True when the type names the current class template without arguments (the injected class name).
+bool Parser::namesInjectedClass(size_t from, size_t to) const {
+	if (to == SIZE_MAX) {
+		to = _position;
+	}
+	if (!classContext()) {
+		return false;
+	}
+	for (size_t i = from; i < to; ++i) {
+		if (_tokens[i].kind != TokenKind::Identifier || (i + 1 < _tokens.size() && _tokens[i + 1].kind == TokenKind::Less)) {
+			continue;
+		}
+		const std::string text(_tokens[i].text);
+		if (text == unqualifiedName(_memberStruct)) {
+			return true;
+		}
+		for (const std::string& building: _classInProgress) {
+			if (text == unqualifiedName(building)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool Parser::injectedLocal(const std::string& name) const {
+	for (size_t i = _blocks.size(); i-- > 0;) {
+		if (_blocks[i].names.count(name)) {
+			return _blocks[i].injected.count(name) != 0;
+		}
+	}
+	return false;
 }
 
 bool Parser::receiverIndependent(const Expression& receiver) const {
@@ -3413,6 +3450,7 @@ bool Parser::receiverIndependent(const Expression& receiver) const {
 	// A field of an object, or an element of an array or a pointer, of a type naming no parameter is as well.
 	case ExpressionKind::Member:
 		return receiver.left->kind == ExpressionKind::Identifier && receiver.left->name == "this" ? !classContext()
+			: receiver.left->kind == ExpressionKind::Identifier && classContext() && injectedLocal(receiver.left->name) ? false
 			: receiverIndependent(*receiver.left);
 	case ExpressionKind::Index: {
 		// A dependent index makes the element dependent, as a dependent call argument does.
@@ -6141,6 +6179,7 @@ StatementPtr Parser::parseStatement() {
 			const size_t typeFrom = _position;
 			declaration.type = parseType(true, true, &base);
 			_localIndependent = typeTokensIndependent(typeFrom);
+			_localInjected = namesInjectedClass(typeFrom);
 			if (declaration.type.arrayLength && !declaration.type.isStdArray) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
@@ -6584,6 +6623,7 @@ StatementPtr Parser::parseForStatement() {
 			const size_t typeFrom = _position;
 			declaration.type = parseType(false, true, &base);
 			_localIndependent = typeTokensIndependent(typeFrom);
+			_localInjected = namesInjectedClass(typeFrom);
 			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (declaration.type.isAuto && (declaration.type.isPointer || declaration.type.arrayLength)) {
 				throw CompileError("a pointer or an array declared with auto is not lowered yet");
