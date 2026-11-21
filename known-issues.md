@@ -476,8 +476,10 @@ supported. Dropped or type-probed initialisers no longer leave dead function loc
 
 Apple accepts the first five, which are refused loudly. It also rejects the last two, so for those only the wording differs.
 
-- `using T = S; T{1,2}`: an alias of a struct, scalar or vector now works at file scope (untested until built); an alias of a pointer or inside a function is refused, though Apple accepts both. `typedef S T; T{1,2}` works,
-  at statement start too.
+- `using T = S; T{1,2}`: an alias of a struct, scalar or vector works at file scope. Still refused where Apple accepts:
+  an alias of a pointer (`using P = device float*;`), of an array (`using A = float[4];`), with a `struct` keyword
+  (`using T = struct S;`), with an attribute (`using T [[maybe_unused]] = S;`), and any alias inside a function.
+  `typedef S T; T{1,2}` works, at statement start too.
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
   struct member that is an array of structs ("an array of structs field in value struct is not lowered yet"),

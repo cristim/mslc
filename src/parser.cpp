@@ -785,12 +785,18 @@ void Parser::parseUsing() {
 	}
 
 	// "using T = type;" is "typedef type T;".
-	if (at(TokenKind::Identifier) && lookahead().kind == TokenKind::Assign) {
+	if (at(TokenKind::Identifier) && (lookahead().kind == TokenKind::Assign || lookahead().kind == TokenKind::LBracket)) {
+		if (lookahead().kind == TokenKind::LBracket) {
+			throw CompileError("an attribute on a type alias is not supported");
+		}
 		if (!_blocks.empty()) {
 			throw CompileError("\"using\" of a type alias inside a function is not supported; declare it at file scope");
 		}
 		const std::string alias = qualify(std::string(advance().text));
 		advance();
+		if (atKeyword("struct") || atKeyword("enum")) {
+			throw CompileError("a \"" + std::string(current().text) + "\" keyword in a type alias is not supported");
+		}
 		const Type target = parseType();
 		if (target.isPointer) {
 			throw CompileError("a type alias of a pointer type is not supported");
