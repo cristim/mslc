@@ -7200,9 +7200,9 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 }
 
 // `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
-// enum or a struct, is the functional cast T(operand). A type name cannot begin a
-// parenthesised expression, so "(" followed by one is always a cast. Returns null
-// when the parenthesis opens an expression.
+// enum or a struct, is the functional cast T(operand). Returns null when the
+// parenthesis opens an expression, which includes one that starts with a functional
+// cast, "(int(x) * 2)": a type name followed by anything but ")" is not a C-style cast.
 ExpressionPtr Parser::parseCast() {
 	const Token& first = lookahead(1);
 	if (first.kind != TokenKind::Identifier && first.kind != TokenKind::ColonColon) {
@@ -7218,11 +7218,18 @@ ExpressionPtr Parser::parseCast() {
 			++skip;
 		}
 		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
+			const size_t open = _position;
 			advance();
 			Type type;
 			parseSpecifierRun(type);
 			if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
+			}
+			// "(int(x) * 2)": the type name starts a functional cast inside a parenthesised
+			// expression, not a C-style cast, so the parenthesis opens an expression.
+			if (!at(TokenKind::RParen)) {
+				_position = open;
+				return nullptr;
 			}
 			expect(TokenKind::RParen, "to close a cast");
 			auto expression = std::make_unique<Expression>();
