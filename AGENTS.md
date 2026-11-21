@@ -132,6 +132,10 @@ leading comment block:
 | `DISASM: <text>` | the disassembly contains `<text>` |
 | `DISASM-NOT: <text>` | the disassembly does not contain `<text>` |
 | `DISASM-MATCH: <regex>` / `DISASM-NO-MATCH: <regex>` | as above, by regex |
+| `DISASM-CAPTURE: <regex>` / `DISASM-MATCH-CAPTURED: <regex>` | the first matches once and keeps its groups as `$1`, `$2`, ... (numbered across CAPTURE lines); the second is a `DISASM-MATCH` in which each `$N` is replaced by that group's text, so a probe can require two instructions to name the same id. Fails if the capture does not match or `$N` has no group |
+| `DISASM-ENTRY-MODES: <entry> <mode>, ...` | the named entry point has exactly these execution modes (not module-wide); ids in a mode are written `%`, e.g. `LocalSizeId % % %`; no modes after the name means none |
+| `DISASM-ENTRY-BUILTINS: <entry> <builtin>, ...` | the named entry point's interface variables carry exactly these BuiltIn decorations (e.g. `SampleMask`, `FragDepth`) |
+| `DISASM-ENTRY-STORES-PER-RETURN: <entry> <builtin>` | in the named entry's own function every block ending in `OpReturn` holds exactly one `OpStore` to the interface variable decorated `BuiltIn <builtin>` (or to an access chain into it), and no block ending in a branch, `switch`, `OpKill`, `OpTerminateInvocation` or `OpUnreachable` stores to it. Structural, stricter than runtime semantics: a store in a non-return predecessor fails even when correct at run time. A store hoisted into one shared exit block counts once for that block. Helper functions are not read; stores through `OpCopyObject` pointers, `OpCopyMemory` and calls inside a return block are not counted (mslc emits none). Fails with no such variable or no `OpReturn` block. Self-tested by `tests/harness/stores_*` |
 | `REFLECT: <text>` / `REFLECT-NOT: <text>` | the reflection JSON does or does not contain `<text>` |
 
 A probe that pins a rejection pins the **reject** path. If a change only lands the

@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: cases=9
+// DIFFCHECK-FLOAT-RANGE: in -1 1
 // DISASM: = OpPhi %float
 //
 // A conditional whose values branch splits the loop condition over several

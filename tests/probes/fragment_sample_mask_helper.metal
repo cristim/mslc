@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: f SampleMask
 // DISASM: OpReturnValue
 // DISASM: BuiltIn SampleMask
 struct O { uint m [[sample_mask]]; };

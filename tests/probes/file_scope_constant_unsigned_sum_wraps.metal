@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // DISASM: = OpConstant %uint 0
 //
 // Unsigned arithmetic wraps by definition: 4294967295u + 1 is 0.

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: f SampleMask
 // DISASM: BuiltIn SampleMask
 // DISASM: BuiltIn FragDepth
 struct O { float4 c [[color(0)]]; float d [[depth(any)]]; uint m [[sample_mask]]; };

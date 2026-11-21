@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=8 local=8
 // The outer x is read after the switch and the inner x carries the case
 // values. The ids are pinned to the ones this module declares, because the
 // claim is which variable each store and load names, not what number the

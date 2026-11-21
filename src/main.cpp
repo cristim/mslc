@@ -80,8 +80,8 @@ namespace {
 			"  -E                    print the preprocessed source and exit\n"
 			"      --dump-tokens   print the token stream and exit\n"
 			"      --compile-library\n"
-			"                       compile an empty translation unit to a Universal\n"
-			"                       SPIR-V 1.5 Linkage library, not a Vulkan executable\n"
+			"                       compile to a Universal SPIR-V 1.5 Linkage object (helpers\n"
+			"                       exported, declared helpers imported), not a Vulkan executable\n"
 			"      --version         print the library version\n");
 	}
 

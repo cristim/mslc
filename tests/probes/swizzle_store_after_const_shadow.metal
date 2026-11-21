@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpVectorShuffle %v4float %[_0-9a-zA-Z]+ %[_0-9a-zA-Z]+ 4 5 2 3[^ _0-9a-zA-Z]
 //
 // A const "a" inside a block does not make the outer, non-const "a" read-only

@@ -1,4 +1,6 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
+// DIFFCHECK-RANGE: ix 0 3
 // DISASM-MATCH: = OpAccessChain %_ptr_PhysicalStorageBuffer_int
 // DISASM-MATCH: = OpAccessChain %_ptr_Function_int
 //

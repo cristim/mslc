@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpVariable %_ptr_Private__arr_int_uint_4 Private
 // DISASM-NOT: OpVariable %_ptr_Function__arr_int_uint_4
 // A constant array is one Private variable with a constant initialiser, read in place with a

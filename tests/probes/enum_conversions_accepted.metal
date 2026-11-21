@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // What Apple accepts: its own enumerator, a cast, a copy, a conditional of its enumerators,
 // the file-scope constant of the type, a helper result, and reading it as an integer.
 enum Mode { A, B, C };

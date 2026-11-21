@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: v 0 100
 // DISASM-MATCH: = OpINotEqual %bool %[_0-9a-zA-Z]+ %uint_0
 // DISASM-MATCH: OpLoopMerge
 //

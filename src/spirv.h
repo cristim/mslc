@@ -86,6 +86,11 @@ public:
 	// pass only operands.
 	Id emit(uint16_t opcode, std::vector<uint32_t> operands = {});
 
+	// As emit() for an instruction with no result id, without spending an id: emit()
+	// returns the next id and advances it, which leaves a hole in the numbering that
+	// many probes pin by number. Use this for instructions added after those probes.
+	void emitNoResult(uint16_t opcode, std::vector<uint32_t> operands = {});
+
 	// Emits an instruction whose first operand is the result type, and records
 	// the value so typeOf() can answer for it later. This is the form almost
 	// every value-producing instruction takes.
@@ -121,6 +126,10 @@ public:
 	size_t functionsMark() const;
 	std::vector<Instruction> takeFunctionsFrom(size_t mark);
 	void appendFunctions(std::vector<Instruction> instructions);
+	// Locals of the current function declared after a mark, for dropping the ones a discarded
+	// emission left behind.
+	size_t localsMark() const;
+	void truncateLocals(size_t mark);
 
 	// The recorded type of a value, or InvalidId when the id is unknown.
 	Id typeOf(Id value) const;

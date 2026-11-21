@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpStore %[_0-9a-zA-Z]+ %int_11[_0-9]* Aligned
 // What does not conflict, all accepted by Apple: a reopened namespace, the same name in
 // another namespace, a local named like a namespace, a function with other parameters

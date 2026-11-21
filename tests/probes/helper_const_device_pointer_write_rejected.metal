@@ -1,0 +1,11 @@
+// EXPECT: error cannot store through "p", which is in the constant address space or declared const
+#include <metal_stdlib>
+using namespace metal;
+void writeConst(const device float* p, uint i, float v) { p[i] = v; }
+kernel void helper_const_device_pointer_write_rejected(device float* out [[buffer(0)]],
+                                                       device const float* in [[buffer(1)]],
+                                                       uint i [[thread_position_in_grid]])
+{
+    writeConst(in, i, 1.0f);
+    out[i] = 0.0f;
+}

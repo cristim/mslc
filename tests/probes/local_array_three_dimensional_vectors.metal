@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM: OpTypeArray %_arr__arr_float_uint_2_uint_2_0 %uint_2_1
 // Three dimensions, and a component of a vector element reached through two indices.
 // Lavapipe readback against Apple's GPU: d[1][1][1] is 9, v[1][0].y is 6.

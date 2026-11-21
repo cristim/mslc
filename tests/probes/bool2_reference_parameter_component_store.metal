@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // A component of a bool2 reference is stored without touching its neighbour.
 kernel void bool2_reference_parameter_component_store(device float *o [[buffer(0)]], device bool2 &b [[buffer(1)]]) {
   b.y = !b.y;

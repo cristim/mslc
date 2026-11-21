@@ -120,6 +120,13 @@ Id Builder::emit(uint16_t opcode, std::vector<uint32_t> operands) {
 	return _nextId++;
 }
 
+void Builder::emitNoResult(uint16_t opcode, std::vector<uint32_t> operands) {
+	Instruction instruction;
+	instruction.opcode = opcode;
+	instruction.words = std::move(operands);
+	_sections[pickSection(opcode)].push_back(std::move(instruction));
+}
+
 Id Builder::emitTyped(uint16_t opcode, Id resultType, std::vector<uint32_t> operands) {
 	// A value-producing instruction is laid out as
 	// [result type, result id, operands...]. Both leading words are needed:
@@ -211,6 +218,16 @@ std::vector<Instruction> Builder::takeFunctionsFrom(size_t mark) {
 	return taken;
 }
 
+size_t Builder::localsMark() const {
+	const auto found = _functionLocals.find(_currentFunction);
+	return found == _functionLocals.end() ? 0 : found->second.size();
+}
+
+void Builder::truncateLocals(size_t mark) {
+	const auto found = _functionLocals.find(_currentFunction);
+	if (found != _functionLocals.end()) { found->second.resize(mark); }
+}
+
 void Builder::appendFunctions(std::vector<Instruction> instructions) {
 	std::vector<Instruction>& body = _sections[Section::Functions];
 	body.insert(body.end(), std::make_move_iterator(instructions.begin()),
@@ -274,9 +291,53 @@ void Builder::serialize(std::vector<uint8_t>& out) const {
 	Id function = InvalidId;
 	bool localsPlaced = false;
 
+	// Metal's safe math never folds these, and a NIR driver does unless the result is
+	// NoContraction (exact). Decorated here, over the instructions that survived, so
+	// a discarded emission cannot leave a decoration naming a missing id.
+	// Per operation, from Apple's -fno-fast-math AIR (#371): fdiv, fmul, fmod, air.dot
+	// and the vector*matrix dots carry no fast-math flags, so they are decorated.
+	// Deliberately not decorated: OpFNegate (exact, folding a sign is bit-identical),
+	// OpMatrixTimesVector/OpMatrixTimesMatrix (Apple emits llvm.fmuladd, so fusing
+	// is allowed there) and the GLSL.std.450 ext insts (Apple's intrinsics are opaque
+	// calls, Smoothstep contains fmuladd, and NoContraction on an ext inst is not defined).
+	std::vector<Instruction> noContraction;
+	if (const auto body = _sections.find(Section::Functions); body != _sections.end()) {
+		for (const Instruction& instruction: body->second) {
+			switch (instruction.opcode) {
+				case OpFConvert:
+				case OpConvertFToS:
+				case OpConvertFToU:
+				case OpConvertSToF:
+				case OpConvertUToF:
+				case OpFAdd:
+				case OpFSub:
+				case OpFMul:
+				case OpFDiv:
+				case OpFRem:
+				case OpDot:
+				case OpMatrixTimesScalar:
+				case OpVectorTimesMatrix: {
+					Instruction decoration;
+					decoration.opcode = OpDecorate;
+					decoration.words = { instruction.words[1],
+						static_cast<uint32_t>(Decoration::NoContraction) };
+					noContraction.push_back(std::move(decoration));
+					break;
+				}
+				default:
+					break;
+			}
+		}
+	}
+
 	for (Section section: kSectionOrder) {
 		auto it = _sections.find(section);
 		if (it == _sections.end()) {
+			if (section == Section::Annotations) {
+				for (const Instruction& decoration: noContraction) {
+					append(decoration);
+				}
+			}
 			continue;
 		}
 
@@ -298,6 +359,12 @@ void Builder::serialize(std::vector<uint8_t>& out) const {
 					}
 				}
 				localsPlaced = true;
+			}
+		}
+
+		if (section == Section::Annotations) {
+			for (const Instruction& decoration: noContraction) {
+				append(decoration);
 			}
 		}
 	}

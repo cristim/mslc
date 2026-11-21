@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=8 local=8
 // The ids are pinned to the ones this module declares, because the claim is
 // which variable each store and load names, not what number the id has.
 // DISASM: %42 = OpVariable %_ptr_Function_int Function

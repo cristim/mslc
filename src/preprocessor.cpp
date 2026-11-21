@@ -102,13 +102,13 @@ typedef float4x4 simd_float4x4;
 	constexpr char kBuiltinHeaderList[] = "<metal_stdlib>, <metal_matrix>, <simd/simd.h>, <simd/matrix_types.h>, "
 		"<simd/packed.h>, <simd/vector_types.h> and the <metal_stdlib> sub-headers <metal_texture>, "
 		"<metal_math>, <metal_common>, <metal_geometric>, <metal_integer>, <metal_relational>, "
-		"<metal_graphics> and <metal_types>";
+		"<metal_graphics>, <metal_types> and <metal_atomic>";
 
 	// The <metal_stdlib> sub-headers whose declarations <metal_stdlib> already has built in.
 	// Each reads as <metal_stdlib> itself, so the two share one include-once state.
 	// Apple has the rest of the metal_* family; mslc does not declare what they hold.
 	constexpr const char* kStdlibSubHeaders[] = {"<metal_texture>", "<metal_math>", "<metal_common>",
-		"<metal_geometric>", "<metal_integer>", "<metal_relational>", "<metal_graphics>", "<metal_types>"};
+		"<metal_geometric>", "<metal_integer>", "<metal_relational>", "<metal_graphics>", "<metal_types>", "<metal_atomic>"};
 
 	// The built-in header a name stands for: a stdlib sub-header is <metal_stdlib>.
 	const std::string& builtinHeaderKey(const std::string& name) {
@@ -240,7 +240,7 @@ typedef float4x4 simd_float4x4;
 			"__has_declspec_attribute", "__has_warning", "__has_embed", "__is_identifier",
 			"__is_target_arch", "__is_target_vendor", "__is_target_os",
 			"__is_target_environment", "__is_target_variant_os",
-			"__is_target_variant_environment", "__building_module", "_Pragma", "__VA_OPT__",
+			"__is_target_variant_environment", "__building_module", "__VA_OPT__",
 		};
 
 		for (const char* candidate: names) {
@@ -254,7 +254,7 @@ typedef float4x4 simd_float4x4;
 	// Names a #define or #undef may not touch, because they are computed or are
 	// operators rather than stored text.
 	bool isBuiltinName(std::string_view name) {
-		return name == "defined" || name == "__VA_ARGS__" || name == "__has_include"
+		return name == "defined" || name == "__VA_ARGS__" || name == "__has_include" || name == "_Pragma"
 			|| builtinByName(name) || isUnsupportedBuiltin(name);
 	}
 
@@ -533,7 +533,8 @@ private:
 	PPTok fromFile(const Cursor& cursor, const Token& token) const;
 
 	void processFile(SourceFile& file, size_t nameId);
-	void scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPTok>& out, size_t depth);
+	void scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPTok>& out, size_t depth,
+		bool keepPragma = false);
 	void flush(std::vector<PPTok>& out);
 	TokenOrigin originOf(const Loc& loc);
 
@@ -545,6 +546,7 @@ private:
 	void includeDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at, bool import);
 	void lineDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
 	void pragmaDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
+	void applyPragma(Cursor* cursor, std::string_view first, const Loc& at);
 	bool evaluateCondition(Cursor& cursor, const std::vector<Token>& line, const Loc& at);
 	void requireNoExtra(const std::vector<Token>& line, size_t used, const char* directive,
 		const Cursor& cursor) const;
@@ -1097,16 +1099,23 @@ void Preprocessor::directive(Cursor& cursor) {
 
 void Preprocessor::pragmaDirective(Cursor& cursor, const std::vector<Token>& line, const Loc& at) {
 	if (line.size() >= 2 && isName(line[1])) {
-		if (line[1].text == "once") {
-			cursor.file.once = true;
-			return;
-		}
+		applyPragma(&cursor, line[1].text, at);
+	}
+}
 
-		// These change which macros exist, so ignoring them would make a later
-		// expansion differ from the reference compiler's.
-		if (line[1].text == "push_macro" || line[1].text == "pop_macro") {
-			fail(at, "#pragma " + std::string(line[1].text) + " is not supported");
+// What #pragma and _Pragma share: the pragmas whose effect mslc honours, by first word.
+void Preprocessor::applyPragma(Cursor* cursor, std::string_view first, const Loc& at) {
+	if (first == "once") {
+		if (cursor) {
+			cursor->file.once = true;
 		}
+		return;
+	}
+
+	// These change which macros exist, so ignoring them would make a later
+	// expansion differ from the reference compiler's.
+	if (first == "push_macro" || first == "pop_macro") {
+		fail(at, "#pragma " + std::string(first) + " is not supported");
 	}
 
 	// A pragma is advice to the compiler. Apple's accepts one it does not know,
@@ -1369,7 +1378,8 @@ bool Preprocessor::isDefinedName(std::string_view name, const Loc& at) const {
 	if (isAlternativeOperator(name)) {
 		fail(at, "C++ operator '" + std::string(name) + "' used as a macro name");
 	}
-	return _macros.find(name) != _macros.end() || builtinByName(name) || name == "__has_include";
+	return _macros.find(name) != _macros.end() || builtinByName(name) || name == "__has_include"
+		|| name == "_Pragma";
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,7 +1842,7 @@ std::vector<PPTok> Preprocessor::substitute(const Macro& macro, const PPTok& nam
 		if (!expandedArguments[index]) {
 			std::deque<PPTok> work(arguments[index].begin(), arguments[index].end());
 			std::vector<PPTok> out;
-			scan(nullptr, work, out, depth + 1);
+			scan(nullptr, work, out, depth + 1, true);
 			expandedArguments[index] = std::move(out);
 		}
 		return *expandedArguments[index];
@@ -1957,7 +1967,8 @@ std::vector<PPTok> Preprocessor::expandBuiltin(Builtin builtin, const PPTok& nam
 	return {};
 }
 
-void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPTok>& out, size_t depth) {
+void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPTok>& out, size_t depth,
+	bool keepPragma) {
 	if (depth > kMaxExpansionDepth) {
 		throw CompileError("macro arguments nested more than " + std::to_string(kMaxExpansionDepth)
 			+ " deep");
@@ -2035,6 +2046,38 @@ void Preprocessor::scan(Cursor* cursor, std::deque<PPTok>& work, std::vector<PPT
 		if (const auto builtin = builtinByName(name)) {
 			for (PPTok& expanded: expandBuiltin(*builtin, token)) {
 				out.push_back(std::move(expanded));
+			}
+			continue;
+		}
+		if (name == "_Pragma") {
+			// The operator spelling of #pragma: the same advice, dropped the same way. A
+			// pragma that changes which macros exist is refused here as it is there.
+			PPTok open, operand, close;
+			pull(open, token.loc, "_Pragma");
+			if (open.tok.kind != TokenKind::LParen) {
+				fail(token.loc, "_Pragma takes a parenthesised string literal");
+			}
+			pull(operand, token.loc, "_Pragma");
+			pull(close, token.loc, "_Pragma");
+			if (!isStringLiteral(operand.tok) || close.tok.kind != TokenKind::RParen) {
+				fail(token.loc, "_Pragma takes a parenthesised string literal");
+			}
+			// While a macro argument is pre-expanded the pragma is kept, so that the rescan
+			// of the substituted body, which has the file, acts on it (C11 6.10.3.4).
+			if (keepPragma && !cursor) {
+				out.push_back(std::move(token));
+				out.push_back(std::move(open));
+				out.push_back(std::move(operand));
+				out.push_back(std::move(close));
+				continue;
+			}
+			const std::string_view text = operand.tok.text;
+			const size_t start = text.find_first_not_of(" \t", text.find('"') + 1);
+			if (start != std::string_view::npos) {
+				const size_t end = text.find_first_not_of(
+					"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", start);
+				applyPragma(cursor, text.substr(start, end == std::string_view::npos ? end : end - start),
+					token.loc);
 			}
 			continue;
 		}

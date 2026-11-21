@@ -1,7 +1,7 @@
-// EXPECT: error expected a type, found [
+// EXPECT: error is a float4[2], which mslc does not pass between stages yet
 //
-// Apple: the attribute cannot be applied to an array type. mslc has no array
-// field in a struct and diagnoses the bracket at the parse.
+// Apple: the attribute cannot be applied to an array type. mslc parses the array
+// member and diagnoses it where the stage interface is built.
 #include <metal_stdlib>
 using namespace metal;
 struct In { float4 a[2] [[attribute(0)]]; };

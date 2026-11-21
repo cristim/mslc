@@ -1,4 +1,5 @@
-// EXPECT: error member helper "Lookup::look" names a file-scope sampler, pass the sampler to it as an argument
+// EXPECT: error is not a sampler
+// Apple: use of undeclared identifier 'S'. The member cannot see a sampler declared below it.
 #include <metal_stdlib>
 using namespace metal;
 struct Lookup { float x; float4 look(texture2d<float> t) const { return t.sample(S, float2(x)); } };

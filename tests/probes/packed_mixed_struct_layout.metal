@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 0 Offset 0
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 1 Offset 4
 // DISASM-MATCH: OpMemberDecorate %_struct_[0-9]+ 2 Offset 16
@@ -27,16 +28,17 @@ struct Mixed
 };
 
 kernel void packed_mixed_struct_layout(device Mixed *out [[buffer(0)]],
-                                       device const Mixed *in [[buffer(1)]])
+                                       device const Mixed *in [[buffer(1)]],
+                                       uint i [[thread_position_in_grid]])
 {
-    out[0].a = in[0].c;
-    out[0].b = in[0].d.xyz;
-    out[0].c = in[0].a;
-    out[0].d = float4(in[0].b, 1.0);
-    out[0].e = in[0].e;
-    out[0].f = in[0].f;
-    out[0].g = in[0].g;
-    out[0].h = in[0].h;
-    out[0].i = in[0].i;
-    out[0].j = in[0].j;
+    out[i].a = in[i].c;
+    out[i].b = in[i].d.xyz;
+    out[i].c = in[i].a;
+    out[i].d = float4(in[i].b, 1.0);
+    out[i].e = in[i].e;
+    out[i].f = in[i].f;
+    out[i].g = in[i].g;
+    out[i].h = in[i].h;
+    out[i].i = in[i].i;
+    out[i].j = in[i].j;
 }

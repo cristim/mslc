@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: OpTypeArray %_arr_float_uint_3 %uint_2
 // Lavapipe readback against Apple's GPU: K[1][2] is 6, hk(1, 0) is 8, K[j - 1][j - 2] with j = 2 is 4.
 constant float K[2][3] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};

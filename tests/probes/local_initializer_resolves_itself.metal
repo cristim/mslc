@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 // A local's own initializer resolves the local being declared, not an outer
 // binding of the same name. `value` in the initializer names the int being
 // declared here, which is uninitialized. Apple accepts this with only an

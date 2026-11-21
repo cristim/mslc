@@ -111,10 +111,15 @@ void mslc_default_options(MslcOptions* options);
 int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* options,
 	uint8_t** outSpirv, size_t* outSpirvSize, char** outReflection, char** outError);
 
-/* Compiles a genuinely empty active translation unit to a Universal SPIR-V 1.5
- * Linkage library, with no entry points or functions. Only comments, preprocessing,
- * semicolons and using namespace metal; are supported. This is not a Vulkan
- * executable. stage must be UNKNOWN; local size and image set policy are unused.
+/* Compiles a translation unit to a Universal SPIR-V 1.5 Linkage object, to be
+ * joined with others by a linker. A genuinely empty unit (only comments,
+ * preprocessing, semicolons and using namespace metal;) gives an empty object.
+ * Otherwise every non-static, non-inline helper the unit defines and that needs
+ * no stage is exported, a helper it only declares may be called and is imported,
+ * and entry points are optional. This is not a Vulkan executable. stage must be
+ * UNKNOWN, and every entry point of the unit is compiled. Local size and image
+ * set policy apply to those entry points as in mslc_translate (default workgroup
+ * size 1,1,1), but no reflection is produced.
  * Source path and include options have the same meaning as in mslc_translate.
  * Returns 0 on success, 1 for unsupported input, 2 for internal/allocation failure.
  * Provided outputs are reset before processing. Successful bytes use mslc_free;

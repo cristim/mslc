@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: in 0 1
 // DISASM-MATCH: = OpIEqual %bool
 // DISASM-NO-MATCH: = OpFOrdEqual
 //

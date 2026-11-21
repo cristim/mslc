@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpBitwiseAnd %uint
 // DISASM-MATCH: = OpBitwiseOr %uint
 // DISASM-MATCH: = OpBitwiseXor %uint

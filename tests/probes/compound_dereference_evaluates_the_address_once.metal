@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-NO-MATCH: OpAccessChain %_ptr_PhysicalStorageBuffer_int .*OpAccessChain %_ptr_PhysicalStorageBuffer_int 
 //
 // *p += 5 computes the element's address once.

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpIEqual %bool
 // DISASM-MATCH: = OpINotEqual %bool
 // DISASM-MATCH: = OpULessThan %bool

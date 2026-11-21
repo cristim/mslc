@@ -1,3 +1,3 @@
-// EXPECT: error expected a type, found [
+// EXPECT: error has [[sample_mask]], which has to be a scalar uint
 struct O { uint m[1] [[sample_mask]]; };
 fragment O f() { O o; return o; }

@@ -23,6 +23,7 @@ set(MSLC_LIBRARY_SOURCES
 	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/ast.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/parser.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/layout.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/sema.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/spirv.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/mslc.cpp

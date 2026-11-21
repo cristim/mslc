@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DISASM-ENTRY-STORES-PER-RETURN: f SampleMask
 // DISASM: BuiltIn SampleMask
 // DISASM: OpTypeArray %uint
 // DISASM: OpCompositeConstruct

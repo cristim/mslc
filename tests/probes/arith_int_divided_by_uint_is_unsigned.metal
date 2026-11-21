@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK-RANGE: b 1 1000
 // DISASM-MATCH: = OpUDiv %uint %[0-9]+ %[0-9]+
 // DISASM-NOT: OpSDiv
 //

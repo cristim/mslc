@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=3 local=3
 // DISASM-NOT: OpPtrAccessChain
 //
 // A thread pointer to a struct reads and writes fields and swizzles through p[i], through

@@ -1,4 +1,5 @@
 // EXPECT: valid
+// DIFFCHECK: writes-zero
 //
 // A || whose right operand is an && expression, 200 deep: each level adds two nested
 // selection constructs. A middling case that stays quick to validate.

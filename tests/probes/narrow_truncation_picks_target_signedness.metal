@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpUConvert %uchar
 // DISASM-MATCH: = OpSConvert %short
 // DISASM-NO-MATCH: = OpSConvert %uchar

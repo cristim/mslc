@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=1 local=1
 // DISASM-MATCH: = OpFOrdEqual %bool
 // DISASM-MATCH: = OpFOrdLessThan %bool
 // DISASM-MATCH: = OpFOrdLessThanEqual %bool

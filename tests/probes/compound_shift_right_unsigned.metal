@@ -1,4 +1,5 @@
 // EXPECT: valid
+// RUN: grid=64 local=8 cases=3
 // DISASM-MATCH: = OpShiftRightLogical %uint %[0-9]+ %uint_3.[ ]+OpStore %[0-9]+ %[0-9]+
 //
 // x >>= 3u stores the result of the operation. A shift whose result is discarded
