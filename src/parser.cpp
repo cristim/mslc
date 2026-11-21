@@ -3304,17 +3304,66 @@ bool Parser::namesDependentParameter(const std::string& name) const {
 	return false;
 }
 
-bool Parser::typeTokensIndependent(size_t from) const {
-	for (size_t i = from; i < _position; ++i) {
+bool Parser::typeTokensIndependent(size_t from, size_t to) const {
+	if (to == SIZE_MAX) {
+		to = _position;
+	}
+	for (size_t i = from; i < to; ++i) {
 		if (_tokens[i].kind != TokenKind::Identifier) {
 			continue;
 		}
 		const std::string text(_tokens[i].text);
-		if (text == "auto" || text == "decltype" || text == "typeof" || text == "__typeof__" || blockName(text)) {
+		if (text == "auto" || text == "decltype" || text == "typeof" || text == "__typeof__") {
+			return false;
+		}
+		// A using-declaration of a block names a namespace member, which is not dependent; a template parameter
+		// ("<template T>") and a local are.
+		if (const std::string* bound = blockName(text); bound && (bound->empty() || bound->front() == '<')) {
+			return false;
+		}
+		// Inside a class template the injected class name is the current instantiation, which is dependent.
+		if (classContext() && (text == unqualifiedName(_memberStruct) || [&] {
+				for (const std::string& building: _classInProgress) {
+					if (text == unqualifiedName(building)) {
+						return true;
+					}
+				}
+				return false;
+			}())) {
 			return false;
 		}
 	}
 	return true;
+}
+
+// "auto a = B{...};" with B a plain struct has the type B whatever the arguments are.
+void Parser::noteAutoConstruction(const std::string& name, size_t from) {
+	if (_localIndependent || _blocks.empty() || _position < from + 3) {
+		return;
+	}
+	const Token& head = _tokens[from];
+	const Token& open = _tokens[from + 1];
+	if (head.kind != TokenKind::Identifier || (open.kind != TokenKind::LBrace && open.kind != TokenKind::LParen)
+		|| !typeTokensIndependent(from, from + 1)) {
+		return;
+	}
+	const std::string text(head.text);
+	if (!_unit.findStruct(text) && !_unit.findStruct(qualify(text))) {
+		return;
+	}
+	const TokenKind closer = open.kind == TokenKind::LBrace ? TokenKind::RBrace : TokenKind::RParen;
+	int depth = 0;
+	for (size_t i = from + 1; i < _position; ++i) {
+		const TokenKind k = _tokens[i].kind;
+		depth += (k == TokenKind::LBrace || k == TokenKind::LParen || k == TokenKind::LBracket) ? 1
+			: (k == TokenKind::RBrace || k == TokenKind::RParen || k == TokenKind::RBracket) ? -1 : 0;
+		if (depth == 0) {
+			if (i + 1 == _position && _tokens[i].kind == closer) {
+				_blocks.back().independent.insert(name);
+			}
+			return;
+		}
+	}
 }
 
 void Parser::noteLocal(const std::string& name) {
@@ -3323,23 +3372,53 @@ void Parser::noteLocal(const std::string& name) {
 	}
 }
 
+bool Parser::classContext() const {
+	return _classMemberInstance || _classDepth > 0;
+}
+
 bool Parser::receiverIndependent(const Expression& receiver) const {
-	if (receiver.kind != ExpressionKind::Identifier) {
+	switch (receiver.kind) {
+	case ExpressionKind::Identifier:
+		if (receiver.name == "this") {
+			return true;
+		}
+		for (size_t i = _blocks.size(); i-- > 0;) {
+			if (_blocks[i].names.count(receiver.name)) {
+				return i == _parameterBlock ? !classContext() && !_dependentParameters.count(receiver.name)
+					: _blocks[i].independent.count(receiver.name) != 0;
+			}
+		}
 		return false;
-	}
-	if (receiver.name == "this") {
+	// A field of "this" has the declared type of a plain struct's field; in a class template it may be a parameter.
+	// A field of an object, or an element of an array or a pointer, of a type naming no parameter is as well.
+	case ExpressionKind::Member:
+		return receiver.left->kind == ExpressionKind::Identifier && receiver.left->name == "this" ? !classContext()
+			: receiverIndependent(*receiver.left);
+	case ExpressionKind::Index:
+		return receiverIndependent(*receiver.left);
+	// A call has a type that depends on nothing only when the function is a plain one, and its arguments are
+	// literals or independent themselves (a dependent argument makes the call dependent through lookup).
+	case ExpressionKind::Call: {
+		if (classContext() || receiver.left->kind != ExpressionKind::Identifier || blockName(receiver.left->name)
+			|| !receiver.left->overloadNames.empty() || _unit.functionTemplates.count(receiver.left->name)) {
+			return false;
+		}
+		const auto declared = _declared.find(receiver.left->name);
+		if (declared == _declared.end() || declared->second != "function") {
+			return false;
+		}
+		for (const ExpressionPtr& argument: receiver.arguments) {
+			const ExpressionKind k = argument->kind;
+			if (k != ExpressionKind::IntLiteral && k != ExpressionKind::FloatLiteral && k != ExpressionKind::BoolLiteral
+				&& !receiverIndependent(*argument)) {
+				return false;
+			}
+		}
 		return true;
 	}
-	if (_classMemberInstance || _classDepth > 0) {
+	default:
 		return false;
 	}
-	for (size_t i = _blocks.size(); i-- > 0;) {
-		if (_blocks[i].names.count(receiver.name)) {
-			return i == _parameterBlock ? !_dependentParameters.count(receiver.name)
-				: _blocks[i].independent.count(receiver.name) != 0;
-		}
-	}
-	return false;
 }
 
 bool Parser::isLocal(const std::string& name) const {
@@ -5687,7 +5766,9 @@ void Parser::measure(Expression& expression) const {
 void Parser::parseAutoInitializer(VariableDeclaration& declaration) {
 	const std::string quoted = "\"" + declaration.name + "\"";
 	if (match(TokenKind::Assign)) {
+		const size_t from = _position;
 		declaration.initializer = parseInitializer();
+		noteAutoConstruction(declaration.name, from);
 	} else if (match(TokenKind::LParen)) {
 		std::vector<ExpressionPtr> arguments = parseArgumentList("to close the initialiser of an auto variable");
 		if (arguments.size() != 1) {
@@ -7485,15 +7566,14 @@ void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
 	}
 	// Inside a template body Apple rejects "x.f<int>(a)" when x depends on a template parameter, and takes it when
 	// x does not. mslc takes it for "this" and for a local or parameter whose declared type names no template
-	// parameter; any other receiver (a field, a call, an element, a local of auto or class-template scope) is
-	// taken as dependent, which over-refuses a few valid sources loudly.
+	// parameter; any other receiver is taken as dependent, which over-refuses a few valid sources loudly.
 	if (taken && !keyword && (_classDepth > 0 || _inInstance) && !receiverIndependent(*member.left)) {
 		throw CompileError("explicit template arguments on \"" + member.memberName + "\" inside a template need the "
 			"keyword unless the receiver is known not to depend on a template parameter: write \".template "
 			+ member.memberName + "<...>(...)\" (Apple requires it when the receiver depends on one; mslc takes the "
-			"bare form only for \"this\" and for a local or parameter whose declared type names no template "
-			"parameter, so a field, an element, a call result, an auto local or a receiver inside a class template "
-			"needs the keyword)");
+			"bare form only where the receiver's type provably names no template parameter, so a dependent "
+			"receiver, an auto local or a receiver inside a class template that is not a concrete local needs the "
+			"keyword)");
 	}
 	if (taken) {
 		return;

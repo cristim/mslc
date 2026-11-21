@@ -709,18 +709,17 @@ receiver, and `Box<T>` members: no value differed.
   above), so a function or constant declared below the class template that its body names is refused.
 - `v.f<float>(x)` is read as template arguments only when some struct declares a member template `f` and a `>(` closes
   the list; a comparison written that way is left alone.
-- Inside a template, `x.f<float>(a)` without the `template` keyword is taken only when `x` is `this` or a local or
-  parameter of a function template or of a member template of a non-template struct whose declared type names no
-  template parameter (and no `auto`). Apple also takes a field (`inner.f<float>(a)`), an element or a call result of a
-  non-dependent type; mslc refuses those loudly and asks for `.template`. Inside a class template (or a member
-  template of one) every bare call except on `this` is refused, as class-scope typedefs are not tracked. `x.template f(a)`
+- Inside a template, `x.f<float>(a)` without the `template` keyword is taken only when `x` is `this`, a local or parameter
+  whose declared type names no template parameter (and no `auto`, no local), a field of `this` of a non-template struct, a
+  field or element of such a receiver, the result of a plain (non-template) function called with literals or such
+  receivers, or `auto a = B{...}` with `B` a plain struct. A block-scope using-declared type counts as concrete. Inside
+  a class template the receiver may be a concrete local (not of the injected class name), never a parameter, a field
+  or a call: those are refused loudly and ask for `.template`, as class-scope typedefs are not tracked. Other
+  concrete receivers Apple accepts (a call result of a function with other arguments, `B{...}.f<float>()`, a
+  class-template-instance local named by the injected name) are also refused loudly. `x.template f(a)`
   (deduced arguments) is accepted when some struct declares a member template `f`; Apple rejects it when `x`'s own `f`
   is a plain member, which mslc diagnoses at the call. No wrong value comes of any of these.
-- More over-refusals of the bare call inside a template, all loud, found in review of #386: a receiver declared through
-  a using-declaration of a block-scope type (`using ns::D; D d{2.0f}; d.f<float>(t);`, the type name is a block name, so
-  it counts as dependent); `auto a = B{1.0f};` with a concrete initializer (every auto is dependent); a concrete local
-  `B b` in a non-template member of a class template (every bare call but on `this` is refused there);
-  a program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member
+- A program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member
   template at the declaration ("the declarator of the template "f" is not a shape mslc can name the function in");
   Apple accepts it. Reproduced with att/e01 in review of #386.
 - `x.f < 3 > (y)` on an int field, where some struct declares a member template `f`, is refused with the misleading

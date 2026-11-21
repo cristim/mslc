@@ -255,12 +255,14 @@ private:
 	bool namesDependentParameter(const std::string& name) const;
 	// Whether the type spelled by the tokens from "from" to the current one names no template parameter, no
 	// block-scope name and no auto; set by the local declarations, read by noteLocal.
-	bool typeTokensIndependent(size_t from) const;
+	bool typeTokensIndependent(size_t from, size_t to = SIZE_MAX) const;
 	bool _localIndependent = false;
 	void noteLocal(const std::string& name);
 	// A receiver of a member call that is a local or parameter of a template instance whose type does not depend on
 	// a template parameter, and "this".
 	bool receiverIndependent(const Expression& receiver) const;
+	bool classContext() const;
+	void noteAutoConstruction(const std::string& name, size_t from);
 	// An instance of a class template, or of a member template of one, is read: its class names are not tracked.
 	bool _classMemberInstance = false;
 	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
