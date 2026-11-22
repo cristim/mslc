@@ -789,28 +789,36 @@ void Parser::parseUsing() {
 		if (lookahead().kind == TokenKind::LBracket) {
 			throw CompileError("an attribute on a type alias is not supported");
 		}
-		if (!_blocks.empty()) {
-			throw CompileError("\"using\" of a type alias inside a function is not supported; declare it at file scope");
-		}
+		const std::string spelled(current().text);
 		const std::string alias = qualify(std::string(advance().text));
 		advance();
 		if (atKeyword("struct") || atKeyword("enum")) {
 			throw CompileError("a \"" + std::string(current().text) + "\" keyword in a type alias is not supported");
 		}
 		const Type target = parseType();
-		if (target.isPointer) {
-			throw CompileError("a type alias of a pointer type is not supported");
+		if (target.isPointer && target.arrayLength) {
+			throw CompileError("a type alias of an array of pointers is not supported");
 		}
-		if (target.arrayLength && !target.isStdArray) {
-			throw CompileError("a type alias of an array type is not supported");
-		}
-		if (target.addressSpace != AddressSpace::None) {
+		if (target.addressSpace != AddressSpace::None && !target.isPointer) {
 			throw CompileError("a type alias of a type with an address space is not supported");
 		}
 		if (!target.namedType.empty() && !_unit.findStruct(target.namedType)) {
 			throw CompileError("unknown type name \"" + target.namedType + "\" in a type alias");
 		}
 		expect(TokenKind::Semicolon, "after a type alias");
+		if (!_blocks.empty()) {
+			// Only a name nothing else has: one that hid or redefined another would need the
+			// scope rules the file-scope table does not have. The block's end removes it.
+			Type existing;
+			if (blockName(spelled) || _blocks.back().aliases.count(spelled) || _declared.count(alias)
+				|| _unit.findStruct(alias) || resolveTypeName(alias, existing)) {
+				throw CompileError("the alias \"" + spelled + "\" in a function names something already "
+					"declared, which mslc does not support");
+			}
+			_typedefs[alias] = target;
+			_blocks.back().typedefs.push_back(alias);
+			return;
+		}
 		registerTypedef(alias, target);
 		return;
 	}
@@ -3154,6 +3162,10 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.namedType = alias->second.namedType;
 	out.enumName = alias->second.enumName;
 	out.isAtomic = alias->second.isAtomic;
+	if (alias->second.isPointer) {
+		out.isPointer = true;
+		out.addressSpace = alias->second.addressSpace;
+	}
 	out.arrayLength = alias->second.arrayLength;
 	out.innerArrayLengths = alias->second.innerArrayLengths;
 	out.isStdArray = alias->second.isStdArray;
@@ -4983,6 +4995,9 @@ void Parser::deduceArrayLength(VariableDeclaration& declaration) {
 bool Parser::parseArrayDimensions(Type& type) {
 	bool deduced = false;
 	bool outermost = true;
+	if (type.arrayLength && !type.isStdArray && at(TokenKind::LBracket)) {
+		throw CompileError("an array of an array alias is not supported");
+	}
 	while (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		advance();
 		if (at(TokenKind::RBracket)) {
@@ -5236,6 +5251,7 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	// name, so the parameter became "Vertex" and the list ended at the "*".
 	while (parseQualifier(type, false)) {
 	}
+	const bool prefixQualified = type.isConst || type.addressSpace != AddressSpace::None;
 
 	// metal::sampler and metal::texture2d, which Apple takes as the unqualified names.
 	if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon
@@ -5291,6 +5307,10 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	} else if (size_t arrayTokens = 0; atStdArray(arrayTokens)) {
 		parseStdArray(type, arrayTokens);
 	} else if (!name.empty() && resolveTypeName(name, type)) {
+		if (type.isPointer && prefixQualified) {
+			throw CompileError("a const or an address space written before a pointer alias is not supported; "
+				"put it in the alias");
+		}
 		consumeName();
 	} else if (atKeyword("enum")) {
 		advance();
@@ -5311,13 +5331,22 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 			+ " \"" + std::string(current().text) + "\"");
 	}
 
+	const bool aliasPointer = type.isPointer;
+	const bool aliasArray = type.arrayLength && !type.isStdArray;
+	const bool constBefore = type.isConst;
 	while (parseQualifier(type, false)) {
+	}
+	if (aliasPointer && type.isConst != constBefore) {
+		throw CompileError("a const written after a pointer alias is not supported; put it in the alias");
 	}
 
 	if (base) {
 		*base = type;
 	}
 	parseDeclaratorStars(type);
+	if (aliasArray && (type.isPointer || at(TokenKind::LBracket))) {
+		throw CompileError("a pointer to an array alias, and an array of one, are not supported");
+	}
 
 	if (type.isStdArray && at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		throw CompileError("an array of array<T, N> is not lowered");
@@ -6198,7 +6227,8 @@ StatementPtr Parser::parseStatement() {
 			declaration.type = parseType(true, true, &base);
 			_localIndependent = typeTokensIndependent(typeFrom);
 			_localInjected = namesInjectedClass(typeFrom);
-			if (declaration.type.arrayLength && !declaration.type.isStdArray) {
+			// An array alias ends in its name; written brackets end in "]".
+			if (declaration.type.arrayLength && !declaration.type.isStdArray && _tokens[_position - 1].kind == TokenKind::RBracket) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
 			if (declaration.type.isAuto && declaration.type.isPointer) {

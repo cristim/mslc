@@ -478,9 +478,13 @@ supported. Dropped or type-probed initialisers no longer leave dead function loc
 
 Apple accepts the first five, which are refused loudly. It also rejects the last two, so for those only the wording differs.
 
-- `using T = S; T{1,2}`: an alias of a struct, scalar or vector works at file scope. Still refused where Apple accepts:
-  an alias of a pointer (`using P = device float*;`), of an array (`using A = float[4];`), with a `struct` keyword
-  (`using T = struct S;`, `using F = enum E;`; the enum message reads 'a "enum" keyword' and should read 'an "enum" keyword', not yet fixed), with an attribute (`using T [[maybe_unused]] = S;`), and any alias inside a function.
+- `using T = S; T{1,2}`: an alias of a struct, scalar, vector, pointer (`using P = device float*;`) or array
+  (`using A = float[4];`) works at file scope and in a function (it ends with its block). Still refused where Apple
+  accepts: a `struct` keyword (`using T = struct S;`, `using F = enum E;`; the enum message reads 'a "enum" keyword'
+  and should read 'an "enum" keyword', not yet fixed), an attribute (`using T [[maybe_unused]] = S;`), a function
+  alias that hides another declaration of its name, a `const` or address space written beside a pointer alias
+  (`const P p`), a pointer or array of an array alias (`A x[2]`, `A*`), and an array alias as a struct member or a
+  helper parameter (as `float a[4]` there). A local of a pointer alias is the existing "a local pointer" refusal.
   `typedef S T; T{1,2}` works, at statement start too.
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a

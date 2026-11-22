@@ -125,6 +125,8 @@ class Parser {
 		// declares without an entry here is one whose type is not known (auto, a resource).
 		std::map<std::string, Type> objectTypes;
 		std::vector<std::string> directives;
+		// The "using T = type;" aliases written in this block, which leave _typedefs with it.
+		std::vector<std::string> typedefs;
 		// Set on the outermost block of a function body or a for body, whose names share a C++
 		// scope with the enclosing parameters or init declaration.
 		bool sharesEnclosingScope = false;
@@ -479,7 +481,12 @@ private:
 
 	public:
 		explicit LocalScope(Parser& parser): _parser(parser) { _parser._blocks.emplace_back(); }
-		~LocalScope() { _parser._blocks.pop_back(); }
+		~LocalScope() {
+			for (const std::string& alias: _parser._blocks.back().typedefs) {
+				_parser._typedefs.erase(alias);
+			}
+			_parser._blocks.pop_back();
+		}
 		LocalScope(const LocalScope&) = delete;
 		LocalScope& operator=(const LocalScope&) = delete;
 	};
