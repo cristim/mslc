@@ -7891,7 +7891,6 @@ ExpressionPtr Parser::parsePrimary() {
 							}
 						}
 						expect(TokenKind::Greater, "to close the template arguments");
-						staticCall->unqualifiedCall = false;
 					}
 					return staticCall;
 				}

@@ -703,6 +703,11 @@ receiver, and `Box<T>` members: no value differed.
   member), an explicit specialisation or instantiation, an out-of-line definition (refused where it is written), a
   template parameter named like one of the class template's, a member template of an unnamed struct, and a call on
   an object in device, constant or threadgroup memory (Apple rejects that too).
+- The static and non-static member template check depends on declaration order (#341): a non-static member
+  function declared after a static template of its name is accepted, and the reverse order is refused. Apple
+  accepts both orders.
+- `template <typename U> U static f(U x)` (`static` after the return type) is refused with a misleading "is not const"
+  message, because only a leading `static` is read; Apple accepts it (#341).
 - The result type of `v.f(x)` is known only once the arguments are deduced, so `v.f(x).field` is refused when the
   template returns its own parameter (it reads as a swizzle), as for a function template. A result that does not
   name a template parameter (`P f(U) const`) is a struct value as usual.
