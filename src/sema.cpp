@@ -4524,8 +4524,7 @@ namespace {
 					&& op != UnaryOperator::BitNot && op != UnaryOperator::Not)
 					|| !canFoldExpression(*expression.left, excluded)) { return false; }
 				const FoldedConstant operand = foldExpression(*expression.left);
-				if ((operand.scalar == ScalarKind::Bool && op != UnaryOperator::Not)
-					|| (isFloatKind(operand.scalar) && op == UnaryOperator::BitNot)) { return false; }
+				if (isFloatKind(operand.scalar) && op == UnaryOperator::BitNot) { return false; }
 				if (op == UnaryOperator::Negate && isSignedInteger(operand.scalar)) {
 					const ScalarKind promoted = promotedKind(operand.scalar);
 					const uint64_t minimum = normalizeInteger(promoted, uint64_t{ 1 } << (mappingFor(promoted).width - 1));
@@ -5321,7 +5320,6 @@ namespace {
 			throw CompileError("an arithmetic, bitwise or comparison operator on a bool vector is not lowered yet; "
 				"convert the bool vector to an int vector first");
 		}
-		if (_types.isBool(leftType)) { left = convert(left, leftType, promotedTo(1)); }
 		if (_types.isBool(rightType)) { right = convert(right, rightType, promotedTo(1)); }
 
 		return emitArithmetic(op, left, right);
