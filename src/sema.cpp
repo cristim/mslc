@@ -4642,22 +4642,6 @@ namespace {
 			&& (isSignedInteger(*from) == isSignedInteger(to)
 				? mappingFor(*from).width <= mappingFor(to).width
 				: !isSignedInteger(*from) && mappingFor(*from).width < mappingFor(to).width);
-		// A constant initialiser must be a valid constant expression whatever its type,
-		// so overflow, an invalid shift or a float division by zero is refused here.
-		if (constantLeaves(expression, {})) {
-			const bool saved = _foldDomainError;
-			_foldDomainError = false;
-			try {
-				foldExpression(expression);
-			} catch (const CompileError&) {
-				_foldDomainError = true;
-			}
-			const bool invalid = _foldDomainError;
-			_foldDomainError = saved;
-			if (invalid) {
-				throw CompileError("this initializer list value requires a supported constant expression; it overflows or is otherwise invalid");
-			}
-		}
 		if (*from != to && !(*from == ScalarKind::Half && to == ScalarKind::Float) && !integerWidening) {
 			if (isFloatKind(*from) && !isFloatKind(to)) {
 				throw CompileError("a floating value cannot be narrowed to an integer or bool in an initializer list");
