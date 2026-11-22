@@ -1,7 +1,6 @@
 // EXPECT: valid
 //
-// A narrowing that fits is accepted in dead code, as in live code, and the dead declaration
-// emits nothing.
+// A narrowing that fits is accepted in dead code, as in live code.
 kernel void dead_code_narrowing_fits(device uint *o [[buffer(0)]])
 {
     o[0] = 1;

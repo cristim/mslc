@@ -2308,6 +2308,11 @@ namespace {
 		// emitted into it until the next label.
 		bool _terminated = false;
 
+		// Whether a statement followed a terminator, and whether to lower such statements
+		// (in a scratch module, for Apple's diagnostics) instead of skipping them.
+		bool _sawDeadCode = false;
+		bool _lowerDeadCode = false;
+
 		// The label of the block being emitted into, which an OpPhi names as the
 		// predecessor a value arrives from.
 		Id _currentBlock = InvalidId;
@@ -2415,6 +2420,8 @@ namespace {
 		}
 
 		std::string run();
+		bool sawDeadCode() const { return _sawDeadCode; }
+		void lowerDeadCode() { _lowerDeadCode = true; }
 
 	private:
 		void emitEntryPoint(spirv::Id functionType);
@@ -13803,15 +13810,20 @@ namespace {
 			beginBlock(labels[i]);
 			for (const StatementPtr& child: statement.switchCases[i].body) {
 				if (_terminated) {
-					if (child->kind == StatementKind::DeclarationStatement) {
-						validateConstexprInitializer(*child->declaration);
-						emitVariableDeclaration(*child->declaration, true);
-						if (child->declaration->type.isConstexpr) {
-							_localFolded[_bindings[child->declaration->name].id]
-								= placeholderConstant(child->declaration->type);
+					_sawDeadCode = true;
+					if (_lowerDeadCode) {
+						beginBlock(_builder.nextId());
+					} else {
+						if (child->kind == StatementKind::DeclarationStatement) {
+							validateConstexprInitializer(*child->declaration);
+							emitVariableDeclaration(*child->declaration, true);
+							if (child->declaration->type.isConstexpr) {
+								_localFolded[_bindings[child->declaration->name].id]
+									= placeholderConstant(child->declaration->type);
+							}
 						}
+						continue;
 					}
-					continue;
 				}
 				emitStatement(*child);
 			}
@@ -13829,16 +13841,24 @@ namespace {
 				// and a block holds nothing after its terminator.
 				for (const StatementPtr& child: statement.children) {
 					if (_terminated) {
-						if (child->kind == StatementKind::DeclarationStatement) {
-							// Apple type-checks code after a return, so the declaration is lowered
-							// for its diagnostics in a block of its own and the instructions lifted out.
-							// Its name stays bound, with its folded value, for the declarations after it.
-							discardLifted([&] {
-								beginBlock(_builder.nextId());
-								emitVariableDeclaration(*child->declaration);
-							});
+						_sawDeadCode = true;
+						if (_lowerDeadCode) {
+							// Scratch pass: Apple type-checks what follows a return, so it is
+							// lowered in an unreachable block whose module is thrown away.
+							beginBlock(_builder.nextId());
+						} else {
+							if (child->kind == StatementKind::DeclarationStatement) {
+								validateConstexprInitializer(*child->declaration);
+								// Its name still counts as a constant for the declarations after it.
+								if (child->declaration->type.isConstexpr && !child->declaration->type.isAuto) {
+									Binding dead;
+									dead.id = _builder.nextId();
+									_localFolded[dead.id] = placeholderConstant(child->declaration->type);
+									_bindings[child->declaration->name] = dead;
+								}
+							}
+							continue;
 						}
-						continue;
 					}
 					emitStatement(*child);
 				}
@@ -14469,7 +14489,17 @@ std::string emitModule(spirv::Builder& builder, const TranslationUnit& unit,
 	}
 	TypeTable types(builder, unit);
 	Emitter emitter(builder, unit, entryPoints, chosen, types);
-	return emitter.run();
+	std::string result = emitter.run();
+	if (emitter.sawDeadCode()) {
+		// Apple type-checks code after a return, but lowering it would put its types and
+		// capabilities in the module, so it is lowered once more in a module that is dropped.
+		spirv::Builder scratch;
+		TypeTable scratchTypes(scratch, unit);
+		Emitter check(scratch, unit, entryPoints, chosen, scratchTypes);
+		check.lowerDeadCode();
+		check.run();
+	}
+	return result;
 }
 
 }

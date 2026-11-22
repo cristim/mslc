@@ -452,9 +452,13 @@ them on master as well), so neither is a regression.
 
 - `const int k = 3; const thread int& r = k; float x{r};` is accepted; Apple does not treat a
   reference to a const as a constant, so it rejects the narrowing.
-- Narrowing in a declaration after `return;` is now checked, as Apple does (`return; uchar x{300};`,
-  `return; constexpr int n = 300; char x{n};`). Still unchecked: an expression statement in dead code, and a
-  declaration after a `return` inside a `switch` case.
+- Code after a `return;` (declarations, nested blocks, if bodies, switch cases) is now type-checked as
+  Apple does, by lowering it once more in a scratch module that is dropped, so it adds no capability,
+  type or constant to the real one. A function with dead code is therefore compiled twice, and a form
+  mslc does not lower yet is now refused in dead code too.
+- A live module that uses both `uchar` and `char` (`uchar x{200}; char y{100};`) carries `OpCapability Int8`
+  twice (spirv-val accepts it). Predates #160; found in review.
+
 
 Arithmetic on a scalar bool promotes it to int, in code and in a constant (`float x{true + 1}`, `-flag`,
 `i += flag`). Still refused as "not lowered yet": arithmetic or a unary `+ - ~` on a bool vector (Apple
