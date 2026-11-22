@@ -454,7 +454,8 @@ them on master as well), so neither is a regression.
   reference to a const as a constant, so it rejects the narrowing.
 - Code after a `return;` (declarations, nested blocks, if bodies, switch cases) is now type-checked as
   Apple does, by lowering it once more in a scratch module that is dropped, so it adds no capability,
-  type or constant to the real one. A function with dead code is therefore compiled twice, and a form
+  type or constant to the real one (one exception: an uninitialized declaration after a `return` in a
+  non-last switch case still gets storage in the real module, since a later case may name it). A function with dead code is therefore compiled twice, and a form
   mslc does not lower yet is now refused in dead code too.
 - A live module that uses both `uchar` and `char` (`uchar x{200}; char y{100};`) carries `OpCapability Int8`
   twice (spirv-val accepts it). Predates #160; found in review.

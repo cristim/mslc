@@ -13816,10 +13816,19 @@ namespace {
 					} else {
 						if (child->kind == StatementKind::DeclarationStatement) {
 							validateConstexprInitializer(*child->declaration);
-							emitVariableDeclaration(*child->declaration, true);
-							if (child->declaration->type.isConstexpr) {
-								_localFolded[_bindings[child->declaration->name].id]
-									= placeholderConstant(child->declaration->type);
+							// Only a later case can name it (and then it has no initializer), so
+							// storage is emitted only for that; the last case's is checked in the scratch pass.
+							if (i + 1 < statement.switchCases.size()) {
+								emitVariableDeclaration(*child->declaration, true);
+								if (child->declaration->type.isConstexpr) {
+									_localFolded[_bindings[child->declaration->name].id]
+										= placeholderConstant(child->declaration->type);
+								}
+							} else if (child->declaration->type.isConstexpr && !child->declaration->type.isAuto) {
+								Binding dead;
+								dead.id = _builder.nextId();
+								_localFolded[dead.id] = placeholderConstant(child->declaration->type);
+								_bindings[child->declaration->name] = dead;
 							}
 						}
 						continue;
