@@ -13830,14 +13830,13 @@ namespace {
 				for (const StatementPtr& child: statement.children) {
 					if (_terminated) {
 						if (child->kind == StatementKind::DeclarationStatement) {
-							validateConstexprInitializer(*child->declaration);
-							// Its name still counts as a constant for the declarations after it.
-							if (child->declaration->type.isConstexpr && !child->declaration->type.isAuto) {
-								Binding dead;
-								dead.id = _builder.nextId();
-								_localFolded[dead.id] = placeholderConstant(child->declaration->type);
-								_bindings[child->declaration->name] = dead;
-							}
+							// Apple type-checks code after a return, so the declaration is lowered
+							// for its diagnostics in a block of its own and the instructions lifted out.
+							// Its name stays bound, with its folded value, for the declarations after it.
+							discardLifted([&] {
+								beginBlock(_builder.nextId());
+								emitVariableDeclaration(*child->declaration);
+							});
 						}
 						continue;
 					}

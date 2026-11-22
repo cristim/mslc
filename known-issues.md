@@ -447,13 +447,14 @@ of the #354 fix.
 
 ## Constant-expression narrowing: over-accepts and gaps (#160)
 
-Apple rejects these and mslc accepts them. Both predate the #160 change (the reviewer found
+Apple rejects these and mslc accepts them. They predate the #160 change (the reviewer found
 them on master as well), so neither is a regression.
 
 - `const int k = 3; const thread int& r = k; float x{r};` is accepted; Apple does not treat a
   reference to a const as a constant, so it rejects the narrowing.
-- Narrowing in dead code after `return;` is not checked: `return; constexpr int n = 300; char x{n};`
-  is accepted, Apple rejects it.
+- Narrowing in a declaration after `return;` is now checked, as Apple does (`return; uchar x{300};`,
+  `return; constexpr int n = 300; char x{n};`). Still unchecked: an expression statement in dead code, and a
+  declaration after a `return` inside a `switch` case.
 
 Arithmetic on a scalar bool promotes it to int, in code and in a constant (`float x{true + 1}`, `-flag`,
 `i += flag`). Still refused as "not lowered yet": arithmetic or a unary `+ - ~` on a bool vector (Apple
