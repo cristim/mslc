@@ -352,6 +352,13 @@ struct ModuleOptions {
 // writes constantID s = max(1, bytes / e) into VkSpecializationInfo when it creates the pipeline, where e
 // is Metal's element size (a float3 is 16). SpecIds 0 to 2 are the workgroup size; the arguments take
 // 3 upward in declaration order across the module, so two kernels never share one. There is no descriptor.
+// A vertex function's returned struct adds one { "kind": "StageOutput", "location": n, "name": user,
+// "type": "float4" } per field that is not [[position]] or [[point_size]], and a fragment function's
+// [[stage_in]] struct one { "kind": "StageInput", ... } the same way. name is the field's [[user(name)]],
+// or the field's own name without one, and location is the Location of the variable. Apple pairs a
+// vertex output with a fragment input by name and type when it builds the pipeline, whatever the fields'
+// positions, but each function is compiled on its own and gets its Locations from its own struct. A host
+// that builds the pipeline has to give a fragment input the Location its partner output has.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //
