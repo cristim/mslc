@@ -11878,6 +11878,13 @@ namespace {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::Location), *locations[index] });
 
+				// The pairing of a vertex output with a fragment input is by name (see stageLocations), and
+				// the two functions are usually compiled apart, so the host that links them needs each one's
+				// names, types and Locations.
+				addReflectionEntry(std::string("{ \"kind\": \"") + (isInput ? "StageInput" : "StageOutput")
+					+ "\", \"location\": " + std::to_string(*locations[index]) + ", \"name\": \""
+					+ field.attributes.userName.value_or(field.name) + "\", \"type\": \"" + typeName(field.type) + "\" }");
+
 				if (integral && interpolation != Interpolation::None && interpolation != Interpolation::Flat) {
 					throw CompileError(what + " is " + typeName(field.type) + ", which requires [[flat]]; "
 						"an integer is not interpolated, and Apple's compiler rejects any other qualifier");
