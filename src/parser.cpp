@@ -815,8 +815,12 @@ void Parser::parseUsing() {
 				throw CompileError("the alias \"" + spelled + "\" in a function names something already "
 					"declared, which mslc does not support");
 			}
-			_typedefs[alias] = target;
-			_blocks.back().typedefs.push_back(alias);
+			// Bound as a template parameter is: a key no spelling reaches, and the block's name for it,
+			// so that a namespace's own or an outer T cannot be found instead.
+			const std::string key = "<alias " + spelled + ">";
+			_typedefs[key] = target;
+			_blocks.back().names[spelled] = key;
+			_blocks.back().typedefs.push_back(key);
 			return;
 		}
 		registerTypedef(alias, target);
