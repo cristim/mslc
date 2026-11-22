@@ -2237,6 +2237,40 @@ namespace {
 	// number or bool, so a call written against another signature fails to compile.
 	enum class SizeComponent : uint32_t { Width = 0, Height = 1, Depth = 2, ArraySize = 2 };
 
+	// Whether a name appears in an expression, ignoring what shadows it: a name that is only
+	// maybe used errs toward being kept.
+	bool mentionsName(const Expression* expression, const std::string& name) {
+		if (!expression) { return false; }
+		if (expression->kind == ExpressionKind::Identifier && expression->name == name) { return true; }
+		if (mentionsName(expression->left.get(), name) || mentionsName(expression->right.get(), name)) { return true; }
+		for (const ExpressionPtr& argument: expression->arguments) {
+			if (mentionsName(argument.get(), name)) { return true; }
+		}
+		for (const InitializerElement& element: expression->elements) {
+			if (mentionsName(element.value.get(), name)) { return true; }
+		}
+		return false;
+	}
+
+	bool mentionsName(const Statement* statement, const std::string& name) {
+		if (!statement) { return false; }
+		if (mentionsName(statement->expression.get(), name) || mentionsName(statement->forCondition.get(), name)
+			|| mentionsName(statement->forIncrement.get(), name) || mentionsName(statement->whileCondition.get(), name)
+			|| mentionsName(statement->thenBranch.get(), name) || mentionsName(statement->elseBranch.get(), name)
+			|| mentionsName(statement->forBody.get(), name) || mentionsName(statement->whileBody.get(), name)) { return true; }
+		if (statement->declaration && mentionsName(statement->declaration->initializer.get(), name)) { return true; }
+		if (statement->forInitializer && mentionsName(statement->forInitializer->initializer.get(), name)) { return true; }
+		for (const StatementPtr& child: statement->children) {
+			if (mentionsName(child.get(), name)) { return true; }
+		}
+		for (const SwitchCase& kase: statement->switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				if (mentionsName(child.get(), name)) { return true; }
+			}
+		}
+		return false;
+	}
+
 	class Emitter {
 		spirv::Builder& _builder;
 		const TranslationUnit& _unit;
@@ -13816,9 +13850,15 @@ namespace {
 					} else {
 						if (child->kind == StatementKind::DeclarationStatement) {
 							validateConstexprInitializer(*child->declaration);
-							// Only a later case can name it (and then it has no initializer), so
-							// storage is emitted only for that; the last case's is checked in the scratch pass.
-							if (i + 1 < statement.switchCases.size()) {
+							// Only a later case can name it (and then it has no initializer), so storage
+							// is emitted only for that; the rest is checked in the scratch pass.
+							bool namedLater = false;
+							for (size_t later = i + 1; later < statement.switchCases.size() && !namedLater; ++later) {
+								for (const StatementPtr& after: statement.switchCases[later].body) {
+									namedLater = namedLater || mentionsName(after.get(), child->declaration->name);
+								}
+							}
+							if (namedLater) {
 								emitVariableDeclaration(*child->declaration, true);
 								if (child->declaration->type.isConstexpr) {
 									_localFolded[_bindings[child->declaration->name].id]
