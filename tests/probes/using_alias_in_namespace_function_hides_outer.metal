@@ -1,5 +1,6 @@
 // EXPECT: valid
 // RUN: grid=1 local=1
+// DISASM-NOT: OpConvertFToS
 //
 // An alias in a function inside a namespace is the function's own T, not the outer T. Apple accepts.
 #include <metal_stdlib>

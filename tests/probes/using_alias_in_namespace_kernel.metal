@@ -1,5 +1,6 @@
 // EXPECT: valid
 // RUN: grid=1 local=1
+// DISASM-NOT: OpConvertFToS
 //
 // An alias in a kernel declared inside a namespace. Apple accepts.
 #include <metal_stdlib>
