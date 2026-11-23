@@ -52,6 +52,18 @@ class CorpusFiles(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertIn("vertex=vs", r["reason"])
 
+    def test_bare_field_line_is_an_error_naming_it(self):
+        r, = diffcheck.check_one(None, *listing("vertex=vs\n")[0])
+        self.assertEqual(r["status"], "error")
+        self.assertIn("vertex=vs", r["reason"])
+
+    def test_duplicate_std_is_an_error_naming_the_field(self):
+        for line in ("x.metal std=3.1 std=\n", "x.metal std= std=3.1\n", "x.metal std=3.1 std=3.0\n"):
+            r, = diffcheck.check_one(None, *listing(line)[0])
+            self.assertEqual(r["status"], "error", line)
+            self.assertIn("std=", r["reason"], line)
+            self.assertIn("more than once", r["reason"], line)
+
     def test_error_takes_precedence_over_too_few_compared(self):
         with tempfile.TemporaryDirectory() as d:
             lst = os.path.join(d, "l.txt")

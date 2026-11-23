@@ -330,6 +330,9 @@ def corpus_files(listing, root):
             files.append((path, std, None, "bad corpus list line %r: %r is a field, the path comes first"
                           % (line, fields[0])))
             continue
+        if sum(f.startswith("std=") for f in fields[1:]) > 1:
+            files.append((path, std, None, "bad corpus list line %r: std= given more than once" % line))
+            continue
         if std == "":
             files.append((path, std, None, "bad corpus list line %r: std= needs a value" % line))
             continue
