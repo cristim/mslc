@@ -61,7 +61,7 @@ if rc == 77:
     sys.exit(77)
 
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
-             "multi_target", "mixed_components"):
+             "multi_target", "mixed_components", "half_fwidth"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
