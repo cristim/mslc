@@ -128,6 +128,32 @@ class UlpBound(unittest.TestCase):
     def test_a_name_that_merely_contains_a_function_does_not_count(self):
         self.assertEqual(compare.ulp_bound_for_source("float mysin(float x); y = mysin(x);"), 0)
 
+    def test_half_divide_gets_the_half_divide_bound(self):
+        self.assertEqual(compare.HALF_DIVIDE_ULP, 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 3.0h;"), 2)
+        self.assertEqual(compare.ulp_bound_for_source("half4 a = x; a /= y;"), 2)
+
+    def test_float_divide_and_half_without_divide_stay_exact(self):
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 3.0f;"), 0)
+        self.assertEqual(compare.ulp_bound_for_source("half x = v[i] * 3.0h; // a / b"), 0)
+
+    def test_half_divide_bound_covers_apple_and_lavapipe_1870_667(self):
+        apple, lvp = struct.pack("<H", 0x334e), struct.pack("<H", 0x3350)
+        self.assertFalse(compare.leaf_equal(apple, lvp, "half", 0))
+        self.assertTrue(compare.leaf_equal(apple, lvp, "half", compare.HALF_DIVIDE_ULP))
+
+    def test_half_divide_bound_rejects_three_ulp_around_the_correct_result(self):
+        good = 0x334f
+        b = lambda v: struct.pack("<H", v)
+        for off in (-3, 3):
+            self.assertFalse(compare.leaf_equal(b(good), b(good + off), "half", compare.HALF_DIVIDE_ULP))
+        for off in (-2, 2):
+            self.assertTrue(compare.leaf_equal(b(good), b(good + off), "half", compare.HALF_DIVIDE_ULP))
+
+    def test_half_literals_without_leading_digit_or_with_exponent(self):
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / .5h;"), 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 1e3h;"), 2)
+
 
 class UlpBoundsByRoot(unittest.TestCase):
     ENTRY = "kernel void k(device float *a, device float *b, uint i [[thread_position_in_grid]]) { %s }"

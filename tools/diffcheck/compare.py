@@ -51,6 +51,13 @@ ULP_BOUNDS = {
     "step": 0, "length": 4, "distance": 4, "normalize": 4, "dot": 4, "cross": 4,
 }
 
+# Half `x / y` and `1.0 / x` are specified correctly rounded (MSL Table 8.3, p373), but neither
+# backend is: for a = 0x397b, 3.0h the exact quotient is 1870.667 ulp, correctly rounded 0x334f,
+# Apple gives 0x334e and lavapipe (plain OpFDiv) 0x3350, 2 ULP apart (issue #389). Float divide
+# is exact on both, so the bound only applies to a source that names `half` and divides. The
+# bound is per source, so it also loosens float leaves of such a kernel.
+HALF_DIVIDE_ULP = 2
+
 
 def _fields(scalar):
     return _FLOAT[scalar]
@@ -108,7 +115,7 @@ def _strip(source):
 
 
 def _call_bound(text):
-    bound = 0
+    bound = HALF_DIVIDE_ULP if re.search(r"\bhalf[234]?\b|(?<![\w.])(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?h\b", text) and "/" in text else 0
     for name, ulp in ULP_BOUNDS.items():
         if ulp > bound and re.search(r"(?<![\w.])(?:\w+::)*%s\s*\(" % name, text):
             bound = ulp
