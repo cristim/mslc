@@ -105,11 +105,14 @@ class UlpBound(unittest.TestCase):
         self.assertEqual(compare.ulp_bound_for_source('// sin( here\nconst char* s = "pow(";\n/* exp( */ x = a + b;'), 0)
 
     def test_exact_only_source_has_no_bound(self):
-        self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + sqrt(c) / d;"), 0)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + fma(c, d, e) / d;"), 0)
 
     def test_correctly_rounded_functions_have_no_bound(self):
-        for name in ("sqrt", "fma"):
-            self.assertNotIn(name, compare.ULP_BOUNDS)
+        self.assertNotIn("fma", compare.ULP_BOUNDS)
+
+    def test_sqrt_gets_vulkan_inversesqrt_bound(self):
+        self.assertEqual(compare.ULP_BOUNDS["sqrt"], 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = sqrt(v[i]);"), 2)
 
     def test_rsqrt_gets_vulkan_inversesqrt_bound(self):
         self.assertEqual(compare.ULP_BOUNDS["rsqrt"], 2)
