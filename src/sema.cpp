@@ -11361,6 +11361,7 @@ namespace {
 		}
 
 		const Id floatType = _types.scalar(ScalarKind::Float);
+		bool minLodLiteral = false;
 		const auto scalarArgument = [&](const Expression& option, const std::string& what) {
 			if (option.arguments.size() != 1) {
 				throw CompileError(what + " takes one argument");
@@ -11414,6 +11415,8 @@ namespace {
 				}
 				stage = 2;
 				minLod = scalarArgument(option, "min_lod_clamp");
+				minLodLiteral = option.arguments[0]->kind == ExpressionKind::FloatLiteral
+					|| option.arguments[0]->kind == ExpressionKind::IntLiteral;
 			} else {
 				if (stage > 2 || offset != InvalidId || isCubeKind(kind)) {
 					throw CompileError(isCubeKind(kind) ? "a cube sample takes no offset"
@@ -11442,11 +11445,17 @@ namespace {
 				"implicit lod or gradients only");
 		}
 		const bool library = _entryPoint == &_libraryScope;
-		// Measured on Apple GPU: min_lod_clamp(m) alone in a kernel reads level 0 for m = 1.0, as if
-		// ignored (the AIR carries it, the hardware does not clamp), so it is dropped here.
-		if (!library && minLod != InvalidId && bias == InvalidId && gradientX == InvalidId && lod == InvalidId
+		// Measured on Apple GPU only for a texture2d sample in a kernel function with a constant
+		// min_lod_clamp(1.0) alone (RGBA32F 4x4, nearest mips): it reads level 0, as if ignored (the AIR
+		// carries it, the hardware does not clamp), so exactly that shape drops it. A depth or compare
+		// sample, a non-constant argument, gradients and a helper function were not measured.
+		if (!library && _helper == nullptr && minLodLiteral && !compare && !texture.pointeeMsl.isDepth
+			&& kind == ResourceKind::Texture2D && bias == InvalidId && gradientX == InvalidId && lod == InvalidId
 			&& _entryPoint->stage == Stage::Kernel) {
 			minLod = InvalidId;
+		}
+		if (!library && minLod != InvalidId && gradientX != InvalidId && _entryPoint->stage == Stage::Kernel) {
+			throw CompileError("min_lod_clamp with gradients in a kernel is not lowered: Apple's result there is not measured");
 		}
 		if (derivatives && !sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId)) {
 			if (library) {
