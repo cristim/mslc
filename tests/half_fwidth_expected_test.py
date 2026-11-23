@@ -2,19 +2,19 @@
 """Half fragment fwidth (#173) against values computed on the host, run on lavapipe.
 
 mslc compiles tests/diffcheck/graphics/half_fwidth_special.metal, lavapipe draws it, and every
-covered pixel of both half targets is compared with numpy float16 arithmetic: widen to float32,
-|dx| + |dy| over the pixel's 2x2 quad, narrow to half. A NaN must be a NaN and an infinity an infinity
-(an exact bit match otherwise). A planted miscompile of the fwidth (OpFwidth replaced by OpDPdx or
-OpDPdy, made by diffcheck_mutate_mslc.py) must be reported, so a comparison that cannot fail is caught.
+covered pixel of both half targets is compared with numpy float16 arithmetic: dx and dy over the pixel's
+2x2 quad taken in float32, each narrowed to half, then |dx| + |dy| added in half. A NaN must be a NaN and an
+infinity an infinity (an exact bit match otherwise). Planted miscompiles of the lowering (OpDPdx taken as OpDPdy, the final OpFAdd turned into an OpFSub, made by diffcheck_mutate_mslc.py) must be reported, so a
+comparison that cannot fail is caught.
 
 The expectation assumes lavapipe's fine derivative convention: dx is taken inside the pixel's own row
 and dy inside its own column of the 2x2 quad. SPIR-V leaves coarse or fine unspecified, so this test
 pins lavapipe's behaviour, not a rule of the language.
 
 tests/half_fwidth_wide.metal has a |dx| that is not a half (1024 next to 2^-10), so narrowing each term
-first gives a different result from the float32 sum narrowed once. The test checks that the two differ and
-that mslc follows the second, which is the lowering it implements. Apple's GPU follows the first (measured
-with tools/diffcheck on that shader: 1026 where mslc gives 1025), an open parity gap recorded in known-issues.md.
+first gives a different result from the float32 sum narrowed once (1026 against 1025 at |dy| = 1.5). Apple's
+GPU gives 1026 (measured with tools/diffcheck); mslc follows it. The test checks that the two policies differ
+and that mslc gives the first.
 Exits 77 (ctest SKIP) when lavapipe is not available.
 
 usage: half_fwidth_expected_test.py <mslc> <vkhost>
@@ -63,16 +63,17 @@ def inputs(x, y):
     return [rounded, tiny, inf_in, nan_in, inf_inf, over, wide]
 
 
-def expected(x, y, narrow_terms=False):
-    """Seven half fwidth results: the float32 sum of the two quad differences, narrowed once.
-    `narrow_terms` narrows |dx| and |dy| to half first (the wrong policy, used to prove the test can tell)."""
+def expected(x, y, float_sum=False):
+    """Seven half fwidth results as Apple computes them: |dx| and |dy| each narrowed to half, then added
+    (a half add is the exact sum rounded once). `float_sum` adds in float32 and narrows once instead (the
+    wrong policy, used to prove the test can tell)."""
     x0, y0 = x & ~1, y & ~1
     out = []
     with np.errstate(all="ignore"):
         for i in range(7):
             dx = f32(inputs(x | 1, y)[i]) - f32(inputs(x0, y)[i])
             dy = f32(inputs(x, y | 1)[i]) - f32(inputs(x, y0)[i])
-            if narrow_terms:
+            if not float_sum:
                 dx, dy = f32(f16(dx)), f32(f16(dy))
             out.append(f16(abs(dx) + abs(dy)))
     return out
@@ -102,14 +103,14 @@ def draw(mslc_cmd, source=SOURCE):
         return c0, np.frombuffer(open(outs[1], "rb").read(), "<u2").reshape(H, W, 2)
 
 
-def mismatches(color0, color1, indices, narrow_terms=False):
+def mismatches(color0, color1, indices, float_sum=False):
     """Differences between the drawn targets and the host values `indices` of `expected`."""
     bad, nonfinite = [], 0
     for y in range(H):
         for x in range(W):
             got = (list(color0[y, x]) + (list(color1[y, x]) if color1 is not None else []))[:len(indices)]
             if x in XS and y in YS:
-                want = [expected(x, y, narrow_terms)[k] for k in indices]
+                want = [expected(x, y, float_sum)[k] for k in indices]
             else:
                 want = [f16(v) for v in (CLEAR[:4] + CLEAR[:2])[:len(indices)]]
             for i, (g, w) in enumerate(zip(got, want)):
@@ -121,9 +122,9 @@ def mismatches(color0, color1, indices, narrow_terms=False):
     return bad, nonfinite
 
 
-def check(mslc_cmd, source=SOURCE, narrow_terms=False):
+def check(mslc_cmd, source=SOURCE, float_sum=False):
     indices = list(range(6)) if source == SOURCE else [6]
-    return mismatches(*draw(mslc_cmd, source), indices=indices, narrow_terms=narrow_terms)
+    return mismatches(*draw(mslc_cmd, source), indices=indices, float_sum=float_sum)
 
 
 try:
@@ -131,16 +132,16 @@ try:
         raise hosts.Unavailable("no lavapipe ICD")
     bad, nonfinite = check(mslc)
     assert not bad, ("baseline differs from the host value", bad[:8], len(bad))
-    # Narrow once is enforced: a |dx| that is not a half must give the float32-sum result, and the
-    # wrong policy (each term narrowed to half first) must be told apart from it.
+    # Narrowing each term first is enforced: a |dx| that is not a half must give the Apple result, and the
+    # wrong policy (float32 sum narrowed once) must be told apart from it.
     bad, _ = check(mslc, WIDE)
     assert not bad, ("wide case differs from the host value", bad[:8], len(bad))
-    wrong, _ = check(mslc, WIDE, narrow_terms=True)
-    assert wrong, "narrowing each term first gives the same values: the test cannot see the policy"
+    wrong, _ = check(mslc, WIDE, float_sum=True)
+    assert wrong, "a float32 sum gives the same values as narrowing each term: the test cannot see the policy"
     # Vacuity: the NaN, infinity and overflow cases are really among the expected values.
     assert nonfinite > 0, "no non-finite expected value was compared"
-    for replacement in ("OpDPdx %float", "OpDPdy %float"):
-        os.environ.update(MSLC_REAL=mslc, MUT=json.dumps([[r"OpFwidth %float", replacement]]), MUT_STAGE="fragment")
+    for replacement, edits in (("dx taken as dy", [[r"OpDPdx %float", "OpDPdy %float"]]), ("add becomes subtract", [[r"OpFAdd %half", "OpFSub %half"]])):
+        os.environ.update(MSLC_REAL=mslc, MUT=json.dumps(edits), MUT_STAGE="fragment")
         for source in (SOURCE, WIDE):
             bad, _ = check(MUTATE, source)
             assert bad, ("mutant not detected", replacement, source)

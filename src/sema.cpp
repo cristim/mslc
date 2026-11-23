@@ -8523,8 +8523,22 @@ namespace {
 			if (_types.bitWidth(type) == 16) {
 				const Id float32Type = _types.vector(ScalarKind::Float, _types.vectorWidth(type));
 				const Id widened = convert(values[0], type, float32Type);
-				const Id result = _builder.emitTyped(spirv::OpFwidth, float32Type, { widened });
-				return convert(result, float32Type, type);
+				// Apple narrows |dx| and |dy| to half before adding them (measured on the GPU:
+				// 1024 - 2^-10 plus 1.5 is 1026, not the 1025 a float32 sum gives). Core
+				// SPIR-V derivatives are 32-bit, so each is taken in float32 and narrowed.
+				if (_glslSet == InvalidId) {
+					std::vector<uint32_t> setName;
+					spirv::Builder::appendString(setName, "GLSL.std.450");
+					_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+				}
+				constexpr uint32_t kFAbs = 4;
+				const auto magnitude = [&](spirv::Opcode derivative) {
+					const Id difference = convert(_builder.emitTyped(derivative, float32Type, { widened }), float32Type, type);
+					return _builder.emitTyped(spirv::OpExtInst, type, { _glslSet, kFAbs, difference });
+				};
+				const Id horizontal = magnitude(spirv::OpDPdx);
+				const Id vertical = magnitude(spirv::OpDPdy);
+				return _builder.emitTyped(spirv::OpFAdd, type, { horizontal, vertical });
 			}
 
 			return _builder.emitTyped(spirv::OpFwidth, type, { values[0] });

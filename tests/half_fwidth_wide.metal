@@ -1,8 +1,9 @@
-// fwidth of a half whose |dx| is not a half (#173), for tests/half_fwidth_expected_test.py.
+// RUN: vertex=vs fragment=fs cases=1
+// DIFFCHECK-POSITION: pos
+// fwidth of a half whose |dx| is not a half (#173), also used by tests/half_fwidth_expected_test.py.
 // 1024 sits next to 2^-10 in a quad row, so |dx| = 1024 - 2^-10 needs more than 11 significand bits;
-// adding |dy| = 1.5 gives a different half depending on whether each term is narrowed to half first
-// or the float32 sum is narrowed once. Apple narrows the terms first (see the test); mslc narrows once.
-// No RUN line: Apple and mslc differ here, so diffcheck must not draw it as a matching probe.
+// adding |dy| = 1.5 gives 1026 when each term is narrowed to half first (Apple, and mslc) and 1025 when
+// the float32 sum is narrowed once.
 #include <metal_stdlib>
 using namespace metal;
 struct VIn { float4 pos [[attribute(0)]]; };

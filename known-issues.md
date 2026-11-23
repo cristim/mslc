@@ -117,29 +117,18 @@ attachment. What it does not cover:
 - A mismatched input and output type at one index is refused with Apple's wording, but only
   against the return type of the same function.
 
-## half `fwidth` lowers via widen-to-float32, Apple parity unmeasured (#173)
+## half `fwidth` narrows each derivative to half before the sum (#173)
 
-`fwidth` on a `half`/`half2`/`half3`/`half4` argument lowers by converting the
-operand to `float32`, emitting `OpFwidth` (core SPIR-V requires 32-bit float
-components), and converting the result back to `half`. This is proven
-internally correct by a lavapipe readback (exact affine-input derivative,
-tolerance 0, two compiler mutants both caught), but **Apple's own half-fwidth
-rounding policy is unmeasured on this machine** (no Apple toolchain is
-reachable here). Apple is known to emit a native `air.fwidth.v2f16` for half,
-which may compute the difference/sum in half precision directly rather than
-widening to float32 first; the two approaches are not guaranteed to produce
-bit-identical results. The project owner was asked directly and chose to land
-this lowering with the gap stated rather than wait for hardware access to
-measure it. If Apple hardware/toolchain access becomes available, measure
-`air.fwidth.v2f16`'s actual output against mslc's widen-compute-narrow output
-and update or remove this entry.
-
-Measured on the Apple GPU (tools/diffcheck, `tests/half_fwidth_wide.metal`): when |dx| is
-not representable in half (1024 next to 2^-10, with |dy| = 1.5), Apple returns 1026 and mslc
-1025. Apple narrows the terms to half before the sum (or computes in half); mslc sums in
-float32 and narrows once. For inputs whose terms are all halves (`half_fwidth` and
-`half_fwidth_special`, including NaN, Inf, subnormal and overflow) the two match bit for bit.
-`tests/half_fwidth_expected_test.py` pins mslc's narrow-once behaviour, not Apple's.
+`fwidth` on a `half`/`half2`/`half3`/`half4` argument widens the operand to
+`float32` (core SPIR-V derivatives are 32-bit), takes `OpDPdx` and `OpDPdy`, narrows
+each to half, applies `FAbs` and adds in half. Apple's GPU does the same: on
+`tests/half_fwidth_wide.metal` (1024 next to 2^-10, |dy| = 1.5) both give 1026,
+where a float32 sum narrowed once gives 1025. Measured with tools/diffcheck, Apple
+GPU against lavapipe: `half_fwidth`, `half_fwidth_special` (rounding, subnormal, Inf,
+NaN, inf - inf, overflow) and `half_fwidth_wide` all match bit for bit, and
+`tests/half_fwidth_expected_test.py` checks the values against numpy float16.
+Not covered: half varyings interpolated from vertex data, and whether Apple uses a
+coarse or fine derivative on other hardware (lavapipe is fine).
 
 ## mslc emits Vulkan-valid modules that this lavapipe rejects
 
