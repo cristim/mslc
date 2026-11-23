@@ -1212,6 +1212,47 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 	return name;
 }
 
+// "template RET name<arguments>(parameters);" of a helper function template. An instance is made where
+// a call needs it, so one nothing calls has no effect, as in clang; the declaration only has to name a
+// function template. An entry point (an attribute, or a stage keyword) would need host_name entry
+// points and stays refused.
+void Parser::parseExplicitInstantiation() {
+	size_t open = 0;
+	for (; lookahead(open).kind != TokenKind::LParen; ++open) {
+		const Token& token = lookahead(open);
+		if (token.kind == TokenKind::EndOfFile || token.kind == TokenKind::Semicolon) {
+			throw CompileError("an explicit template instantiation is not lowered");
+		}
+		if (token.kind == TokenKind::LBracket || (token.kind == TokenKind::Identifier
+			&& (token.text == "kernel" || token.text == "vertex" || token.text == "fragment"))) {
+			throw CompileError("an explicit template instantiation of an entry point is not lowered");
+		}
+	}
+	size_t name = open;
+	if (name > 0 && lookahead(name - 1).kind == TokenKind::Greater) {
+		int depth = 0;
+		do {
+			--name;
+			depth += lookahead(name).kind == TokenKind::Greater ? 1 : lookahead(name).kind == TokenKind::Less ? -1 : 0;
+		} while (depth > 0 && name > 0);
+	}
+	if (name == 0 || lookahead(name - 1).kind != TokenKind::Identifier
+		|| (name > 1 && lookahead(name - 2).kind == TokenKind::ColonColon)) {
+		throw CompileError("an explicit template instantiation is not lowered");
+	}
+	const std::string spelled(lookahead(name - 1).text);
+	if (!_unit.functionTemplates.count(qualify(spelled)) && !_unit.functionTemplates.count(spelled)) {
+		throw CompileError("an explicit instantiation of \"" + spelled + "\" does not name a function template");
+	}
+	while (!at(TokenKind::Semicolon)) {
+		if (at(TokenKind::EndOfFile)) {
+			throw CompileError("an explicit template instantiation is not terminated");
+		}
+		advance();
+	}
+	advance();
+}
+
 // "template" at file scope: a function template. It is parsed far enough to know its parameters,
 // its name and where it ends; the tokens and the name state are kept, and a call that selects it
 // has it re-parsed with its arguments bound (instantiateTemplate). A body is only meaningful with
@@ -1220,7 +1261,8 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 void Parser::parseTemplateDeclaration() {
 	advance();
 	if (!at(TokenKind::Less)) {
-		throw CompileError("an explicit template instantiation is not lowered");
+		parseExplicitInstantiation();
+		return;
 	}
 	if (lookahead().kind == TokenKind::Greater) {
 		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "

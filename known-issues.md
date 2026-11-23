@@ -897,3 +897,8 @@ Apple's value is undefined.
   `Outer<float>` made before `Box<float>`) is refused with "argument types are declared after the template".
   Apple accepts it. The seeds are made in request order and a member template captures its names when the
   struct ends. The message is wrong for this case; the refusal is loud.
+
+## Explicit instantiation of a helper function template (#341)
+
+- `template float f<float>(int);` (a signature that matches no instance of `f`) is accepted and ignored; Apple
+  rejects it. Only the name is checked, and nothing is emitted, so the result is harmless.
