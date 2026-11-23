@@ -368,6 +368,8 @@ struct Expression {
 
 	// Construct: the type being constructed
 	std::optional<Type> constructType;
+	// Construct: as_type<T>(x), a bit reinterpretation and not a conversion.
+	bool bitReinterpret = false;
 
 	// Line the expression started on, for diagnostics.
 	size_t line = 0;

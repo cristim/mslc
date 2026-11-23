@@ -2835,6 +2835,7 @@ namespace {
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitConstruct(const Expression& expression);
+		Id emitAsType(const Expression& expression, Id toType, const std::string& spelled);
 		Id emitConstructList(const Expression& expression, Id toType);
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
 			const std::string& spelled);
@@ -4347,6 +4348,32 @@ namespace {
 		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
 	}
 
+	// as_type<T>(x) of a scalar to a scalar of the same width is one OpBitcast, as in
+	// Apple's AIR. Vectors and a change of width are not lowered.
+	Id Emitter::emitAsType(const Expression& expression, Id toType, const std::string& spelled) {
+		if (expression.arguments.size() != 1) {
+			throw CompileError("as_type<" + spelled + "> takes exactly one operand");
+		}
+
+		const Id value = emitExpression(*expression.arguments.front());
+		const Id fromType = _builder.typeOf(value);
+		const bool scalars = _types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) == 1
+			&& !_types.matrixInfo(fromType) && !_types.matrixInfo(toType)
+			&& !_types.isBool(fromType) && !_types.isBool(toType);
+		if (!scalars) {
+			throw CompileError("as_type<" + spelled + "> is lowered between scalar numeric types "
+				"only, and mslc does not reinterpret vectors, bools or aggregates yet");
+		}
+
+		const uint32_t fromBits = _types.bitWidth(fromType);
+		if (fromBits == 0 || fromBits != _types.bitWidth(toType)) {
+			throw CompileError("as_type<" + spelled + "> needs an operand of the same size as "
+				+ spelled + "; a " + std::to_string(fromBits) + "-bit operand is not");
+		}
+
+		return fromType == toType ? value : _builder.emitTyped(spirv::OpBitcast, toType, { value });
+	}
+
 	Id Emitter::emitConstruct(const Expression& expression) {
 		if (!expression.constructType) {
 			throw CompileError("a constructor needs the type it constructs");
@@ -4382,6 +4409,10 @@ namespace {
 		}
 
 		const Id toType = declaredTypeOf(target);
+
+		if (expression.bitReinterpret) {
+			return emitAsType(expression, toType, spelled);
+		}
 
 		// One vector per column, a single scalar for the diagonal, or one matrix of
 		// the same shape. A list of scalars filling it element by element is its own
@@ -8930,7 +8961,7 @@ namespace {
 	// folds none of those.
 	FoldedConstant Emitter::foldScalarConstruct(const Expression& expression) {
 		const Type* type = expression.constructType ? &*expression.constructType : nullptr;
-		if (!type || !type->isScalar() || type->isMatrix() || type->isPointer || type->isAtomic
+		if (expression.bitReinterpret || !type || !type->isScalar() || type->isMatrix() || type->isPointer || type->isAtomic
 			|| !type->namedType.empty() || !type->enumName.empty() || expression.arguments.size() != 1) {
 			throw CompileError("a constant's initialiser has to be a value that can be worked out "
 				"from the declarations before it, and this is not one");

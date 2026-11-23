@@ -7456,6 +7456,9 @@ ExpressionPtr Parser::parseNamedCast() {
 	expression->kind = ExpressionKind::Construct;
 	expression->line = line();
 
+	const bool asType = atKeyword("as_type");
+	const std::string cast = asType ? "as_type" : "static_cast";
+	expression->bitReinterpret = asType;
 	advance();
 	advance();
 
@@ -7473,7 +7476,7 @@ ExpressionPtr Parser::parseNamedCast() {
 			if (nameTokens > 0 && lookahead(nameTokens).kind == TokenKind::Less) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
 			}
-			throw CompileError("expected a type name in \"static_cast<\", found \""
+			throw CompileError("expected a type name in \"" + cast + "<\", found \""
 				+ std::string(current().text) + "\"");
 		}
 		type = *target;
@@ -7485,14 +7488,14 @@ ExpressionPtr Parser::parseNamedCast() {
 	if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 		throw CompileError("a cast to a pointer, reference or template type is not supported");
 	}
-	expect(TokenKind::Greater, "to close the type of a static_cast");
-	expect(TokenKind::LParen, "for the operand of a static_cast");
+	expect(TokenKind::Greater, asType ? "to close the type of an as_type" : "to close the type of a static_cast");
+	expect(TokenKind::LParen, asType ? "for the operand of an as_type" : "for the operand of a static_cast");
 	{
 		const NestingScope scope(*this);
 		expression->arguments.push_back(parseExpression());
 	}
-	expect(TokenKind::RParen, "to close a static_cast");
-	if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
+	expect(TokenKind::RParen, asType ? "to close an as_type" : "to close a static_cast");
+	if (!asType) if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
 		return call;
 	}
 	expression->constructType = type;
@@ -7809,7 +7812,7 @@ ExpressionPtr Parser::parsePrimary() {
 	}
 
 	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
-		if (atKeyword("static_cast")) {
+		if (atKeyword("static_cast") || atKeyword("as_type")) {
 			return parseNamedCast();
 		}
 		if (atKeyword("reinterpret_cast") || atKeyword("const_cast")) {
