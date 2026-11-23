@@ -11416,7 +11416,7 @@ namespace {
 				stage = 2;
 				minLod = scalarArgument(option, "min_lod_clamp");
 				minLodLiteral = option.arguments[0]->kind == ExpressionKind::FloatLiteral
-					|| option.arguments[0]->kind == ExpressionKind::IntLiteral;
+					&& !option.arguments[0]->floatIsHalf && option.arguments[0]->floatValue == 1.0;
 			} else {
 				if (stage > 2 || offset != InvalidId || isCubeKind(kind)) {
 					throw CompileError(isCubeKind(kind) ? "a cube sample takes no offset"
@@ -11446,10 +11446,11 @@ namespace {
 		}
 		const bool library = _entryPoint == &_libraryScope;
 		// Measured on Apple GPU only for a texture2d sample in a kernel function with a constant
-		// min_lod_clamp(1.0) alone (RGBA32F 4x4, nearest mips): it reads level 0, as if ignored (the AIR
-		// carries it, the hardware does not clamp), so exactly that shape drops it. A depth or compare
-		// sample, a non-constant argument, gradients and a helper function were not measured.
-		if (!library && _helper == nullptr && minLodLiteral && !compare && !texture.pointeeMsl.isDepth
+		// min_lod_clamp(1.0) alone (RGBA32F 4x4, nearest mips, no offset): it reads level 0, as if ignored
+		// (the AIR carries it, the hardware does not clamp), so exactly that shape drops it. Any other
+		// value, an integer literal, an offset, a half or int texture, a depth or compare sample, a
+		// non-constant argument, gradients and a helper function were not measured.
+		if (!library && _helper == nullptr && minLodLiteral && offset == InvalidId && texture.pointeeMsl.scalar == ScalarKind::Float && !compare && !texture.pointeeMsl.isDepth
 			&& kind == ResourceKind::Texture2D && bias == InvalidId && gradientX == InvalidId && lod == InvalidId
 			&& _entryPoint->stage == Stage::Kernel) {
 			minLod = InvalidId;
