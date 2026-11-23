@@ -175,6 +175,17 @@ def _skipped(res, reason):
     return res
 
 
+def vertex_attribute_findings(attributes, apple):
+    """Findings where mslc's stage_in attribute types (read from its SPIR-V) differ from Apple's
+    MTLFunction.vertexAttributes, by location, scalar kind or component count. An attribute only
+    one side has is a finding too."""
+    mine = {loc: (a["scalar"], a["comps"]) for loc, a in attributes.items()}
+    theirs = {a["index"]: (a["scalar"], a["comps"]) for a in apple}
+    return ["vertex attribute %d: mslc has %s x%d, Apple has %s x%d" % (
+        loc, *(mine.get(loc) or ("nothing", 0)), *(theirs.get(loc) or ("nothing", 0)))
+        for loc in sorted(set(mine) | set(theirs)) if mine.get(loc) != theirs.get(loc)]
+
+
 def _prepare(opts, source, vs, fs, params, work, includes):
     """Compile both stages and decide everything the draw needs. Returns (plan, None) or
     (None, result) when the file is skipped or erroneous."""
@@ -250,6 +261,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     except hosts.HostError as e:
         return None, _skipped(res, str(e))
     findings, layouts = [], {}
+    findings += vertex_attribute_findings(attributes, apple["vertex_attributes"])
     for stage in ("vertex", "fragment"):
         ep, a = compiled[stage][1], apple[stage]
         if a["unsupported"]:

@@ -317,8 +317,17 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo reflection:&refl error:&err];
     if (!pso) die([@"pipeline failed: " stringByAppendingString:err.localizedDescription ?: @"?"]);
     if (!draw) {
+        // The stage_in attributes the Metal source declares, independent of the vertex descriptor built from mslc's types.
+        NSMutableArray *attrs = [NSMutableArray array];
+        for (MTLVertexAttribute *a in vfn.vertexAttributes) {
+            const char *scalar; int rows, cols; NSUInteger colStride;
+            if (shape(a.attributeType, &scalar, &rows, &cols, &colStride) && cols == 1)
+                [attrs addObject:@{@"index": @(a.attributeIndex), @"name": a.name, @"scalar": @(scalar), @"comps": @(rows)}];
+            else
+                [attrs addObject:@{@"index": @(a.attributeIndex), @"name": a.name, @"scalar": @"other", @"comps": @0}];
+        }
         NSDictionary *doc = @{@"device": device.name, @"vertex": reflectBindings(refl.vertexBindings, YES, YES),
-            @"fragment": reflectBindings(refl.fragmentBindings, YES, YES)};
+            @"fragment": reflectBindings(refl.fragmentBindings, YES, YES), @"vertex_attributes": attrs};
         NSData *j = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
         if (!m[@"reflection"] || ![j writeToFile:m[@"reflection"][0] atomically:YES]) die(@"cannot write the reflection");
         return 0;

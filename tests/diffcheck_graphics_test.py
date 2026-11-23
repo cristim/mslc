@@ -42,6 +42,20 @@ OpDecorate %5 Location 3
 """
 
 
+class VertexAttributes(unittest.TestCase):
+    def test_matching_types_have_no_findings(self):
+        mine = {0: {"scalar": "float", "comps": 4}, 2: {"scalar": "uint", "comps": 1}}
+        apple = [{"index": 2, "scalar": "uint", "comps": 1}, {"index": 0, "scalar": "float", "comps": 4}]
+        self.assertEqual(graphics.vertex_attribute_findings(mine, apple), [])
+
+    def test_type_width_and_presence_differences_are_findings(self):
+        mine = {0: {"scalar": "float", "comps": 4}, 1: {"scalar": "int", "comps": 2}}
+        apple = [{"index": 0, "scalar": "float", "comps": 3}, {"index": 1, "scalar": "uint", "comps": 2},
+                 {"index": 5, "scalar": "float", "comps": 1}]
+        self.assertEqual(len(graphics.vertex_attribute_findings(mine, apple)), 3)
+        self.assertEqual(len(graphics.vertex_attribute_findings({}, apple[:1])), 1)
+
+
 class Directives(unittest.TestCase):
     def test_graphics_directives(self):
         d = directives.parse("// RUN: vertex=vs fragment=fs width=8 instances=2\n// DIFFCHECK-GEOMETRY: 1,2 3,4 5,6,0.25\n"
