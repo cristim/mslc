@@ -4348,8 +4348,8 @@ namespace {
 		return _builder.emitTyped(spirv::OpCompositeConstruct, toType, columns);
 	}
 
-	// as_type<T>(x) of a scalar to a scalar of the same width is one OpBitcast, as in
-	// Apple's AIR. Vectors and a change of width are not lowered.
+	// as_type<T>(x) between numeric values of the same component count and component
+	// width is one OpBitcast, as in Apple's AIR. Other shapes are not lowered.
 	Id Emitter::emitAsType(const Expression& expression, Id toType, const std::string& spelled) {
 		if (expression.arguments.size() != 1) {
 			throw CompileError("as_type<" + spelled + "> takes exactly one operand");
@@ -4357,18 +4357,22 @@ namespace {
 
 		const Id value = emitExpression(*expression.arguments.front());
 		const Id fromType = _builder.typeOf(value);
-		const bool scalars = _types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) == 1
-			&& !_types.matrixInfo(fromType) && !_types.matrixInfo(toType)
+		const bool numeric = !_types.matrixInfo(fromType) && !_types.matrixInfo(toType)
 			&& !_types.isBool(fromType) && !_types.isBool(toType);
-		if (!scalars) {
-			throw CompileError("as_type<" + spelled + "> is lowered between scalar numeric types "
-				"only, and mslc does not reinterpret vectors, bools or aggregates yet");
+		if (!numeric) {
+			throw CompileError("as_type<" + spelled + "> is lowered between numeric scalars and "
+				"vectors only, and mslc does not reinterpret matrices, bools or aggregates yet");
+		}
+		if (_types.vectorWidth(fromType) != _types.vectorWidth(toType)) {
+			throw CompileError("as_type<" + spelled + "> needs an operand with the same number of "
+				"components; mslc does not change the component count yet");
 		}
 
 		const uint32_t fromBits = _types.bitWidth(fromType);
 		if (fromBits == 0 || fromBits != _types.bitWidth(toType)) {
 			throw CompileError("as_type<" + spelled + "> needs an operand of the same size as "
-				+ spelled + "; a " + std::to_string(fromBits) + "-bit operand is not");
+				+ spelled + "; its components are " + std::to_string(fromBits) + " bits wide, not the same");
+
 		}
 
 		return fromType == toType ? value : _builder.emitTyped(spirv::OpBitcast, toType, { value });
