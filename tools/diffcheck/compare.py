@@ -102,14 +102,110 @@ def leaf_equal(a, b, scalar, ulp=0, eps=0.0):
     return ulp_distance(a, b, scalar) <= ulp
 
 
-def ulp_bound_for_source(source):
-    """The loosest bound among the inexact functions the source calls."""
+def _strip(source):
     # Comments and string literals are not calls.
-    source = re.sub(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"", " ", source, flags=re.S)
+    return re.sub(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"", " ", source, flags=re.S)
+
+
+def _call_bound(text):
     bound = 0
     for name, ulp in ULP_BOUNDS.items():
-        if ulp > bound and re.search(r"(?<![\w.])(?:\w+::)*%s\s*\(" % name, source):
+        if ulp > bound and re.search(r"(?<![\w.])(?:\w+::)*%s\s*\(" % name, text):
             bound = ulp
+    return bound
+
+
+def ulp_bound_for_source(source):
+    """The loosest bound among the inexact functions the source calls."""
+    return _call_bound(_strip(source))
+
+
+_SCALAR = r"(?:bool|char|uchar|short|ushort|int|uint|long|ulong|half|float)[234]?"
+_DECL = re.compile(r"^(?:const\s+)?%s\s+(\w+)\s*(?:=\s*(.*))?$" % _SCALAR, re.S)
+_STORE = re.compile(r"^(\w+)\s*((?:\[[^\[\]]*\]\s*)*)[-+*/%]?=(?!=)\s*(.*)$", re.S)
+_FUNCTION = re.compile(r"^\s*(?:(?:kernel|vertex|fragment)\s+)\w[\w:<>]*\s+\w+\s*\(([^(){};]*)\)\s*\{([^{}]*)\}\s*$", re.S)
+_BUFFER_LIKE = re.compile(r"[*&]|\b(?:device|constant|threadgroup|texture\w*|sampler|depth\w*)\b")
+_UNSAFE_EXPR = (
+    re.compile(r"[\w\])]\s*(?:\.|->)\s*[A-Za-z_]"),  # member access
+    re.compile(r"(?<!&)&(?!&)"),  # address-of, reference
+    re.compile(r"\b(?:\w*_cast|as_type\w*|decltype|auto|sizeof|typeof)\b"),
+    re.compile(r"\([^()]*\*\s*\)"),  # pointer cast
+    re.compile(r"\(\s*(?:const\s+)?%s\s*\)" % _SCALAR),  # C-style value cast
+)
+
+
+def _simple_expr(expr, buffers):
+    """No way to reach a buffer except by a subscripted read, and no hidden aliasing or casts."""
+    if any(p.search(expr) for p in _UNSAFE_EXPR) or _split_comma(expr):
+        return False
+    return not any(re.search(r"(?<![\w.])%s\b(?!\s*\[)" % re.escape(b), expr) for b in buffers)
+
+
+def _split_comma(text):
+    depth = 0
+    for ch in text:
+        depth += ch in "(["
+        depth -= ch in ")]"
+        if ch == "," and depth == 0:
+            return True
+    return False
+
+
+def ulp_bounds_by_root(source):
+    """{root: ULP bound} for what each kernel buffer parameter or scalar local can hold, so a buffer
+    written from sqrt does not inherit the bound of an unrelated pow elsewhere in the shader.
+
+    An allowlist, deliberately looser than a precise analysis: the split applies only when the source
+    is one entry point whose body is nothing but scalar or vector declarations and plain
+    `local[...] = rhs;` or `buffer[...] = rhs;` stores, with no braces, member access, address-of,
+    cast, `auto`/`decltype`/`using`/`typedef`, pointer or reference, helper function, or bare buffer
+    name in an expression. Any other source returns {} and callers use the whole-source bound, which
+    is never tighter than the truth. A root's bound is the loosest bound among the right-hand sides
+    stored to it and every other root those sides read."""
+    source = re.sub(r"(?m)^\s*#\s*(?:include|pragma)\b.*$", " ", _strip(source))
+    source = re.sub(r"\busing\s+namespace\s+metal\s*;", " ", source)
+    source = re.sub(r"\[\[.*?\]\]", "", source, flags=re.S)
+    m = _FUNCTION.match(source)
+    if m is None:
+        return {}
+    buffers = set()
+    for param in re.split(r",", m.group(1)):
+        if param.strip() and _BUFFER_LIKE.search(param):
+            ident = re.findall(r"\w+", param)
+            if not ident:
+                return {}
+            buffers.add(ident[-1])
+    stores, locals_ = [], set()
+    for stmt in m.group(2).split(";"):
+        if not stmt.strip():
+            continue
+        d = _DECL.match(stmt.strip())
+        if d:
+            name, init = d.group(1), d.group(2)
+            if name in buffers or name in locals_ or (init is not None and not _simple_expr(init, buffers)):
+                return {}
+            locals_.add(name)
+            if init is not None:
+                stores.append((name, init))
+            continue
+        st = _STORE.match(stmt.strip())
+        if st is None or not _simple_expr(st.group(3), buffers):
+            return {}
+        root, subs = st.group(1), st.group(2).strip()
+        if not (root in buffers and subs or root in locals_):
+            return {}
+        stores.append((root, st.group(3) + " " + subs))
+    bound = {root: 0 for root, _ in stores}
+    for root, rhs in stores:
+        bound[root] = max(bound[root], _call_bound(rhs))
+    changed = True
+    while changed:
+        changed = False
+        for root, rhs in stores:
+            for ident in set(re.findall(r"\w+", rhs)):
+                if bound.get(ident, 0) > bound[root]:
+                    bound[root] = bound[ident]
+                    changed = True
     return bound
 
 
