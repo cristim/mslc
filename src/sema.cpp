@@ -6342,6 +6342,9 @@ namespace {
 	// The overload a call names, chosen by its arguments. Arity alone often decides; otherwise the
 	// arguments are evaluated here, once, left to right, and handed on in prepared so the call
 	// does not evaluate them again.
+	static std::string templateMarker(const TemplateParameter& parameter);
+	static bool sameValueType(const Type& a, const Type& b);
+
 	Emitter::HelperFunction* Emitter::resolveOverload(const Expression& call, const std::vector<HelperFunction*>& set,
 		const std::vector<const FunctionTemplate*>& templates, const std::set<std::string>& adl,
 		std::vector<Id>& prepared, const Expression* receiver) {
@@ -6501,13 +6504,16 @@ namespace {
 		}
 
 		// A template competes through its instance; one that cannot be deduced is no candidate (as in C++).
+		std::map<const HelperFunction*, const TemplateCandidate*> patternOf;
 		for (const TemplateCandidate& candidate: patterns) {
 			std::vector<TemplateArgument> deduced = candidate.arguments;
 			if (!deduceTemplateArguments(*candidate.declaration, *candidate.pattern, candidate.given, arguments, deduced)) {
 				continue;
 			}
 			try {
-				candidates.push_back(&templateInstance(*candidate.declaration, std::move(deduced)).helper);
+				HelperFunction* made = &templateInstance(*candidate.declaration, std::move(deduced)).helper;
+				candidates.push_back(made);
+				patternOf[made] = &candidate;
 			} catch (const SubstitutionFailure&) {
 				// The signature with these arguments is ill-formed (an enable_if): not a candidate.
 			}
@@ -6530,6 +6536,46 @@ namespace {
 				+ describe(candidates) + (templateList.empty() ? "" : "; templates: " + templateList));
 		}
 
+		// Whether the second template's parameters can all be read off the first's, by value types and
+		// consistent markers only; anything else (pointers, class instances, arrays) is left unordered.
+		const auto deducibleFrom = [&](const TemplateCandidate& from, const TemplateCandidate& to) {
+			if (from.pattern->parameters.size() != to.pattern->parameters.size()) {
+				return false;
+			}
+			std::map<std::string, const Parameter*> bound;
+			for (size_t i = 0; i < to.pattern->parameters.size(); ++i) {
+				const Parameter& a = from.pattern->parameters[i];
+				const Parameter& b = to.pattern->parameters[i];
+				const auto plain = [](const FunctionDecl& decl, const Parameter& p) {
+					return !p.type.isPointer && !p.type.arrayLength && p.type.resource == ResourceKind::None
+						&& !decl.dependentInstances.count(p.type.namedType);
+				};
+				if (!plain(*from.pattern, a) || !plain(*to.pattern, b) || a.isReference != b.isReference
+					|| a.type.isConst != b.type.isConst) {
+					return false;
+				}
+				const auto isParameter = [](const FunctionTemplate& declaration, const Type& type) {
+					return isTemplateMarker(type) && std::any_of(declaration.parameters.begin(), declaration.parameters.end(),
+						[&](const TemplateParameter& p) { return p.isType && templateMarker(p) == type.namedType; });
+				};
+				if (isParameter(*to.declaration, b.type)) {
+					const auto [slot, fresh] = bound.emplace(b.type.namedType, &a);
+					if (!fresh && (slot->second->type.namedType != a.type.namedType || !sameValueType(slot->second->type, a.type))) {
+						return false;
+					}
+				} else if (isParameter(*from.declaration, a.type) || !sameValueType(a.type, b.type)) {
+					return false;
+				}
+			}
+			return true;
+		};
+		const auto moreSpecialized = [&](const HelperFunction* first, const HelperFunction* second) {
+			const auto a = patternOf.find(first);
+			const auto b = patternOf.find(second);
+			return a != patternOf.end() && b != patternOf.end() && deducibleFrom(*a->second, *b->second)
+				&& !deducibleFrom(*b->second, *a->second);
+		};
+
 		// One wins when no worse on any argument and better on one, or equal and a function beside a template.
 		const auto beats = [&](const auto& first, const auto& second) {
 			const std::vector<ConversionCost>& a = first.second;
@@ -6544,7 +6590,8 @@ namespace {
 				}
 				better = better || (ranked ? a[i].rank < b[i].rank : qualified);
 			}
-			return better || (!isInstance(first.first->definition) && isInstance(second.first->definition));
+			return better || (!isInstance(first.first->definition) && isInstance(second.first->definition))
+				|| moreSpecialized(first.first, second.first);
 		};
 		for (const auto& winner: viable) {
 			if (std::all_of(viable.begin(), viable.end(), [&](const auto& other) {
