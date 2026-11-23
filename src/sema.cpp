@@ -11399,6 +11399,12 @@ namespace {
 				"implicit lod or gradients only");
 		}
 		const bool library = _entryPoint == &_libraryScope;
+		// Measured on Apple GPU: min_lod_clamp(m) alone in a kernel reads level 0 for m = 1.0, as if
+		// ignored (the AIR carries it, the hardware does not clamp), so it is dropped here.
+		if (!library && minLod != InvalidId && bias == InvalidId && gradientX == InvalidId && lod == InvalidId
+			&& _entryPoint->stage == Stage::Kernel) {
+			minLod = InvalidId;
+		}
 		if (derivatives && !sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId)) {
 			if (library) {
 				throw StageError("bias or min_lod_clamp in a library helper: they need derivatives, which exist only in a "
