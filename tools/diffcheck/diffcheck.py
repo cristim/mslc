@@ -337,7 +337,7 @@ def corpus_files(listing, root):
 
 def check_one(opts, path, std, run=None, bad_line=None):
     if bad_line:
-        return [{"file": path, "entry": "*", "status": "skipped", "reason": bad_line, "cases": []}]
+        return [{"file": path, "entry": "*", "status": "error", "reason": bad_line, "cases": []}]
     try:
         return [dict(r, file=path) for r in check_file(opts, path, std, run)]
     except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:

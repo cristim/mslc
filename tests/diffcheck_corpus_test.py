@@ -28,13 +28,13 @@ class CorpusFiles(unittest.TestCase):
     def test_bare_line_has_an_empty_run(self):
         self.assertEqual(listing("a.metal\n")[0][2], {})
 
-    def test_malformed_line_is_skipped_and_the_next_line_still_parses(self):
+    def test_malformed_line_is_an_error_and_the_next_line_still_parses(self):
         files = listing("x.metal bogus=1\nx.metal vertex=\nx.metal width=0x\ny.metal width=4\n")
         self.assertEqual(len(files), 4)
         for bad in files[:3]:
             self.assertEqual(len(bad), 4)
             r, = diffcheck.check_one(None, *bad)
-            self.assertEqual(r["status"], "skipped")
+            self.assertEqual(r["status"], "error")
             self.assertIn("bad corpus list line", r["reason"])
         self.assertEqual(files[3][2], {"width": 4})
 
