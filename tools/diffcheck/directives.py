@@ -42,21 +42,28 @@ def _point(token):
     return tuple(values) if len(values) == 3 else (values[0], values[1], 0.5)
 
 
+def parse_run_pairs(pairs):
+    """{key: value} for `key=value` tokens of a RUN line (or of a corpus list line)."""
+    run = {}
+    for pair in pairs:
+        key, _, value = pair.partition("=")
+        if key in RUN_NAMES and re.fullmatch(r"[A-Za-z_]\w*", value):
+            run[key] = value
+            continue
+        if key not in RUN_KEYS or not value.isdigit() or int(value) < 1:
+            raise ValueError("bad RUN parameter %r (a positive number; keys: %s; a name for %s)" % (
+                pair, ", ".join(sorted(RUN_KEYS)), ", ".join(sorted(RUN_NAMES))))
+        run[key] = int(value)
+    return run
+
+
 def parse(source):
     result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
         if m:
-            for pair in m.group(1).split():
-                key, _, value = pair.partition("=")
-                if key in RUN_NAMES and re.fullmatch(r"[A-Za-z_]\w*", value):
-                    result["run"][key] = value
-                    continue
-                if key not in RUN_KEYS or not value.isdigit() or int(value) < 1:
-                    raise ValueError("bad RUN parameter %r (a positive number; keys: %s; a name for %s)" % (
-                        pair, ", ".join(sorted(RUN_KEYS)), ", ".join(sorted(RUN_NAMES))))
-                result["run"][key] = int(value)
+            result["run"].update(parse_run_pairs(m.group(1).split()))
             continue
         m = re.match(r"\s*//\s*DIFFCHECK:\s*writes-zero\s*$", line)
         if m:

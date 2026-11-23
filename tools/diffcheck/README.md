@@ -19,7 +19,9 @@ loader and Mesa's lavapipe (`brew install mesa vulkan-loader`; the ICD is found 
 lavapipe manifest is accepted), `cc` and `clang++`. The two hosts are built on demand into
 `$TMPDIR/diffcheck-hosts`. Nothing else outside this repository is needed.
 
-A corpus list has one path per line, `#` comments, and an optional `std=3.1`. Paths are
+A corpus list has one path per line, `#` comments, an optional `std=3.1` and the fields of a
+`// RUN:` line (`vertex=vs fragment=fs width=32 ...`), which override the file's own, so a file you do
+not edit can be drawn as a graphics pair. Paths are
 relative to `--root` (default: the list's directory), so third-party shaders stay out of
 the repository: the harness takes any path.
 

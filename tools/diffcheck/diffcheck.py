@@ -265,12 +265,13 @@ def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
     return results + unknown_directives(opts, d, results)
 
 
-def check_file(opts, path, std=None):
+def check_file(opts, path, std=None, run=None):
     """Results for every kernel in `path` (or the one named by --entry)."""
     here = os.path.dirname(os.path.abspath(path))
     includes = opts.includes + [here, os.path.dirname(here)]
     text = hostenv.read_text(path)
     d = directives.parse(text)
+    d["run"].update(run or {})
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
         vs, fs = opts.vertex or d["run"].get("vertex"), opts.fragment or d["run"].get("fragment")
@@ -314,7 +315,9 @@ def check_file(opts, path, std=None):
 
 
 def corpus_files(listing, root):
-    """(path, std) for each line of a corpus list: `path [std=3.1]`, # comments, relative to root."""
+    """(path, std, run) for each line of a corpus list: `path [std=3.1] [vertex=vs fragment=fs width=32 ...]`,
+    # comments, relative to root. The run fields are those of a `// RUN:` line and override it, so a file
+    you do not edit can still be drawn as a graphics pair."""
     files = []
     for line in hostenv.read_text(listing).splitlines():
         line = line.split("#", 1)[0].strip()
@@ -322,13 +325,14 @@ def corpus_files(listing, root):
             continue
         fields = line.split()
         std = next((f[4:] for f in fields[1:] if f.startswith("std=")), None)
-        files.append((os.path.join(root, fields[0]), std))
+        run = directives.parse_run_pairs([f for f in fields[1:] if not f.startswith("std=")])
+        files.append((os.path.join(root, fields[0]), std, run))
     return files
 
 
-def check_one(opts, path, std):
+def check_one(opts, path, std, run=None):
     try:
-        return [dict(r, file=path) for r in check_file(opts, path, std)]
+        return [dict(r, file=path) for r in check_file(opts, path, std, run)]
     except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:
         return [{"file": path, "entry": "*", "status": "error", "reason": "%s: %s" % (type(e).__name__, e), "cases": []}]
 
@@ -420,7 +424,7 @@ def main(argv=None):
             root = opts.root or os.path.dirname(os.path.abspath(opts.corpus))
             results = run_files(opts, corpus_files(opts.corpus, root))
         else:
-            results = run_files(opts, [(opts.file, None)])
+            results = run_files(opts, [(opts.file, None, {})])
     except hosts.Unavailable as e:
         print("SKIPPED: %s" % e)
         return hostenv.SKIP
