@@ -11038,9 +11038,13 @@ namespace {
 		const std::string takes = std::string("texture write takes exactly ") + (element == ScalarKind::Int ? "an " : "a ") + scalarKindName(element)
 			+ "4 or a number and a uint" + suffix + " or ushort" + suffix + " coordinate"
 			+ (layers == 2 ? " and a face and an array index" : layers == 1 ? (kind == ResourceKind::TextureCube ? " and a face" : " and a layer") : "");
+		if (call.arguments.size() == 3 + layers && kind == ResourceKind::TextureBuffer) {
+			throw CompileError("write on a texture_buffer takes a value and one coordinate: a texture_buffer has no mip levels");
+		}
 		if (call.arguments.size() == 3 + layers) {
 			throw CompileError("mip arguments are unsupported on access::" + std::string(textureAccessName(access))
-				+ " textures; write takes only a value, a coordinate and a layer where the texture has one");
+				+ " textures: Apple accepts the level, but a Vulkan storage image view is one level, so the host binds it; "
+				"write takes only a value, a coordinate and a layer where the texture has one");
 		}
 		if (call.arguments.size() != 2 + layers) {
 			throw CompileError(takes);
@@ -11664,7 +11668,8 @@ namespace {
 		const size_t fixed = 1 + layers;
 		if (storage && arguments.size() == fixed + 1) {
 			throw CompileError(std::string("mip arguments are unsupported on access::")
-				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; read takes only a coordinate");
+				+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures: Apple accepts the level, but a Vulkan "
+				"storage image view is one level, so the host binds it; read takes only a coordinate");
 		}
 		if (arguments.size() < fixed || arguments.size() > fixed + 1) {
 			throw CompileError(std::string("read takes a coordinate")
@@ -11772,7 +11777,8 @@ namespace {
 				: texture.pointeeMsl.isMultisampled
 				? name + " takes no arguments: a multisampled texture has no mip levels"
 				: std::string("mip arguments are unsupported on access::")
-					+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures; " + name + " takes no arguments");
+					+ textureAccessName(texture.pointeeMsl.textureAccess) + " textures: Apple accepts the level, but a Vulkan "
+					"storage image view is one level, so the host binds it; " + name + " takes no arguments");
 		}
 		if (call.arguments.size() > 1) {
 			throw CompileError(name + " takes an optional lod; this call passes "

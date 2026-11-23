@@ -1,4 +1,4 @@
-// EXPECT: error mip arguments are unsupported
+// EXPECT: error write on a texture_buffer takes a value and one coordinate: a texture_buffer has no mip levels
 // Apple refuses this texture_buffer call too (no matching write).
 #include <metal_stdlib>
 using namespace metal;

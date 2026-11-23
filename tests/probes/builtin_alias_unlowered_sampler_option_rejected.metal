@@ -1,4 +1,4 @@
-// EXPECT: error the sampler option "reduction" is not lowered yet
+// EXPECT: error the sampler option "reduction" is accepted by Apple but not lowered: Vulkan selects it with VkSamplerReductionMode
 // Apple accepts this; mslc does not lower the option. An option family reached through an alias gets its family-specific diagnostic, as through metal::.
 #include <metal_stdlib>
 namespace M = ::metal;

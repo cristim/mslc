@@ -6489,7 +6489,9 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 			"mag_filter", "min_filter", "mip_filter", "compare_func", "max_anisotropy", "lod_clamp", "border_color",
 		};
 		if (unlowered.count(family)) {
-			throw CompileError("the sampler option \"" + family + "\" is not lowered yet; mslc lowers "
+			throw CompileError("the sampler option \"" + family + "\" is accepted by Apple but not lowered: Vulkan "
+				"selects it with VkSamplerReductionMode (VK_EXT_sampler_filter_minmax) and the reflection's sampler "
+				"has no field for it, so it would be dropped silently; mslc lowers "
 				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter, "
 				"mip_filter, compare_func, max_anisotropy, lod_clamp and border_color");
 		}
@@ -6560,6 +6562,11 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 		const auto filter = [&]() -> SamplerFilter {
 			if (value == "nearest") return SamplerFilter::Nearest;
 			if (value == "linear") return SamplerFilter::Linear;
+			if (value == "bicubic") {
+				throw CompileError("\"" + spelled + "\" is accepted by Apple but not lowered: Vulkan has bicubic "
+					"filtering only as VK_EXT_filter_cubic / VK_IMG_filter_cubic, outside core, and the reflection's "
+					"sampler has no field for it, so it would be dropped silently");
+			}
 			throw CompileError("\"" + spelled + "\" is not a sampler filter");
 		};
 
