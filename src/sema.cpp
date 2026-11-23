@@ -6536,34 +6536,77 @@ namespace {
 				+ describe(candidates) + (templateList.empty() ? "" : "; templates: " + templateList));
 		}
 
-		// Whether the second template's parameters can all be read off the first's, by value types and
-		// consistent markers only; anything else (pointers, class instances, arrays) is left unordered.
+		// Whether the second template's parameters can all be read off the first's, by value types, class
+		// template instances and consistent markers; anything else (pointers, arrays) is left unordered.
 		const auto deducibleFrom = [&](const TemplateCandidate& from, const TemplateCandidate& to) {
 			if (from.pattern->parameters.size() != to.pattern->parameters.size()) {
 				return false;
 			}
-			std::map<std::string, const Parameter*> bound;
+			const auto isParameter = [](const FunctionTemplate& declaration, const Type& type) {
+				return isTemplateMarker(type) && std::any_of(declaration.parameters.begin(), declaration.parameters.end(),
+					[&](const TemplateParameter& p) { return p.isType && templateMarker(p) == type.namedType; });
+			};
+			const auto isInstance = [](const FunctionDecl& decl, const Type& type) {
+				return decl.dependentInstances.count(type.namedType) > 0;
+			};
+			// A parameter of the second template takes the first's type for it; asked again, it must agree.
+			std::map<std::string, std::pair<Type, bool>> bound;
+			const auto bind = [&](const std::string& marker, const Type& type, bool whole) {
+				const auto [slot, fresh] = bound.emplace(marker, std::make_pair(type, whole));
+				return fresh || (slot->second.second == whole && slot->second.first.namedType == type.namedType
+					&& sameValueType(slot->second.first, type) && slot->second.first.isConst == type.isConst);
+			};
+			const auto matchInstance = [&](const auto& self, const Type& a, const Type& b) -> bool {
+				const DependentInstance& have = from.pattern->dependentInstances.at(a.namedType);
+				const DependentInstance& want = to.pattern->dependentInstances.at(b.namedType);
+				if (have.classTemplate != want.classTemplate || have.arguments.size() != want.arguments.size()) {
+					return false;
+				}
+				for (size_t k = 0; k < want.arguments.size(); ++k) {
+					const TemplateArgument& x = have.arguments[k];
+					const TemplateArgument& y = want.arguments[k];
+					if (x.isType != y.isType) {
+						return false;
+					}
+					if (!y.isType) {
+						if (x.value != y.value) {
+							return false;
+						}
+					} else if (isInstance(*to.pattern, y.type)) {
+						if (!isInstance(*from.pattern, x.type) || x.type.isConst != y.type.isConst
+							|| !self(self, x.type, y.type)) {
+							return false;
+						}
+					} else if (isParameter(*to.declaration, y.type)) {
+						if (y.type.isConst != x.type.isConst || !bind(y.type.namedType, x.type, false)) {
+							return false;
+						}
+					} else if (isParameter(*from.declaration, x.type) || isInstance(*from.pattern, x.type)
+						|| !sameValueType(x.type, y.type) || x.type.isConst != y.type.isConst) {
+						return false;
+					}
+				}
+				return true;
+			};
 			for (size_t i = 0; i < to.pattern->parameters.size(); ++i) {
 				const Parameter& a = from.pattern->parameters[i];
 				const Parameter& b = to.pattern->parameters[i];
-				const auto plain = [](const FunctionDecl& decl, const Parameter& p) {
-					return !p.type.isPointer && !p.type.arrayLength && p.type.resource == ResourceKind::None
-						&& !decl.dependentInstances.count(p.type.namedType);
+				const auto plain = [](const Parameter& p) {
+					return !p.type.isPointer && !p.type.arrayLength && p.type.resource == ResourceKind::None;
 				};
-				if (!plain(*from.pattern, a) || !plain(*to.pattern, b) || a.isReference != b.isReference
-					|| a.type.isConst != b.type.isConst) {
+				if (!plain(a) || !plain(b) || a.isReference != b.isReference || a.type.isConst != b.type.isConst) {
 					return false;
 				}
-				const auto isParameter = [](const FunctionTemplate& declaration, const Type& type) {
-					return isTemplateMarker(type) && std::any_of(declaration.parameters.begin(), declaration.parameters.end(),
-						[&](const TemplateParameter& p) { return p.isType && templateMarker(p) == type.namedType; });
-				};
-				if (isParameter(*to.declaration, b.type)) {
-					const auto [slot, fresh] = bound.emplace(b.type.namedType, &a);
-					if (!fresh && (slot->second->type.namedType != a.type.namedType || !sameValueType(slot->second->type, a.type))) {
+				if (isInstance(*to.pattern, b.type)) {
+					if (!isInstance(*from.pattern, a.type) || !matchInstance(matchInstance, a.type, b.type)) {
 						return false;
 					}
-				} else if (isParameter(*from.declaration, a.type) || !sameValueType(a.type, b.type)) {
+				} else if (isParameter(*to.declaration, b.type)) {
+					if (!bind(b.type.namedType, a.type, true)) {
+						return false;
+					}
+				} else if (isInstance(*from.pattern, a.type) || isParameter(*from.declaration, a.type)
+					|| !sameValueType(a.type, b.type)) {
 					return false;
 				}
 			}

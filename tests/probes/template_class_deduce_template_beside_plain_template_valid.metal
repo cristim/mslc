@@ -1,5 +1,6 @@
-// EXPECT: error is ambiguous
-// Refs #341: slice 5e: f(Box<T>) beside f(T) is ambiguous here (partial ordering is not lowered; Apple picks the first).
+// EXPECT: valid
+// DISASM-NOT: OpFAdd
+// Refs #341: f(Box<T>) beside f(T): Apple picks the first, the more specialized.
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> struct Box { T v; };
