@@ -47,7 +47,7 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
     touts = {tb.index: os.path.join(work, "%s%s-out-t%d-%d.bin" % (backend, tag, case, tb.index)) for tb, _, _ in texels}
-    extra = (resources.lines(textures, run["samplers"]) + resources.texel_lines(texels, touts)
+    extra = (resources.lines(textures, run["samplers"], backend) + resources.texel_lines(texels, touts)
              + resources.threadgroup_lines(run["threadgroups"], run["local"], backend))
     if backend == "apple":
         text = ["mode run"] + run["lines"] + ["entry " + run["entry"], "local %d 1 1" % run["local"],
@@ -188,7 +188,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
                                   params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
-        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case))
+        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"])
         for i, l in sorted(layouts.items()):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,

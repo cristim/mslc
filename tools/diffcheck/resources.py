@@ -80,30 +80,46 @@ def unsupported(entry, apple):
     reasons += ["texture %s is written (Apple access %s)" % (t["name"], t["access"]) for t in plain if t["access"] != "read"]
     reasons += ["texture_buffer %s has element type %s" % (t["name"], t["data"]) for t in apple["textures"]
                 if t["type"] == "texturebuffer" and t["data"] not in TEXEL_TYPES]
-    embedded = entry["embedded_samplers"] or [b for b in entry["bindings"] if "embedded_sampler" in b]
-    return reasons + (["embedded samplers"] if embedded else [])
+    for state in entry["embedded_samplers"]:
+        reasons += ["embedded sampler %s is %s, the Vulkan host builds only nearest or linear, no mips, no compare, normalised"
+                    % (k, state[k]) for k, ok in EMBEDDED_PLAIN.items() if state[k] != ok]
+        reasons += ["embedded sampler address %s" % state[a] for a in ("s_address", "t_address", "r_address") if state[a] not in VK_ADDRESS]
+    return reasons
 
 
-def seed(bindings, rng, profile, base):
+# What an embedded sampler must say for the Vulkan host to build it, and the VkSamplerAddressMode of each address
+# (ClampToZero is a transparent black border, Apple's clamp_to_zero).
+EMBEDDED_PLAIN = {"mip_filter": "None", "compare_function": "Never", "normalized_coordinates": True, "anisotropy": 1}
+VK_ADDRESS = {"Repeat": 0, "MirrorRepeat": 1, "ClampToEdge": 2, "ClampToZero": 3}
+
+
+def seed(bindings, rng, profile, base, embedded=()):
     """Writes one texture file per Texture binding to `base`+name and returns the manifest
     tuples ([(index, set, binding, file, access)], [(index, set, binding)]), in binding order;
-    `access` is mslc's texture_access: a `Read` texture is a storage image in SPIR-V, the rest are sampled."""
+    `access` is mslc's texture_access: a `Read` texture is a storage image in SPIR-V, the rest are sampled.
+    A sampler tuple is (index, set, binding), or for an embedded sampler (None, set, binding, (s, t, r) modes, linear)
+    from the entry's `embedded` states."""
     textures, samplers = [], []
     for b in bindings:
         if b["kind"] == "Texture":
             path = "%stex%d.bin" % (base, b["metal_index"])
             hostenv.write_bytes(path, texture_data(rng, profile))
             textures.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"], path, b["texture_access"]))
+        elif b["kind"] == "Sampler" and "embedded_sampler" in b:
+            e = embedded[b["embedded_sampler"]]
+            samplers.append((None, b["descriptor"]["set"], b["descriptor"]["binding"],
+                             tuple(VK_ADDRESS[e[a]] for a in ("s_address", "t_address", "r_address")), e["mag_filter"] == "Linear"))
         elif b["kind"] == "Sampler":
             samplers.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"]))
     return textures, samplers
 
 
-def lines(textures, samplers):
-    """The manifest lines both hosts read."""
+def lines(textures, samplers, backend="vulkan"):
+    """The manifest lines both hosts read; Apple has an embedded sampler in the shader, so only Vulkan is told of it."""
     return (["%s %d %d %d %d %d %s" % ("storagetexture" if a == "Read" else "texture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f)
              for i, s, b, f, a in textures]
-            + ["sampler %d %d %d" % s for s in samplers])
+            + ["sampler %d %d %d" % s for s in samplers if s[0] is not None]
+            + ["esampler %d %d %d %d %d %d" % (s[1], s[2], *s[3], s[4]) for s in samplers if s[0] is None and backend != "apple"])
 
 
 def texel_layout(name, scalar, access, components=4):

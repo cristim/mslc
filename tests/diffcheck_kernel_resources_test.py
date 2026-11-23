@@ -129,13 +129,26 @@ class Resources(unittest.TestCase):
         self.assertTrue(resources.lines([(0, 0, 0, "f", "Sample")], [])[0].startswith("texture 0 "))
 
     def test_unsupported(self):
-        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Write"}], "embedded_samplers": [1]}
+        plain0 = {"s_address": "Repeat", "t_address": "Repeat", "r_address": "Repeat", "mag_filter": "Nearest", "min_filter": "Nearest",
+                  "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1}
+        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Write"}], "embedded_samplers": [dict(plain0, mip_filter="Linear")]}
         apple_side = {"textures": [{"name": "t", "type": "3d", "data": "int", "access": "write"}]}
         text = "; ".join(resources.unsupported(entry, apple_side))
-        for needle in ("access Write", "not a 2D float", "is written", "embedded samplers"):
+        for needle in ("access Write", "not a 2D float", "is written", "embedded sampler mip_filter is Linear"):
             self.assertIn(needle, text)
-        embedded = {"bindings": [{"kind": "Sampler", "embedded_sampler": 0, "name": "s"}], "embedded_samplers": []}
-        self.assertEqual(resources.unsupported(embedded, {"textures": []}), ["embedded samplers"])
+        plain = {"s_address": "Repeat", "t_address": "ClampToEdge", "r_address": "MirrorRepeat", "mag_filter": "Linear",
+                 "min_filter": "Linear", "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1}
+        embedded = {"bindings": [{"kind": "Sampler", "embedded_sampler": 0, "name": "s", "descriptor": {"set": 1, "binding": 2}}],
+                    "embedded_samplers": [plain]}
+        self.assertEqual(resources.unsupported(embedded, {"textures": []}), [])
+        self.assertEqual(resources.seed(embedded["bindings"], random.Random(1), "moderate", "x-", embedded["embedded_samplers"]),
+                         ([], [(None, 1, 2, (0, 2, 1), True)]))
+        self.assertEqual(resources.lines([], [(None, 1, 2, (0, 2, 1), True)]), ["esampler 1 2 0 2 1 1"])
+        self.assertEqual(resources.lines([], [(None, 1, 2, (0, 2, 1), True)], "apple"), [])
+        odd = {"bindings": [], "embedded_samplers": [dict(plain, compare_function="Less", s_address="ClampToBorder")]}
+        text = "; ".join(resources.unsupported(odd, {"textures": []}))
+        self.assertIn("compare_function is Less", text)
+        self.assertIn("address ClampToBorder", text)
         self.assertEqual(resources.cross_check(embedded["bindings"], {"textures": [], "samplers": []}), [])
         ok = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Read"}], "embedded_samplers": []}
         self.assertEqual(resources.unsupported(ok, {"textures": [{"name": "t", "type": "2d", "data": "float", "access": "read"}]}), [])

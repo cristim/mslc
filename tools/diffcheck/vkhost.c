@@ -11,6 +11,7 @@
 //   local X Y Z             groups X Y Z
 //   buffer <member> <bytes> <input file> <output file>
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>   (at most 4)
+//   esampler <set> <binding> <S> <T> <R> <linear 0|1>   (kernel mode: an embedded sampler, state in VkSamplerAddressMode values)
 //   sampler <metal index> <set> <binding>                               (at most 4)
 //   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
 //                                memory arguments: the element count of their Workgroup array; at most 8)
@@ -149,13 +150,21 @@ static void fillBuf(Buf b, const void *data, size_t n);
 // Nearest, normalised; the address mode is picked by the Metal sampler index, as in metalhost, so a
 // swapped sampler binding changes what a coordinate outside [0, 1] reads: 0 clamp to edge,
 // 1 repeat, 2 mirrored repeat.
-static VkSampler makeNearestSampler(unsigned index) {
+// An embedded (`constexpr`) sampler is listed with its own state, `esampler SET BINDING S T R FILTER`
+// (the three VkSamplerAddressMode values, FILTER 0 nearest or 1 linear), because Apple has it in the shader.
+static VkSampler makeSampler(VkSamplerAddressMode u, VkSamplerAddressMode v, VkSamplerAddressMode w, VkFilter filter) {
     VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = sci.addressModeV = sci.addressModeW = index % 3 == 0 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
-        : index % 3 == 1 ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    sci.magFilter = sci.minFilter = filter; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = u; sci.addressModeV = v; sci.addressModeW = w;
+    sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkSampler sampler; CHK(vkCreateSampler(dev, &sci, NULL, &sampler));
     return sampler;
+}
+
+static VkSampler makeNearestSampler(unsigned index) {
+    VkSamplerAddressMode m = index % 3 == 0 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+        : index % 3 == 1 ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    return makeSampler(m, m, m, VK_FILTER_NEAREST);
 }
 
 // The image and the staging buffer holding the file's RGBA32F texels.
@@ -196,7 +205,7 @@ int main(int argc, char **argv) {
     char spv[1024] = "", entry[256] = "main", in[MAXBUF][1024], out[MAXBUF][1024];
     unsigned local[3] = {1, 1, 1}, groups[3] = {1, 1, 1}, set = 0, member[MAXBUF], nbuf = 0;
     unsigned long long bytes[MAXBUF];
-    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0;
+    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0, eaddr[MAXTEX][4];
     char tfile[MAXTEX][1024]; int tstore[MAXTEX];
     unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
     unsigned bset[MAXTB], bbind[MAXTB], bcomp[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
@@ -221,7 +230,8 @@ int main(int argc, char **argv) {
                 continue;
             }
         }
-        if (ns < MAXTEX && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { ns++; continue; }
+        if (ns < MAXTEX && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { eaddr[ns++][3] = 0; continue; }
+        if (ns < MAXTEX && sscanf(line, "esampler %u %u %u %u %u %u", &sset[ns], &sbind[ns], &eaddr[ns][0], &eaddr[ns][1], &eaddr[ns][2], &sidx[ns]) == 6) { eaddr[ns++][3] = 1; continue; }
         if (line[0] != '\n') die("bad manifest line: %s", line);
     }
     fclose(mf);
@@ -311,7 +321,9 @@ int main(int argc, char **argv) {
             wr[nw].descriptorType = tstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[nw++].pImageInfo = &ii[i];
         }
         for (unsigned i = 0; i < ns; i++) {
-            si[i] = (VkDescriptorImageInfo){makeNearestSampler(sidx[i]), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            VkSampler sampler = eaddr[i][3] ? makeSampler(eaddr[i][0], eaddr[i][1], eaddr[i][2], sidx[i] ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
+                                            : makeNearestSampler(sidx[i]);
+            si[i] = (VkDescriptorImageInfo){sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
             wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[nw].dstSet = dset[sset[i]]; wr[nw].dstBinding = sbind[i]; wr[nw].descriptorCount = 1;
             wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[nw++].pImageInfo = &si[i];

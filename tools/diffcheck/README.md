@@ -114,7 +114,7 @@ back (there is no transfer-feedback path), so a vertex miscompile shows only thr
 puts in the attachments.
 
 Skipped with the reason (follow-up work): a writable `[[buffer]]` in either stage, vertex-stage
-textures, non-2D or non-float textures, embedded samplers, framebuffer fetch, a scalar half vertex
+textures, non-2D or non-float textures, embedded samplers in a graphics pair, framebuffer fetch, a scalar half vertex
 attribute, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws, blending,
 stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
 
@@ -162,7 +162,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374), writable
-  textures, non-2D or non-float textures, embedded (`constexpr`) samplers (all #374). Graphics pairs have their
+  textures, non-2D or non-float textures (all #374). Graphics pairs have their
   own mode, below.
 
 ## Kernel threadgroup memory arguments
@@ -186,6 +186,10 @@ edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample
 Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
 binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
 unit square; the filter is always nearest, so a wrong filter state is not detected (#374).
+
+An embedded (`constexpr`) sampler in a kernel is in Apple's shader, so Apple gets no binding for it; the Vulkan
+host builds it from mslc's `embedded_samplers` state (address modes, nearest or linear). A state it cannot build (mips,
+compare, unnormalised coordinates, anisotropy) is skipped with the reason.
 
 Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
 change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the
