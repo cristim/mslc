@@ -4576,6 +4576,11 @@ namespace {
 			case ExpressionKind::Conditional: return provenByFolding(expression, excluded);
 			case ExpressionKind::Construct: {
 				const Type* type = expression.constructType ? &*expression.constructType : nullptr;
+				if (expression.bitReinterpret) {
+					return type && !type->isVector() && !type->isMatrix() && !type->isPointer
+						&& !type->arrayLength && type->namedType.empty() && type->enumName.empty()
+						&& expression.arguments.size() == 1 && canFoldExpression(*expression.arguments.front(), excluded);
+				}
 				if (type && type->isVector() && !type->isMatrix() && !type->isPointer && !type->arrayLength
 					&& type->namedType.empty() && type->enumName.empty()) {
 					// An explicit conversion of each component; a float to an integer has a
@@ -8861,6 +8866,55 @@ namespace {
 			case ExpressionKind::Unary: return foldUnary(expression);
 			case ExpressionKind::Conditional: return foldConditional(expression);
 			case ExpressionKind::Construct:
+				if (expression.bitReinterpret) {
+					// as_type<T>(x) keeps the operand's bits: read them back as T, as Apple folds it.
+					const FoldedConstant operand = foldExpression(*expression.arguments.front());
+					const bool numeric = !operand.isComposite && operand.scalar != ScalarKind::Bool
+						&& operand.scalar != ScalarKind::Double;
+					const ScalarKind target = expression.constructType->scalar;
+					if (!numeric || target == ScalarKind::Double || target == ScalarKind::Bool) {
+						throw CompileError("a constant's initialiser has to be a value that can be worked out "
+							"from the declarations before it, and this is not one");
+					}
+					const uint32_t width = mappingFor(operand.scalar).width;
+					if (width != mappingFor(target).width) {
+						throw CompileError("as_type<" + typeName(*expression.constructType) + "> needs an operand of the same size");
+					}
+
+					// A NaN is folded as a double, which keeps neither its sign nor its payload, so its bits
+					// are not known here; refuse rather than fold a different pattern.
+					if (isFloatKind(operand.scalar) && std::isnan(operand.number)) {
+						throw CompileError("as_type of a NaN in a constant is not lowered yet, since its payload is not kept");
+					}
+					uint64_t bits = 0;
+					if (operand.scalar == ScalarKind::Half) {
+						bits = halfBitsOf(operand.number);
+					} else if (operand.scalar == ScalarKind::Float) {
+						const auto narrowed = static_cast<float>(operand.number);
+						uint32_t word = 0;
+						std::memcpy(&word, &narrowed, sizeof(word));
+						bits = word;
+					} else {
+						bits = width == 64 ? operand.integer : operand.integer & ((uint64_t{ 1 } << width) - 1);
+					}
+
+					FoldedConstant folded;
+					folded.scalar = target;
+					if (target == ScalarKind::Half) {
+						folded.number = halfValueOf(static_cast<uint32_t>(bits));
+					} else if (target == ScalarKind::Float) {
+						const auto word = static_cast<uint32_t>(bits);
+						float value = 0.0f;
+						std::memcpy(&value, &word, sizeof(value));
+						folded.number = value;
+					} else {
+						folded.integer = normalizeInteger(target, bits);
+					}
+					if (isFloatKind(target) && std::isnan(folded.number)) {
+						throw CompileError("as_type to a NaN in a constant is not lowered yet, since its payload is not kept");
+					}
+					return folded;
+				}
 				// (Mode)1, Mode(1) and static_cast<Mode>(1): the value converts to the
 				// enum's integer type, whatever enum or integer it was.
 				if (expression.constructType && !expression.constructType->enumName.empty()
