@@ -27,20 +27,23 @@ SCALARS = {
 _FLOAT = {"float": ("<f", "<I", 8, 23), "half": ("<e", "<H", 5, 10)}
 
 # Bounds in ULP for results Apple and lavapipe round differently. Exactly rounded
-# operations (+ - * / sqrt rsqrt fma and the rounding functions) are not listed: they
+# operations (+ - * / sqrt fma and the rounding functions) are not listed: they
 # must match to the bit. A function that is not here is compared exactly.
 # Values are MSL Specification section 8.4, Table 8.1 (single precision, safe math,
 # which is how metalhost.mm compiles), the loosest value for float:
 #   p369: acos asin acosh asinh cos cosh exp exp2 exp10 sin sinh cospi sinpi sincos log log2: 4
 #   p369: atan atanh: 5; atan2: 6; fmod: 0
 #   p370: log10: 4; pow powr: 16; tan tanpi: 6; tanh: 5; rsqrt: correctly rounded (unlisted)
+# rsqrt is the exception to the table: Apple is correctly rounded but lavapipe is not.
+# Vulkan allows 2 ULP for InverseSqrt (Vulkan spec, "Precision and Operation of SPIR-V
+# Instructions"), and 3 cases (64 elements, seed 1) differ by exactly 1 ULP, issue #387.
 # mix smoothstep step length distance normalize dot cross are not in the table: starting
 # values, to be tightened by measurement.
 ULP_BOUNDS = {
     "sin": 4, "cos": 4, "tan": 6, "asin": 4, "acos": 4, "atan": 5, "atan2": 6,
     "sinh": 4, "cosh": 4, "tanh": 5, "asinh": 4, "acosh": 4, "atanh": 5,
     "sinpi": 4, "cospi": 4, "tanpi": 6, "sincos": 4,
-    "exp": 4, "exp2": 4, "exp10": 4, "log": 4, "log2": 4, "log10": 4,
+    "exp": 4, "exp2": 4, "exp10": 4, "log": 4, "log2": 4, "log10": 4, "rsqrt": 2,
     "pow": 16, "powr": 16, "fmod": 0, "mix": 4, "smoothstep": 4,
     "step": 0, "length": 4, "distance": 4, "normalize": 4, "dot": 4, "cross": 4,
 }

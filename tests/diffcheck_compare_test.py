@@ -108,8 +108,12 @@ class UlpBound(unittest.TestCase):
         self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + sqrt(c) / d;"), 0)
 
     def test_correctly_rounded_functions_have_no_bound(self):
-        for name in ("sqrt", "rsqrt", "fma"):
+        for name in ("sqrt", "fma"):
             self.assertNotIn(name, compare.ULP_BOUNDS)
+
+    def test_rsqrt_gets_vulkan_inversesqrt_bound(self):
+        self.assertEqual(compare.ULP_BOUNDS["rsqrt"], 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = rsqrt(v[i]);"), 2)
 
     def test_bounds_follow_msl_table_8_1(self):
         self.assertEqual([compare.ULP_BOUNDS[n] for n in ("tan", "atan", "atan2", "tanh", "log10")], [6, 5, 6, 5, 4])
