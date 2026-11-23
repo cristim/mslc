@@ -19,6 +19,10 @@ if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)
 	add_test(NAME diffcheck/vkhost COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_vkhost_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-vkhost> ${DIFFCHECK_TESTS}/diffcheck/fma_kernel.metal)
 	set_tests_properties(diffcheck/vkhost PROPERTIES SKIP_RETURN_CODE 77)
+	# Half fragment fwidth against host-computed values, with planted miscompiles that must be caught (#173).
+	add_test(NAME diffcheck/half-fwidth-expected COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/half_fwidth_expected_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/half-fwidth-expected PROPERTIES SKIP_RETURN_CODE 77)
 else()
 	message(STATUS "diffcheck: no Vulkan loader or headers, the Vulkan host is not built")
 endif()

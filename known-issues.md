@@ -134,6 +134,13 @@ measure it. If Apple hardware/toolchain access becomes available, measure
 `air.fwidth.v2f16`'s actual output against mslc's widen-compute-narrow output
 and update or remove this entry.
 
+Measured on the Apple GPU (tools/diffcheck, `tests/half_fwidth_wide.metal`): when |dx| is
+not representable in half (1024 next to 2^-10, with |dy| = 1.5), Apple returns 1026 and mslc
+1025. Apple narrows the terms to half before the sum (or computes in half); mslc sums in
+float32 and narrows once. For inputs whose terms are all halves (`half_fwidth` and
+`half_fwidth_special`, including NaN, Inf, subnormal and overflow) the two match bit for bit.
+`tests/half_fwidth_expected_test.py` pins mslc's narrow-once behaviour, not Apple's.
+
 ## mslc emits Vulkan-valid modules that this lavapipe rejects
 
 `PhysicalStorageBuffer64` addressing with a binding-0 address block is correct
