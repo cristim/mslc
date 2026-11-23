@@ -286,7 +286,9 @@ test (55 of them); the other 7 are corpus-only.
   Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
   The edge profile contains denormals, and no grid size or seed keeps them out reliably (a grid that stops
   before the first denormal passes at one seed and fails at the next). Bring them back with a way to keep
-  denormals out of the inputs.
+  denormals out of the inputs. `compare.compare` ignores a bool leaf difference at an element whose
+  read-only inputs hold a float32 denormal (`denormal_elements`), but these four store `uint`, which
+  stays exact, so they still mismatch and stay out.
 
 Not in the list, and why:
 

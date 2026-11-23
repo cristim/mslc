@@ -203,10 +203,11 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                 if l["name"] == name:
                     outs["mslc"][i][int(at)] ^= 0xff
         case_diffs = []
+        flushed = set().union(*(compare.denormal_elements(l, data[i]) for i, l in layouts.items() if l["access"] == "read"))
         for i, lay in sorted({**layouts, **tlayouts}.items()):
             if lay["name"] in excluded:
                 continue
-            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp)):
+            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp), flushed=flushed):
                 case_diffs.append(d.to_json())
         both = {**compared, **tcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])

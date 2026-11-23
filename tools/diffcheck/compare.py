@@ -11,6 +11,11 @@ Rules, in order of strength:
                       a number never matches and never passes a ULP bound, because
                       every ordered comparison with a NaN is false and would let it through
   infinities          must be the same infinity
+  float32 denormals   Apple flushes a denormal to zero in a float compare and in float to bool
+                      (#377); mslc declares no DenormFlushToZero, so a bool output
+                      may differ at an element whose input holds a float denormal (see
+                      denormal_elements). Float outputs and half denormals stay exact: a plain
+                      copy keeps the denormal on both backends, and half agrees already
 """
 
 import re
@@ -131,11 +136,30 @@ class Diff:
                 "apple_hex": self.apple[::-1].hex(), "mslc_hex": self.mslc[::-1].hex()}
 
 
-def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0):
+def denormal_elements(layout, data):
+    """Element indices of `data` (one buffer of `layout`) holding a float32 denormal.
+
+    float32 only: Apple and mslc agree on half denormals (#377)."""
+    stride = layout["stride"]
+    found = set()
+    for element in range(len(data) // stride):
+        for leaf in layout["leaves"]:
+            if leaf["scalar"] != "float":
+                continue
+            at = element * stride + leaf["off"]
+            v = int.from_bytes(data[at:at + 4], "little")
+            if (v >> 23) & 0xff == 0 and v & 0x7fffff:
+                found.add(element)
+    return found
+
+
+def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0, flushed=()):
     """Compare two buffers of one layout; returns up to `limit` Diffs.
 
     layout: {"name", "stride", "leaves": [{"off", "scalar"}]}. Both buffers must have
-    the same length, a multiple of the stride.
+    the same length, a multiple of the stride. `flushed` holds element indices whose inputs
+    carry a float32 denormal: a bool leaf there may differ, because Apple flushes
+    the denormal in a compare or float to bool and mslc does not (#377).
     """
     if len(apple) != len(mslc):
         raise ValueError("buffers differ in length: %d vs %d" % (len(apple), len(mslc)))
@@ -148,6 +172,8 @@ def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0):
             at = base + leaf["off"]
             a, b = bytes(apple[at:at + size]), bytes(mslc[at:at + size])
             if not leaf_equal(a, b, leaf["scalar"], ulp, eps):
+                if element in flushed and SCALARS[leaf["scalar"]][1] == "bool":
+                    continue
                 diffs.append(Diff(layout["name"], element, at, leaf["scalar"], a, b))
                 if len(diffs) >= limit:
                     return diffs

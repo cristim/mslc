@@ -94,6 +94,41 @@ class Compare(unittest.TestCase):
         self.assertEqual(len(compare.compare(self.LAYOUT, a, b, limit=5)), 5)
 
 
+class DenormalFlush(unittest.TestCase):
+    """Issue #377: Apple flushes a float32 denormal in a compare and in float to bool."""
+    V = {"name": "v", "stride": 4, "leaves": [{"off": 0, "scalar": "float"}]}
+    OUT = {"name": "out", "stride": 4, "leaves": [{"off": 0, "scalar": "uint"}]}
+    BOUT = {"name": "bout", "stride": 1, "leaves": [{"off": 0, "scalar": "bool"}]}
+    FOUT = {"name": "fout", "stride": 4, "leaves": [{"off": 0, "scalar": "float"}]}
+
+    def test_finds_float32_denormals_only(self):
+        data = b"".join([bits(0x3f800000), bits(0), bits(1), bits(0x807fffff), bits(0x00800000), bits(0x7f800000)])
+        self.assertEqual(compare.denormal_elements(self.V, data), {2, 3})
+
+    def test_half_denormals_are_not_flushed(self):
+        half = {"name": "h", "stride": 2, "leaves": [{"off": 0, "scalar": "half"}]}
+        self.assertEqual(compare.denormal_elements(half, bytes([0x01, 0x00])), set())
+
+    def test_bool_of_a_denormal_input_may_differ(self):
+        # bout[6] = bool(v[6]): Apple 0, mslc 1 (the denormal is kept).
+        apple, mslc = bytes(8), bytes(int(i == 6) for i in range(8))
+        self.assertEqual(compare.compare(self.BOUT, apple, mslc, flushed={6}), [])
+        self.assertEqual([d.element for d in compare.compare(self.BOUT, apple, mslc, flushed={5})], [6])
+
+    def test_an_int_difference_at_a_denormal_element_still_fails(self):
+        apple, mslc = b"".join(bits(0) for _ in range(8)), b"".join(bits(int(i == 6)) for i in range(8))
+        self.assertEqual([d.element for d in compare.compare(self.OUT, apple, mslc, flushed={6})], [6])
+
+    def test_the_same_difference_without_a_denormal_input_is_reported(self):
+        apple, mslc = b"".join(bits(0) for _ in range(8)), b"".join(bits(int(i == 6)) for i in range(8))
+        self.assertEqual([d.element for d in compare.compare(self.OUT, apple, mslc)], [6])
+
+    def test_a_float_output_still_differs_at_a_denormal_element(self):
+        # A plain copy keeps the denormal on both backends, so a difference there is a real bug.
+        (diff,) = compare.compare(self.FOUT, bits(1), bits(0), flushed={0})
+        self.assertEqual(diff.element, 0)
+
+
 class UlpBound(unittest.TestCase):
     def test_source_calling_pow_gets_the_pow_bound(self):
         self.assertEqual(compare.ulp_bound_for_source("o[i] = pow(a, b);"), compare.ULP_BOUNDS["pow"])
