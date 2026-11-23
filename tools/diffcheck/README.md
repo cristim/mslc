@@ -189,7 +189,8 @@ unit square; the filter is always nearest, so a wrong filter state is not detect
 
 An embedded (`constexpr`) sampler in a kernel is in Apple's shader, so Apple gets no binding for it; the Vulkan
 host builds it from mslc's `embedded_samplers` state (address modes, nearest or linear). A state it cannot build (mips,
-compare, unnormalised coordinates, anisotropy) is skipped with the reason.
+compare, unnormalised coordinates, anisotropy, a min filter that differs from the mag filter, a lod range) is skipped
+with the reason. Known gap: a linear filter on a format without the linear-filter feature bit is not checked.
 
 Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
 change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the

@@ -83,6 +83,11 @@ def unsupported(entry, apple):
     for state in entry["embedded_samplers"]:
         reasons += ["embedded sampler %s is %s, the Vulkan host builds only nearest or linear, no mips, no compare, normalised"
                     % (k, state[k]) for k, ok in EMBEDDED_PLAIN.items() if state[k] != ok]
+        if state["min_filter"] != state["mag_filter"]:
+            reasons.append("embedded sampler min_filter %s differs from mag_filter %s, the Vulkan host sets one filter for both"
+                           % (state["min_filter"], state["mag_filter"]))
+        reasons += ["embedded sampler %s is %s, the Vulkan host builds the full lod range" % (k, state[k])
+                    for k, ok in EMBEDDED_LOD.items() if state[k] != ok]
         reasons += ["embedded sampler address %s" % state[a] for a in ("s_address", "t_address", "r_address") if state[a] not in VK_ADDRESS]
     return reasons
 
@@ -90,6 +95,7 @@ def unsupported(entry, apple):
 # What an embedded sampler must say for the Vulkan host to build it, and the VkSamplerAddressMode of each address
 # (ClampToZero is a transparent black border, Apple's clamp_to_zero).
 EMBEDDED_PLAIN = {"mip_filter": "None", "compare_function": "Never", "normalized_coordinates": True, "anisotropy": 1}
+EMBEDDED_LOD = {"lod_min": 0, "lod_max": 65504}
 VK_ADDRESS = {"Repeat": 0, "MirrorRepeat": 1, "ClampToEdge": 2, "ClampToZero": 3}
 
 
