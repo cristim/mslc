@@ -11357,9 +11357,16 @@ namespace {
 				throw StageError("bias or min_lod_clamp in a library helper: they need derivatives, which exist only in a "
 					"fragment function, and a library does not know its caller's stage");
 			}
-			if (_entryPoint->stage != Stage::Fragment) {
-				throw CompileError("bias and min_lod_clamp are lowered in a fragment function only: they act on the "
-					"level the derivatives give, which a vertex or kernel function does not have");
+			// Measured on Apple GPU: in a kernel, bias(b) samples level b (clamped at 0), the level
+			// a plain sample takes there being 0.
+			const bool kernelBias = bias != InvalidId && minLod == InvalidId && _entryPoint->stage == Stage::Kernel;
+			if (kernelBias) {
+				lod = bias;
+				bias = InvalidId;
+			} else if (_entryPoint->stage != Stage::Fragment) {
+				throw CompileError("min_lod_clamp, and bias outside a kernel, are lowered in a fragment function only: "
+					"they act on the level the derivatives give, which a vertex function does not have, and "
+					"Apple's min_lod_clamp result in a kernel is not lowered");
 			}
 		}
 
