@@ -325,12 +325,19 @@ def corpus_files(listing, root):
             continue
         fields = line.split()
         std = next((f[4:] for f in fields[1:] if f.startswith("std=")), None)
-        run = directives.parse_run_pairs([f for f in fields[1:] if not f.startswith("std=")])
-        files.append((os.path.join(root, fields[0]), std, run))
+        path = os.path.join(root, fields[0])
+        try:
+            run = directives.parse_run_pairs([f for f in fields[1:] if not f.startswith("std=")])
+        except ValueError as e:
+            files.append((path, std, None, "bad corpus list line %r: %s" % (line, e)))
+            continue
+        files.append((path, std, run))
     return files
 
 
-def check_one(opts, path, std, run=None):
+def check_one(opts, path, std, run=None, bad_line=None):
+    if bad_line:
+        return [{"file": path, "entry": "*", "status": "skipped", "reason": bad_line, "cases": []}]
     try:
         return [dict(r, file=path) for r in check_file(opts, path, std, run)]
     except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:

@@ -114,6 +114,10 @@ class UlpBound(unittest.TestCase):
     def test_bounds_follow_msl_table_8_1(self):
         self.assertEqual([compare.ULP_BOUNDS[n] for n in ("tan", "atan", "atan2", "tanh", "log10")], [6, 5, 6, 5, 4])
 
+    def test_bounds_not_pinned_elsewhere_follow_table_8_1(self):
+        names = ("sinpi", "cospi", "tanpi", "sincos", "atanh", "asin", "acos")
+        self.assertEqual([compare.ULP_BOUNDS[n] for n in names], [4, 4, 6, 4, 5, 4, 4])
+
     def test_a_name_that_merely_contains_a_function_does_not_count(self):
         self.assertEqual(compare.ulp_bound_for_source("float mysin(float x); y = mysin(x);"), 0)
 
