@@ -326,6 +326,13 @@ def corpus_files(listing, root):
         fields = line.split()
         std = next((f[4:] for f in fields[1:] if f.startswith("std=")), None)
         path = os.path.join(root, fields[0])
+        if "=" in fields[0]:
+            files.append((path, std, None, "bad corpus list line %r: %r is a field, the path comes first"
+                          % (line, fields[0])))
+            continue
+        if std == "":
+            files.append((path, std, None, "bad corpus list line %r: std= needs a value" % line))
+            continue
         try:
             run = directives.parse_run_pairs([f for f in fields[1:] if not f.startswith("std=")])
         except ValueError as e:
@@ -447,12 +454,12 @@ def main(argv=None):
     if not results:
         print("diffcheck: nothing to check", file=sys.stderr)
         return ERROR
+    if "error" in statuses:
+        return ERROR
     compared = sum(1 for r in results if r["status"] not in ("skipped", "error", "invalid"))
     if compared < opts.min_compared:
         print("diffcheck: %d compared, --min-compared wants %d" % (compared, opts.min_compared), file=sys.stderr)
         return MISMATCH
-    if "error" in statuses:
-        return ERROR
     if statuses <= {"matched"}:
         return OK
     if statuses <= {"skipped"}:

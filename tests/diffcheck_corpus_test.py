@@ -42,6 +42,23 @@ class CorpusFiles(unittest.TestCase):
         r, = diffcheck.check_one(None, *listing("x.metal bogus=1\n")[0])
         self.assertIn("bogus=1", r["reason"])
 
+    def test_empty_std_is_an_error(self):
+        r, = diffcheck.check_one(None, *listing("x.metal std=\n")[0])
+        self.assertEqual(r["status"], "error")
+        self.assertIn("std=", r["reason"])
+
+    def test_field_in_path_position_is_an_error_naming_it(self):
+        r, = diffcheck.check_one(None, *listing("vertex=vs a.metal\n")[0])
+        self.assertEqual(r["status"], "error")
+        self.assertIn("vertex=vs", r["reason"])
+
+    def test_error_takes_precedence_over_too_few_compared(self):
+        with tempfile.TemporaryDirectory() as d:
+            lst = os.path.join(d, "l.txt")
+            with open(lst, "w") as f:
+                f.write("x.metal bogus=1\n")
+            self.assertEqual(diffcheck.main(["--corpus", lst, "--min-compared", "5"]), diffcheck.ERROR)
+
     def test_list_line_run_overrides_the_files_own_run_line(self):
         own = directives.parse("// RUN: width=8 height=8\nkernel void k() {}\n")["run"]
         listed = listing("a.metal width=16\n")[0][2]

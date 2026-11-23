@@ -21,8 +21,8 @@ lavapipe manifest is accepted), `cc` and `clang++`. The two hosts are built on d
 
 A corpus list has one path per line, `#` comments, an optional `std=3.1` and the fields of a
 `// RUN:` line (`vertex=vs fragment=fs width=32 ...`), which override the file's own, so a file you do
-not edit can be drawn as a graphics pair. An unknown or malformed field on a list line is reported
-as an error, naming the field, so the run fails, and the other lines still run. Paths are
+not edit can be drawn as a graphics pair. An unknown or malformed field, an empty `std=`, or a field in the path position is reported
+as an error, naming it, so the run exits with an error (even if `--min-compared` is also unmet), and the other lines still run. Paths are
 relative to `--root` (default: the list's directory), so third-party shaders stay out of
 the repository: the harness takes any path.
 
