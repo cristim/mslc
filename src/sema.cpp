@@ -11099,6 +11099,12 @@ namespace {
 				"write(value, coordinate); \"" + method + "\" is not lowered yet");
 		}
 		if (access != TextureAccess::Sample && access != TextureAccess::Write && method != "read" && !sized) {
+			if (method == "get_num_mip_levels") {
+				throw CompileError(std::string("access::") + textureAccessName(access) + " textures lower only read(), "
+					"the size queries and statement write(); \"get_num_mip_levels\" is refused because a Vulkan "
+					"storage image view is a single level, so OpImageQueryLevels would answer 1 where Metal's texture "
+					"answers its full level count");
+			}
 			throw CompileError(std::string("access::") + textureAccessName(access) + " textures lower only read(), "
 				+ (access == TextureAccess::ReadWrite ? "statement write() and " : "") + "the size queries; \""
 				+ method + "\" is not lowered yet");
@@ -11148,7 +11154,8 @@ namespace {
 		if (isCubeKind(kind)) {
 			throw CompileError(std::string("the ") + resourceKindName(kind) + " method \"" + method
 				+ "\" is not lowered yet; mslc lowers sample, gather, get_width and get_height on a cube "
-				"and get_array_size on a cube array");
+				"and get_array_size on a cube array"
+				+ (method == "read" ? "; read is refused because Vulkan's OpImageFetch does not take a Cube image" : ""));
 		}
 		throw CompileError("the texture method \"" + method + "\" is not lowered yet; mslc lowers "
 			"sample, read, get_width, get_height, get_depth on a texture3d and get_array_size on an "

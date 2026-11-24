@@ -1,4 +1,4 @@
-// EXPECT: error the texturecube_array method "read" is not lowered yet
+// EXPECT: error read is refused because Vulkan's OpImageFetch does not take a Cube image
 // Apple accepts read on a sampled cube array; Vulkan's OpImageFetch has no cube dimension.
 #include <metal_stdlib>
 using namespace metal;

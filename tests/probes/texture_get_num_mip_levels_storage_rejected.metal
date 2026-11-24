@@ -1,4 +1,4 @@
-// EXPECT: error access::read textures lower only read()
+// EXPECT: error a Vulkan storage image view is a single level
 // Apple accepts get_num_mip_levels on a storage texture; a Vulkan storage image has no level query.
 #include <metal_stdlib>
 using namespace metal;
