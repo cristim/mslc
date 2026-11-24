@@ -120,11 +120,11 @@ if(NOT at EQUAL -1)
 	message(FATAL_ERROR "an empty library must declare no entry point:\n${disassembly}")
 endif()
 
-# 3. Default mode still refuses the same file, with the entry-point reason.
-run_mslc(output 1 -o "${OUT_DIR}/empty_executable.spv" "${empty}")
-string(FIND "${output}" "declares no function" at)
-if(at EQUAL -1)
-	message(FATAL_ERROR "default mode should still refuse an empty translation unit for having no entry point, got:\n${output}")
+# 3. Default mode compiles the same file to a library with no functions, which has no module.
+file(REMOVE "${OUT_DIR}/empty_executable.spv")
+run_mslc(output 0 -o "${OUT_DIR}/empty_executable.spv" "${empty}")
+if(EXISTS "${OUT_DIR}/empty_executable.spv")
+	message(FATAL_ERROR "default mode should write no module for an empty translation unit, got:\n${output}")
 endif()
 
 # 4. Default mode still compiles a real kernel as a Vulkan executable.
@@ -293,8 +293,12 @@ string(FIND "${helpers_dis}" "OpEntryPoint" at)
 if(NOT at EQUAL -1)
 	message(FATAL_ERROR "a library of helpers must declare no entry point:\n${helpers_dis}")
 endif()
-run_mslc(output 1 -o "${OUT_DIR}/helpers_executable.spv" "${helpers}")
-expect_contains("${output}" "no kernel, vertex or fragment entry point" "default mode on helpers")
+file(REMOVE "${OUT_DIR}/helpers_executable.spv")
+run_mslc(output 0 -o "${OUT_DIR}/helpers_executable.spv" "${helpers}")
+expect_contains("${output}" "no module" "default mode on helpers")
+if(EXISTS "${OUT_DIR}/helpers_executable.spv")
+	message(FATAL_ERROR "default mode should write no module for helpers with no entry point")
+endif()
 
 # Overloaded helpers (#266): one Linkage name per signature, and a plain name where there is one.
 set(overloads_spv "${OUT_DIR}/overloads.spv")

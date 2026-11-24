@@ -1699,26 +1699,10 @@ std::vector<const FunctionDecl*> selectEntryPoints(const TranslationUnit& unit, 
 		return found;
 	}
 
-	if (requested == Stage::None) {
-		// Vulkan shader modules require an entry point; count helpers by name.
-		std::set<std::string> names;
-		for (const FunctionDecl& helper: unit.helpers) {
-			names.insert(helper.name);
-		}
-		const size_t helpers = names.size();
-		throw CompileError(helpers == 0
-			? std::string("this source declares no function, and mslc emits one SPIR-V module per "
-				"library: Vulkan requires an entry point, so a file with no kernel, vertex or "
-				"fragment function cannot be compiled")
-			: "this source declares " + std::to_string(helpers) + (helpers == 1 ? " helper function" : " helper functions")
-				+ " and no kernel, vertex or fragment entry point. Apple's compiler builds a "
-				"library of the helpers, but a Vulkan module needs an entry point, so mslc "
-				"cannot compile a file whose functions are all helpers");
-	}
-
-	throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel"
-		: requested == Stage::Vertex ? "vertex" : "fragment")
-		+ " entry point in this source");
+	// A source with no entry point at all is a library with no functions, which the caller handles.
+	throw CompileError(std::string("no ") + (requested == Stage::Kernel ? "kernel "
+		: requested == Stage::Vertex ? "vertex " : requested == Stage::Fragment ? "fragment " : "")
+		+ "entry point in this source");
 }
 
 //

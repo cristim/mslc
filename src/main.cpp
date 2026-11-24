@@ -8,6 +8,7 @@
 #include "lexer.h"
 #include "preprocessor.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -310,6 +311,25 @@ int main(int argc, char** argv) {
 		mslc_free(error);
 		mslc_free(reflection);
 		return 1;
+	}
+
+	// A source with no entry point is a library with no functions, which has no module; a module left at the
+	// output path by an earlier run is removed, so it cannot be taken for this one.
+	if (!spirv && !compileLibrary) {
+		if (std::remove(output.c_str()) != 0 && errno != ENOENT) {
+			std::fprintf(stderr, "mslc: cannot remove \"%s\"\n", output.c_str());
+			mslc_free(reflection);
+			return 2;
+		}
+		if (!reflectionPath.empty() && reflection
+			&& !writeFile(reflectionPath.c_str(), reflection, std::strlen(reflection))) {
+			std::fprintf(stderr, "mslc: cannot write \"%s\"\n", reflectionPath.c_str());
+			mslc_free(reflection);
+			return 2;
+		}
+		std::printf("mslc: %s has no kernel, vertex or fragment function, so there is no module to write\n", input);
+		mslc_free(reflection);
+		return 0;
 	}
 
 	if (!writeFile(output.c_str(), spirv, spirvSize)) {

@@ -125,6 +125,17 @@ namespace {
 		// A Linkage object may be all helpers; a Vulkan executable may not.
 		const bool hasEntryPoint = std::any_of(unit.functions.begin(), unit.functions.end(),
 			[](const mslc::FunctionDecl& function) { return !function.isHelper(); });
+		if (!object && !hasEntryPoint && effective.stage == MSLC_STAGE_UNKNOWN) {
+			// Metal makes a library with no functions of a source with no entry point, and Vulkan has no module
+			// without one, so there is no module. The source is still compiled as a Linkage object would be, so
+			// an error in it is reported, and the reflection lists no entry point.
+			mslc::ModuleOptions libraryOptions;
+			libraryOptions.linkageObject = true;
+			mslc::spirv::Builder scratch;
+			reflection = mslc::emitModule(scratch, unit, {}, libraryOptions);
+			module.clear();
+			return;
+		}
 		const auto entryPoints = object && !hasEntryPoint ? std::vector<const mslc::FunctionDecl*>()
 			: mslc::selectEntryPoints(unit, stageFromApi(effective.stage));
 		mslc::ModuleOptions moduleOptions;
@@ -288,20 +299,22 @@ int mslc_translate(const char* source, size_t sourceLength, const MslcOptions* o
 		// whenever the source declared more than one.
 		const std::string& document = reflection;
 
-		auto* buffer = static_cast<uint8_t*>(std::malloc(module.size()));
-		if (!buffer) {
-			throw std::bad_alloc();
-		}
-		std::memcpy(buffer, module.data(), module.size());
+		if (!module.empty()) {
+			auto* buffer = static_cast<uint8_t*>(std::malloc(module.size()));
+			if (!buffer) {
+				throw std::bad_alloc();
+			}
+			std::memcpy(buffer, module.data(), module.size());
 
-		if (outSpirv) {
-			*outSpirv = buffer;
-		} else {
-			std::free(buffer);
-		}
+			if (outSpirv) {
+				*outSpirv = buffer;
+			} else {
+				std::free(buffer);
+			}
 
-		if (outSpirvSize) {
-			*outSpirvSize = module.size();
+			if (outSpirvSize) {
+				*outSpirvSize = module.size();
+			}
 		}
 
 		if (outReflection) {

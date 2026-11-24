@@ -2,6 +2,8 @@
 # against the probe's own expectation line, one of
 #
 #   // EXPECT: valid              compiles and passes spirv-val
+#   // EXPECT: no module          compiles to a library with no functions, which has
+#                                 no module; only REFLECT needles apply
 #   // EXPECT: error <substring>  fails, with <substring> in the diagnostic
 #
 # A valid probe can also pin the disassembly, for a bug whose output validates
@@ -144,22 +146,32 @@ execute_process(
 	ERROR_VARIABLE output
 )
 
-if(expectation STREQUAL "valid")
+if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 	if(NOT status EQUAL 0)
 		message(FATAL_ERROR "${name}: expected to compile, mslc exited ${status}:\n${output}")
 	endif()
-	# Never skip: an unvalidated module must not count as a pass.
-	if(NOT SPIRV_VAL)
-		message(FATAL_ERROR "${name}: spirv-val not found; install SPIRV-Tools and re-run cmake")
-	endif()
-	execute_process(
-		COMMAND "${SPIRV_VAL}" --target-env vulkan1.3 "${spv}"
-		RESULT_VARIABLE status
-		OUTPUT_VARIABLE output
-		ERROR_VARIABLE output
-	)
-	if(NOT status EQUAL 0)
-		message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
+	if(expectation STREQUAL "no module")
+		if(EXISTS "${spv}")
+			message(FATAL_ERROR "${name}: expected no module, mslc wrote one")
+		endif()
+		file(STRINGS "${PROBE}" disasmLines REGEX "DISASM")
+		if(disasmLines)
+			message(FATAL_ERROR "${name}: a probe that expects no module has no disassembly to check")
+		endif()
+	else()
+		# Never skip: an unvalidated module must not count as a pass.
+		if(NOT SPIRV_VAL)
+			message(FATAL_ERROR "${name}: spirv-val not found; install SPIRV-Tools and re-run cmake")
+		endif()
+		execute_process(
+			COMMAND "${SPIRV_VAL}" --target-env vulkan1.3 "${spv}"
+			RESULT_VARIABLE status
+			OUTPUT_VARIABLE output
+			ERROR_VARIABLE output
+		)
+		if(NOT status EQUAL 0)
+			message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
+		endif()
 	endif()
 
 	# A needle with a misspelt or unspaced prefix matches none of the collectors
