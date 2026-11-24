@@ -4,7 +4,7 @@ Every case uses one of three profiles, cycled by --cases:
   moderate  small values that most kernels handle the same way on any GPU
   wide      random bit patterns (floats limited to finite values)
   edge      half the leaves come from the edge set (0, 1, -1, INT_MIN/MAX, UINT_MAX,
-            +-0, +-inf, NaN, denormals, +-1e-38, +-1e38), the rest from `wide`
+            +-0, +-inf, NaN, +-1.2e-38, +-1e38; float32 denormals are never generated, see no_denormal_float), the rest from `wide`
 bool leaves are only ever 0 or 1. Bytes that no leaf covers (struct padding) are
 0, or 0xA5 with poison_padding, so a kernel that reads padding differs from one
 that does not. With sentinel the whole buffer is 0x7f bytes instead (0x7f7f7f7f
@@ -24,10 +24,19 @@ def _bits(value, fmt):
     return int.from_bytes(struct.pack(fmt, value), "little")
 
 
+def no_denormal_float(bits):
+    """A float32 bit pattern with a denormal replaced by the zero of the same sign. Apple's GPU
+    flushes a denormal in a compare or float-to-bool and mslc declares no DenormFlushToZero (#377),
+    so a denormal in the seeded inputs would be a known difference on every compare. The one
+    dedicated probe (tests/diffcheck/denormal_compare_flush.metal) builds its denormals in the
+    kernel. Normals, zeros, infinities and NaNs pass through."""
+    return bits & 0x80000000 if bits & 0x7f800000 == 0 else bits
+
+
 _EDGE_FLOAT = {
     "float": [0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc00000,
-              0x00000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff]
-             + [_bits(v, "<f") for v in (1e-38, -1e-38, 1e38, -1e38)],
+              0x00800000, 0x7f7fffff, 0xff7fffff]
+             + [_bits(v, "<f") for v in (1.2e-38, -1.2e-38, 1e38, -1e38)],
     "half": [0x0000, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x03ff, 0x0400, 0x7bff, 0xfbff],
 }
 
@@ -54,6 +63,11 @@ def _step(walk, table, rng):
 
 
 def leaf_bits(rng, scalar, profile, bounds=None, walk=None, float_bounds=None):
+    bits = _leaf_bits(rng, scalar, profile, bounds, walk, float_bounds)
+    return no_denormal_float(bits) if scalar == "float" else bits
+
+
+def _leaf_bits(rng, scalar, profile, bounds, walk, float_bounds):
     size, kind = SCALARS[scalar]
     if kind == "bool":
         return rng.getrandbits(1)

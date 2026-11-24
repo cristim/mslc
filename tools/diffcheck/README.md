@@ -41,8 +41,7 @@ In `--corpus` mode skips do not fail the run.
    cross-checked (buffer index and name); a disagreement is itself a finding.
 3. Per case, every buffer is filled from one seeded generator and both backends get the same
    bytes. Cases cycle three profiles: `moderate` (small values), `wide` (random bits, finite
-   floats) and `edge` (0, 1, -1, INT_MIN/MAX, UINT_MAX, +-0, +-inf, NaN, denormals, +-1e-38,
-   +-1e38). bool leaves are only ever 0 or 1. `--sentinel` adds a case whose buffers are all
+   floats) and `edge` (0, 1, -1, INT_MIN/MAX, UINT_MAX, +-0, +-inf, NaN, +-1.2e-38, +-1e38; float32 denormals are never generated, because Apple flushes them in a compare and mslc does not, #377: `denormal_compare_flush.metal` pins that difference). bool leaves are only ever 0 or 1. `--sentinel` adds a case whose buffers are all
    0x7f bytes (a finite float), so a store outside the expected bytes shows. `--poison-padding`
    fills struct padding with 0xA5.
 4. All buffers are read back and compared leaf by leaf, writable and read-only alike.
@@ -284,9 +283,7 @@ test (55 of them); the other 7 are corpus-only.
 - `bool_from_float_is_unordered_compare`, `bool_vector_from_float_vector_is_unordered_compare`,
   `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are not in the list:
   Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
-  The edge profile contains denormals, and no grid size or seed keeps them out reliably (a grid that stops
-  before the first denormal passes at one seed and fails at the next). Bring them back with a way to keep
-  denormals out of the inputs.
+  The inputs no longer contain float32 denormals, so they can return once each is measured.
 
 Not in the list, and why:
 
@@ -314,8 +311,9 @@ Not in the list, and why:
   `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
   other `pp_metal_*` probe.
 - Lavapipe rejects some valid modules (an empty struct passed by value: `vkCreateComputePipelines` -13, #376).
-- Apple flushes denormal floats in a float compare and in a float to bool conversion (#377); the
-  edge profile contains denormals, so a probe that compares or converts float inputs can mismatch there.
+- Apple flushes denormal floats in a float compare and in a float to bool conversion; mslc declares no
+  DenormFlushToZero (#377). The inputs contain no float32 denormal; `tests/diffcheck/denormal_compare_flush.metal`
+  pins the difference (Apple 0, mslc 1), checked by `tests/diffcheck_denormal_test.py`.
 - **Fixed, #368:** lavapipe used to fold `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`,
   `x * 0` to `0` and `(x + 1) - 1` to `x`, because mslc's SPIR-V carried no `NoContraction` and no
   `SignedZeroInfNanPreserve`. The `safe_math_*` probes pin each case; a mismatch of that shape now is a new bug.

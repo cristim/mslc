@@ -20,6 +20,23 @@ def make(profile, seed=1, **kw):
     return inputs.fill_buffer(LAYOUT, 400, random.Random(seed), profile, **kw)
 
 
+class Denormals(unittest.TestCase):
+    def test_no_float32_denormal_is_generated(self):
+        layout = {"name": "b", "stride": 4, "leaves": [{"off": 0, "scalar": "float"}]}
+        for profile in inputs.PROFILES:
+            for seed in range(10):
+                data = inputs.fill_buffer(layout, 500, random.Random(seed), profile, phase=seed)
+                for i in range(500):
+                    bits = struct.unpack_from("<I", data, i * 4)[0]
+                    self.assertFalse(bits & 0x7f800000 == 0 and bits & 0x007fffff, (profile, seed, hex(bits)))
+
+    def test_denormal_becomes_signed_zero_and_others_are_unchanged(self):
+        self.assertEqual(inputs.no_denormal_float(0x00000001), 0)
+        self.assertEqual(inputs.no_denormal_float(0x807fffff), 0x80000000)
+        for bits in (0, 0x80000000, 0x00800000, 0x3f800000, 0x7f800000, 0x7fc00000, 0xff7fffff):
+            self.assertEqual(inputs.no_denormal_float(bits), bits)
+
+
 class Fill(unittest.TestCase):
     def test_same_seed_same_bytes(self):
         self.assertEqual(make("edge"), make("edge"))
@@ -65,7 +82,7 @@ class Fill(unittest.TestCase):
         data = inputs.fill_buffer(LAYOUT, 120, random.Random(7), "edge")
         floats = {struct.unpack_from("<I", data, i * 16)[0] for i in range(120)}
         for want in (0x7fc00000, 0x7f800000, 0xff800000, 0x80000000, 0x7f7fffff,
-                     int.from_bytes(struct.pack("<f", 1e-38), "little"), int.from_bytes(struct.pack("<f", -1e38), "little")):
+                     int.from_bytes(struct.pack("<f", 1.2e-38), "little"), int.from_bytes(struct.pack("<f", -1e38), "little")):
             self.assertIn(want, floats, hex(want))
 
     def test_the_case_number_shifts_the_walk(self):

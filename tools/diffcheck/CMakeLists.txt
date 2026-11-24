@@ -72,6 +72,10 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
 	set_tests_properties(diffcheck/kernel-driver PROPERTIES SKIP_RETURN_CODE 77)
 
+	add_test(NAME diffcheck/denormal COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_denormal_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/denormal PROPERTIES SKIP_RETURN_CODE 77)
+
 	add_test(NAME diffcheck/graphics-driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_graphics_driver_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
 	set_tests_properties(diffcheck/graphics-driver PROPERTIES SKIP_RETURN_CODE 77)
