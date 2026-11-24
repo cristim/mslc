@@ -138,13 +138,15 @@ with tempfile.TemporaryDirectory() as d:
     rc, out, data = run(typo)
     assert rc == 2 and "ff" in out, (rc, out)
 
-# Without the directive the file-wide 4 ULP bound hides the one ULP error: the directive is what catches it.
+# Without the directive the per-buffer bound still holds the exactly rounded buffer to 0 ULP
+# (ulp_bounds_by_root), so the one ULP error in it is caught; the loose buffer keeps its 4 ULP bound.
 with tempfile.TemporaryDirectory() as d:
     loose = os.path.join(d, "ulp_loose.metal")
     with open(probe("ulp_per_buffer")) as src, open(loose, "w") as dst:
         dst.write("".join(l for l in src if "DIFFCHECK-ULP" not in l))
     rc, out, data = mutated(loose, next(edits for name, edits, _ in MUTANTS if name == "ulp_per_buffer"))
-    assert rc == 0 and data["status"] == "matched", ("the bound is no longer file-wide", rc, out)
+    assert rc != 0 and data is not None and data["status"] == "mismatched" and "exact" in json.dumps(data), (
+        "the per-buffer bound no longer holds the exact buffer", rc, out)
 
 # A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))
