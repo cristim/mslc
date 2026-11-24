@@ -2559,7 +2559,9 @@ VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaratio
 		deduceLength = parseArrayDimensions(declaration.type);
 	}
 
-	if (!match(TokenKind::Assign)) {
+	// Apple takes the brace list in place of "=", so "constant int k{5}" and
+	// "constant int k = {5}" are the same declaration.
+	if (!match(TokenKind::Assign) && !at(TokenKind::LBrace)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
 			+ std::string(tokenKindName(kind())));
 	}
@@ -4830,13 +4832,12 @@ int64_t Parser::namedConstantValue(const Expression& identifier, bool nested, bo
 	return found->value;
 }
 
-// An integer declared const or constexpr (a file-scope one is a constant by its address space) and
-// initialised by a constant expression is one a later array length may name. A value its own type
-// cannot hold is not recorded, because Apple would convert it and evaluateConstant would not.
+// An integer declared const or constexpr (or at file scope) with a constant initialiser may be
+// named by a later array length; a value its own type cannot hold is left out.
 void Parser::recordConstant(const VariableDeclaration& declaration, bool local) {
 	const Type& type = declaration.type;
-	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || type.arrayLength
-		|| type.vectorWidth != 0 || !declaration.initializer) {
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || (!local && type.isAtomic)
+		|| type.arrayLength || !type.isScalar() || !type.namedType.empty() || !declaration.initializer) {
 		return;
 	}
 	int64_t low = 0;
@@ -4854,10 +4855,9 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 		default: return;
 	}
 
-	// "= 3", "{3}" and "(3)" initialise the same way.
 	const Expression* initializer = declaration.initializer.get();
-	if (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1
-		&& initializer->elements.front().fieldName.empty()) {
+	while (initializer->kind == ExpressionKind::InitList && !initializer->constructType
+		&& initializer->elements.size() == 1 && initializer->elements.front().fieldName.empty()) {
 		initializer = initializer->elements.front().value.get();
 	}
 	if (initializer->kind == ExpressionKind::Construct && initializer->arguments.size() == 1
@@ -4866,10 +4866,13 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 		initializer = initializer->arguments.front().get();
 	}
 	int64_t value = 0;
-	try {
-		value = evaluateConstant(*initializer, false);
-	} catch (const CompileError&) {
-		return;
+	if (!(initializer->kind == ExpressionKind::InitList && !initializer->constructType
+		&& initializer->elements.empty())) {
+		try {
+			value = evaluateConstant(*initializer, false);
+		} catch (const CompileError&) {
+			return;
+		}
 	}
 	if (type.scalar == ScalarKind::Bool && value != 0) {
 		value = 1;

@@ -4558,8 +4558,13 @@ namespace {
 				for (const VariableDeclaration& global: _unit.globals) {
 					if (global.name != expression.name || !global.initializer) { continue; }
 					const Expression* initializer = global.initializer.get();
-					while (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1) {
+					while (initializer->kind == ExpressionKind::InitList && !initializer->constructType
+						&& initializer->elements.size() == 1 && initializer->elements.front().fieldName.empty()) {
 						initializer = initializer->elements.front().value.get();
+					}
+					if (initializer->kind == ExpressionKind::InitList && !initializer->constructType
+						&& initializer->elements.empty()) {
+						return true;
 					}
 					return initializer->kind != ExpressionKind::InitList && canFoldExpression(*initializer, global.name);
 				}
@@ -9354,23 +9359,30 @@ namespace {
 		return folded;
 	}
 
-	// Folds an initialiser of the given declared type. A list of values for a
-	// vector or a struct is a composite, and anything else is a scalar, so the
-	// declared type is what says which the source wrote.
 	FoldedConstant Emitter::foldInitializer(const Type& type, const Expression& initializer, bool braced) {
-		if (type.isMatrix()) {
+		if (type.isAtomic) {
+			throw CompileError("a file-scope atomic constant is not lowered");
+		}
+		if (initializer.kind == ExpressionKind::InitList && initializer.constructType
+			&& (type.namedType.empty() || initializer.constructType->namedType != type.namedType
+				|| initializer.constructType->arrayLength || initializer.constructType->isPointer
+				|| initializer.constructType->isVector() || initializer.constructType->isMatrix())) {
+			throw CompileError("a constant of \"" + typeName(type) + "\" cannot be initialised from \""
+				+ typeName(*initializer.constructType) + "\"");
+		}
+		if (type.isMatrix() && !type.isPointer) {
 			return foldMatrix(initializer, &type);
 		}
 
 		if (initializer.kind != ExpressionKind::InitList) {
-			if (!type.namedType.empty()) {
+			if (!type.namedType.empty() && !type.isPointer) {
 				throw CompileError("the struct \"" + type.namedType + "\" is initialised with a "
 					"braced list naming its fields, not with a single value");
 			}
 
 			// "int4(1)" and "float4(a, b, c, d)": a vector built by its own constructor, each
 			// component converted as it is at run time.
-			if (type.vectorWidth > 1 && initializer.kind == ExpressionKind::Construct
+			if (type.isVector() && !type.isPointer && initializer.kind == ExpressionKind::Construct
 				&& initializer.constructType && !initializer.constructType->isMatrix()) {
 				const Type& built = *initializer.constructType;
 				if (built.scalar != type.scalar || built.vectorWidth != type.vectorWidth) {
@@ -9388,14 +9400,21 @@ namespace {
 				return vector;
 			}
 
-			if (type.vectorWidth > 1) {
+			if (type.isVector() && !type.isPointer) {
 				throw CompileError("a " + std::string(scalarKindName(type.scalar))
 					+ std::to_string(type.vectorWidth) + " constant is initialised with a braced "
 					"list of its components or a constructor of its own type "
 					"(not a single value, another constant or an expression)");
 			}
 
+			if (!type.enumName.empty() && !type.isPointer) {
+				requireEnumValue(type.enumName, initializer, "an element of the initializer list");
+			}
+
 			FoldedConstant folded = foldExpression(initializer);
+			if (type.isPointer) {
+				throw CompileError("a file-scope pointer constant is not lowered yet");
+			}
 			if (folded.isComposite) {
 				throw CompileError("a composite cannot initialise a scalar");
 			}
@@ -9425,11 +9444,36 @@ namespace {
 			return convertConstant(folded, type.scalar);
 		}
 
+		if (type.isPointer) {
+			throw CompileError("a file-scope pointer constant is not lowered yet");
+		}
+
+		if (type.isScalar() && type.namedType.empty() && !type.arrayLength) {
+			if (initializer.elements.size() > 1) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ " constant takes one value in a brace list, found "
+					+ std::to_string(initializer.elements.size()));
+			}
+
+			if (initializer.elements.empty()) {
+				FoldedConstant zero;
+				zero.scalar = type.scalar;
+				return zero;
+			}
+
+			const InitializerElement& element = initializer.elements.front();
+			if (!element.fieldName.empty()) {
+				throw CompileError("a scalar's brace list holds its value, but \""
+					+ element.fieldName + "\" names a field");
+			}
+			return foldInitializer(type, *element.value, true);
+		}
+
 		FoldedConstant folded;
 		folded.isComposite = true;
 		folded.type = declaredTypeOf(type);
 
-		if (type.vectorWidth > 1) {
+		if (type.isVector()) {
 			// A vector's components are positional, so the list is the vector in
 			// order and each element is the vector's own component type.
 			if (initializer.elements.size() != type.vectorWidth) {
@@ -9666,6 +9710,10 @@ namespace {
 			const Expression& value = *element.value;
 			std::vector<double> values;
 			if (value.kind == ExpressionKind::InitList) {
+				if (value.constructType) {
+					throw CompileError("a column of " + typeName(type) + " cannot be initialised from \""
+						+ typeName(*value.constructType) + "\"");
+				}
 				if (value.elements.size() != rows) {
 					throw CompileError("chosen constructor is explicit in copy-initialization: a column of "
 						+ typeName(type) + " takes " + std::to_string(rows) + " values in braces, found "
@@ -9735,6 +9783,10 @@ namespace {
 		FoldedConstant folded;
 		switch (expression.kind) {
 			case ExpressionKind::InitList:
+				if (expression.constructType) {
+					throw CompileError("a matrix constant is initialised with a matrix, not a "
+						+ typeName(*expression.constructType));
+				}
 				if (!expected) {
 					throw CompileError("a braced list needs the matrix type it initialises");
 				}
@@ -9771,20 +9823,31 @@ namespace {
 		return folded;
 	}
 
-	// A file-scope "constant" is a compile-time constant, so its initialiser is
-	// folded and the result declared as one of the module's constants, with no
-	// binding of its own.
+	// A file-scope "constant" is folded to one of the module's constants, with no binding of its own.
 	Id Emitter::declareGlobalConstant(const VariableDeclaration& declaration) {
+		if (declaration.type.isAtomic) {
+			throw CompileError("a file-scope atomic constant is not lowered");
+		}
 		if (declaration.type.isMatrix() && declaration.type.isConstexpr) {
 			throw CompileError("constexpr variable \"" + declaration.name
 				+ "\" must be initialized by a constant expression");
 		}
-		if (!declaration.type.enumName.empty() && declaration.initializer->kind != ExpressionKind::InitList) {
-			requireEnumValue(declaration.type.enumName, *declaration.initializer,
-				"the constant \"" + declaration.name + "\"");
+		if (!declaration.type.enumName.empty()) {
+			const Expression* entry = declaration.initializer.get();
+			while (entry->kind == ExpressionKind::InitList && !entry->constructType
+				&& entry->elements.size() == 1 && entry->elements.front().fieldName.empty()) {
+				entry = entry->elements.front().value.get();
+			}
+			if (entry->kind != ExpressionKind::InitList) {
+				requireEnumValue(declaration.type.enumName, *entry,
+					"the constant \"" + declaration.name + "\"");
+			}
 		}
 		_foldDomainError = false;
 		const FoldedConstant folded = foldInitializer(declaration.type, *declaration.initializer);
+		if (declaration.type.isPointer) {
+			throw CompileError("a file-scope pointer constant is not lowered yet");
+		}
 		if (_foldDomainError && declaration.type.isConstexpr) {
 			throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
 				"constant expression");
@@ -9826,10 +9889,11 @@ namespace {
 	// in place by a kernel and a helper alike, and indexing it is one access chain.
 	void Emitter::declareFileScopeArray(const VariableDeclaration& declaration, size_t position) {
 		const Type& type = declaration.type;
-		if (type.isPointer || type.resource != ResourceKind::None) {
-			throw CompileError("a file-scope array of pointers or resources is not lowered yet");
+		if (type.isPointer || type.isAtomic || type.resource != ResourceKind::None) {
+			throw CompileError("a file-scope array of pointers, atomics or resources is not lowered yet");
 		}
-		if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList) {
+		if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList
+			|| declaration.initializer->constructType) {
 			throw CompileError("array initializer must be an initializer list");
 		}
 
@@ -9842,7 +9906,7 @@ namespace {
 				requireEnumValue(leaf.enumName, *entry, "an element of the initializer list");
 			}
 			_foldDomainError = false;
-			const FoldedConstant folded = foldInitializer(leaf, *entry);
+			const FoldedConstant folded = foldInitializer(leaf, *entry, true);
 			if (_foldDomainError && type.isConstexpr) {
 				throw CompileError("constexpr variable \"" + declaration.name + "\" must be initialized by a "
 					"constant expression");
@@ -13470,12 +13534,14 @@ namespace {
 		if (!storageOnly && declaration.initializer && !_types.isAggregate(typeId)
 			&& (type.isConstexpr || (type.isConst && !isFloatKind(type.scalar)))) {
 			const Expression* expression = declaration.initializer.get();
-			while (expression->kind == ExpressionKind::InitList && expression->elements.size() == 1) {
+			while (expression->kind == ExpressionKind::InitList && !expression->constructType
+				&& expression->elements.size() == 1 && expression->elements.front().fieldName.empty()) {
 				expression = expression->elements.front().value.get();
 			}
 			FoldedConstant folded;
 			folded.scalar = type.scalar;
-			const bool empty = expression->kind == ExpressionKind::InitList && expression->elements.empty();
+			const bool empty = expression->kind == ExpressionKind::InitList && !expression->constructType
+				&& expression->elements.empty();
 			if (empty || canFoldExpression(*expression, declaration.name)) {
 				if (!empty) { folded = foldExpression(*expression); }
 				const ScalarKind to = type.scalar;
