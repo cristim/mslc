@@ -481,6 +481,12 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 	// these start beyond that.
 	constexpr uint32_t kGridSizeSpecializationID = 0x40000;
 
+	// The SpecIds of a function constant [[function_constant(n)]]: its value at this plus n, and a bool that the
+	// host sets when it gives the constant a value at the other plus n. Threadgroup argument lengths take the
+	// SpecIds from 3 up to the first of these.
+	constexpr uint32_t kFunctionConstantSpecializationID = 0x10000;
+	constexpr uint32_t kFunctionConstantDefinedSpecializationID = 0x20000;
+
 	// Every name an expression or statement refers to. A constexpr sampler nothing
 	// refers to has no state in Apple's AIR, so it gets no binding either.
 	void collectIdentifiers(const Expression& expression, std::set<std::string>& names) {
@@ -2321,6 +2327,21 @@ namespace {
 		// constant belongs to the module rather than to the entry point, and an
 		// entry point's own names are looked up first.
 		std::map<std::string, ConstantBinding> _constants;
+		// The file-scope function constants, keyed by name. Their specialization constants are declared when
+		// the source first reads them, so a constant nothing reads asks for no capability its type needs.
+		struct FunctionConstant {
+			const VariableDeclaration* declaration = nullptr;
+			Id value = InvalidId;
+			Id defined = InvalidId;
+		};
+		std::map<std::string, FunctionConstant> _functionConstants;
+		// "constant bool b = is_function_constant_defined(c);": b, and the c it stands for.
+		std::map<std::string, std::string> _functionConstantDefinedAliases;
+		// The function constants each function reads in the code emitted for it, and the functions each calls:
+		// an entry point's reflection lists the constants of every function it reaches. A helper is emitted once
+		// for the entry points that share it, so what it reads is kept with it rather than with an entry point.
+		std::map<const FunctionDecl*, std::set<std::string>> _functionConstantReads;
+		std::map<const FunctionDecl*, std::set<const FunctionDecl*>> _functionCallees;
 		// The file-scope samplers, by name, and the ones the entry point being
 		// emitted names, which are looked up after its own parameters and locals.
 		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
@@ -2571,6 +2592,12 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
+		void declareFunctionConstant(const VariableDeclaration& declaration);
+		void declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read);
+		const std::string* functionConstantNamed(const std::string& name) const;
+		Id functionConstantValue(const std::string& name, bool defined);
+		Id emitIsFunctionConstantDefined(const Expression& call);
+		std::string functionConstantsJson();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void bindResourceAlias(const VariableDeclaration& declaration, const Type* declared);
@@ -3339,6 +3366,13 @@ namespace {
 		// at file scope is not a parameter of the entry point that reads it.
 		const Binding* found = findResourceBinding(expression.name);
 		if (!found) {
+			if (_functionConstants.count(expression.name)) {
+				return functionConstantValue(expression.name, false);
+			}
+			const auto alias = _functionConstantDefinedAliases.find(expression.name);
+			if (alias != _functionConstantDefinedAliases.end()) {
+				return functionConstantValue(alias->second, true);
+			}
 			const auto constant = _constants.find(expression.name);
 			if (constant != _constants.end()) {
 				return constant->second.id;
@@ -4684,9 +4718,12 @@ namespace {
 		const bool terminated = _terminated;
 		const uint32_t depth = _controlDepth;
 		const size_t targets = _jumpTargets.size();
+		// what the lifted code reads is not read
+		const auto functionConstantReads = _functionConstantReads;
 		emit();
 		_builder.takeFunctionsFrom(mark);
 		_builder.truncateLocals(locals);
+		_functionConstantReads = functionConstantReads;
 		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
 		_currentBlock = block;
 		_terminated = terminated;
@@ -5915,6 +5952,10 @@ namespace {
 			throw CompileError(name + " returns void and has no value");
 		}
 
+		if (name == "__metal_is_function_constant_defined") {
+			return emitIsFunctionConstantDefined(expression);
+		}
+
 		if (isAtomicFunction(name)) {
 			if (name == "atomic_store_explicit") {
 				throw CompileError("atomic_store_explicit returns void and has no value");
@@ -7049,6 +7090,7 @@ namespace {
 	// A call is an edge of the call graph. validateHelpers sees the edges whose callee a name
 	// identifies; the others are checked here, against the edges emitted so far.
 	void Emitter::noteCall(const FunctionDecl& callee) {
+		_functionCallees[_helper ? _helper : _entryPoint].insert(&callee);
 		if (!_helper) {
 			return;
 		}
@@ -9539,6 +9581,111 @@ namespace {
 		return id;
 	}
 
+	// A [[function_constant(n)]] is recorded here and declared where it is first read. Of the other constants,
+	// only "constant bool b = is_function_constant_defined(c);" may read one, as another name for whether c
+	// is defined: an initialiser computed from a value given at pipeline creation is not folded.
+	void Emitter::declareFunctionConstant(const VariableDeclaration& declaration) {
+		for (const auto& [name, other]: _functionConstants) {
+			if (*other.declaration->functionConstantIndex == *declaration.functionConstantIndex) {
+				throw CompileError("the function constants \"" + name + "\" and \"" + declaration.name
+					+ "\" have the same index " + std::to_string(*declaration.functionConstantIndex));
+			}
+		}
+		_functionConstants[declaration.name].declaration = &declaration;
+	}
+
+	// "constant bool b = is_function_constant_defined(c);" makes b another name for whether c is defined. Any
+	// other initialiser that reads a function constant is refused.
+	void Emitter::declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read) {
+		const Expression& initializer = *declaration.initializer;
+		const bool alias = initializer.kind == ExpressionKind::Call && initializer.left
+			&& initializer.left->kind == ExpressionKind::Identifier
+			&& builtinCalleeName(initializer.left->name) == "__metal_is_function_constant_defined"
+			&& initializer.arguments.size() == 1 && initializer.arguments[0]->kind == ExpressionKind::Identifier
+			&& _functionConstants.count(initializer.arguments[0]->name);
+		if (!alias) {
+			throw CompileError("the constant \"" + declaration.name + "\" is initialised from the function constant \""
+				+ read + "\", and the only such initialiser mslc lowers is is_function_constant_defined(" + read + ")");
+		}
+		const Type& type = declaration.type;
+		if (type.scalar != ScalarKind::Bool || type.vectorWidth > 1 || type.isPointer || type.arrayLength) {
+			throw CompileError("the constant \"" + declaration.name + "\" holds is_function_constant_defined(...) "
+				"and has to be a bool");
+		}
+		_functionConstantDefinedAliases[declaration.name] = initializer.arguments[0]->name;
+	}
+
+	// The function constant a name stands for, through "constant bool b = is_function_constant_defined(c);" too.
+	const std::string* Emitter::functionConstantNamed(const std::string& name) const {
+		const auto constant = _functionConstants.find(name);
+		if (constant != _functionConstants.end()) {
+			return &constant->first;
+		}
+		const auto alias = _functionConstantDefinedAliases.find(name);
+		return alias == _functionConstantDefinedAliases.end() ? nullptr : &alias->second;
+	}
+
+	// The value of a function constant, or with `defined` the bool that says whether it was given one, as a
+	// specialization constant that defaults to zero (false).
+	Id Emitter::functionConstantValue(const std::string& name, bool defined) {
+		FunctionConstant& constant = _functionConstants.at(name);
+		_functionConstantReads[_helper ? _helper : _entryPoint].insert(name);
+		const uint32_t index = *constant.declaration->functionConstantIndex;
+		if (constant.value == InvalidId) {
+			const ScalarKind kind = constant.declaration->type.scalar;
+			const Id type = _types.scalar(kind);
+			if (kind == ScalarKind::Bool) {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstantFalse, type, { });
+			} else if (kind == ScalarKind::Long || kind == ScalarKind::ULong) {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstant, type, { 0u, 0u });
+			} else {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstant, type, { 0u });
+			}
+			_builder.emit(spirv::OpDecorate, { constant.value, static_cast<uint32_t>(spirv::Decoration::SpecId),
+				kFunctionConstantSpecializationID + index });
+			constant.defined = _builder.emitDeclTyped(spirv::OpSpecConstantFalse, _types.scalar(ScalarKind::Bool), { });
+			_builder.emit(spirv::OpDecorate, { constant.defined, static_cast<uint32_t>(spirv::Decoration::SpecId),
+				kFunctionConstantDefinedSpecializationID + index });
+		}
+		return defined ? constant.defined : constant.value;
+	}
+
+	Id Emitter::emitIsFunctionConstantDefined(const Expression& call) {
+		if (call.arguments.size() != 1 || call.arguments[0]->kind != ExpressionKind::Identifier
+			|| !_functionConstants.count(call.arguments[0]->name) || findResourceBinding(call.arguments[0]->name)) {
+			throw CompileError("is_function_constant_defined takes the name of a function constant");
+		}
+		return functionConstantValue(call.arguments[0]->name, true);
+	}
+
+	// The reflection of the function constants the entry point reads, itself or in a function it reaches, by index.
+	std::string Emitter::functionConstantsJson() {
+		std::map<uint32_t, std::string> byIndex;
+		std::set<const FunctionDecl*> reached { _entryPoint };
+		std::vector<const FunctionDecl*> pending { _entryPoint };
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+			for (const std::string& name: _functionConstantReads[function]) {
+				byIndex[*_functionConstants.at(name).declaration->functionConstantIndex] = name;
+			}
+			for (const FunctionDecl* callee: _functionCallees[function]) {
+				if (reached.insert(callee).second) {
+					pending.push_back(callee);
+				}
+			}
+		}
+		std::string json;
+		for (const auto& [index, name]: byIndex) {
+			const VariableDeclaration& declaration = *_functionConstants.at(name).declaration;
+			json += std::string(json.empty() ? "" : ",") + "\n\t\t\t\t{ \"name\": \"" + name + "\", \"type\": \""
+				+ scalarKindName(declaration.type.scalar) + "\", \"index\": " + std::to_string(index)
+				+ ", \"spec_id\": " + std::to_string(kFunctionConstantSpecializationID + index)
+				+ ", \"defined_spec_id\": " + std::to_string(kFunctionConstantDefinedSpecializationID + index) + " }";
+		}
+		return json;
+	}
+
 	// The module's own declarations, in source order. A constant is declared
 	// before the entry point that reads it, which is what lets the folder resolve
 	// one constant's initialiser against the ones above it.
@@ -9550,6 +9697,20 @@ namespace {
 				continue;
 			}
 			_builder.setSection(spirv::Section::TypesGlobals);
+			if (global.functionConstantIndex) {
+				declareFunctionConstant(global);
+				continue;
+			}
+			if (global.initializer && !_functionConstants.empty()) {
+				std::set<std::string> read;
+				collectIdentifiers(*global.initializer, read);
+				const auto constant = std::find_if(read.begin(), read.end(),
+					[&](const std::string& name) { return functionConstantNamed(name) != nullptr; });
+				if (constant != read.end()) {
+					declareFunctionConstantAlias(global, *constant);
+					continue;
+				}
+			}
 			if (global.type.arrayLength) {
 				declareFileScopeArray(global, position);
 				continue;
@@ -10365,6 +10526,9 @@ namespace {
 
 		const Id elementType = declaredTypeOf(element);
 		const Id count = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 1u });
+		if (_nextSpecId == kFunctionConstantSpecializationID) {
+			throw CompileError(what + " is one more than mslc has specialization constants for");
+		}
 		const uint32_t specId = _nextSpecId++;
 		_builder.emit(spirv::OpDecorate, { count, static_cast<uint32_t>(spirv::Decoration::SpecId), specId });
 		const Id arrayType = _types.arrayOfLengthId(elementType, count);
@@ -13597,7 +13761,7 @@ namespace {
 		}
 		rejectPlaceThroughConditional(target, "assigning to");
 		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
-			&& _constants.count(root.name)) {
+			&& (_constants.count(root.name) || functionConstantNamed(root.name))) {
 			throw CompileError("cannot store to \"" + root.name + "\", a constant declared at file scope");
 		}
 	}
@@ -14448,6 +14612,10 @@ namespace {
 				document += "\t\t\t\"grid_size_spec_ids\": [" + std::to_string(kGridSizeSpecializationID) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 1) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 2) + "],\n";
+			}
+			const std::string functionConstants = functionConstantsJson();
+			if (!functionConstants.empty()) {
+				document += "\t\t\t\"function_constants\": [" + functionConstants + "\n\t\t\t],\n";
 			}
 			document += "\t\t\t\"bindings\": [\n";
 			document += _reflection;

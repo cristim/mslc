@@ -31,6 +31,9 @@ enum class Stage {
 };
 
 // Scalar type kinds. Width is in bits; vectors are a count of one of these.
+// The largest index [[function_constant(n)]] takes.
+constexpr uint32_t kMaxFunctionConstantIndex = 65535;
+
 enum class ScalarKind {
 	Void,
 	Bool,
@@ -449,6 +452,10 @@ struct VariableDeclaration {
 
 	// A sampler local: the state its options spell.
 	std::optional<SamplerState> sampler;
+
+	// A file-scope constant declared [[function_constant(n)]]: its index n. It has no initialiser; its value
+	// is given when a function is made from the library.
+	std::optional<uint32_t> functionConstantIndex;
 };
 
 struct Statement {
