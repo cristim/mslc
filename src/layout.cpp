@@ -39,8 +39,11 @@ uint32_t alignTo(uint32_t offset, uint32_t alignment) {
 }
 
 // The element a member is made of, before any array dimension: what Metal
-// lays out for one scalar, vector or matrix of its type.
+// lays out for one scalar, vector or matrix of its type, or for a pointer.
 VectorLayout elementLayout(const Type& type) {
+	if (type.isPointer) {
+		return { 8, 8 };
+	}
 	const uint32_t components = type.vectorWidth > 1 ? type.vectorWidth : 1;
 	const uint32_t scalarBytes = storageBytesOf(type.scalar);
 	return type.isMatrix() ? matrixLayoutFor(scalarBytes, type.matrixColumns, components)

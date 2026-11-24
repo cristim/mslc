@@ -1,6 +1,5 @@
-// EXPECT: error a pointer member ("p" of "S") is not lowered yet
-// A struct with a pointer member used as a buffer was lowered with the pointer dropped
-// to a scalar and q at the wrong offset (#346); it is refused until pointers are lowered.
+// EXPECT: error a pointer member ("p" of "S") to a struct or to atomics is not lowered yet
+// A pointer member is lowered for a scalar, vector or matrix pointee only.
 struct T { float a; };
 struct S { device T *p; float q; };
 kernel void struct_pointer_member_to_struct_rejected(device float *o [[buffer(0)]],

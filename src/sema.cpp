@@ -822,6 +822,9 @@ std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::v
 	const StructDecl* decl = _unit.findStruct(name);
 	for (size_t i = 0; i < types.size(); ++i) {
 		const Type& field = decl->fields[i].type;
+		if (field.isPointer) {
+			continue;
+		}
 		if (field.arrayLength) {
 			// Only the array wrappers differ between the forms: a laid-out array
 			// carries ArrayStride, and the element is the same type in both.
@@ -1264,6 +1267,10 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 
 uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 	const uint32_t bits = bitWidth(type);
+	if (bits == 0 && storageClassOf(type)) {
+		// A pointer held in a buffer, as a struct's pointer member is: 8 bytes.
+		return 8;
+	}
 	if (bits == 0) {
 		// A struct is as aligned as its most aligned member, which spirv-val needs
 		// to be at least its largest scalar: 8 for a long.
@@ -1479,9 +1486,14 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 			throw CompileError("the array member \"" + field.name + "\" of \"" + decl->name
 				+ "\" is an array of pointers, which mslc does not lower");
 		}
-		if (field.type.isPointer) {
+		if (field.type.isPointer && field.type.addressSpace != AddressSpace::Device
+			&& field.type.addressSpace != AddressSpace::Constant) {
 			throw CompileError("a pointer member (\"" + field.name + "\" of \"" + decl->name
-				+ "\") is not lowered yet; pass the pointer as its own [[buffer(n)]] argument");
+				+ "\") has to point at device or constant memory to be lowered");
+		}
+		if (field.type.isPointer && (!field.type.namedType.empty() || field.type.isAtomic)) {
+			throw CompileError("a pointer member (\"" + field.name + "\" of \"" + decl->name
+				+ "\") to a struct or to atomics is not lowered yet");
 		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
@@ -1492,6 +1504,11 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 			: components > 1
 			? vector(field.type.scalar, field.type.vectorWidth)
 			: scalar(field.type.scalar);
+		// A device or constant pointer member holds a buffer's GPU address, so it is
+		// the pointer a pointer parameter is: to the { T runtime_array[] } of its pointee.
+		if (field.type.isPointer) {
+			valueType = bufferPointer(blockStructFor(valueType, field.type.isPacked));
+		}
 		if (field.type.arrayLength) {
 			for (auto inner = field.type.innerArrayLengths.rbegin(); inner != field.type.innerArrayLengths.rend(); ++inner) {
 				valueType = array(valueType, *inner);
@@ -2619,8 +2636,9 @@ namespace {
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
 		Id emitPlaceAddress(const Expression& left);
-		const Expression& storeRoot(const Expression& target) const;
-		void requireStorable(const Expression& target) const;
+		const Expression& storeRoot(const Expression& target);
+		bool readOnlyRoot(const Expression& root);
+		void requireStorable(const Expression& target);
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
@@ -2719,6 +2737,8 @@ namespace {
 		Id wordIndex(Id index, const char* what);
 		Id stepIndex(const Expression& expression, const char* what);
 		Id emitMember(const Expression& expression);
+		const Type* pointerMemberType(const Expression& expression);
+		std::optional<Binding> pointerMemberBinding(const Expression& expression);
 		size_t arrayMemberRank(const Expression& expression, size_t& outIndices);
 		std::optional<Id> emitArrayMemberElement(const Expression& expression, bool asAddress);
 		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
@@ -2734,7 +2754,7 @@ namespace {
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call, std::set<std::string>* adlOnly = nullptr);
 		const StructDecl* adlStructOf(const Expression& argument);
-		bool inConstantSpace(const Expression& place) const;
+		bool inConstantSpace(const Expression& place);
 		std::optional<Type> placeType(const Expression& place);
 		std::optional<Type> sizeofPlaceType(const Expression& place);
 		std::optional<Type> sizeofExpressionType(const Expression& expression);
@@ -2840,7 +2860,7 @@ namespace {
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-			size_t first) const;
+			size_t first);
 		HelperFunction& pointerSpecialisation(const Expression& call, HelperFunction& generic,
 			size_t first, std::vector<Id>& arrays);
 		// The pointer value a device or constant pointer argument passes: the whole
@@ -3510,29 +3530,31 @@ namespace {
 			return *element;
 		}
 
-		if (isElementAccess(expression)) {
+		const std::optional<Binding> member = pointerMemberBinding(*expression.left);
+		if (!member && isElementAccess(expression)) {
 			return emitElementAccess(expression, asAddress);
 		}
 
-		if (expression.left->kind != ExpressionKind::Identifier) {
+		if (!member && expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError(expression.isDereference ? kDereferenceOperand
 				: "indexing an expression is not supported yet; index a parameter or local directly");
 		}
 
-		const auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end() || !it->second.isPointer) {
-			throw CompileError("\"" + expression.left->name + "\" is not a pointer, so it cannot "
+		const std::string& name = member ? expression.left->memberName : expression.left->name;
+		const auto it = _bindings.find(name);
+		if (!member && (it == _bindings.end() || !it->second.isPointer)) {
+			throw CompileError("\"" + name + "\" is not a pointer, so it cannot "
 				"be indexed");
 		}
 
-		if (expression.isDereference && !it->second.isBuffer && !it->second.pointeeMsl.arrayLength) {
-			throw CompileError(notAPointer(expression.left->name));
+		const Binding& binding = member ? *member : it->second;
+
+		if (expression.isDereference && !binding.isBuffer && !binding.pointeeMsl.arrayLength) {
+			throw CompileError(notAPointer(name));
 		}
 
-		const Binding& binding = it->second;
-
 		if (binding.pointeeMsl.isAtomic) {
-			throw CompileError("\"" + expression.left->name + "\" points at atomics, which are read and written "
+			throw CompileError("\"" + name + "\" points at atomics, which are read and written "
 				"only by the atomic_*_explicit functions");
 		}
 
@@ -3803,6 +3825,49 @@ namespace {
 
 		outDeclName = decl.name;
 		return decl.fields.size();
+	}
+
+	// The type of a device or constant pointer member that a member access names,
+	// as p in s.p; null for any other expression.
+	const Type* Emitter::pointerMemberType(const Expression& expression) {
+		if (expression.kind != ExpressionKind::Member) {
+			return nullptr;
+		}
+		const StructDecl* decl = structOf(*expression.left);
+		if (!decl) {
+			return nullptr;
+		}
+		std::string declName;
+		const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
+		return field < decl->fields.size() && decl->fields[field].type.isPointer
+			? &decl->fields[field].type : nullptr;
+	}
+
+	// s.p as the pointer it holds, bound as a helper's pointer parameter is, so that
+	// s.p[i] and *s.p walk the buffer it points into. Nothing for an expression that
+	// is not a pointer member.
+	std::optional<Binding> Emitter::pointerMemberBinding(const Expression& expression) {
+		const Type* type = pointerMemberType(expression);
+		if (!type) {
+			return std::nullopt;
+		}
+
+		Id fieldType = InvalidId;
+		const Id address = emitMemberAddress(expression, fieldType);
+		const auto [pointee, block] = bufferParamTypes(*type);
+		Binding bound;
+		bound.id = loadFromBuffer(address, fieldType);
+		bound.isPointer = true;
+		bound.pointeeType = pointee;
+		bound.bufferPointeeType = block;
+		bound.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
+		bound.isBuffer = true;
+		bound.ownAddress = true;
+		bound.readOnly = type->isConst || type->addressSpace == AddressSpace::Constant;
+		bound.pointeeMsl = *type;
+		bound.pointeeMsl.isPointer = false;
+		bound.pointeeMsl.isConst = false;
+		return bound;
 	}
 
 	const ConstantBinding* Emitter::constantFor(const Expression* expression) {
@@ -4129,6 +4194,11 @@ namespace {
 				{ constant->id, static_cast<uint32_t>(field) });
 		}
 
+		if (pointerMemberType(expression)) {
+			throw CompileError("the pointer member \"" + expression.memberName + "\" is only lowered "
+				"when indexed or dereferenced, as in s.p[i] or *s.p");
+		}
+
 		// The chain says which binding the access starts from, which is not the
 		// name on the left of the '.' when that is an index.
 		std::string rootName;
@@ -4193,6 +4263,10 @@ namespace {
 		size_t memberField = 0;
 
 		for (const AccessStep& step: steps) {
+			if (inMember && current.isPointer) {
+				throw CompileError("the pointer member \"" + memberOwner->fields[memberField].name
+					+ "\" is only lowered when indexed or dereferenced, as in s.p[i] or *s.p");
+			}
 			if (step.isIndex) {
 				// An element of an array member: one more step of the same chain, in
 				// whichever storage class the struct lives.
@@ -4273,9 +4347,10 @@ namespace {
 
 		outFieldType = declaredTypeOf(current);
 		const bool arrayInBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
-		if (current.arrayLength && arrayInBuffer) {
+		if ((current.arrayLength || current.isPointer) && arrayInBuffer) {
 			// A struct in a buffer holds its array with a stride, which is another type than the
-			// local's; the member's type in the laid-out struct is what the chain points at.
+			// local's, and a pointer as a buffer pointer; the member's type in the laid-out
+			// struct is what the chain points at.
 			TypeTable::StructForm form;
 			if (!memberOwner || !_types.structForm(_types.namedStruct(memberOwner->name), form)) {
 				throw CompileError("an array member in a buffer has no laid-out struct to take its type from");
@@ -4298,7 +4373,7 @@ namespace {
 		// A reference local bound to a buffer element holds that element's address
 		// and has no buffer of its own, but its fields are laid out the same way.
 		const bool inBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
-		const bool packed = inBuffer && current.isPacked;
+		const bool packed = inBuffer && current.isPacked && !current.isPointer;
 		const bool bytes = inBuffer && _types.isBool(outFieldType);
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(storageClass, packed
@@ -7431,7 +7506,7 @@ namespace {
 	// the same storage would have its write overwritten by the stale copy. Two
 	// bare variables are the same pointer and alias as C++ does.
 	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-		size_t first) const {
+		size_t first) {
 		struct Passed { std::string root; bool temporary; std::vector<AccessStep> steps; };
 		std::vector<Passed> passed;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
@@ -7658,8 +7733,11 @@ namespace {
 
 	// Whether a name, an element or a member lives in the constant address space: a constant buffer, a
 	// file-scope constant, or a constant reference parameter of the function being emitted.
-	bool Emitter::inConstantSpace(const Expression& place) const {
+	bool Emitter::inConstantSpace(const Expression& place) {
 		const Expression& root = storeRoot(place);
+		if (const Type* pointer = pointerMemberType(root)) {
+			return pointer->addressSpace == AddressSpace::Constant;
+		}
 		if (root.kind != ExpressionKind::Identifier) {
 			return false;
 		}
@@ -7718,6 +7796,11 @@ namespace {
 				std::optional<Type> type = placeType(*place.left);
 				if (!type) {
 					return std::nullopt;
+				}
+				// An index of a pointer member, s.p[i] or *s.p, is its pointee.
+				if (type->isPointer) {
+					type->isPointer = false;
+					return type;
 				}
 				if (type->arrayLength) {
 					type->dropOuterDimension();
@@ -7864,7 +7947,15 @@ namespace {
 		};
 		// Whether a place cannot be written: a const object, one in the constant address space, or a member of one.
 		const auto readOnly = [&](const Expression& place) {
-			const Expression& root = storeRoot(place);
+			const Expression* found = &storeRoot(place);
+			if (pointerMemberType(*found)) {
+				// Through the pointer its pointee decides; the pointer itself is part of its struct.
+				if (found != &place) {
+					return readOnlyRoot(*found);
+				}
+				found = &storeRoot(*place.left);
+			}
+			const Expression& root = *found;
 			if (root.kind != ExpressionKind::Identifier) {
 				return true;
 			}
@@ -12835,6 +12926,9 @@ namespace {
 					: std::optional<std::string>(returned.enumName);
 			}
 			case ExpressionKind::Index: {
+				if (const Type* pointer = pointerMemberType(*expression.left)) {
+					return pointer->enumName;
+				}
 				if (expression.left->kind != ExpressionKind::Identifier) return std::nullopt;
 				const auto local = _bindings.find(expression.left->name);
 				if (local == _bindings.end()) return std::nullopt;
@@ -13343,6 +13437,10 @@ namespace {
 		if (left.kind == ExpressionKind::Index) {
 			address = emitIndex(left, true);
 		} else if (left.kind == ExpressionKind::Member) {
+			if (pointerMemberType(left)) {
+				throw CompileError("the pointer member \"" + left.memberName + "\" is only lowered "
+					"when indexed or dereferenced, as in s.p[i] or *s.p");
+			}
 			Id fieldType = InvalidId;
 			address = emitMemberAddress(left, fieldType);
 		} else if (left.kind == ExpressionKind::Identifier) {
@@ -13402,10 +13500,9 @@ namespace {
 		}
 
 		const Expression* root = &storeRoot(base);
-		const auto rootBinding = _bindings.find(root->name);
-		if (rootBinding != _bindings.end() && rootBinding->second.readOnly) {
-			throw CompileError("assigning to " + quoted + " of \"" + root->name
-				+ "\", which is const or in constant memory");
+		if (readOnlyRoot(*root)) {
+			throw CompileError("assigning to " + quoted + " of \"" + (root->kind == ExpressionKind::Member
+				? root->memberName : root->name) + "\", which is const or in constant memory");
 		}
 
 		const Id address = emitPlaceAddress(base);
@@ -13575,18 +13672,30 @@ namespace {
 	}
 
 	// The variable a store lands in: the head of a chain of member and element
-	// accesses, since constness and storage follow the chain.
-	const Expression& Emitter::storeRoot(const Expression& target) const {
+	// accesses, since constness and storage follow the chain. A pointer member,
+	// as s.p in s.p[i], ends the chain: what it points at is not part of s.
+	const Expression& Emitter::storeRoot(const Expression& target) {
 		const Expression* root = &target;
-		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+		while ((root->kind == ExpressionKind::Member && !pointerMemberType(*root))
+			|| root->kind == ExpressionKind::Index) {
 			root = root->left.get();
 		}
 		return *root;
 	}
 
+	// Whether a store through a place's root is refused: a const or constant
+	// variable, or a pointer member to const or constant memory.
+	bool Emitter::readOnlyRoot(const Expression& root) {
+		if (const Type* pointer = pointerMemberType(root)) {
+			return pointer->isConst || pointer->addressSpace == AddressSpace::Constant;
+		}
+		const auto binding = root.kind == ExpressionKind::Identifier ? _bindings.find(root.name) : _bindings.end();
+		return binding != _bindings.end() && binding->second.readOnly;
+	}
+
 	// A store to something that is not a variable of the entry point: a literal,
 	// which is what an enumerator is by now, or a file-scope constant.
-	void Emitter::requireStorable(const Expression& target) const {
+	void Emitter::requireStorable(const Expression& target) {
 		const Expression& root = storeRoot(target);
 		if (root.kind == ExpressionKind::IntLiteral || root.kind == ExpressionKind::FloatLiteral
 			|| root.kind == ExpressionKind::BoolLiteral) {
@@ -13653,12 +13762,10 @@ namespace {
 		}
 
 		const Expression* root = &storeRoot(left);
-		if (root->kind == ExpressionKind::Identifier) {
-			const auto target = _bindings.find(root->name);
-			if (target != _bindings.end() && target->second.readOnly) {
-				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
-					"constant address space or declared const");
-			}
+		if (readOnlyRoot(*root)) {
+			throw CompileError("cannot store through \"" + (root->kind == ExpressionKind::Member
+				? root->memberName : root->name) + "\", which is in the "
+				"constant address space or declared const");
 		}
 
 		const Id address = emitPlaceAddress(left);
