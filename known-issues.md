@@ -902,3 +902,14 @@ Apple's value is undefined.
 
 - `template float f<float>(int);` (a signature that matches no instance of `f`) is accepted and ignored; Apple
   rejects it. Only the name is checked, and nothing is emitted, so the result is harmless.
+
+## Linear sampling of inf and NaN texels differs from Apple (#374, diffcheck)
+
+- With the edge input profile (inf and NaN texels), a `filter::linear` sample gives a number on Apple where
+  lavapipe gives NaN, so `embedded_sampler_linear.metal` and the linear output of
+  `embedded_sampler_clamp_to_zero.metal` cannot be compared on that profile. Measured example, `embedded_sampler_linear`,
+  `outA` element 5 offset 92, seed 1: Apple `-6.7059e-07` (0xb5340298), mslc on lavapipe NaN (0x7fc00000); element 0
+  gives Apple `inf` against NaN. The likely cause (not isolated) is a zero filter weight times an infinite texel,
+  which lavapipe evaluates to NaN and Apple apparently skips. Both probes therefore declare `cases=1` (the moderate,
+  finite profile) with a per-buffer `DIFFCHECK-ULP`. Whether real shaders can see it is open: it needs a texture
+  holding inf or NaN.
