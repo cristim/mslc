@@ -9425,6 +9425,30 @@ namespace {
 			return convertConstant(folded, type.scalar);
 		}
 
+		// A scalar's own brace list is the value it holds: an empty list is zero and
+		// one value is the scalar, with the narrowing rules a braced value gets. More
+		// than one is the excess-element error Apple gives.
+		if (type.vectorWidth <= 1 && type.namedType.empty() && !type.isPointer && !type.arrayLength) {
+			if (initializer.elements.size() > 1) {
+				throw CompileError("a " + std::string(scalarKindName(type.scalar))
+					+ " constant takes one value in a brace list, found "
+					+ std::to_string(initializer.elements.size()));
+			}
+
+			if (initializer.elements.empty()) {
+				FoldedConstant zero;
+				zero.scalar = type.scalar;
+				return zero;
+			}
+
+			const InitializerElement& element = initializer.elements.front();
+			if (!element.fieldName.empty()) {
+				throw CompileError("a scalar's brace list holds its value, but \""
+					+ element.fieldName + "\" names a field");
+			}
+			return foldInitializer(type, *element.value, true);
+		}
+
 		FoldedConstant folded;
 		folded.isComposite = true;
 		folded.type = declaredTypeOf(type);

@@ -2559,7 +2559,9 @@ VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaratio
 		deduceLength = parseArrayDimensions(declaration.type);
 	}
 
-	if (!match(TokenKind::Assign)) {
+	// Apple takes the brace list in place of "=", so "constant int k{5}" and
+	// "constant int k = {5}" are the same declaration.
+	if (!match(TokenKind::Assign) && !at(TokenKind::LBrace)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
 			+ std::string(tokenKindName(kind())));
 	}

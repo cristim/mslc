@@ -494,9 +494,12 @@ Apple accepts the first five, which are refused loudly. It also rejects the last
   indexing a temporary (`S{{1,2},3}.a[1]`), a braced return from an entry point (a helper's `return {1,2};` works, #362), and the
   parenthesised copy `A z(A{{1},2})` ("constructing a A is not lowered yet", as for any struct).
 - File-scope `constant` structs with a positional or array-member initialiser (a plain `constant P g = {1, 4};` gets the same "initialised by field name" error; designators on a plain struct work), which Apple accepts: `constant Q g =
-  {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` ("needs an
-  initialiser, found {") and `constant Q g = {.a = {1,2,3}, .s = 4};` ("a constant of \"\" is not a struct this
-  source declares").
+  {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` (the same
+  field-name error, now that a brace list is accepted in place of "=") and `constant Q g = {.a = {1,2,3}, .s = 4};`
+  ("a constant of \"\" is not a struct this source declares").
+- A file-scope `constant` of a scalar, vector or array takes its brace list with or without "=" (#390). A bool
+  still does not convert to or from a number in a constant, where Apple accepts both: `constant bool b = 1;`,
+  `constant bool b{1};`, `constant int k = true;` and `constant float f{true};` are refused.
 - Assigning to a conditional or comma that yields a place, including `(c ? s : t) = S{3,4}`,
   `(c ? S{1,2} : S{3,4}) = S{3,4}`, `(c ? s : t).a = 9` and a reference bound to a member of one;
   a store, `++`, reference binding or by-reference argument on such a member is refused with a
