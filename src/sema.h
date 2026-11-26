@@ -50,6 +50,9 @@ private:
 	// array of that struct steps by.
 	std::map<spirv::Id, uint32_t> _structSizes;
 	std::map<std::pair<spirv::Id, bool>, spirv::Id> _blockStructs;
+	// The stride each block struct's runtime array was decorated with, in bytes:
+	// the Metal size of the element, which pointer arithmetic scales by.
+	std::map<std::pair<spirv::Id, bool>, uint32_t> _blockStrides;
 	std::map<spirv::Id, spirv::Id> _matrixReferenceStructs;
 	std::map<spirv::Id, spirv::Id> _bufferPointers;
 
@@ -219,6 +222,7 @@ public:
 	// element type and layout. A packed vector element steps by its components'
 	// total size, and an unpacked one by Metal's rule, which rounds a 3-vector up.
 	spirv::Id blockStructFor(spirv::Id elementType, bool packed);
+	uint32_t blockStride(spirv::Id elementType, bool packed);
 	// { matrix m; } as a Block: a matrix reached by reference, since its layout
 	// decorations belong to a struct member.
 	spirv::Id matrixReferenceStruct(spirv::Id matrixType);

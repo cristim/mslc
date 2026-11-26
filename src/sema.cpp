@@ -873,7 +873,17 @@ spirv::Id TypeTable::blockStructFor(spirv::Id elementType, bool packed) {
 	decorateMatrixMember(structure, 0, elementType);
 
 	_blockStructs.emplace(std::make_pair(elementType, packed), structure);
+	_blockStrides.emplace(std::make_pair(elementType, packed), stride);
 	return structure;
+}
+
+// The stride a buffer of the element steps, in bytes: the Metal size of the
+// element, which pointer arithmetic has to scale by (a float3 is 16 bytes in
+// Metal and 12 in SPIR-V). blockStructFor has computed it; the struct is
+// declared on demand, which is where the stride comes from.
+uint32_t TypeTable::blockStride(Id elementType, bool packed) {
+	blockStructFor(elementType, packed);
+	return _blockStrides.at(std::make_pair(elementType, packed));
 }
 
 spirv::Id TypeTable::matrixReferenceStruct(spirv::Id matrixType) {
@@ -1722,6 +1732,11 @@ namespace {
 		// device or constant pointer parameter, rather than a member of the
 		// entry point's binding-0 address block that has to be loaded first.
 		bool ownAddress = false;
+		// True for a helper's device or constant pointer parameter bound as a pointer
+		// to one element (the argument's element, or element 0 of the buffer it
+		// named): indexing steps with OpPtrAccessChain, and a bare use is a pointer
+		// value, which is refused.
+		bool elementPointer = false;
 		// True for a const local of integral type whose initialiser is a constant
 		// expression: C++ lets it stand in a constant expression.
 		bool constantValue = false;
@@ -2460,6 +2475,7 @@ namespace {
 	private:
 		void emitEntryPoint(spirv::Id functionType);
 		Id constantU32(uint32_t value);
+		Id constantU64(uint64_t value);
 	// indium splits descriptor sets by stage: set 0 from the vertex function,
 	// set 1 from the fragment function. A kernel has one set.
 	uint32_t descriptorSet() const {
@@ -2471,6 +2487,11 @@ namespace {
 		// the { T runtime_array[] } struct the pointer is to: what an entry point's
 		// own buffer parameter binds and what such a helper parameter takes.
 		std::pair<Id, Id> bufferParamTypes(const Type& type);
+		// One element step of a pointer into a buffer, in bytes: Metal's element is
+		// its own size there, which a float3 padded to a register makes wider than
+		// the SPIR-V type, so a pointer's own scaling would walk the wrong elements.
+		Id elementStep(Id pointer, const Expression& index, Id pointeeType, uint32_t stride,
+			bool negateOffset = false);
 		void loadThreadsPerThreadgroup();
 		// The address of a packed vector's storage, viewed as a pointer to the
 		// vector itself, which is what a load or store wants.
@@ -2888,6 +2909,11 @@ namespace {
 		return _builder.emitDeclTyped(spirv::OpConstant, _uintType, { value });
 	}
 
+	Id Emitter::constantU64(uint64_t value) {
+		return _builder.emitDeclTyped(spirv::OpConstant, _types.scalar(ScalarKind::ULong),
+			{ static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32) });
+	}
+
 	Id Emitter::declaredTypeOf(const Type& type) {
 		// A pointer and an array are not one value each, and answering with the
 		// base type says something narrower than the type that was asked about. A
@@ -3061,6 +3087,31 @@ namespace {
 			throw CompileError("undeclared type \"" + type.namedType + "\"");
 		}
 		return { pointee, _types.blockStructFor(pointee, type.isPacked) };
+	}
+
+	// One element step of a pointer into a buffer: the address in bytes, plus the
+	// index times the element's Metal size, back into a pointer of the same
+	// pointee. The index is widened to 64 bits signed, so p - n walks backwards
+	// the way two's-complement address arithmetic does.
+	Id Emitter::elementStep(Id pointer, const Expression& index, Id pointeeType, uint32_t stride,
+		bool negateOffset) {
+		const Id u64 = _types.scalar(ScalarKind::ULong);
+		const Id i64 = _types.scalar(ScalarKind::Long);
+		const Id raw = emitExpression(index);
+		Id widened = convert(raw, _builder.typeOf(raw), u64);
+		if (negateOffset) {
+			// A subtracted step is a negated one: sign the value, negate it, and
+			// add it as the same 64-bit pattern, so address - n is the wraparound
+			// addition a 64-bit address space makes correct.
+			const Id signedValue = _builder.emitTyped(spirv::OpBitcast, i64, { widened });
+			widened = _builder.emitTyped(spirv::OpBitcast, u64,
+				{ _builder.emitTyped(spirv::OpSNegate, i64, { signedValue }) });
+		}
+		const Id bytes = _builder.emitTyped(spirv::OpIMul, u64, { widened, constantU64(stride) });
+		const Id address = _builder.emitTyped(spirv::OpConvertPtrToU, u64, { pointer });
+		const Id moved = _builder.emitTyped(spirv::OpIAdd, u64, { address, bytes });
+		return _builder.emitTyped(spirv::OpConvertUToPtr,
+			_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, pointeeType), { moved });
 	}
 
 	// A struct is declared once as a value and once as a buffer's laid-out
@@ -3334,6 +3385,12 @@ namespace {
 				"use atomic_load_explicit");
 		}
 
+		if (binding.elementPointer) {
+			throw CompileError("the pointer \"" + expression.name + "\" is used as a value (a copy, a "
+				"comparison or an arithmetic result kept in a local); mslc does not lower pointer "
+				"values yet; index it, as " + expression.name + "[i]");
+		}
+
 		if (binding.pointeeMsl.isStdArray && binding.pointeeMsl.arrayLength && binding.isPointer && !binding.isBuffer
 			&& binding.bufferPointeeType == InvalidId && isLocalStorage(binding.storageClass) && !binding.isAddress) {
 			return loadFrom(binding.id, binding.pointeeType);
@@ -3480,6 +3537,30 @@ namespace {
 
 		if (const auto element = emitArrayMemberElement(expression, asAddress)) {
 			return *element;
+		}
+
+		// A helper's device or constant pointer parameter points at one element of
+		// its buffer: an index steps it by the element's Metal size, in bytes.
+		if (expression.left->kind == ExpressionKind::Identifier) {
+			const auto pointed = _bindings.find(expression.left->name);
+			if (pointed != _bindings.end() && pointed->second.elementPointer) {
+				const Binding& pointedBinding = pointed->second;
+				if (expression.arguments.size() != 1) {
+					throw CompileError("expected exactly one index, found "
+						+ std::to_string(expression.arguments.size()));
+				}
+				const bool packed = pointedBinding.pointeeMsl.isPacked;
+				const bool bytes = _types.isBool(pointedBinding.pointeeType);
+				const Id stepped = elementStep(pointedBinding.id, *expression.arguments[0],
+					packed ? _types.packedStorage(pointedBinding.pointeeMsl.scalar,
+							pointedBinding.pointeeMsl.vectorWidth)
+						: bytes ? _types.boolStorage(pointedBinding.pointeeType)
+						: pointedBinding.pointeeType,
+					_types.blockStride(pointedBinding.pointeeType, packed));
+				const Id address = packed ? packedVectorAddress(stepped, pointedBinding.pointeeType)
+					: bytes ? boolAddress(stepped, pointedBinding.pointeeType) : stepped;
+				return asAddress ? address : loadFromBuffer(address, pointedBinding.pointeeType);
+			}
 		}
 
 		if (isElementAccess(expression)) {
@@ -4172,9 +4253,19 @@ namespace {
 		bool inMember = false;
 		const StructDecl* memberOwner = nullptr;
 		size_t memberField = 0;
+		// A helper's element pointer takes its first index as a byte-exact element
+		// step rather than an access-chain operand: Metal's element is wider than
+		// the SPIR-V type where a float3 is padded to a register.
+		bool elementStepped = false;
+		const Expression* elementIndex = nullptr;
 
 		for (const AccessStep& step: steps) {
 			if (step.isIndex) {
+				if (binding.elementPointer && !elementStepped) {
+					elementStepped = true;
+					elementIndex = step.index;
+					continue;
+				}
 				// An element of an array member: one more step of the same chain, in
 				// whichever storage class the struct lives.
 				if (inMember && current.arrayLength) {
@@ -4271,8 +4362,14 @@ namespace {
 			? spirv::StorageClass::PhysicalStorageBuffer : binding.storageClass;
 
 		// The base is the address the chain starts from: the buffer's own pointer,
-		// loaded from the binding-0 block, or the variable itself.
-		operands.insert(operands.begin(), fromBuffer ? bufferBase(binding) : binding.id);
+		// loaded from the binding-0 block, the variable itself, or a helper's
+		// element pointer moved to the element the first index named.
+		Id chainBase = fromBuffer ? bufferBase(binding) : binding.id;
+		if (elementStepped) {
+			chainBase = elementStep(binding.id, *elementIndex, binding.pointeeType,
+				_types.blockStride(binding.pointeeType, binding.pointeeMsl.isPacked));
+		}
+		operands.insert(operands.begin(), chainBase);
 
 		// A packed member of a laid-out struct is stored as an array of its
 		// components, and is viewed as the vector once it has an address.
@@ -7343,8 +7440,10 @@ namespace {
 				if (parameter.type.isPointer
 					&& (parameter.type.addressSpace == AddressSpace::Device
 						|| parameter.type.addressSpace == AddressSpace::Constant)) {
-					helper.parameterTypes.push_back(
-						_types.bufferPointer(bufferParamTypes(parameter.type).second));
+					// The parameter is a pointer to one element, so p[i] is an
+					// OpPtrAccessChain away from the argument's element 0 or n.
+					helper.parameterTypes.push_back(_types.pointer(
+						spirv::StorageClass::PhysicalStorageBuffer, bufferParamTypes(parameter.type).first));
 				} else {
 					helper.parameterTypes.push_back(parameter.type.isPointer
 						? _types.pointer(spirv::StorageClass::Function,
@@ -7493,48 +7592,152 @@ namespace {
 		return result;
 	}
 
-	// A device or constant pointer argument names a whole buffer: an entry point's
-	// own buffer parameter, or the pointer parameter of the calling helper. Apple
-	// also takes &b[i] and b + n, pointers into the middle of one, and pointer
-	// values copied or compared; none of those is a name the helper's parameter
-	// can hold, so each is refused.
+	// A device or constant pointer argument is a pointer to one element the
+	// helper can index: a whole buffer named by an entry point's parameter or by
+	// the calling helper's own pointer parameter, &b[i], or pointer arithmetic
+	// p + n, n + p and p - n over one of those. Pointer values copied, compared
+	// or kept in a local, and pointers to members (&b[i].m), are not names the
+	// helper's parameter can hold, so each is refused.
 	Id Emitter::bufferPointerArgument(const Expression& argument, const Parameter& parameter,
 		const std::string& what) {
 		const std::string space = addressSpaceName(parameter.type.addressSpace);
-		if (argument.kind != ExpressionKind::Identifier) {
-			throw CompileError(what + " has to name a whole buffer, because parameter \"" + parameter.name
-				+ "\" is a pointer in the " + space + " address space, and &b[i] and other pointers "
-				"into the middle of one are not lowered yet");
-		}
-		if (argument.fileScope) {
-			// A file-scope object is a constant, a sampler or a struct, never a buffer; without
-			// this a "::data" spelled past a kernel buffer of the same name would silently bind
-			// the buffer, because this path never calls emitExpression's file-scope correction.
-			throw CompileError(what + " is \"" + argument.name + "\", which names a file-scope object, "
-				+ "and a file-scope object is not a buffer; parameter \"" + parameter.name + "\" is a "
-				+ "pointer in the " + space + " address space and takes one");
-		}
-		const auto binding = _bindings.find(argument.name);
-		if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.isBuffer
-			|| binding->second.bufferPointeeType == InvalidId) {
-			throw CompileError(what + " is \"" + argument.name + "\", which is not a buffer; parameter \""
-				+ parameter.name + "\" is a pointer in the " + space + " address space and takes one");
-		}
-		if (binding->second.pointeeMsl.addressSpace != parameter.type.addressSpace) {
+		// The buffer the pointer is taken from, and how far into it the element
+		// sits: a bare name with no offset, an &b[i] address, or an arithmetic
+		// step over one of those.
+		const Binding* root = nullptr;
+		const Expression* offset = nullptr;
+		bool negate = false;
+		const std::function<bool(const Expression&)> isPointerForm =
+			[&](const Expression& expression) {
+			if (expression.kind == ExpressionKind::Identifier) {
+				if (expression.fileScope) {
+					return false;
+				}
+				const auto binding = _bindings.find(expression.name);
+				return binding != _bindings.end()
+					&& (binding->second.elementPointer
+						|| (binding->second.isPointer && binding->second.isBuffer
+							&& binding->second.bufferPointeeType != InvalidId));
+			}
+			if (expression.kind == ExpressionKind::Unary
+				&& expression.unaryOperator == UnaryOperator::AddressOf) {
+				const Expression& element = *expression.left;
+				return element.kind == ExpressionKind::Index && !element.isDereference
+					&& element.left->kind == ExpressionKind::Identifier
+					&& element.arguments.size() == 1
+					&& isPointerForm(*element.left);
+			}
+			if (expression.kind == ExpressionKind::Binary
+				&& (expression.binaryOperator == BinaryOperator::Add
+					|| expression.binaryOperator == BinaryOperator::Subtract)) {
+				return (isPointerForm(*expression.left) && !isPointerForm(*expression.right))
+					|| (expression.binaryOperator == BinaryOperator::Add
+						&& isPointerForm(*expression.right) && !isPointerForm(*expression.left));
+			}
+			return false;
+		};
+		std::function<void(const Expression&)> resolve = [&](const Expression& expression) {
+			if (expression.kind == ExpressionKind::Identifier) {
+				if (expression.fileScope) {
+					// A file-scope object is a constant, a sampler or a struct, never a
+					// buffer; without this a "::data" spelled past a kernel buffer of the
+					// same name would silently bind the buffer, because this path never
+					// calls emitExpression's file-scope correction.
+					throw CompileError(what + " is \"" + expression.name + "\", which names a "
+						+ "file-scope object, and a file-scope object is not a buffer; parameter \""
+						+ parameter.name + "\" is a pointer in the " + space + " address space "
+						+ "and takes one");
+				}
+				const auto binding = _bindings.find(expression.name);
+				if (binding == _bindings.end()) {
+					throw CompileError(what + " is \"" + expression.name + "\", which is not a "
+						+ "buffer or a pointer; parameter \"" + parameter.name + "\" is a pointer "
+						+ "in the " + space + " address space and takes one");
+				}
+				if (binding->second.elementPointer) {
+					// A pointer parameter of the calling helper, already at an element.
+					root = &binding->second;
+					return;
+				}
+				if (!binding->second.isPointer || !binding->second.isBuffer
+					|| binding->second.bufferPointeeType == InvalidId) {
+					throw CompileError(what + " is \"" + expression.name + "\", which is not a buffer; "
+						+ "parameter \"" + parameter.name + "\" is a pointer in the " + space
+						+ " address space and takes one");
+				}
+				root = &binding->second;
+				return;
+			}
+			if (expression.kind == ExpressionKind::Unary
+				&& expression.unaryOperator == UnaryOperator::AddressOf) {
+				// &b[i]: the address of one element of a whole buffer. A pointer to a
+				// member (&b[i].m) has no stride of its own to walk later, and &p on a
+				// pointer is a pointer to a pointer, so neither is lowered.
+				const Expression& element = *expression.left;
+				if (element.kind != ExpressionKind::Index || element.isDereference
+					|| element.left->kind != ExpressionKind::Identifier
+					|| element.arguments.size() != 1) {
+					throw CompileError(what + " is & of something that is not a whole buffer or one "
+						+ "of its elements; &b[i] is the form a pointer argument takes, and &b[i].m "
+						+ "is not lowered yet");
+				}
+				resolve(*element.left);
+				if (offset) {
+					throw CompileError(what + " is & of an element of something that is already an "
+						+ "addressed element, which is not lowered yet");
+				}
+				offset = element.arguments[0].get();
+				return;
+			}
+			if (expression.kind == ExpressionKind::Binary
+				&& (expression.binaryOperator == BinaryOperator::Add
+					|| expression.binaryOperator == BinaryOperator::Subtract)) {
+				// p + n, n + p and p - n: a step from a pointer the forms above name.
+				if (!isPointerForm(*expression.left) && !isPointerForm(*expression.right)) {
+					throw CompileError(what + " is arithmetic on a pointer mslc does not lower; "
+						+ "a pointer plus or minus an integer is the form that is lowered");
+				}
+				const bool leftIsPointer = isPointerForm(*expression.left);
+				const Expression* pointerSide = leftIsPointer
+					? expression.left.get() : expression.right.get();
+				const Expression* integerSide = leftIsPointer
+					? expression.right.get() : expression.left.get();
+				if (!leftIsPointer
+					&& expression.binaryOperator != BinaryOperator::Add) {
+					throw CompileError(what + " subtracts a pointer from an integer, which is not "
+						+ "lowered; p - n is the form that is lowered");
+				}
+				negate = expression.binaryOperator == BinaryOperator::Subtract;
+				resolve(*pointerSide);
+				if (offset) {
+					throw CompileError(what + " steps a pointer that is already at an element of a "
+						+ "buffer, which is not lowered yet; step from &b[0] or the buffer itself");
+				}
+				offset = integerSide;
+				return;
+			}
+			throw CompileError(what + " is not a form that names a buffer or one of its elements; "
+				+ "a whole buffer, &b[i] or p + n is what a pointer parameter takes");
+		};
+		resolve(argument);
+
+		if (root->pointeeMsl.addressSpace != parameter.type.addressSpace) {
 			throw CompileError(what + " is in the "
-				+ addressSpaceName(binding->second.pointeeMsl.addressSpace) + " address space, but "
+				+ addressSpaceName(root->pointeeMsl.addressSpace) + " address space, but "
 				+ "parameter \"" + parameter.name + "\" takes a pointer in the " + space
 				+ " one, and Metal does not convert between address spaces");
 		}
-		// The pointee has to be the type the parameter names, as the source spells it and
-		// as it is laid out: an atomic_uint buffer and a uint one share a block struct, an
-		// enum and its underlying type share the scalar, and a float3 buffer and a
-		// packed_float3 one share a vector type but stride 16 and 12. Ordinary loads and
-		// stores through the parameter would read or write the wrong thing, so only a
-		// difference in const qualification is allowed.
-		const Type& given = binding->second.pointeeMsl;
+		// The pointee has to be the type the parameter names, as the source spells it
+		// and as it is laid out: an atomic_uint buffer and a uint one share a block
+		// struct, an enum and its underlying type share the scalar, and a float3
+		// buffer and a packed_float3 one share a vector type but stride 16 and 12.
+		// Ordinary loads and stores through the parameter would read or write the
+		// wrong thing, so only a difference in const qualification is allowed.
+		const Type& given = root->pointeeMsl;
 		if (given.isAtomic != parameter.type.isAtomic || given.enumName != parameter.type.enumName
-			|| binding->second.bufferPointeeType != bufferParamTypes(parameter.type).second) {
+			|| (root->elementPointer
+				? root->pointeeType != bufferParamTypes(parameter.type).first
+				: root->bufferPointeeType != bufferParamTypes(parameter.type).second)) {
 			throw CompileError(what + " is a buffer of " + typeName(given) + ", and parameter \""
 				+ parameter.name + "\" points at " + typeName(parameter.type)
 				+ ", which is not the same element type");
@@ -7543,11 +7746,39 @@ namespace {
 		// only a device pointer that is not const could change a const buffer.
 		const bool canWrite = parameter.type.addressSpace == AddressSpace::Device
 			&& !parameter.type.isConst;
-		if (binding->second.readOnly && canWrite) {
+		if (root->readOnly && canWrite) {
 			throw CompileError(what + " is const, and parameter \"" + parameter.name
 				+ "\" is a pointer that can change it");
 		}
-		return bufferBase(binding->second);
+
+		// The value: a pointer to the element the helper starts at. A pointer
+		// parameter of the calling helper is the value itself; a whole buffer's
+		// pointer is stepped to element 0 of its runtime array, and &b[i] and
+		// p + n step it further, in bytes.
+		if (root->elementPointer && !offset) {
+			return root->id;
+		}
+		const bool packed = root->pointeeMsl.isPacked;
+		const bool bytes = _types.isBool(root->pointeeType);
+		const Id pointee = packed
+			? _types.packedStorage(root->pointeeMsl.scalar, root->pointeeMsl.vectorWidth)
+			: bytes ? _types.boolStorage(root->pointeeType) : root->pointeeType;
+		Id stepped = root->elementPointer
+			? root->id
+			: _builder.emitTyped(spirv::OpAccessChain,
+				_types.pointer(spirv::StorageClass::PhysicalStorageBuffer, pointee),
+				{ bufferBase(*root), constantU32(0), constantU32(0) });
+		if (offset) {
+			stepped = elementStep(stepped, *offset, pointee,
+				_types.blockStride(root->pointeeType, packed), negate);
+		}
+		if (packed) {
+			return packedVectorAddress(stepped, root->pointeeType);
+		}
+		if (bytes) {
+			return boolAddress(stepped, root->pointeeType);
+		}
+		return stepped;
 	}
 
 	// A thread pointer parameter takes a local array of its element type. Vulkan
@@ -8401,19 +8632,17 @@ namespace {
 			if (parameter.type.isPointer) {
 				if (parameter.type.addressSpace == AddressSpace::Device
 					|| parameter.type.addressSpace == AddressSpace::Constant) {
-					// A whole buffer, passed as the pointer value the argument gave:
-					// p[i], *p and p->field walk it like an entry point's buffer.
-					const auto [pointee, block] = bufferParamTypes(parameter.type);
+					// A pointer to one element of the buffer the argument named: p[i]
+					// steps with OpPtrAccessChain, *p and p->field reach element 0, and
+					// the element is the laid-out form a buffer member has.
 					Binding bound;
 					bound.id = values[i];
 					bound.isPointer = true;
-					bound.pointeeType = pointee;
-					bound.bufferPointeeType = block;
+					bound.pointeeType = bufferParamTypes(parameter.type).first;
 					bound.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
 					bound.structType = parameter.type.namedType.empty()
 						? nullptr : _unit.findStruct(parameter.type.namedType);
-					bound.isBuffer = true;
-					bound.ownAddress = true;
+					bound.elementPointer = true;
 					bound.readOnly = parameter.type.isConst
 						|| parameter.type.addressSpace == AddressSpace::Constant;
 					bound.pointeeMsl = parameter.type;
@@ -13581,6 +13810,10 @@ namespace {
 			// the address to store to. A buffer parameter is a descriptor and a
 			// plain value is loaded, so only this case takes the binding.
 			const auto it = _bindings.find(left.name);
+			if (it != _bindings.end() && it->second.elementPointer) {
+				throw CompileError("assigning to the pointer \"" + left.name + "\" is not lowered yet; "
+					"Metal lets a pointer be reassigned, mslc does not");
+			}
 			if (it != _bindings.end() && it->second.pointeeMsl.isAtomic) {
 				throw CompileError("the atomic \"" + left.name + "\" cannot be used as an ordinary place; "
 					"use the atomic functions");
