@@ -102,6 +102,12 @@ void mslc_default_options(MslcOptions* options);
  *                     document describing the entry point, descriptor bindings
  *                     and local size. Owned by the caller, mslc_free().
  *
+ * A source with no kernel, vertex or fragment function, translated with the
+ * stage left UNKNOWN, is a library with no functions, as Metal compiles it.
+ * Vulkan has no module without an entry point, so there is none: the call
+ * succeeds with outSpirv NULL and outSpirvSize 0, and the reflection lists no
+ * entry point. The source is compiled all the same, so an error in it fails.
+ *
  * On failure returns a non-zero value, leaves outSpirv NULL, and when outError
  * is non-NULL stores a NUL-terminated diagnostic owned by the caller.
  *

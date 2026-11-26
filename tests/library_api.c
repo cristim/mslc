@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
 		CHECK(mslc_compile_library(include, strlen(include), &options, &bytes, &size, &diagnostic) == 0);
 		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
 		mslc_free(bytes);
-	}
+  }
 	{
 		// A helper emitted once for two kernels: both list the function constant it reads.
 		const char* shared =
@@ -166,11 +166,24 @@ int main(int argc, char** argv) {
 		CHECK(listed == 2);
 		mslc_free(reflection);
 	}
+  // No entry point: a library with no functions, which has no module, and a reflection with no entry point.
+	const char* noEntryPoints[] = { "", "float helper() { return 1; }" };
+	for (size_t i = 0; i < sizeof(noEntryPoints) / sizeof(noEntryPoints[0]); i++) {
+		uint8_t* spirv = (uint8_t*)1;
+		size_t spirvSize = 99;
+		char* reflection = NULL;
+		char* error = NULL;
+		CHECK(mslc_translate(noEntryPoints[i], strlen(noEntryPoints[i]), NULL, &spirv, &spirvSize, &reflection, &error) == 0);
+		CHECK(spirv == NULL && spirvSize == 0 && error == NULL);
+		CHECK(reflection != NULL && strstr(reflection, "\"entry_points\": [\n\t]") != NULL);
+		mslc_free(reflection);
+	}
+  // A stage asked for is an entry point the source has to have.
+	MslcOptions kernel;
+	mslc_default_options(&kernel);
+	kernel.stage = MSLC_STAGE_KERNEL;
 	char* error = NULL;
-	CHECK(mslc_translate("", 0, NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
-	mslc_free(error);
-	const char* helper = "float helper() { return 1; }";
-	CHECK(mslc_translate(helper, strlen(helper), NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
+	CHECK(mslc_translate("", 0, &kernel, NULL, NULL, NULL, &error) == 1 && error != NULL);
 	mslc_free(error);
 	return 0;
 }

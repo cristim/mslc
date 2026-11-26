@@ -71,11 +71,22 @@ run_expects(missing_reflect "usage: mslc")
 # An input that does not exist is a failure, not an empty module.
 run(absent_input nonzero "${WORK_DIR}/does-not-exist.metal")
 
-# A file-scope declaration alone reaches the Vulkan shader entry-point check.
+# A file-scope declaration alone is a library with no functions: no module, and
+# a reflection that lists no entry point.
 set(bad "${WORK_DIR}/bad.metal")
 file(WRITE "${bad}" "constant float x = 1.0;\n")
-run(no_entry_point nonzero "-o;${WORK_DIR}/bad.spv;${bad}")
-run_expects(no_entry_point "declares no function, and mslc emits one SPIR-V module per library")
+file(REMOVE "${WORK_DIR}/bad.json")
+file(WRITE "${WORK_DIR}/bad.spv" "a module from an earlier run")
+run(no_entry_point 0 "-o;${WORK_DIR}/bad.spv;--reflect;${WORK_DIR}/bad.json;${bad}")
+run_expects(no_entry_point "so there is no module to write")
+if(EXISTS "${WORK_DIR}/bad.spv")
+	message(FATAL_ERROR "no_entry_point: a module is at the output path")
+endif()
+file(READ "${WORK_DIR}/bad.json" reflection)
+string(JSON entries LENGTH "${reflection}" entry_points)
+if(NOT entries EQUAL 0)
+	message(FATAL_ERROR "no_entry_point: the reflection lists entry points:\n${reflection}")
+endif()
 
 # -V runs the validator, and a valid module passes it. That is the success side
 # of the case run_validate_failure.cmake checks the failure of.
