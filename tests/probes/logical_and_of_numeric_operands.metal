@@ -2,6 +2,10 @@
 // DISASM-MATCH: = OpFUnordNotEqual %bool %[_0-9a-zA-Z]+ %float_0[^_0-9a-zA-Z]
 // DISASM-MATCH: = OpINotEqual %bool %[_0-9a-zA-Z]+ %int_0[^_0-9a-zA-Z]
 // DISASM-MATCH: = OpPhi %bool %false %[_0-9a-zA-Z]+ %[_0-9a-zA-Z]+ %[_0-9a-zA-Z]+
+// RUN: grid=64 local=16 cases=9
+// Apple flushes a float32 denormal in a compare and in bool(x) (#377); the seeded inputs
+// contain no float32 denormals, so both backends agree at nine cases (measured 2026-11).
+
 //
 // && compares each numeric operand with zero, the right one in the block that
 // is entered only when the left is non-zero.

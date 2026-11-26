@@ -2,6 +2,10 @@
 // DISASM-MATCH: = OpFUnordNotEqual %v2bool %[_0-9a-zA-Z]+ %[_0-9a-zA-Z]+[^ _0-9a-zA-Z]
 // DISASM-NOT: OpFOrdNotEqual
 // DISASM-NOT: OpConvertFToU
+// RUN: grid=64 local=16 cases=9
+// Apple flushes a float32 denormal in a compare and in bool(x) (#377); the seeded inputs
+// contain no float32 denormals, so both backends agree at nine cases (measured 2026-11).
+
 //
 // A numeric vector converts to a bool vector as "not equal to zero", and a NaN is
 // not equal to zero, so the compare is the unordered one.

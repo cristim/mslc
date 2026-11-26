@@ -260,9 +260,9 @@ local=1` because every thread stores to element 0); 5 were zero only because the
 reached the branch, so they bound the input with `DIFFCHECK-RANGE`; 10 race on element 0 and run
 `grid=1 local=1`; 1 reads uninitialised memory and was dropped from the list.
 
-The 71 mismatches and 15 errors (#375) are triaged. None was a silent miscompile. 62 are in the list
+The 71 mismatches and 15 errors (#375) are triaged. None was a silent miscompile. 66 are in the list
 now, each with a `RUN`, `DIFFCHECK-RANGE` or `DIFFCHECK-FLOAT-RANGE` line. Only a `RUN` line registers a ctest
-test (55 of them); the other 7 are corpus-only.
+test (59 of them); the other 7 are corpus-only.
 
 - Most (about 45) were the same race: every thread stores to element 0 or to overlapping elements, and
   the last writer differs between backends. A kernel that stores to fixed elements runs at `grid=1
@@ -281,9 +281,10 @@ test (55 of them); the other 7 are corpus-only.
   output zero, so they say `writes-zero`; they are termination checks only (a mutant that just stores
   zero survives).
 - `bool_from_float_is_unordered_compare`, `bool_vector_from_float_vector_is_unordered_compare`,
-  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are not in the list:
+  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` mismatched because
   Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
-  The inputs no longer contain float32 denormals, so they can return once each is measured.
+  Once the inputs stopped generating float32 denormals the four agreed at nine cases, and they are back
+  in the list at `grid=64 local=16 cases=9`.
 
 Not in the list, and why:
 
