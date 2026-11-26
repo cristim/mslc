@@ -281,9 +281,10 @@ test (55 of them); the other 7 are corpus-only.
   output zero, so they say `writes-zero`; they are termination checks only (a mutant that just stores
   zero survives).
 - `bool_from_float_is_unordered_compare`, `bool_vector_from_float_vector_is_unordered_compare`,
-  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are not in the list:
+  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are back in the list:
   Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
-  The inputs no longer contain float32 denormals, so they can return once each is measured.
+  The inputs no longer contain float32 denormals (`no_denormal_float`), so all four match across moderate,
+  wide and edge profiles.
 
 Not in the list, and why:
 
@@ -332,7 +333,7 @@ when it does not. Unproven on a real runner: read that step's log on the first r
 under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
 the only way). A failing job-level `continue-on-error` job may still show a red check on the commit;
 that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match (at the default grid or the one their `RUN` line names); the job
-requires 1,105 compared (the list compares 1,185 kernels).
+requires at least 1,105 compared.
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
 ctest test `diffcheck/probe/<name>` and kills a mutant the disassembly regexes cannot.
