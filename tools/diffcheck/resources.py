@@ -1,11 +1,11 @@
 """Textures, samplers and texel buffers as both modes feed them: the same seeded texels on both sides, bound by
 Apple's index and by the set and binding of mslc's reflection.
 
-A texture is 2D, RGBA32Float (access sample, read, write or read_write in a kernel; sample in graphics); a sampler
-is nearest, normalised, no mips, with an address mode picked by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored
-repeat). Probes should sample at a texel centre (an edge or a filter is where the backends may legitimately differ).
-A writable texture's 4x4 texels are read back and compared like a buffer. Anything else is reported by `unsupported`
-and the file is skipped.
+A texture is 2D, RGBA of float, half, int, uint, short or ushort in a kernel (access sample, read, write or
+read_write; float with sample in graphics); a sampler is nearest, normalised, no mips, with an address mode picked
+by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored repeat). Probes should sample at a texel centre (an edge
+or a filter is where the backends may legitimately differ). A writable texture's 4x4 texels are read back and
+compared like a buffer. Anything else is reported by `unsupported` and the file is skipped.
 
 A texel buffer (`texture_buffer<T, access>`, kernel mode only) is a buffer of texels of 4 (the default), 2 or 1
 components of T (float, half, int, uint, short or ushort; `DIFFCHECK-TEXEL` picks the count), seeded like a device
@@ -31,8 +31,9 @@ TEXEL_ACCESS = {"read": ("Read", "UniformTexelBuffer"), "readwrite": ("ReadWrite
 TexelBuffer = collections.namedtuple("TexelBuffer", "index set binding uniform scalar components layout")
 
 
-def texture_data(rng, profile):
-    return bytearray(b"".join(inputs.leaf_bits(rng, "float", profile).to_bytes(4, "little")
+def texture_data(rng, profile, scalar="float"):
+    size = compare.SCALARS[scalar][0]
+    return bytearray(b"".join(inputs.leaf_bits(rng, scalar, profile).to_bytes(size, "little")
                               for _ in range(4 * TEXTURE_SIZE * TEXTURE_SIZE)))
 
 
@@ -81,7 +82,8 @@ def unsupported(entry, apple):
     reasons = ["texture %s access %s" % (b["name"], b.get("texture_access")) for b in entry["bindings"]
                if b["kind"] == "Texture" and b.get("texture_access") not in ("Sample", "Read", "Write", "ReadWrite")]
     plain = [t for t in apple["textures"] if t["type"] != "texturebuffer"]
-    reasons += ["texture %s is not a 2D float texture" % t["name"] for t in plain if t["type"] != "2d" or t["data"] != "float"]
+    reasons += ["texture %s is not a 2D texture" % t["name"] for t in plain if t["type"] != "2d"]
+    reasons += ["texture %s has element type %s" % (t["name"], t["data"]) for t in plain if t["type"] == "2d" and t["data"] not in TEXEL_TYPES]
     reasons += ["texture_buffer %s has element type %s" % (t["name"], t["data"]) for t in apple["textures"]
                 if t["type"] == "texturebuffer" and t["data"] not in TEXEL_TYPES]
     for state in entry["embedded_samplers"]:
@@ -103,18 +105,21 @@ EMBEDDED_LOD = {"lod_min": 0, "lod_max": 65504}
 VK_ADDRESS = {"Repeat": 0, "MirrorRepeat": 1, "ClampToEdge": 2, "ClampToZero": 3}
 
 
-def seed(bindings, rng, profile, base, embedded=()):
+def seed(bindings, rng, profile, base, embedded=(), apple=None):
     """Writes one texture file per Texture binding to `base`+name and returns the manifest
-    tuples ([(index, set, binding, file, access)], [(index, set, binding)]), in binding order;
+    tuples ([(index, set, binding, file, access, scalar)], [(index, set, binding)]), in binding order;
     `access` is mslc's texture_access: a `Read`, `Write` or `ReadWrite` texture is a storage image in SPIR-V,
-    a `Sample` one is sampled. A sampler tuple is (index, set, binding), or for an embedded sampler
+    a `Sample` one is sampled; `scalar` is Apple's element type ("float" when `apple` is omitted, as in graphics).
+    A sampler tuple is (index, set, binding), or for an embedded sampler
     (None, set, binding, (s, t, r) modes, linear) from the entry's `embedded` states."""
+    by_index = {t["index"]: t["data"] for t in (apple or {}).get("textures", ()) if t["type"] != "texturebuffer"}
     textures, samplers = [], []
     for b in bindings:
         if b["kind"] == "Texture":
+            scalar = by_index.get(b["metal_index"], "float")
             path = "%stex%d.bin" % (base, b["metal_index"])
-            hostenv.write_bytes(path, texture_data(rng, profile))
-            textures.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"], path, b["texture_access"]))
+            hostenv.write_bytes(path, texture_data(rng, profile, scalar))
+            textures.append((b["metal_index"], b["descriptor"]["set"], b["descriptor"]["binding"], path, b["texture_access"], scalar))
         elif b["kind"] == "Sampler" and "embedded_sampler" in b:
             e = embedded[b["embedded_sampler"]]
             samplers.append((None, b["descriptor"]["set"], b["descriptor"]["binding"],
@@ -127,11 +132,14 @@ def seed(bindings, rng, profile, base, embedded=()):
 def lines(textures, samplers, backend="vulkan", outputs=None):
     """The manifest lines both hosts read; Apple has an embedded sampler in the shader, so only Vulkan is told of it.
     A writable texture (`outputs` maps its Metal index to an output file) is a `storagetexture` with `write` or `readwrite`
-    and its output file at the end."""
+    and its output file at the end; a non-float texture adds its scalar type after the input file."""
     outputs = outputs or {}
-    return (["%s %d %d %d %d %d %s%s" % ("texture" if a == "Sample" else "storagetexture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f,
-                                         " %s %s" % (a.lower(), outputs[i]) if i in outputs else "")
-             for i, s, b, f, a in textures]
+    tex_lines = []
+    for i, s, b, f, a, *rest in textures:
+        scalar = rest[0] if rest else "float"
+        tail = " %s %s %s" % (scalar, a.lower(), outputs[i]) if i in outputs else (" " + scalar if scalar != "float" else "")
+        tex_lines.append("%s %d %d %d %d %d %s%s" % ("texture" if a == "Sample" else "storagetexture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f, tail))
+    return (tex_lines
             + ["sampler %d %d %d" % s for s in samplers if s[0] is not None]
             + ["esampler %d %d %d %d %d %d" % (s[1], s[2], *s[3], s[4]) for s in samplers if s[0] is None and backend != "apple"])
 
@@ -142,7 +150,7 @@ def texture_key(index):
 
 def texture_layouts(apple):
     """{texture_key(index): layout} for every writable 2D texture in Apple's reflection."""
-    return {texture_key(t["index"]): texel_layout(t["name"], "float", t["access"], 4)
+    return {texture_key(t["index"]): texel_layout(t["name"], t["data"], t["access"], 4)
             for t in apple["textures"] if t["type"] != "texturebuffer" and t["access"] != "read"}
 
 

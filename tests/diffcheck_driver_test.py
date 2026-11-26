@@ -99,7 +99,7 @@ with tempfile.TemporaryDirectory() as d:
     assert r.returncode == 0, r
     assert "6 kernels: 4 compared, 4 matched, 2 skipped" in r.stdout, r.stdout
     reasons = {os.path.basename(x["file"]): x["reason"] for x in json.load(open(report))["results"] if x["status"] == "skipped"}
-    assert "not a 2D float" in reasons["texture_3d_kernel.metal"], reasons
+    assert "not a 2D texture" in reasons["texture_3d_kernel.metal"], reasons
     assert "nope" in reasons["missing.metal"] or "mslc" in reasons["missing.metal"], reasons
     open(listing, "a").write("%s\n" % kernel("zero_kernel.metal"))
     r = subprocess.run(base, capture_output=True, text=True)

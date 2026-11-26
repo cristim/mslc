@@ -48,7 +48,7 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
     wouts = {i: os.path.join(work, "%s%s-out-tex%d-%d.bin" % (backend, tag, case, i))
-             for i, _, _, _, a in textures if a in ("Write", "ReadWrite")}
+             for i, _, _, _, a, *_ in textures if a in ("Write", "ReadWrite")}
     touts = {tb.index: os.path.join(work, "%s%s-out-t%d-%d.bin" % (backend, tag, case, tb.index)) for tb, _, _ in texels}
     extra = (resources.lines(textures, run["samplers"], backend, wouts) + resources.texel_lines(texels, touts)
              + resources.threadgroup_lines(run["threadgroups"], run["local"], backend))
@@ -76,17 +76,19 @@ def unused_textures(run, params, textures, texels, bindings, compared, apple_out
     buffer is an output, not an input, and is not a candidate."""
     names = {b["metal_index"]: b["name"] for b in bindings if b["kind"] == "Texture"}
     unused = []
-    for n, (index, set_, binding, path, access) in enumerate(textures):
+    for n, (index, set_, binding, path, access, *rest) in enumerate(textures):
         if access == "Write":
             continue
+        scalar = rest[0] if rest else "float"
         key, data = resources.texture_key(index), hostenv.read_bytes(path)
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
-        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile)
+        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar)
         hostenv.write_bytes(alt, alt_data)
-        swapped = [(i, s, b, alt if i == index else f, a) for i, s, b, f, a in textures]
+        swapped = [(i, s, b, alt if i == index else f, a, *r) for i, s, b, f, a, *r in textures]
         again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)
-        own = key in compared and any((apple_outs[key][o:o + 16] != data[o:o + 16] or again[key][o:o + 16] != alt_data[o:o + 16])
-                                      and apple_outs[key][o:o + 16] != again[key][o:o + 16] for o in range(0, len(data), 16))
+        stride = 4 * compare.SCALARS[scalar][0]
+        own = key in compared and any((apple_outs[key][o:o + stride] != data[o:o + stride] or again[key][o:o + stride] != alt_data[o:o + stride])
+                                      and apple_outs[key][o:o + stride] != again[key][o:o + stride] for o in range(0, len(data), stride))
         if not own and not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items() if i != key):
             unused.append(names[index])
     for n, (tb, path, data) in enumerate(texels):
@@ -203,9 +205,9 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
                                   params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
-        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"])
+        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"], apple)
         data.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p))
-                     for i, _, _, p, _ in textures if resources.texture_key(i) in wlayouts})
+                     for i, _, _, p, *_ in textures if resources.texture_key(i) in wlayouts})
         for i, l in sorted(layouts.items()):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,

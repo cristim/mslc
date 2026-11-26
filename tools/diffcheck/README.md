@@ -161,7 +161,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374),
-  non-2D or non-float textures (#374). Graphics pairs have their
+  non-2D textures (#374). Graphics pairs have their
   own mode, below.
 
 ## Kernel threadgroup memory arguments
@@ -175,14 +175,15 @@ its threadgroup arguments below the local size.
 
 ## Kernel textures and samplers
 
-A kernel with `texture2d<float>` arguments (access `sample`, `read`, `write` or `read_write`) and runtime `sampler`
-arguments is run like any other: each case seeds one 4x4 RGBA32Float texture per binding from the
-case's generator (profile and seed as for buffers, so NaN and infinity texels appear in the `edge`
-case) and gives both sides the same bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
+A kernel with `texture2d<T>` arguments (T: float, half, int, uint, short or ushort; access `sample`, `read`, `write`
+or `read_write`) and runtime `sampler` arguments is run like any other: each case seeds one 4x4 RGBA texture of T
+(RGBA32Float, RGBA16Float, RGBA32Sint, RGBA32Uint, RGBA16Sint or RGBA16Uint) per binding from the case's generator
+(profile and seed as for buffers, so NaN and infinity texels appear in the `edge` case) and gives both sides the same
+bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
 Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index,
-name and access. After the dispatch, every `write` or `read_write` texture's 4x4 texels
-are read back and compared leaf by leaf (4 float leaves per texel, so texels no thread writes must keep
-their seed), and the negative control perturbs one writable texture as its own group. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
+name and access, and the element type comes from Apple's reflection. After the dispatch, every `write` or
+`read_write` texture's 4x4 texels are read back and compared leaf by leaf (4 leaves of T per texel, so texels no
+thread writes must keep their seed), and the negative control perturbs one writable texture as its own group. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
 edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample at texel centres.
 Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
 binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
@@ -200,8 +201,8 @@ coordinates the kernel wrote, so a texture the kernel merely overwrites without 
 texture is an output and is not tested this way. A declaration for a texture that is in fact used
 is an `error`, so a stale directive cannot hide a texture. Probes are in `tests/diffcheck/kernel`
 (`diffcheck/kernel/<name>`, run at grid 64 or 16, local 16) and `diffcheck/kernel-driver` plants
-miscompiles in the SPIR-V of the real output: swapped texel or write coordinates, swapped written float4
-components, two textures (sampled, write-only or read-write) swapped between bindings, an unswapped sample coordinate,
+miscompiles in the SPIR-V of the real output: swapped texel or write coordinates, swapped written float4 or int4
+components, two textures (sampled, read-only, write-only or read-write) swapped between bindings, an unswapped sample coordinate,
 two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
 
 ## Kernel texel buffers
