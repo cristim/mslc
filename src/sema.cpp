@@ -481,6 +481,12 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 	// these start beyond that.
 	constexpr uint32_t kGridSizeSpecializationID = 0x40000;
 
+	// The SpecIds of a function constant [[function_constant(n)]]: its value at this plus n, and a bool that the
+	// host sets when it gives the constant a value at the other plus n. Threadgroup argument lengths take the
+	// SpecIds from 3 up to the first of these.
+	constexpr uint32_t kFunctionConstantSpecializationID = 0x10000;
+	constexpr uint32_t kFunctionConstantDefinedSpecializationID = 0x20000;
+
 	// Every name an expression or statement refers to. A constexpr sampler nothing
 	// refers to has no state in Apple's AIR, so it gets no binding either.
 	void collectIdentifiers(const Expression& expression, std::set<std::string>& names) {
@@ -822,6 +828,9 @@ std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::v
 	const StructDecl* decl = _unit.findStruct(name);
 	for (size_t i = 0; i < types.size(); ++i) {
 		const Type& field = decl->fields[i].type;
+		if (field.isPointer) {
+			continue;
+		}
 		if (field.arrayLength) {
 			// Only the array wrappers differ between the forms: a laid-out array
 			// carries ArrayStride, and the element is the same type in both.
@@ -1264,6 +1273,10 @@ TypeTable::AddressBlock TypeTable::addressBlock(const std::vector<Id>& pointeeTy
 
 uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 	const uint32_t bits = bitWidth(type);
+	if (bits == 0 && storageClassOf(type)) {
+		// A pointer held in a buffer, as a struct's pointer member is: 8 bytes.
+		return 8;
+	}
 	if (bits == 0) {
 		// A struct is as aligned as its most aligned member, which spirv-val needs
 		// to be at least its largest scalar: 8 for a long.
@@ -1479,9 +1492,14 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 			throw CompileError("the array member \"" + field.name + "\" of \"" + decl->name
 				+ "\" is an array of pointers, which mslc does not lower");
 		}
-		if (field.type.isPointer) {
+		if (field.type.isPointer && field.type.addressSpace != AddressSpace::Device
+			&& field.type.addressSpace != AddressSpace::Constant) {
 			throw CompileError("a pointer member (\"" + field.name + "\" of \"" + decl->name
-				+ "\") is not lowered yet; pass the pointer as its own [[buffer(n)]] argument");
+				+ "\") has to point at device or constant memory to be lowered");
+		}
+		if (field.type.isPointer && (!field.type.namedType.empty() || field.type.isAtomic)) {
+			throw CompileError("a pointer member (\"" + field.name + "\" of \"" + decl->name
+				+ "\") to a struct or to atomics is not lowered yet");
 		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
@@ -1492,6 +1510,11 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 			: components > 1
 			? vector(field.type.scalar, field.type.vectorWidth)
 			: scalar(field.type.scalar);
+		// A device or constant pointer member holds a buffer's GPU address, so it is
+		// the pointer a pointer parameter is: to the { T runtime_array[] } of its pointee.
+		if (field.type.isPointer) {
+			valueType = bufferPointer(blockStructFor(valueType, field.type.isPacked));
+		}
 		if (field.type.arrayLength) {
 			for (auto inner = field.type.innerArrayLengths.rbegin(); inner != field.type.innerArrayLengths.rend(); ++inner) {
 				valueType = array(valueType, *inner);
@@ -2305,6 +2328,21 @@ namespace {
 		// constant belongs to the module rather than to the entry point, and an
 		// entry point's own names are looked up first.
 		std::map<std::string, ConstantBinding> _constants;
+		// The file-scope function constants, keyed by name. Their specialization constants are declared when
+		// the source first reads them, so a constant nothing reads asks for no capability its type needs.
+		struct FunctionConstant {
+			const VariableDeclaration* declaration = nullptr;
+			Id value = InvalidId;
+			Id defined = InvalidId;
+		};
+		std::map<std::string, FunctionConstant> _functionConstants;
+		// "constant bool b = is_function_constant_defined(c);": b, and the c it stands for.
+		std::map<std::string, std::string> _functionConstantDefinedAliases;
+		// The function constants each function reads in the code emitted for it, and the functions each calls:
+		// an entry point's reflection lists the constants of every function it reaches. A helper is emitted once
+		// for the entry points that share it, so what it reads is kept with it rather than with an entry point.
+		std::map<const FunctionDecl*, std::set<std::string>> _functionConstantReads;
+		std::map<const FunctionDecl*, std::set<const FunctionDecl*>> _functionCallees;
 		// The file-scope samplers, by name, and the ones the entry point being
 		// emitted names, which are looked up after its own parameters and locals.
 		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
@@ -2555,6 +2593,12 @@ namespace {
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
+		void declareFunctionConstant(const VariableDeclaration& declaration);
+		void declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read);
+		const std::string* functionConstantNamed(const std::string& name) const;
+		Id functionConstantValue(const std::string& name, bool defined);
+		Id emitIsFunctionConstantDefined(const Expression& call);
+		std::string functionConstantsJson();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void bindResourceAlias(const VariableDeclaration& declaration, const Type* declared);
@@ -2603,8 +2647,9 @@ namespace {
 		void emitAssignment(const Expression& left, const Expression& right,
 			std::optional<BinaryOperator> compound);
 		Id emitPlaceAddress(const Expression& left);
-		const Expression& storeRoot(const Expression& target) const;
-		void requireStorable(const Expression& target) const;
+		const Expression& storeRoot(const Expression& target);
+		bool readOnlyRoot(const Expression& root);
+		void requireStorable(const Expression& target);
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
@@ -2703,6 +2748,8 @@ namespace {
 		Id wordIndex(Id index, const char* what);
 		Id stepIndex(const Expression& expression, const char* what);
 		Id emitMember(const Expression& expression);
+		const Type* pointerMemberType(const Expression& expression);
+		std::optional<Binding> pointerMemberBinding(const Expression& expression);
 		size_t arrayMemberRank(const Expression& expression, size_t& outIndices);
 		std::optional<Id> emitArrayMemberElement(const Expression& expression, bool asAddress);
 		Id emitMemberAddress(const Expression& expression, Id& outFieldType);
@@ -2718,7 +2765,7 @@ namespace {
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call, std::set<std::string>* adlOnly = nullptr);
 		const StructDecl* adlStructOf(const Expression& argument);
-		bool inConstantSpace(const Expression& place) const;
+		bool inConstantSpace(const Expression& place);
 		std::optional<Type> placeType(const Expression& place);
 		std::optional<Type> sizeofPlaceType(const Expression& place);
 		std::optional<Type> sizeofExpressionType(const Expression& expression);
@@ -2824,7 +2871,7 @@ namespace {
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-			size_t first) const;
+			size_t first);
 		HelperFunction& pointerSpecialisation(const Expression& call, HelperFunction& generic,
 			size_t first, std::vector<Id>& arrays);
 		// The pointer value a device or constant pointer argument passes: the whole
@@ -3323,6 +3370,13 @@ namespace {
 		// at file scope is not a parameter of the entry point that reads it.
 		const Binding* found = findResourceBinding(expression.name);
 		if (!found) {
+			if (_functionConstants.count(expression.name)) {
+				return functionConstantValue(expression.name, false);
+			}
+			const auto alias = _functionConstantDefinedAliases.find(expression.name);
+			if (alias != _functionConstantDefinedAliases.end()) {
+				return functionConstantValue(alias->second, true);
+			}
 			const auto constant = _constants.find(expression.name);
 			if (constant != _constants.end()) {
 				return constant->second.id;
@@ -3494,29 +3548,31 @@ namespace {
 			return *element;
 		}
 
-		if (isElementAccess(expression)) {
+		const std::optional<Binding> member = pointerMemberBinding(*expression.left);
+		if (!member && isElementAccess(expression)) {
 			return emitElementAccess(expression, asAddress);
 		}
 
-		if (expression.left->kind != ExpressionKind::Identifier) {
+		if (!member && expression.left->kind != ExpressionKind::Identifier) {
 			throw CompileError(expression.isDereference ? kDereferenceOperand
 				: "indexing an expression is not supported yet; index a parameter or local directly");
 		}
 
-		const auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end() || !it->second.isPointer) {
-			throw CompileError("\"" + expression.left->name + "\" is not a pointer, so it cannot "
+		const std::string& name = member ? expression.left->memberName : expression.left->name;
+		const auto it = _bindings.find(name);
+		if (!member && (it == _bindings.end() || !it->second.isPointer)) {
+			throw CompileError("\"" + name + "\" is not a pointer, so it cannot "
 				"be indexed");
 		}
 
-		if (expression.isDereference && !it->second.isBuffer && !it->second.pointeeMsl.arrayLength) {
-			throw CompileError(notAPointer(expression.left->name));
+		const Binding& binding = member ? *member : it->second;
+
+		if (expression.isDereference && !binding.isBuffer && !binding.pointeeMsl.arrayLength) {
+			throw CompileError(notAPointer(name));
 		}
 
-		const Binding& binding = it->second;
-
 		if (binding.pointeeMsl.isAtomic) {
-			throw CompileError("\"" + expression.left->name + "\" points at atomics, which are read and written "
+			throw CompileError("\"" + name + "\" points at atomics, which are read and written "
 				"only by the atomic_*_explicit functions");
 		}
 
@@ -3787,6 +3843,49 @@ namespace {
 
 		outDeclName = decl.name;
 		return decl.fields.size();
+	}
+
+	// The type of a device or constant pointer member that a member access names,
+	// as p in s.p; null for any other expression.
+	const Type* Emitter::pointerMemberType(const Expression& expression) {
+		if (expression.kind != ExpressionKind::Member) {
+			return nullptr;
+		}
+		const StructDecl* decl = structOf(*expression.left);
+		if (!decl) {
+			return nullptr;
+		}
+		std::string declName;
+		const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
+		return field < decl->fields.size() && decl->fields[field].type.isPointer
+			? &decl->fields[field].type : nullptr;
+	}
+
+	// s.p as the pointer it holds, bound as a helper's pointer parameter is, so that
+	// s.p[i] and *s.p walk the buffer it points into. Nothing for an expression that
+	// is not a pointer member.
+	std::optional<Binding> Emitter::pointerMemberBinding(const Expression& expression) {
+		const Type* type = pointerMemberType(expression);
+		if (!type) {
+			return std::nullopt;
+		}
+
+		Id fieldType = InvalidId;
+		const Id address = emitMemberAddress(expression, fieldType);
+		const auto [pointee, block] = bufferParamTypes(*type);
+		Binding bound;
+		bound.id = loadFromBuffer(address, fieldType);
+		bound.isPointer = true;
+		bound.pointeeType = pointee;
+		bound.bufferPointeeType = block;
+		bound.storageClass = spirv::StorageClass::PhysicalStorageBuffer;
+		bound.isBuffer = true;
+		bound.ownAddress = true;
+		bound.readOnly = type->isConst || type->addressSpace == AddressSpace::Constant;
+		bound.pointeeMsl = *type;
+		bound.pointeeMsl.isPointer = false;
+		bound.pointeeMsl.isConst = false;
+		return bound;
 	}
 
 	const ConstantBinding* Emitter::constantFor(const Expression* expression) {
@@ -4113,6 +4212,11 @@ namespace {
 				{ constant->id, static_cast<uint32_t>(field) });
 		}
 
+		if (pointerMemberType(expression)) {
+			throw CompileError("the pointer member \"" + expression.memberName + "\" is only lowered "
+				"when indexed or dereferenced, as in s.p[i] or *s.p");
+		}
+
 		// The chain says which binding the access starts from, which is not the
 		// name on the left of the '.' when that is an index.
 		std::string rootName;
@@ -4177,6 +4281,10 @@ namespace {
 		size_t memberField = 0;
 
 		for (const AccessStep& step: steps) {
+			if (inMember && current.isPointer) {
+				throw CompileError("the pointer member \"" + memberOwner->fields[memberField].name
+					+ "\" is only lowered when indexed or dereferenced, as in s.p[i] or *s.p");
+			}
 			if (step.isIndex) {
 				// An element of an array member: one more step of the same chain, in
 				// whichever storage class the struct lives.
@@ -4257,9 +4365,10 @@ namespace {
 
 		outFieldType = declaredTypeOf(current);
 		const bool arrayInBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
-		if (current.arrayLength && arrayInBuffer) {
+		if ((current.arrayLength || current.isPointer) && arrayInBuffer) {
 			// A struct in a buffer holds its array with a stride, which is another type than the
-			// local's; the member's type in the laid-out struct is what the chain points at.
+			// local's, and a pointer as a buffer pointer; the member's type in the laid-out
+			// struct is what the chain points at.
 			TypeTable::StructForm form;
 			if (!memberOwner || !_types.structForm(_types.namedStruct(memberOwner->name), form)) {
 				throw CompileError("an array member in a buffer has no laid-out struct to take its type from");
@@ -4282,7 +4391,7 @@ namespace {
 		// A reference local bound to a buffer element holds that element's address
 		// and has no buffer of its own, but its fields are laid out the same way.
 		const bool inBuffer = fromBuffer || binding.storageClass == spirv::StorageClass::PhysicalStorageBuffer;
-		const bool packed = inBuffer && current.isPacked;
+		const bool packed = inBuffer && current.isPacked && !current.isPointer;
 		const bool bytes = inBuffer && _types.isBool(outFieldType);
 		const Id address = _builder.emitTyped(spirv::OpAccessChain,
 			_types.pointer(storageClass, packed
@@ -4668,9 +4777,12 @@ namespace {
 		const bool terminated = _terminated;
 		const uint32_t depth = _controlDepth;
 		const size_t targets = _jumpTargets.size();
+		// what the lifted code reads is not read
+		const auto functionConstantReads = _functionConstantReads;
 		emit();
 		_builder.takeFunctionsFrom(mark);
 		_builder.truncateLocals(locals);
+		_functionConstantReads = functionConstantReads;
 		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
 		_currentBlock = block;
 		_terminated = terminated;
@@ -5899,6 +6011,10 @@ namespace {
 			throw CompileError(name + " returns void and has no value");
 		}
 
+		if (name == "__metal_is_function_constant_defined") {
+			return emitIsFunctionConstantDefined(expression);
+		}
+
 		if (isAtomicFunction(name)) {
 			if (name == "atomic_store_explicit") {
 				throw CompileError("atomic_store_explicit returns void and has no value");
@@ -7033,6 +7149,7 @@ namespace {
 	// A call is an edge of the call graph. validateHelpers sees the edges whose callee a name
 	// identifies; the others are checked here, against the edges emitted so far.
 	void Emitter::noteCall(const FunctionDecl& callee) {
+		_functionCallees[_helper ? _helper : _entryPoint].insert(&callee);
 		if (!_helper) {
 			return;
 		}
@@ -7415,7 +7532,7 @@ namespace {
 	// the same storage would have its write overwritten by the stale copy. Two
 	// bare variables are the same pointer and alias as C++ does.
 	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-		size_t first) const {
+		size_t first) {
 		struct Passed { std::string root; bool temporary; std::vector<AccessStep> steps; };
 		std::vector<Passed> passed;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
@@ -7642,8 +7759,11 @@ namespace {
 
 	// Whether a name, an element or a member lives in the constant address space: a constant buffer, a
 	// file-scope constant, or a constant reference parameter of the function being emitted.
-	bool Emitter::inConstantSpace(const Expression& place) const {
+	bool Emitter::inConstantSpace(const Expression& place) {
 		const Expression& root = storeRoot(place);
+		if (const Type* pointer = pointerMemberType(root)) {
+			return pointer->addressSpace == AddressSpace::Constant;
+		}
 		if (root.kind != ExpressionKind::Identifier) {
 			return false;
 		}
@@ -7702,6 +7822,11 @@ namespace {
 				std::optional<Type> type = placeType(*place.left);
 				if (!type) {
 					return std::nullopt;
+				}
+				// An index of a pointer member, s.p[i] or *s.p, is its pointee.
+				if (type->isPointer) {
+					type->isPointer = false;
+					return type;
 				}
 				if (type->arrayLength) {
 					type->dropOuterDimension();
@@ -7848,7 +7973,15 @@ namespace {
 		};
 		// Whether a place cannot be written: a const object, one in the constant address space, or a member of one.
 		const auto readOnly = [&](const Expression& place) {
-			const Expression& root = storeRoot(place);
+			const Expression* found = &storeRoot(place);
+			if (pointerMemberType(*found)) {
+				// Through the pointer its pointee decides; the pointer itself is part of its struct.
+				if (found != &place) {
+					return readOnlyRoot(*found);
+				}
+				found = &storeRoot(*place.left);
+			}
+			const Expression& root = *found;
 			if (root.kind != ExpressionKind::Identifier) {
 				return true;
 			}
@@ -9523,6 +9656,111 @@ namespace {
 		return id;
 	}
 
+	// A [[function_constant(n)]] is recorded here and declared where it is first read. Of the other constants,
+	// only "constant bool b = is_function_constant_defined(c);" may read one, as another name for whether c
+	// is defined: an initialiser computed from a value given at pipeline creation is not folded.
+	void Emitter::declareFunctionConstant(const VariableDeclaration& declaration) {
+		for (const auto& [name, other]: _functionConstants) {
+			if (*other.declaration->functionConstantIndex == *declaration.functionConstantIndex) {
+				throw CompileError("the function constants \"" + name + "\" and \"" + declaration.name
+					+ "\" have the same index " + std::to_string(*declaration.functionConstantIndex));
+			}
+		}
+		_functionConstants[declaration.name].declaration = &declaration;
+	}
+
+	// "constant bool b = is_function_constant_defined(c);" makes b another name for whether c is defined. Any
+	// other initialiser that reads a function constant is refused.
+	void Emitter::declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read) {
+		const Expression& initializer = *declaration.initializer;
+		const bool alias = initializer.kind == ExpressionKind::Call && initializer.left
+			&& initializer.left->kind == ExpressionKind::Identifier
+			&& builtinCalleeName(initializer.left->name) == "__metal_is_function_constant_defined"
+			&& initializer.arguments.size() == 1 && initializer.arguments[0]->kind == ExpressionKind::Identifier
+			&& _functionConstants.count(initializer.arguments[0]->name);
+		if (!alias) {
+			throw CompileError("the constant \"" + declaration.name + "\" is initialised from the function constant \""
+				+ read + "\", and the only such initialiser mslc lowers is is_function_constant_defined(" + read + ")");
+		}
+		const Type& type = declaration.type;
+		if (type.scalar != ScalarKind::Bool || type.vectorWidth > 1 || type.isPointer || type.arrayLength) {
+			throw CompileError("the constant \"" + declaration.name + "\" holds is_function_constant_defined(...) "
+				"and has to be a bool");
+		}
+		_functionConstantDefinedAliases[declaration.name] = initializer.arguments[0]->name;
+	}
+
+	// The function constant a name stands for, through "constant bool b = is_function_constant_defined(c);" too.
+	const std::string* Emitter::functionConstantNamed(const std::string& name) const {
+		const auto constant = _functionConstants.find(name);
+		if (constant != _functionConstants.end()) {
+			return &constant->first;
+		}
+		const auto alias = _functionConstantDefinedAliases.find(name);
+		return alias == _functionConstantDefinedAliases.end() ? nullptr : &alias->second;
+	}
+
+	// The value of a function constant, or with `defined` the bool that says whether it was given one, as a
+	// specialization constant that defaults to zero (false).
+	Id Emitter::functionConstantValue(const std::string& name, bool defined) {
+		FunctionConstant& constant = _functionConstants.at(name);
+		_functionConstantReads[_helper ? _helper : _entryPoint].insert(name);
+		const uint32_t index = *constant.declaration->functionConstantIndex;
+		if (constant.value == InvalidId) {
+			const ScalarKind kind = constant.declaration->type.scalar;
+			const Id type = _types.scalar(kind);
+			if (kind == ScalarKind::Bool) {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstantFalse, type, { });
+			} else if (kind == ScalarKind::Long || kind == ScalarKind::ULong) {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstant, type, { 0u, 0u });
+			} else {
+				constant.value = _builder.emitDeclTyped(spirv::OpSpecConstant, type, { 0u });
+			}
+			_builder.emit(spirv::OpDecorate, { constant.value, static_cast<uint32_t>(spirv::Decoration::SpecId),
+				kFunctionConstantSpecializationID + index });
+			constant.defined = _builder.emitDeclTyped(spirv::OpSpecConstantFalse, _types.scalar(ScalarKind::Bool), { });
+			_builder.emit(spirv::OpDecorate, { constant.defined, static_cast<uint32_t>(spirv::Decoration::SpecId),
+				kFunctionConstantDefinedSpecializationID + index });
+		}
+		return defined ? constant.defined : constant.value;
+	}
+
+	Id Emitter::emitIsFunctionConstantDefined(const Expression& call) {
+		if (call.arguments.size() != 1 || call.arguments[0]->kind != ExpressionKind::Identifier
+			|| !_functionConstants.count(call.arguments[0]->name) || findResourceBinding(call.arguments[0]->name)) {
+			throw CompileError("is_function_constant_defined takes the name of a function constant");
+		}
+		return functionConstantValue(call.arguments[0]->name, true);
+	}
+
+	// The reflection of the function constants the entry point reads, itself or in a function it reaches, by index.
+	std::string Emitter::functionConstantsJson() {
+		std::map<uint32_t, std::string> byIndex;
+		std::set<const FunctionDecl*> reached { _entryPoint };
+		std::vector<const FunctionDecl*> pending { _entryPoint };
+		while (!pending.empty()) {
+			const FunctionDecl* function = pending.back();
+			pending.pop_back();
+			for (const std::string& name: _functionConstantReads[function]) {
+				byIndex[*_functionConstants.at(name).declaration->functionConstantIndex] = name;
+			}
+			for (const FunctionDecl* callee: _functionCallees[function]) {
+				if (reached.insert(callee).second) {
+					pending.push_back(callee);
+				}
+			}
+		}
+		std::string json;
+		for (const auto& [index, name]: byIndex) {
+			const VariableDeclaration& declaration = *_functionConstants.at(name).declaration;
+			json += std::string(json.empty() ? "" : ",") + "\n\t\t\t\t{ \"name\": \"" + name + "\", \"type\": \""
+				+ scalarKindName(declaration.type.scalar) + "\", \"index\": " + std::to_string(index)
+				+ ", \"spec_id\": " + std::to_string(kFunctionConstantSpecializationID + index)
+				+ ", \"defined_spec_id\": " + std::to_string(kFunctionConstantDefinedSpecializationID + index) + " }";
+		}
+		return json;
+	}
+
 	// The module's own declarations, in source order. A constant is declared
 	// before the entry point that reads it, which is what lets the folder resolve
 	// one constant's initialiser against the ones above it.
@@ -9534,6 +9772,20 @@ namespace {
 				continue;
 			}
 			_builder.setSection(spirv::Section::TypesGlobals);
+			if (global.functionConstantIndex) {
+				declareFunctionConstant(global);
+				continue;
+			}
+			if (global.initializer && !_functionConstants.empty()) {
+				std::set<std::string> read;
+				collectIdentifiers(*global.initializer, read);
+				const auto constant = std::find_if(read.begin(), read.end(),
+					[&](const std::string& name) { return functionConstantNamed(name) != nullptr; });
+				if (constant != read.end()) {
+					declareFunctionConstantAlias(global, *constant);
+					continue;
+				}
+			}
 			if (global.type.arrayLength) {
 				declareFileScopeArray(global, position);
 				continue;
@@ -10349,6 +10601,9 @@ namespace {
 
 		const Id elementType = declaredTypeOf(element);
 		const Id count = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 1u });
+		if (_nextSpecId == kFunctionConstantSpecializationID) {
+			throw CompileError(what + " is one more than mslc has specialization constants for");
+		}
 		const uint32_t specId = _nextSpecId++;
 		_builder.emit(spirv::OpDecorate, { count, static_cast<uint32_t>(spirv::Decoration::SpecId), specId });
 		const Id arrayType = _types.arrayOfLengthId(elementType, count);
@@ -12819,6 +13074,9 @@ namespace {
 					: std::optional<std::string>(returned.enumName);
 			}
 			case ExpressionKind::Index: {
+				if (const Type* pointer = pointerMemberType(*expression.left)) {
+					return pointer->enumName;
+				}
 				if (expression.left->kind != ExpressionKind::Identifier) return std::nullopt;
 				const auto local = _bindings.find(expression.left->name);
 				if (local == _bindings.end()) return std::nullopt;
@@ -13327,6 +13585,10 @@ namespace {
 		if (left.kind == ExpressionKind::Index) {
 			address = emitIndex(left, true);
 		} else if (left.kind == ExpressionKind::Member) {
+			if (pointerMemberType(left)) {
+				throw CompileError("the pointer member \"" + left.memberName + "\" is only lowered "
+					"when indexed or dereferenced, as in s.p[i] or *s.p");
+			}
 			Id fieldType = InvalidId;
 			address = emitMemberAddress(left, fieldType);
 		} else if (left.kind == ExpressionKind::Identifier) {
@@ -13386,10 +13648,9 @@ namespace {
 		}
 
 		const Expression* root = &storeRoot(base);
-		const auto rootBinding = _bindings.find(root->name);
-		if (rootBinding != _bindings.end() && rootBinding->second.readOnly) {
-			throw CompileError("assigning to " + quoted + " of \"" + root->name
-				+ "\", which is const or in constant memory");
+		if (readOnlyRoot(*root)) {
+			throw CompileError("assigning to " + quoted + " of \"" + (root->kind == ExpressionKind::Member
+				? root->memberName : root->name) + "\", which is const or in constant memory");
 		}
 
 		const Id address = emitPlaceAddress(base);
@@ -13559,18 +13820,30 @@ namespace {
 	}
 
 	// The variable a store lands in: the head of a chain of member and element
-	// accesses, since constness and storage follow the chain.
-	const Expression& Emitter::storeRoot(const Expression& target) const {
+	// accesses, since constness and storage follow the chain. A pointer member,
+	// as s.p in s.p[i], ends the chain: what it points at is not part of s.
+	const Expression& Emitter::storeRoot(const Expression& target) {
 		const Expression* root = &target;
-		while (root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) {
+		while ((root->kind == ExpressionKind::Member && !pointerMemberType(*root))
+			|| root->kind == ExpressionKind::Index) {
 			root = root->left.get();
 		}
 		return *root;
 	}
 
+	// Whether a store through a place's root is refused: a const or constant
+	// variable, or a pointer member to const or constant memory.
+	bool Emitter::readOnlyRoot(const Expression& root) {
+		if (const Type* pointer = pointerMemberType(root)) {
+			return pointer->isConst || pointer->addressSpace == AddressSpace::Constant;
+		}
+		const auto binding = root.kind == ExpressionKind::Identifier ? _bindings.find(root.name) : _bindings.end();
+		return binding != _bindings.end() && binding->second.readOnly;
+	}
+
 	// A store to something that is not a variable of the entry point: a literal,
 	// which is what an enumerator is by now, or a file-scope constant.
-	void Emitter::requireStorable(const Expression& target) const {
+	void Emitter::requireStorable(const Expression& target) {
 		const Expression& root = storeRoot(target);
 		if (root.kind == ExpressionKind::IntLiteral || root.kind == ExpressionKind::FloatLiteral
 			|| root.kind == ExpressionKind::BoolLiteral) {
@@ -13581,7 +13854,7 @@ namespace {
 		}
 		rejectPlaceThroughConditional(target, "assigning to");
 		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
-			&& _constants.count(root.name)) {
+			&& (_constants.count(root.name) || functionConstantNamed(root.name))) {
 			throw CompileError("cannot store to \"" + root.name + "\", a constant declared at file scope");
 		}
 	}
@@ -13637,12 +13910,10 @@ namespace {
 		}
 
 		const Expression* root = &storeRoot(left);
-		if (root->kind == ExpressionKind::Identifier) {
-			const auto target = _bindings.find(root->name);
-			if (target != _bindings.end() && target->second.readOnly) {
-				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
-					"constant address space or declared const");
-			}
+		if (readOnlyRoot(*root)) {
+			throw CompileError("cannot store through \"" + (root->kind == ExpressionKind::Member
+				? root->memberName : root->name) + "\", which is in the "
+				"constant address space or declared const");
 		}
 
 		const Id address = emitPlaceAddress(left);
@@ -14432,6 +14703,10 @@ namespace {
 				document += "\t\t\t\"grid_size_spec_ids\": [" + std::to_string(kGridSizeSpecializationID) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 1) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 2) + "],\n";
+			}
+			const std::string functionConstants = functionConstantsJson();
+			if (!functionConstants.empty()) {
+				document += "\t\t\t\"function_constants\": [" + functionConstants + "\n\t\t\t],\n";
 			}
 			document += "\t\t\t\"bindings\": [\n";
 			document += _reflection;

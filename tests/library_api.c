@@ -147,8 +147,26 @@ int main(int argc, char** argv) {
 		CHECK(mslc_compile_library(include, strlen(include), &options, &bytes, &size, &diagnostic) == 0);
 		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
 		mslc_free(bytes);
+  }
+	{
+		// A helper emitted once for two kernels: both list the function constant it reads.
+		const char* shared =
+			"constant int c [[function_constant(0)]];\n"
+			"template <typename T> T leaf() { return T(c); }\n"
+			"int shared() { return leaf<int>(); }\n"
+			"kernel void a(device int* out [[buffer(0)]]) { out[0] = shared(); }\n"
+			"kernel void b(device int* out [[buffer(0)]]) { out[0] = shared() + 1; }\n";
+		char* reflection = NULL;
+		char* error = NULL;
+		CHECK(mslc_translate(shared, strlen(shared), NULL, NULL, NULL, &reflection, &error) == 0 && reflection != NULL);
+		int listed = 0;
+		for (const char* at = reflection; (at = strstr(at, "{ \"name\": \"c\", \"type\": \"int\"")) != NULL; at++) {
+			listed++;
+		}
+		CHECK(listed == 2);
+		mslc_free(reflection);
 	}
-	// No entry point: a library with no functions, which has no module, and a reflection with no entry point.
+  // No entry point: a library with no functions, which has no module, and a reflection with no entry point.
 	const char* noEntryPoints[] = { "", "float helper() { return 1; }" };
 	for (size_t i = 0; i < sizeof(noEntryPoints) / sizeof(noEntryPoints[0]); i++) {
 		uint8_t* spirv = (uint8_t*)1;
@@ -160,7 +178,7 @@ int main(int argc, char** argv) {
 		CHECK(reflection != NULL && strstr(reflection, "\"entry_points\": [\n\t]") != NULL);
 		mslc_free(reflection);
 	}
-	// A stage asked for is an entry point the source has to have.
+  // A stage asked for is an entry point the source has to have.
 	MslcOptions kernel;
 	mslc_default_options(&kernel);
 	kernel.stage = MSLC_STAGE_KERNEL;

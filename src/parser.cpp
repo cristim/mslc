@@ -2449,6 +2449,33 @@ VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaratio
 		deduceLength = parseArrayDimensions(declaration.type);
 	}
 
+	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+		const std::string what = "the function constant \"" + declaration.name + "\"";
+		parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+			if (name != "function_constant") {
+				throw CompileError("attribute \"" + name + "\" does not apply to a file-scope constant");
+			}
+			if (!argument || *argument > kMaxFunctionConstantIndex) {
+				throw CompileError(what + " needs an index from 0 to " + std::to_string(kMaxFunctionConstantIndex));
+			}
+			declaration.functionConstantIndex = *argument;
+		});
+		const Type& type = declaration.type;
+		if (type.arrayLength || deduceLength) {
+			throw CompileError(what + " is an array, and mslc lowers scalar function constants only");
+		}
+		if (type.isPointer || type.vectorWidth > 1 || type.isMatrix() || !type.namedType.empty()
+			|| !type.enumName.empty() || type.resource != ResourceKind::None || type.isAtomic
+			|| type.scalar == ScalarKind::Void || type.scalar == ScalarKind::Double) {
+			throw CompileError(what + " has the type " + typeName(type) + ", and mslc lowers scalar function "
+				"constants only");
+		}
+		if (at(TokenKind::Assign)) {
+			throw CompileError(what + " has an initialiser, but its value is given when a function is made");
+		}
+		return declaration;
+	}
+
 	if (!match(TokenKind::Assign)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
 			+ std::string(tokenKindName(kind())));
