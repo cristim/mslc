@@ -148,6 +148,24 @@ int main(int argc, char** argv) {
 		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
 		mslc_free(bytes);
 	}
+	{
+		// A helper emitted once for two kernels: both list the function constant it reads.
+		const char* shared =
+			"constant int c [[function_constant(0)]];\n"
+			"template <typename T> T leaf() { return T(c); }\n"
+			"int shared() { return leaf<int>(); }\n"
+			"kernel void a(device int* out [[buffer(0)]]) { out[0] = shared(); }\n"
+			"kernel void b(device int* out [[buffer(0)]]) { out[0] = shared() + 1; }\n";
+		char* reflection = NULL;
+		char* error = NULL;
+		CHECK(mslc_translate(shared, strlen(shared), NULL, NULL, NULL, &reflection, &error) == 0 && reflection != NULL);
+		int listed = 0;
+		for (const char* at = reflection; (at = strstr(at, "{ \"name\": \"c\", \"type\": \"int\"")) != NULL; at++) {
+			listed++;
+		}
+		CHECK(listed == 2);
+		mslc_free(reflection);
+	}
 	char* error = NULL;
 	CHECK(mslc_translate("", 0, NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
 	mslc_free(error);
