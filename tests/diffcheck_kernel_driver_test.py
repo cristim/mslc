@@ -45,7 +45,7 @@ def mutated(path, edits):
 
 BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write",
              "texture_nonfloat_read", "texture_nonfloat_write", "sampler_modes",
-             "layout_unread_member", "ulp_per_buffer", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
+             "layout_unread_member", "ulp_per_buffer", "ulp_per_field", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
              "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
              "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
@@ -87,6 +87,8 @@ MUTANTS = [
     ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
     # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
     ("ulp_per_buffer", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
+    # per-field struct ULP: an exactly rounded struct field off by one ULP next to sqrt and exp fields
+    ("ulp_per_field", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
     # threadgroup argument: the spec constant that sizes the first argument's array is no longer the id the reflection names
     ("threadgroup_argument", [[r"SpecId 3$", "SpecId 9"]], "mismatched"),
     # threadgroup argument: a thread reads the wrong neighbour's slot

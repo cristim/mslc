@@ -26,7 +26,7 @@
 // #include a local header, which an in-memory source cannot resolve.
 //
 // The reflection lists, per buffer: index, name, access, whether it is a pointer, the
-// byte stride of one element, and every scalar leaf of the element type as {off, scalar}.
+// byte stride of one element, and every scalar leaf of the element type as {off, scalar[, field]}.
 // Vectors and matrices are flattened to their components, structs and arrays are
 // walked, so the driver needs no knowledge of Metal types. Arguments the harness cannot
 // feed (textures, samplers, threadgroup memory, argument buffers) are listed in
@@ -78,19 +78,22 @@ static NSString *dataName(MTLDataType t) {
 }
 
 static void addLeaves(NSMutableArray *out, NSUInteger base, MTLDataType t, MTLStructType *st, MTLArrayType *at,
-                      NSString *what) {
+                      NSString *what, NSString *field) {
     const char *scalar; int rows, cols; NSUInteger colStride;
     if (t == MTLDataTypeStruct && st) {
-        for (MTLStructMember *m in st.members)
-            addLeaves(out, base + m.offset, m.dataType, m.structType, m.arrayType, [what stringByAppendingFormat:@".%@", m.name]);
+        for (MTLStructMember *m in st.members) {
+            NSString *sub = field.length ? [field stringByAppendingFormat:@".%@", m.name] : m.name;
+            addLeaves(out, base + m.offset, m.dataType, m.structType, m.arrayType, [what stringByAppendingFormat:@".%@", m.name], sub);
+        }
     } else if (t == MTLDataTypeArray && at) {
         for (NSUInteger i = 0; i < at.arrayLength; i++)
-            addLeaves(out, base + i * at.stride, at.elementType, at.elementStructType, at.elementArrayType, what);
+            addLeaves(out, base + i * at.stride, at.elementType, at.elementStructType, at.elementArrayType, what, field);
     } else if (shape(t, &scalar, &rows, &cols, &colStride)) {
         NSUInteger sz = scalarSize(scalar);
         for (int c = 0; c < cols; c++)
             for (int r = 0; r < rows; r++)
-                [out addObject:@{@"off": @(base + c * colStride + r * sz), @"scalar": @(scalar)}];
+                [out addObject:field.length ? @{@"off": @(base + c * colStride + r * sz), @"scalar": @(scalar), @"field": field}
+                                            : @{@"off": @(base + c * colStride + r * sz), @"scalar": @(scalar)}];
     } else {
         [g_unsupported addObject:[NSString stringWithFormat:@"%@: data type %lu", what, (unsigned long)t]];
     }
@@ -135,10 +138,10 @@ static NSDictionary *reflectBindings(NSArray<id<MTLBinding>> *list, BOOL graphic
         if (pointer) {
             MTLPointerType *p = bb.bufferPointerType;
             stride = p.elementIsArgumentBuffer ? 0 : p.dataSize;
-            addLeaves(leaves, 0, p.elementType, p.elementStructType, p.elementArrayType, bb.name);
+            addLeaves(leaves, 0, p.elementType, p.elementStructType, p.elementArrayType, bb.name, @"");
         } else {
             stride = bb.bufferDataSize;
-            addLeaves(leaves, 0, bb.bufferDataType, bb.bufferStructType, nil, bb.name);
+            addLeaves(leaves, 0, bb.bufferDataType, bb.bufferStructType, nil, bb.name, @"");
         }
         NSArray *access = @[@"read", @"readwrite", @"write"];
         [buffers addObject:@{@"index": @(bb.index), @"name": bb.name, @"access": access[bb.access],

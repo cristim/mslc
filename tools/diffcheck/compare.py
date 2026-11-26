@@ -128,12 +128,13 @@ def ulp_bound_for_source(source):
 
 
 _SCALAR = r"(?:bool|char|uchar|short|ushort|int|uint|long|ulong|half|float)[234]?"
+_SCALAR_ONLY = r"(?:bool|char|uchar|short|ushort|int|uint|long|ulong|half|float)"
 _DECL = re.compile(r"^(?:const\s+)?%s\s+(\w+)\s*(?:=\s*(.*))?$" % _SCALAR, re.S)
-_STORE = re.compile(r"^(\w+)\s*((?:\[[^\[\]]*\]\s*)*)[-+*/%]?=(?!=)\s*(.*)$", re.S)
+_STORE = re.compile(r"^(\w+)\s*((?:\[[^\[\]]*\]\s*)+(?:\.\s*[A-Za-z_]\w*\s*)*)?[-+*/%]?=(?!=)\s*(.*)$", re.S)
 _FUNCTION = re.compile(r"^\s*(?:(?:kernel|vertex|fragment)\s+)\w[\w:<>]*\s+\w+\s*\(([^(){};]*)\)\s*\{([^{}]*)\}\s*$", re.S)
 _BUFFER_LIKE = re.compile(r"[*&]|\b(?:device|constant|threadgroup|texture\w*|sampler|depth\w*)\b")
 _UNSAFE_EXPR = (
-    re.compile(r"[\w\])]\s*(?:\.|->)\s*[A-Za-z_]"),  # member access
+    re.compile(r"[\w\])]\s*->\s*[A-Za-z_]"),  # pointer member access
     re.compile(r"(?<!&)&(?!&)"),  # address-of, reference
     re.compile(r"\b(?:\w*_cast|as_type\w*|decltype|auto|sizeof|typeof)\b"),
     re.compile(r"\([^()]*\*\s*\)"),  # pointer cast
@@ -141,10 +142,20 @@ _UNSAFE_EXPR = (
 )
 
 
-def _simple_expr(expr, buffers):
-    """No way to reach a buffer except by a subscripted read, and no hidden aliasing or casts."""
+_STRUCT = re.compile(r"^\s*struct\s+(\w+)\s*\{\s*((?:%s\s+\w+\s*;\s*)+)\}\s*;\s*" % _SCALAR_ONLY)
+
+
+def _simple_expr(expr, buffers, struct_fields):
+    """No way to reach a buffer except by a subscripted read (or `.field` of a scalar struct field), and no hidden aliasing or casts."""
     if any(p.search(expr) for p in _UNSAFE_EXPR) or _split_comma(expr):
         return False
+    scrubbed = re.sub(r"\b(\w+)\s*\[[^\[\]]*\]\s*\.\s*([A-Za-z_]\w*)(?!\s*[\.\[(])",
+                      lambda m: " " if m.group(2) in struct_fields.get(m.group(1), ()) else m.group(0), expr)
+    if re.search(r"[\w\])]\s*\.\s*[A-Za-z_]", scrubbed):
+        return False
+    for inner in re.findall(r"\[([^\[\]]*)\]", expr):
+        if not _simple_expr(inner, buffers, struct_fields):
+            return False
     return not any(re.search(r"(?<![\w.])%s\b(?!\s*\[)" % re.escape(b), expr) for b in buffers)
 
 
@@ -158,30 +169,60 @@ def _split_comma(text):
     return False
 
 
+def _access_paths(text, buffers, locals_):
+    """Every local or buffer (or `buffer.field`) read by `text`, plus any inner subscript identifiers."""
+    paths = set()
+    def sub(m):
+        base, chain = m.group(1), m.group(2)
+        for inner in re.findall(r"\[([^\[\]]*)\]", chain):
+            paths.update(_access_paths(inner, buffers, locals_))
+        fields = re.findall(r"\.\s*([A-Za-z_]\w*)", chain)
+        if base in buffers:
+            paths.add("%s.%s" % (base, ".".join(fields)) if fields else base)
+        elif base in locals_:
+            paths.add(base)
+        return " "
+    rest = re.sub(r"\b(\w+)((?:\s*\[[^\[\]]*\])+(?:\s*\.\s*[A-Za-z_]\w*)*)", sub, text)
+    for ident in re.findall(r"\w+", rest):
+        if ident in buffers or ident in locals_:
+            paths.add(ident)
+    return paths
+
+
 def ulp_bounds_by_root(source):
-    """{root: ULP bound} for what each kernel buffer parameter or scalar local can hold, so a buffer
-    written from sqrt does not inherit the bound of an unrelated pow elsewhere in the shader.
+    """{root: ULP bound} for what each kernel buffer parameter (`b` or `b.field`) or scalar local can hold,
+    so a buffer or struct field written from sqrt does not inherit the bound of an unrelated pow elsewhere
+    in the shader.
 
     An allowlist, deliberately looser than a precise analysis: the split applies only when the source
-    is one entry point whose body is nothing but scalar or vector declarations and plain
-    `local[...] = rhs;` or `buffer[...] = rhs;` stores, with no braces, member access, address-of,
-    cast, `auto`/`decltype`/`using`/`typedef`, pointer or reference, helper function, or bare buffer
-    name in an expression. Any other source returns {} and callers use the whole-source bound, which
-    is never tighter than the truth. A root's bound is the loosest bound among the right-hand sides
-    stored to it and every other root those sides read."""
-    source = re.sub(r"(?m)^\s*#\s*(?:include|pragma)\b.*$", " ", _strip(source))
-    source = re.sub(r"\busing\s+namespace\s+metal\s*;", " ", source)
-    source = re.sub(r"\[\[.*?\]\]", "", source, flags=re.S)
-    m = _FUNCTION.match(source)
+    is one entry point (optionally preceded by plain struct definitions of scalar fields)
+    whose body is nothing but scalar or vector declarations and plain
+    `local[...] = rhs;`, `buffer[...] = rhs;` or `buffer[...].field = rhs;` stores, with no braces,
+    pointer `->`, method calls, address-of, cast, `auto`/`decltype`/`using`/`typedef`, pointer or
+    reference, helper function, or bare buffer name in an expression. Any other source returns {} and
+    callers use the whole-source bound, which is never tighter than the truth. A root's bound is the
+    loosest bound among the right-hand sides stored to it and every other root those sides read."""
+    stripped = re.sub(r"(?m)^\s*#\s*(?:include|pragma)\b.*$", " ", _strip(source))
+    stripped = re.sub(r"\busing\s+namespace\s+metal\s*;", " ", stripped)
+    stripped = re.sub(r"\[\[.*?\]\]", "", stripped, flags=re.S)
+    struct_defs = {}
+    while sm := _STRUCT.match(stripped):
+        struct_defs[sm.group(1)] = {f.split()[-1] for f in sm.group(2).split(";") if f.strip()}
+        stripped = stripped[sm.end():]
+    m = _FUNCTION.match(stripped)
     if m is None:
         return {}
-    buffers = set()
+    buffers, struct_fields = set(), {}
     for param in re.split(r",", m.group(1)):
         if param.strip() and _BUFFER_LIKE.search(param):
             ident = re.findall(r"\w+", param)
             if not ident:
                 return {}
             buffers.add(ident[-1])
+            if param.count("*") == 1 and "[" not in param and "&" not in param:
+                for t in ident[:-1]:
+                    if t in struct_defs:
+                        struct_fields[ident[-1]] = struct_defs[t]
     stores, locals_ = [], set()
     for stmt in m.group(2).split(";"):
         if not stmt.strip():
@@ -189,30 +230,45 @@ def ulp_bounds_by_root(source):
         d = _DECL.match(stmt.strip())
         if d:
             name, init = d.group(1), d.group(2)
-            if name in buffers or name in locals_ or (init is not None and not _simple_expr(init, buffers)):
+            if name in buffers or name in locals_ or (init is not None and not _simple_expr(init, buffers, struct_fields)):
                 return {}
             locals_.add(name)
             if init is not None:
                 stores.append((name, init))
             continue
         st = _STORE.match(stmt.strip())
-        if st is None or not _simple_expr(st.group(3), buffers):
+        if st is None or not _simple_expr(st.group(3), buffers, struct_fields):
             return {}
-        root, subs = st.group(1), st.group(2).strip()
-        if not (root in buffers and subs or root in locals_):
+        root, subs = st.group(1), (st.group(2) or "").strip()
+        inners = re.findall(r"\[([^\[\]]*)\]", subs)
+        for inner in inners:
+            if not _simple_expr(inner, buffers, struct_fields):
+                return {}
+        fields = re.findall(r"\.\s*([A-Za-z_]\w*)", subs)
+        if root in locals_:
+            if fields:
+                return {}
+            target = root
+        elif root in buffers and subs and (not fields or (len(inners) == 1 and len(fields) == 1 and fields[0] in struct_fields.get(root, ()))):
+            target = "%s.%s" % (root, fields[0]) if fields else root
+        else:
             return {}
-        stores.append((root, st.group(3) + " " + subs))
-    bound = {root: 0 for root, _ in stores}
-    for root, rhs in stores:
-        bound[root] = max(bound[root], _call_bound(rhs))
+        stores.append((target, st.group(3) + " " + " ".join(inners)))
+    stores_set = {t for t, _ in stores}
+    if any(any(other != t and other.startswith(t + ".") for other in stores_set) for t in stores_set):
+        return {}
+    bound = {target: 0 for target, _ in stores}
+    for target, rhs in stores:
+        bound[target] = max(bound[target], _call_bound(rhs))
     changed = True
     while changed:
         changed = False
-        for root, rhs in stores:
-            for ident in set(re.findall(r"\w+", rhs)):
-                if bound.get(ident, 0) > bound[root]:
-                    bound[root] = bound[ident]
-                    changed = True
+        for target, rhs in stores:
+            for path in _access_paths(rhs, buffers, locals_):
+                for cand, val in list(bound.items()):
+                    if (cand == path or cand.startswith(path + ".") or path.startswith(cand + ".")) and val > bound[target]:
+                        bound[target] = val
+                        changed = True
     return bound
 
 
@@ -234,10 +290,24 @@ class Diff:
                 "apple_hex": self.apple[::-1].hex(), "mslc_hex": self.mslc[::-1].hex()}
 
 
-def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0):
+def leaf_ulp(lay, leaf, explicit, by_root, default):
+    """The ULP bound for one leaf of `lay`: an explicit DIFFCHECK-ULP on the buffer wins, then a per-field
+    or per-buffer bound from `by_root`, then `default`."""
+    name = lay["name"]
+    if name in explicit:
+        return explicit[name]
+    field = leaf.get("field")
+    if field and "%s.%s" % (name, field) in by_root:
+        return by_root["%s.%s" % (name, field)]
+    if field and any(k.startswith(name + ".") for k in by_root):
+        return 0
+    return by_root.get(name, default)
+
+
+def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0, ulp_by_root=None, explicit_ulp=None):
     """Compare two buffers of one layout; returns up to `limit` Diffs.
 
-    layout: {"name", "stride", "leaves": [{"off", "scalar"}]}. Both buffers must have
+    layout: {"name", "stride", "leaves": [{"off", "scalar", ...}]}. Both buffers must have
     the same length, a multiple of the stride.
     """
     if len(apple) != len(mslc):
@@ -247,10 +317,11 @@ def compare(layout, apple, mslc, ulp=0, limit=16, eps=0.0):
     for element in range(len(apple) // stride):
         base = element * stride
         for leaf in layout["leaves"]:
+            bound = leaf_ulp(layout, leaf, explicit_ulp or {}, ulp_by_root or {}, ulp) if ulp_by_root or explicit_ulp else ulp
             size = SCALARS[leaf["scalar"]][0]
             at = base + leaf["off"]
             a, b = bytes(apple[at:at + size]), bytes(mslc[at:at + size])
-            if not leaf_equal(a, b, leaf["scalar"], ulp, eps):
+            if not leaf_equal(a, b, leaf["scalar"], bound, eps):
                 diffs.append(Diff(layout["name"], element, at, leaf["scalar"], a, b))
                 if len(diffs) >= limit:
                     return diffs

@@ -225,7 +225,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         for i, lay in sorted(all_layouts.items()):
             if lay["name"] in excluded:
                 continue
-            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp_by_buffer.get(lay["name"], ulp))):
+            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], ulp, ulp_by_root=ulp_by_buffer, explicit_ulp=params["ulp"]):
                 case_diffs.append(d.to_json())
         both = {**compared, **tcompared, **wcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])

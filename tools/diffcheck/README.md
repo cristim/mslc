@@ -157,7 +157,10 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   multiply and add either. Apple's in-expression fusion stays out of scope (known-issues.md).
 - `// DIFFCHECK-ULP: <buffer> <n>` replaces the file-wide ULP bound for one buffer (0 = bit-exact),
   so a buffer that must be exact is not loosened by a neighbour fed by `exp` (a graphics attachment
-  is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
+  is named `color0`, ...). In a simple single-entry kernel without control flow or aliasing,
+  `ulp_bounds_by_root` derives each buffer's (and each scalar struct field's) ULP bound from the
+  expressions stored into it automatically. It cannot loosen the interpolation tolerance of a
+  graphics attachment.
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374),

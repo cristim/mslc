@@ -229,6 +229,45 @@ class UlpBoundsByRoot(unittest.TestCase):
     def test_bare_buffer_name_in_an_expression_gives_no_split(self):
         self.assertEqual(self.by("float t = sqrt(2.0f); a[0] = t; b[0] = foo(a);"), {})
 
+    def test_per_field_struct_bounds(self):
+        src = ("struct Out { float root; float loose; float exact; };\n"
+               "kernel void k(device const float *in, device Out *out, uint i [[thread_position_in_grid]]) {\n"
+               "  out[i].root = sqrt(in[i]); out[i].loose = exp(in[i]); out[i].exact = in[i] * 3.0f;\n}")
+        by = compare.ulp_bounds_by_root(src)
+        self.assertEqual(by, {"out.root": 2, "out.loose": 4, "out.exact": 0})
+        lay = {"name": "out", "stride": 12,
+               "leaves": [{"off": 0, "scalar": "float", "field": "root"},
+                          {"off": 4, "scalar": "float", "field": "loose"},
+                          {"off": 8, "scalar": "float", "field": "exact"}]}
+        a = bits(0x3f800000) + bits(0x3f800000) + bits(0x3f800000)
+        b = bits(0x3f800002) + bits(0x3f800004) + bits(0x3f800000)
+        self.assertEqual(compare.compare(lay, a, b, 4, ulp_by_root=by), [])
+        bad_exact = bits(0x3f800002) + bits(0x3f800004) + bits(0x3f800001)
+        (diff,) = compare.compare(lay, a, bad_exact, 4, ulp_by_root=by)
+        self.assertEqual(diff.offset, 8)
+        bad_root = bits(0x3f800003) + bits(0x3f800004) + bits(0x3f800000)
+        (diff,) = compare.compare(lay, a, bad_root, 4, ulp_by_root=by)
+        self.assertEqual(diff.offset, 0)
+
+    def test_per_field_read_propagates_and_mixed_whole_struct_store_gives_no_split(self):
+        src = ("struct S { float a; float b; };\n"
+               "kernel void k(device S *s, device float *o, uint i [[thread_position_in_grid]]) {\n"
+               "  s[i].a = sqrt(2.0f); s[i].b = 1.0f; o[i] = s[i].a + 1.0f;\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(src), {"s.a": 2, "s.b": 0, "o": 2})
+        mixed = ("struct S { float a; float b; };\n"
+                 "kernel void k(device S *s, device const S *in, uint i [[thread_position_in_grid]]) {\n"
+                 "  s[i] = in[i]; s[i].a = sqrt(2.0f);\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(mixed), {})
+        unknown_field = ("struct S { float a; };\n"
+                         "kernel void k(device S *s, uint i [[thread_position_in_grid]]) { s[i].b = sqrt(2.0f); }")
+        self.assertEqual(compare.ulp_bounds_by_root(unknown_field), {})
+        multi_sub = ("struct S { float a; };\n"
+                     "kernel void k(device S *s, uint i [[thread_position_in_grid]]) { s[i][0].a = sqrt(2.0f); }")
+        self.assertEqual(compare.ulp_bounds_by_root(multi_sub), {})
+        ref_param = ("struct S { float a; };\n"
+                     "kernel void k(constant S &s, device float *o, uint i [[thread_position_in_grid]]) { o[i] = s[0].a; }")
+        self.assertEqual(compare.ulp_bounds_by_root(ref_param), {})
+
 
 if __name__ == "__main__":
     unittest.main()

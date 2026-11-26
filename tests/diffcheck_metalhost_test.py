@@ -39,6 +39,7 @@ with tempfile.TemporaryDirectory() as d:
     want = [(0, "float"), (4, "float"), (8, "float"), (16, "uint"), (20, "bool"), (22, "half"),
             (24, "float"), (28, "float"), (32, "float"), (36, "float")]
     assert got == want, got
+    assert [l["field"] for l in by_name["in"]["leaves"]] == ["a", "a", "a", "n", "flag", "h", "p", "p", "p", "p"]
     assert by_name["in"]["stride"] == 48 and by_name["in"]["access"] == "read"
     assert by_name["out"]["access"] == "readwrite"
 
