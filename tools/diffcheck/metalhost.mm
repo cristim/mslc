@@ -6,16 +6,16 @@
 //   std <2.4|3.0|3.1|3.2>     local X Y Z       groups X Y Z       reflection <out.json>
 //   contract on|off           (source mode; default off, see below)
 //   buffer <metal index> <bytes> <input file> <output file>          (run mode)
-//   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>
-//                                                    (run mode; storage: mslc's read-access image; set and binding are
-//   sampler <metal index> <set> <binding>                              vkhost's, ignored here)
+//   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file> [write|readwrite <output file>]
+//                                                    (run mode; storage: mslc's storage image, written back when an
+//   sampler <metal index> <set> <binding>             output file is given; set and binding are vkhost's, ignored here)
 //   threadgroup <metal index> <bytes>   setThreadgroupMemoryLength:atIndex: (run mode)
 //   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                       (run mode; a texture_buffer over a shared buffer of RGBA texels of <type>:
 //                                        float half int uint short ushort; storage: shader read and write)
-// A texture is 2D RGBA32Float, shader read; a sampler is nearest and normalised. A texel buffer's bytes
-// are written back to its output file after the dispatch, like a device buffer's. A device that cannot
-// make the texture exits 2 with "unsupported: <reason>", which the driver reports as a skip.
+// A texture is 2D RGBA32Float (shader read, or read and write when an output file is given); a sampler is nearest
+// and normalised. A texel buffer's bytes are written back to its output file after the dispatch, like a device
+// buffer's. A device that cannot make the texture exits 2 with "unsupported: <reason>", which the driver reports as a skip.
 // Graphics: mode reflect-gfx|draw, see drawMain; reflect-gfx writes {vertex, fragment} binding
 // lists (buffers with layouts, textures, samplers) of the render pipeline.
 // The source is compiled with newLibraryWithSource and MTLMathModeSafe, the way Blender
@@ -260,12 +260,12 @@ static id<MTLTexture> target(id<MTLDevice> device, MTLPixelFormat f, NSUInteger 
     return [device newTextureWithDescriptor:td];
 }
 
-// The texture of a `texture` manifest line (INDEX SET BINDING W H FILE) and the one sampler every
-// runtime sampler gets.
+// The texture of a `texture` or `storagetexture` manifest line (INDEX SET BINDING W H FILE [write|readwrite OUT])
+// and the one sampler every runtime sampler gets.
 static id<MTLTexture> sourceTexture(id<MTLDevice> device, NSArray *w) {
     NSUInteger tw = [w[4] integerValue], th = [w[5] integerValue];
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:tw height:th mipmapped:NO];
-    td.usage = MTLTextureUsageShaderRead;
+    td.usage = w.count >= 9 ? (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite) : MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [device newTextureWithDescriptor:td];
     NSData *texels = slurp(w[6], tw * th * 16);
@@ -476,10 +476,12 @@ int main(int argc, char **argv) {
         [enc setComputePipelineState:pso];
         NSMutableArray<id<MTLBuffer>> *bufs = [NSMutableArray array];
         NSMutableArray *keep = [NSMutableArray array];
-        for (NSArray *w in [(lists[@"texture"] ?: @[]) arrayByAddingObjectsFromArray:(lists[@"storagetexture"] ?: @[])]) {
+        NSArray *texSpecs = [(lists[@"texture"] ?: @[]) arrayByAddingObjectsFromArray:(lists[@"storagetexture"] ?: @[])];
+        NSMutableArray<id<MTLTexture>> *texs = [NSMutableArray array];
+        for (NSArray *w in texSpecs) {
             id<MTLTexture> t = sourceTexture(device, w);
             [enc setTexture:t atIndex:[w[1] integerValue]];
-            [keep addObject:t];
+            [texs addObject:t];
         }
         for (NSArray *w in lists[@"threadgroup"]) [enc setThreadgroupMemoryLength:[w[2] integerValue] atIndex:[w[1] integerValue]];
         for (NSArray *w in lists[@"sampler"]) [enc setSamplerState:nearestSampler(device, [w[1] integerValue]) atIndex:[w[1] integerValue]];
@@ -509,6 +511,14 @@ int main(int argc, char **argv) {
             NSUInteger n = [bufSpecs[i][2] integerValue];
             NSData *o = [NSData dataWithBytes:bufs[i].contents length:n];
             if (![o writeToFile:bufSpecs[i][4] atomically:YES]) die(@"cannot write an output file");
+        }
+        for (NSUInteger i = 0; i < texSpecs.count; i++) {
+            NSArray *w = texSpecs[i];
+            if (w.count < 9) continue;
+            NSUInteger tw = [w[4] integerValue], th = [w[5] integerValue];
+            NSMutableData *o = [NSMutableData dataWithLength:tw * th * 16];
+            [texs[i] getBytes:o.mutableBytes bytesPerRow:tw * 16 fromRegion:MTLRegionMake2D(0, 0, tw, th) mipmapLevel:0];
+            if (![o writeToFile:w[8] atomically:YES]) die(@"cannot write a texture output file");
         }
         for (NSUInteger i = 0; i < texelBacking.count; i++)
             if (![[NSData dataWithBytes:texelBacking[i].contents length:texelBacking[i].length] writeToFile:lists[@"texelbuffer"][i][9] atomically:YES])

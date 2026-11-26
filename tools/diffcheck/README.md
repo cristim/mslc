@@ -160,8 +160,8 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
-- Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374), writable
-  textures, non-2D or non-float textures (all #374). Graphics pairs have their
+- Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374),
+  non-2D or non-float textures (#374). Graphics pairs have their
   own mode, below.
 
 ## Kernel threadgroup memory arguments
@@ -175,12 +175,14 @@ its threadgroup arguments below the local size.
 
 ## Kernel textures and samplers
 
-A kernel with `texture2d<float>` arguments (access `sample` or `read`) and runtime `sampler`
+A kernel with `texture2d<float>` arguments (access `sample`, `read`, `write` or `read_write`) and runtime `sampler`
 arguments is run like any other: each case seeds one 4x4 RGBA32Float texture per binding from the
 case's generator (profile and seed as for buffers, so NaN and infinity texels appear in the `edge`
 case) and gives both sides the same bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
-Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index
-and name. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
+Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index,
+name and access. After the dispatch, every `write` or `read_write` texture's 4x4 texels
+are read back and compared leaf by leaf (4 float leaves per texel, so texels no thread writes must keep
+their seed), and the negative control perturbs one writable texture as its own group. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
 edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample at texel centres.
 Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
 binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
@@ -191,13 +193,16 @@ host builds it from mslc's `embedded_samplers` state (address modes, nearest or 
 compare, unnormalised coordinates, anisotropy, a min filter that differs from the mag filter, a lod range) is skipped
 with the reason. Known gap: a linear filter on a format without the linear-filter feature bit is not checked.
 
-Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
+Vacuity guard: in case 0 the texels of each `sample`, `read` or `read_write` texture are replaced by others and Apple's output must
 change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the
-file declares `// DIFFCHECK-UNUSED: <name> <reason>`. A declaration for a texture that is in fact used
+file declares `// DIFFCHECK-UNUSED: <name> <reason>`. For a `read_write` texture its own texels count only at
+coordinates the kernel wrote, so a texture the kernel merely overwrites without reading is unused; a write-only
+texture is an output and is not tested this way. A declaration for a texture that is in fact used
 is an `error`, so a stale directive cannot hide a texture. Probes are in `tests/diffcheck/kernel`
-(`diffcheck/kernel/<name>`, run at grid 64, local 16) and `diffcheck/kernel-driver` plants planted
-miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
-between bindings, an unswapped sample coordinate, two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
+(`diffcheck/kernel/<name>`, run at grid 64 or 16, local 16) and `diffcheck/kernel-driver` plants
+miscompiles in the SPIR-V of the real output: swapped texel or write coordinates, swapped written float4
+components, two textures (sampled, write-only or read-write) swapped between bindings, an unswapped sample coordinate,
+two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
 
 ## Kernel texel buffers
 

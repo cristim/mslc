@@ -1,9 +1,11 @@
 """Textures, samplers and texel buffers as both modes feed them: the same seeded texels on both sides, bound by
 Apple's index and by the set and binding of mslc's reflection.
 
-A texture is 2D, RGBA32Float, shader-read; a sampler is nearest, normalised, no mips, with an
-address mode picked by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored repeat). Probes should sample at a texel centre (an edge or a filter is where the backends may
-legitimately differ). Anything else is reported by `unsupported` and the file is skipped.
+A texture is 2D, RGBA32Float (access sample, read, write or read_write in a kernel; sample in graphics); a sampler
+is nearest, normalised, no mips, with an address mode picked by its Metal index (0 clamp to edge, 1 repeat, 2 mirrored
+repeat). Probes should sample at a texel centre (an edge or a filter is where the backends may legitimately differ).
+A writable texture's 4x4 texels are read back and compared like a buffer. Anything else is reported by `unsupported`
+and the file is skipped.
 
 A texel buffer (`texture_buffer<T, access>`, kernel mode only) is a buffer of texels of 4 (the default), 2 or 1
 components of T (float, half, int, uint, short or ushort; `DIFFCHECK-TEXEL` picks the count), seeded like a device
@@ -19,7 +21,7 @@ import hostenv
 import inputs
 
 TEXTURE_SIZE = 4
-READABLE = {"Sample", "Read"}
+TEXTURE_ACCESS = {"read": ("Sample", "Read"), "write": ("Write",), "readwrite": ("ReadWrite",)}
 TEXEL_TYPES = ("float", "half", "int", "uint", "short", "ushort")
 # Apple's binding access -> mslc's texture_access and descriptor type for a texel buffer.
 TEXEL_ACCESS = {"read": ("Read", "UniformTexelBuffer"), "readwrite": ("ReadWrite", "StorageTexelBuffer"),
@@ -36,7 +38,7 @@ def texture_data(rng, profile):
 
 def cross_check(bindings, apple, label=""):
     """Findings where mslc's texture, sampler and texel buffer bindings differ from Apple's by index
-    or name (and, for a texel buffer, by access and descriptor type)."""
+    or name (and, for a texture or texel buffer, by access and descriptor type)."""
     findings = []
     for kind, key, texel in (("Texture", "textures", False), ("TextureBuffer", "textures", True), ("Sampler", "samplers", False)):
         # An embedded sampler has no Metal index (and is skipped by `unsupported` before this runs).
@@ -45,12 +47,15 @@ def cross_check(bindings, apple, label=""):
         if mine != theirs:
             findings.append("%s%s bindings differ: mslc %s, Apple %s" % (label, kind.lower(), mine, theirs))
     for t in apple["textures"]:
-        if t["type"] != "texturebuffer":
-            continue
         for b in bindings:
-            if b["kind"] == "TextureBuffer" and b.get("metal_index") == t["index"] and (b.get("texture_access"), b.get("descriptor_type")) != TEXEL_ACCESS[t["access"]]:
+            if b.get("metal_index") != t["index"]:
+                continue
+            if t["type"] == "texturebuffer" and b["kind"] == "TextureBuffer" and (b.get("texture_access"), b.get("descriptor_type")) != TEXEL_ACCESS[t["access"]]:
                 findings.append("%stexture_buffer %s is %s in Apple, mslc has access %s as %s" % (
                     label, t["name"], t["access"], b.get("texture_access"), b.get("descriptor_type")))
+            elif t["type"] != "texturebuffer" and b["kind"] == "Texture" and "texture_access" in b and b.get("texture_access") not in TEXTURE_ACCESS[t["access"]]:
+                findings.append("%stexture %s is %s in Apple, mslc has access %s" % (
+                    label, t["name"], t["access"], b.get("texture_access")))
     return findings
 
 
@@ -74,10 +79,9 @@ def threadgroup_lines(threadgroups, local, backend):
 def unsupported(entry, apple):
     """Reasons this entry point's textures and samplers cannot be fed (empty: they can)."""
     reasons = ["texture %s access %s" % (b["name"], b.get("texture_access")) for b in entry["bindings"]
-               if b["kind"] == "Texture" and b.get("texture_access") not in READABLE]
+               if b["kind"] == "Texture" and b.get("texture_access") not in ("Sample", "Read", "Write", "ReadWrite")]
     plain = [t for t in apple["textures"] if t["type"] != "texturebuffer"]
     reasons += ["texture %s is not a 2D float texture" % t["name"] for t in plain if t["type"] != "2d" or t["data"] != "float"]
-    reasons += ["texture %s is written (Apple access %s)" % (t["name"], t["access"]) for t in plain if t["access"] != "read"]
     reasons += ["texture_buffer %s has element type %s" % (t["name"], t["data"]) for t in apple["textures"]
                 if t["type"] == "texturebuffer" and t["data"] not in TEXEL_TYPES]
     for state in entry["embedded_samplers"]:
@@ -102,9 +106,9 @@ VK_ADDRESS = {"Repeat": 0, "MirrorRepeat": 1, "ClampToEdge": 2, "ClampToZero": 3
 def seed(bindings, rng, profile, base, embedded=()):
     """Writes one texture file per Texture binding to `base`+name and returns the manifest
     tuples ([(index, set, binding, file, access)], [(index, set, binding)]), in binding order;
-    `access` is mslc's texture_access: a `Read` texture is a storage image in SPIR-V, the rest are sampled.
-    A sampler tuple is (index, set, binding), or for an embedded sampler (None, set, binding, (s, t, r) modes, linear)
-    from the entry's `embedded` states."""
+    `access` is mslc's texture_access: a `Read`, `Write` or `ReadWrite` texture is a storage image in SPIR-V,
+    a `Sample` one is sampled. A sampler tuple is (index, set, binding), or for an embedded sampler
+    (None, set, binding, (s, t, r) modes, linear) from the entry's `embedded` states."""
     textures, samplers = [], []
     for b in bindings:
         if b["kind"] == "Texture":
@@ -120,12 +124,26 @@ def seed(bindings, rng, profile, base, embedded=()):
     return textures, samplers
 
 
-def lines(textures, samplers, backend="vulkan"):
-    """The manifest lines both hosts read; Apple has an embedded sampler in the shader, so only Vulkan is told of it."""
-    return (["%s %d %d %d %d %d %s" % ("storagetexture" if a == "Read" else "texture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f)
+def lines(textures, samplers, backend="vulkan", outputs=None):
+    """The manifest lines both hosts read; Apple has an embedded sampler in the shader, so only Vulkan is told of it.
+    A writable texture (`outputs` maps its Metal index to an output file) is a `storagetexture` with `write` or `readwrite`
+    and its output file at the end."""
+    outputs = outputs or {}
+    return (["%s %d %d %d %d %d %s%s" % ("texture" if a == "Sample" else "storagetexture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f,
+                                         " %s %s" % (a.lower(), outputs[i]) if i in outputs else "")
              for i, s, b, f, a in textures]
             + ["sampler %d %d %d" % s for s in samplers if s[0] is not None]
             + ["esampler %d %d %d %d %d %d" % (s[1], s[2], *s[3], s[4]) for s in samplers if s[0] is None and backend != "apple"])
+
+
+def texture_key(index):
+    return -129 - index
+
+
+def texture_layouts(apple):
+    """{texture_key(index): layout} for every writable 2D texture in Apple's reflection."""
+    return {texture_key(t["index"]): texel_layout(t["name"], "float", t["access"], 4)
+            for t in apple["textures"] if t["type"] != "texturebuffer" and t["access"] != "read"}
 
 
 def texel_layout(name, scalar, access, components=4):

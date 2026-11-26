@@ -10,15 +10,16 @@
 //   spv <file.spv>          entry <name>          set <descriptor set of the block>
 //   local X Y Z             groups X Y Z
 //   buffer <member> <bytes> <input file> <output file>
-//   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file>   (at most 4)
+//   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba32float file> [write|readwrite <output file>]
+//                                                                       (at most 4)
 //   esampler <set> <binding> <S> <T> <R> <linear 0|1>   (kernel mode: an embedded sampler, state in VkSamplerAddressMode values)
 //   sampler <metal index> <set> <binding>                               (at most 4)
 //   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
 //                                memory arguments: the element count of their Workgroup array; at most 8)
 //   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                                                       (at most 8)
-// A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
-// what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
+// A texture is a 2D RGBA32F sampled image (a storagetexture: a storage image, read-only or with `write|readwrite`
+// written back to the output file after the dispatch) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
 // 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> texels of <components> (1, 2 or 4) components of <type>
 // (float half int uint short ushort: R32_SFLOAT, R32G32_SFLOAT, R32G32B32A32_SFLOAT, R16..., ..._SINT, ..._UINT) over a
 // buffer filled from the input file, a UNIFORM_TEXEL_BUFFER descriptor (sampled) or a STORAGE_TEXEL_BUFFER one,
@@ -167,22 +168,25 @@ static VkSampler makeNearestSampler(unsigned index) {
     return makeSampler(m, m, m, VK_FILTER_NEAREST);
 }
 
-// The image and the staging buffer holding the file's RGBA32F texels.
+// The image and the staging buffer holding the file's RGBA32F texels (`storage` 0 sampled, 1 read, 2 write, 3 readwrite).
 static Img loadTexture(const char *file, unsigned w, unsigned h, int storage, Buf *stage) {
-    Img t = makeImage(VK_FORMAT_R32G32B32A32_SFLOAT, w, h, (storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageUsageFlags usage = (storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | (storage >= 2 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+    Img t = makeImage(VK_FORMAT_R32G32B32A32_SFLOAT, w, h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
     size_t n; void *data = slurp(file, &n);
     if (n != (size_t)w * h * 16) die("%s has the wrong size", file);
     *stage = makeBuf(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0); fillBuf(*stage, data, n); free(data);
     return t;
 }
 
-// Copies the staging buffer into the image and makes it readable by `consumer`.
+// Copies the staging buffer into the image and makes it accessible to `consumer`.
 static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, unsigned w, unsigned h, int storage, VkPipelineStageFlags consumer) {
     VkImageMemoryBarrier to = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to);
     VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
     vkCmdCopyBufferToImage(cmd, stage.buf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-    VkImageMemoryBarrier rd = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    VkAccessFlags dst = (storage != 2 ? VK_ACCESS_SHADER_READ_BIT : 0) | (storage >= 2 ? VK_ACCESS_SHADER_WRITE_BIT : 0);
+    VkImageMemoryBarrier rd = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, dst);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, consumer, 0, 0, NULL, 0, NULL, 1, &rd);
 }
 
@@ -206,7 +210,7 @@ int main(int argc, char **argv) {
     unsigned local[3] = {1, 1, 1}, groups[3] = {1, 1, 1}, set = 0, member[MAXBUF], nbuf = 0;
     unsigned long long bytes[MAXBUF];
     unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0, eaddr[MAXTEX][4];
-    char tfile[MAXTEX][1024]; int tstore[MAXTEX];
+    char tfile[MAXTEX][1024], tout[MAXTEX][1024]; int tstore[MAXTEX];
     unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
     unsigned bset[MAXTB], bbind[MAXTB], bcomp[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
     char btype[MAXTB][16], bin[MAXTB][1024], bout[MAXTB][1024];
@@ -220,8 +224,16 @@ int main(int argc, char **argv) {
         if (sscanf(line, "local %u %u %u", local, local + 1, local + 2) == 3) continue;
         if (sscanf(line, "groups %u %u %u", groups, groups + 1, groups + 2) == 3) continue;
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
-        if (nt < MAXTEX && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 0; continue; }
-        if (nt < MAXTEX && sscanf(line, "storagetexture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tstore[nt++] = 1; continue; }
+        if (nt < MAXTEX && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { tout[nt][0] = 0; tstore[nt++] = 0; continue; }
+        if (nt < MAXTEX) {
+            char mode[16] = ""; tout[nt][0] = 0;
+            int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], mode, tout[nt]);
+            if (n == 5 || n == 7) {
+                if (n == 7 && strcmp(mode, "write") && strcmp(mode, "readwrite")) die("storage texture mode %s is not write or readwrite", mode);
+                tstore[nt++] = n == 5 ? 1 : mode[0] == 'w' ? 2 : 3;
+                continue;
+            }
+        }
         if (nb < MAXTB) {
             char kind[16];
             if (sscanf(line, "texelbuffer %*u %u %u %15s %15s %u %u %1023s %1023s", &bset[nb], &bbind[nb], kind, btype[nb], &bcomp[nb], &btexels[nb], bin[nb], bout[nb]) == 8) {
@@ -268,7 +280,13 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < nb; i++) lb[bset[i]][nlb[bset[i]]++] = (VkDescriptorSetLayoutBinding){bbind[i], bstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    Img tex[MAXTEX]; Buf stage[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
+    Img tex[MAXTEX]; Buf stage[MAXTEX], trb[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
+    for (unsigned i = 0; i < nt; i++) {
+        if ((tstore[i] == 1 || tstore[i] == 3) && !gfeatures.shaderStorageImageReadWithoutFormat)
+            refuse("the device has no shaderStorageImageReadWithoutFormat, which a read storage image needs");
+        if (tstore[i] >= 2 && !gfeatures.shaderStorageImageWriteWithoutFormat)
+            refuse("the device has no shaderStorageImageWriteWithoutFormat, which a writable storage image needs");
+    }
     for (unsigned i = 0; i < nb; i++) {
         unsigned bytes1;
         VkFormat fmt = texelFormat(btype[i], bcomp[i], &bytes1);
@@ -315,6 +333,7 @@ int main(int argc, char **argv) {
         }
         for (unsigned i = 0; i < nt; i++) {
             tex[i] = loadTexture(tfile[i], tw[i], th[i], tstore[i], &stage[i]);
+            if (tstore[i] >= 2) trb[i] = makeBuf((size_t)tw[i] * th[i] * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
             ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view, tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[nw].dstSet = dset[tset[i]]; wr[nw].dstBinding = tbind[i]; wr[nw].descriptorCount = 1;
@@ -364,9 +383,15 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < nt; i++) recordTextureUpload(cmd, tex[i], stage[i], tw[i], th[i], tstore[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (nsets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, nsets, dset, 0, NULL);
     vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
+    for (unsigned i = 0; i < nt; i++) if (tstore[i] >= 2) {
+        VkImageMemoryBarrier post = imgBarrier(tex[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &post);
+        VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {tw[i], th[i], 1}};
+        vkCmdCopyImageToBuffer(cmd, tex[i].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, trb[i].buf, 1, &bc);
+    }
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     CHK(vkEndCommandBuffer(cmd));
     VkQueue q; vkGetDeviceQueue(dev, qf, 0, &q);
     VkSubmitInfo sub = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -379,6 +404,10 @@ int main(int argc, char **argv) {
         FILE *f = fopen(out[i], "wb");
         if (!f || fwrite(m, 1, bytes[i], f) != bytes[i]) die("cannot write %s", out[i]);
         fclose(f); vkUnmapMemory(dev, bufs[i].mem);
+    }
+    for (unsigned i = 0; i < nt; i++) if (tstore[i] >= 2) {
+        void *m; CHK(vkMapMemory(dev, trb[i].mem, 0, VK_WHOLE_SIZE, 0, &m));
+        writeFile(tout[i], m, (size_t)tw[i] * th[i] * 16); vkUnmapMemory(dev, trb[i].mem);
     }
     for (unsigned i = 0; i < nb; i++) {
         void *m; CHK(vkMapMemory(dev, tbuf[i].mem, 0, VK_WHOLE_SIZE, 0, &m));

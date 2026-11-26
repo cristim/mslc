@@ -36,8 +36,9 @@ OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
 
 def run_backend(backend, run, case, textures, tag="", texels=()):
     """{key: output bytes} of one backend for one case: a device buffer under its Metal index, a texel
-    buffer under resources.texel_key. The inputs are the files in-<case>-<index>.bin; `textures` is
-    resources.seed's list and `texels` resources.seed_texels'; `tag` keeps repeat runs' files apart."""
+    buffer under resources.texel_key, a writable 2D texture under resources.texture_key. The inputs are
+    the files in-<case>-<index>.bin; `textures` is resources.seed's list and `texels` resources.seed_texels';
+    `tag` keeps repeat runs' files apart."""
     work, mbuf = run["work"], run["mbuf"]
     rows, outs = [], {}
     for b in mbuf:
@@ -46,8 +47,10 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
         rows.append("buffer %d %d %s %s" % (idx if backend == "apple" else b["member"], run["sizes"][idx],
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
+    wouts = {i: os.path.join(work, "%s%s-out-tex%d-%d.bin" % (backend, tag, case, i))
+             for i, _, _, _, a in textures if a in ("Write", "ReadWrite")}
     touts = {tb.index: os.path.join(work, "%s%s-out-t%d-%d.bin" % (backend, tag, case, tb.index)) for tb, _, _ in texels}
-    extra = (resources.lines(textures, run["samplers"], backend) + resources.texel_lines(texels, touts)
+    extra = (resources.lines(textures, run["samplers"], backend, wouts) + resources.texel_lines(texels, touts)
              + resources.threadgroup_lines(run["threadgroups"], run["local"], backend))
     if backend == "apple":
         text = ["mode run"] + run["lines"] + ["entry " + run["entry"], "local %d 1 1" % run["local"],
@@ -61,6 +64,7 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
     hostenv.write_text(manifest, "\n".join(text) + "\n")
     runner(binary, manifest)
     outs = {idx: bytearray(hostenv.read_bytes(path)) for idx, path in outs.items()}
+    outs.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p)) for i, p in wouts.items()})
     outs.update({resources.texel_key(tb): bytearray(hostenv.read_bytes(touts[tb.index])) for tb, _, _ in texels})
     return outs
 
@@ -68,16 +72,22 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
 def unused_textures(run, params, textures, texels, bindings, compared, apple_outs, profile):
     """Names of the textures and texel buffers Apple's output does not depend on: with that one
     resource's contents replaced by others, every compared leaf is unchanged. One the kernel never reads
-    would make the whole binding path untested while the outputs match. A write-only texel buffer is an
-    output, not an input, and is not a candidate."""
+    would make the whole binding path untested while the outputs match. A write-only texture or texel
+    buffer is an output, not an input, and is not a candidate."""
     names = {b["metal_index"]: b["name"] for b in bindings if b["kind"] == "Texture"}
     unused = []
     for n, (index, set_, binding, path, access) in enumerate(textures):
+        if access == "Write":
+            continue
+        key, data = resources.texture_key(index), hostenv.read_bytes(path)
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
-        hostenv.write_bytes(alt, resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile))
+        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile)
+        hostenv.write_bytes(alt, alt_data)
         swapped = [(i, s, b, alt if i == index else f, a) for i, s, b, f, a in textures]
         again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)
-        if not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items()):
+        own = key in compared and any((apple_outs[key][o:o + 16] != data[o:o + 16] or again[key][o:o + 16] != alt_data[o:o + 16])
+                                      and apple_outs[key][o:o + 16] != again[key][o:o + 16] for o in range(0, len(data), 16))
+        if not own and not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items() if i != key):
             unused.append(names[index])
     for n, (tb, path, data) in enumerate(texels):
         if tb.layout["access"] == "write":
@@ -161,7 +171,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
     tplan = resources.texel_plan(bindings, apple, params["texel"])
-    if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan):
+    wlayouts = resources.texture_layouts(apple)
+    if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan) and not wlayouts:
         result.update(status="skipped", reason="no writable buffer to compare")
         return result
     if local > apple["max_threads"]:
@@ -173,11 +184,14 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     ulp_by_buffer = compare.ulp_bounds_by_root(text)
     excluded = dict(params["exclude"])
     tlayouts = {resources.texel_key(tb): tb.layout for tb in tplan}
-    result["buffers"] = sorted([l["name"] for l in layouts.values()] + [l["name"] for l in tlayouts.values()])
+    all_layouts = {**layouts, **tlayouts, **wlayouts}
+    result["buffers"] = sorted(l["name"] for l in all_layouts.values())
+    result["range_buffers"] = sorted(l["name"] for l in {**layouts, **tlayouts}.values())
     result["textures"] = sorted(t["name"] for t in apple["textures"])
     result["texel_buffers"] = sorted(tb.layout["name"] for tb in tplan)
     compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
     tcompared = {i: l for i, l in tlayouts.items() if l["name"] not in excluded}
+    wcompared = {i: l for i, l in wlayouts.items() if l["name"] not in excluded}
 
     profiles = [(opts.profiles[c % len(opts.profiles)], False) for c in range(params["cases"])]
     if opts.sentinel:
@@ -190,6 +204,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                                   params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
         textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"])
+        data.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p))
+                     for i, _, _, p, _ in textures if resources.texture_key(i) in wlayouts})
         for i, l in sorted(layouts.items()):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,
@@ -200,23 +216,23 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         outs = {backend: run_backend(backend, run, case, textures, texels=texels) for backend in ("apple", "mslc")}
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")
-            for i, l in {**layouts, **tlayouts}.items():
+            for i, l in all_layouts.items():
                 if l["name"] == name:
                     outs["mslc"][i][int(at)] ^= 0xff
         case_diffs = []
-        for i, lay in sorted({**layouts, **tlayouts}.items()):
+        for i, lay in sorted(all_layouts.items()):
             if lay["name"] in excluded:
                 continue
             for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp_by_buffer.get(lay["name"], ulp))):
                 case_diffs.append(d.to_json())
-        both = {**compared, **tcompared}
+        both = {**compared, **tcompared, **wcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])
         # Negative control (control_holds): excluded buffers are not candidates, perturbing one would test nothing.
-        control_ok = control_holds([compared, tcompared], outs["mslc"], outs["apple"])
+        control_ok = control_holds([compared, tcompared, wcompared], outs["mslc"], outs["apple"])
         result["cases"].append({"case": case, "profile": profile, "diffs": case_diffs[:16],
                                 "diff_count": len(case_diffs), "negative_control": control_ok})
         if case == 0:
-            unused = unused_textures(run, params, textures, texels, bindings, {**compared, **tcompared}, outs["apple"], profile)
+            unused = unused_textures(run, params, textures, texels, bindings, both, outs["apple"], profile)
     declared = dict(params["unused"])
     undeclared = sorted(set(unused) - set(declared))
     result["status"], result["reason"] = checks.verdict(result["cases"], nonzero, params["writes_zero"], undeclared)
@@ -235,15 +251,16 @@ def unknown_directives(opts, d, results):
     """A directive naming no buffer (or, for UNUSED, texture) of any compared kernel is a typo that
     would silently do nothing."""
     known = set().union(*(r.get("buffers", []) for r in results))
+    ranged = set().union(*(r.get("range_buffers", r.get("buffers", [])) for r in results))
     textures = set().union(*(r.get("textures", []) for r in results))
     texel_buffers = set().union(*(r.get("texel_buffers", []) for r in results))
     errors = []
     if known:
-        named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], known),
-                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], known), "DIFFCHECK-UNUSED": (d["unused"], textures),
+        named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], ranged),
+                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], ranged), "DIFFCHECK-UNUSED": (d["unused"], textures),
                  "DIFFCHECK-ULP": (d["ulp"], known), "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
         if not opts.corpus:
-            named["--range"] = (opts.ranges, known)
+            named["--range"] = (opts.ranges, ranged)
         for directive, (table, names) in named.items():
             unknown = sorted(set(table) - names)
             if unknown:

@@ -127,15 +127,27 @@ class Resources(unittest.TestCase):
         self.assertTrue(lines[0].startswith("storagetexture 2 1 5 4 4 "), lines)  # access::read is a storage image
         self.assertEqual(lines[1], "sampler 1 1 6")
         self.assertTrue(resources.lines([(0, 0, 0, "f", "Sample")], [])[0].startswith("texture 0 "))
+        self.assertEqual(resources.lines([(0, 1, 2, "in.bin", "Write"), (3, 1, 4, "rw.bin", "ReadWrite")], [],
+                                         outputs={0: "out.bin", 3: "rw-out.bin"}),
+                         ["storagetexture 0 1 2 4 4 in.bin write out.bin",
+                          "storagetexture 3 1 4 4 4 rw.bin readwrite rw-out.bin"])
+        wlay = resources.texture_layouts({"textures": [{"index": 0, "name": "r", "type": "2d", "data": "float", "access": "read"},
+                                                       {"index": 2, "name": "w", "type": "2d", "data": "float", "access": "write"},
+                                                       {"index": 5, "name": "tb", "type": "texturebuffer", "data": "float", "access": "write"}]})
+        self.assertEqual(list(wlay), [resources.texture_key(2)])
+        self.assertEqual((wlay[resources.texture_key(2)]["name"], wlay[resources.texture_key(2)]["access"], wlay[resources.texture_key(2)]["stride"]),
+                         ("w", "write", 16))
+        self.assertTrue({resources.texture_key(i) for i in range(128)}.isdisjoint(
+            {resources.texel_key(resources.TexelBuffer(i, 0, 0, False, "float", 4, {})) for i in range(128)}))
 
     def test_unsupported(self):
         plain0 = {"s_address": "Repeat", "t_address": "Repeat", "r_address": "Repeat", "mag_filter": "Nearest", "min_filter": "Nearest",
                   "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1,
                   "lod_min": 0, "lod_max": 65504}
-        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Write"}], "embedded_samplers": [dict(plain0, mip_filter="Linear")]}
+        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Bogus"}], "embedded_samplers": [dict(plain0, mip_filter="Linear")]}
         apple_side = {"textures": [{"name": "t", "type": "3d", "data": "int", "access": "write"}]}
         text = "; ".join(resources.unsupported(entry, apple_side))
-        for needle in ("access Write", "not a 2D float", "is written", "embedded sampler mip_filter is Linear"):
+        for needle in ("access Bogus", "not a 2D float", "embedded sampler mip_filter is Linear"):
             self.assertIn(needle, text)
         plain = {"s_address": "Repeat", "t_address": "ClampToEdge", "r_address": "MirrorRepeat", "mag_filter": "Linear",
                  "min_filter": "Linear", "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1,
@@ -159,14 +171,18 @@ class Resources(unittest.TestCase):
         for needle in ("min_filter Linear differs from mag_filter Nearest", "lod_min is 1", "lod_max is 2.5"):
             self.assertIn(needle, text)
         self.assertEqual(resources.cross_check(embedded["bindings"], {"textures": [], "samplers": []}), [])
-        ok = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Read"}], "embedded_samplers": []}
-        self.assertEqual(resources.unsupported(ok, {"textures": [{"name": "t", "type": "2d", "data": "float", "access": "read"}]}), [])
+        for ma, aa in (("Read", "read"), ("Write", "write"), ("ReadWrite", "readwrite")):
+            ok = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": ma}], "embedded_samplers": []}
+            self.assertEqual(resources.unsupported(ok, {"textures": [{"name": "t", "type": "2d", "data": "float", "access": aa}]}), [])
 
     def test_cross_check(self):
-        mine = [{"kind": "Texture", "metal_index": 0, "name": "t"}, {"kind": "Sampler", "metal_index": 0, "name": "s"}]
-        good = {"textures": [{"index": 0, "name": "t", "type": "2d"}], "samplers": [{"index": 0, "name": "s"}]}
+        mine = [{"kind": "Texture", "metal_index": 0, "name": "t", "texture_access": "Write"},
+                {"kind": "Sampler", "metal_index": 0, "name": "s"}]
+        good = {"textures": [{"index": 0, "name": "t", "type": "2d", "access": "write"}], "samplers": [{"index": 0, "name": "s"}]}
         self.assertEqual(resources.cross_check(mine, good), [])
-        bad = {"textures": [{"index": 1, "name": "t", "type": "2d"}], "samplers": []}
+        wrong_access = [dict(mine[0], texture_access="Read"), mine[1]]
+        self.assertEqual(len(resources.cross_check(wrong_access, good)), 1)
+        bad = {"textures": [{"index": 1, "name": "t", "type": "2d", "access": "write"}], "samplers": []}
         self.assertEqual(len(resources.cross_check(mine, bad)), 2)
 
     TEXEL = {"kind": "TextureBuffer", "metal_index": 3, "name": "tb", "descriptor": {"set": 1, "binding": 4},

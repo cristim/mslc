@@ -43,13 +43,24 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer", "threadgroup_argument",
-             "texel_buffer_read", "texel_buffer_write", "texel_buffer_read_write", "texel_buffer_unused",
-             "texel_buffer_r_read", "texel_buffer_rg_read", "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write", "sampler_modes",
+             "layout_unread_member", "ulp_per_buffer", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
+             "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
+             "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
     ("texture_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: the x and y of a write coordinate swapped
+    ("texture_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: two components of a written float4 swapped
+    ("texture_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: the two write-only textures change bindings
+    ("texture_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # texture, read_write: the two read_write textures change bindings
+    ("texture_read_write", [["Binding 0$", "Binding 9"], ["Binding 1$", "Binding 0"], ["Binding 9$", "Binding 1"]], "mismatched"),
+    # texture, read_write: the x and y of the read_write coordinate swapped
+    ("texture_read_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
     # texture: the two textures change bindings
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
@@ -148,13 +159,17 @@ with tempfile.TemporaryDirectory() as d:
     assert rc != 0 and data is not None and data["status"] == "mismatched" and "exact" in json.dumps(data), (
         "the per-buffer bound no longer holds the exact buffer", rc, out)
 
-# A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
+# A texture the output does not depend on fails unless declared; a non-2D texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texture_unused_read_write"))
+assert rc == 1 and data["status"] == "unused-texture" and "w" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_stale_unused"))
 assert rc == 2 and data["status"] == "error" and "used" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_write_kernel"))
-assert rc == 3 and "access Write" in data["reason"], (rc, out)
+assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(fixture("texture_3d_kernel"))
+assert rc == 3 and "not a 2D float" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_read_write"))
