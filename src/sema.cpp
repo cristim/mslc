@@ -545,7 +545,17 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 		return *root;
 	}
 
-	void collectWritten(const Expression& expression, std::set<std::string>& names) {
+	// A function name without its qualification.
+	std::string unqualifiedName(const std::string& name) {
+		const size_t at = name.rfind("::");
+		return at == std::string::npos ? name : name.substr(at + 2);
+	}
+
+	// The argument positions, by function name, that some function of that name takes by a mutable
+	// reference. Overloads are not resolved here, so any of them counts.
+	using ReferenceSlots = std::set<std::pair<std::string, size_t>>;
+
+	void collectWritten(const Expression& expression, const ReferenceSlots& references, std::set<std::string>& names) {
 		const bool step = expression.kind == ExpressionKind::Unary
 			&& (expression.unaryOperator == UnaryOperator::PreIncrement || expression.unaryOperator == UnaryOperator::PreDecrement
 				|| expression.unaryOperator == UnaryOperator::PostIncrement
@@ -556,25 +566,37 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 				names.insert(root.name);
 			}
 		}
+		// An argument a callee may bind a mutable reference to.
+		if (expression.kind == ExpressionKind::Call && expression.left) {
+			const Expression& callee = *expression.left;
+			const std::string name = callee.kind == ExpressionKind::Identifier ? unqualifiedName(callee.name)
+				: callee.kind == ExpressionKind::Member ? callee.name : std::string();
+			for (size_t i = 0; !name.empty() && i < expression.arguments.size(); ++i) {
+				const Expression& root = writtenRoot(*expression.arguments[i]);
+				if (root.kind == ExpressionKind::Identifier && references.count({ name, i })) {
+					names.insert(root.name);
+				}
+			}
+		}
 		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
-			if (child) collectWritten(*child, names);
+			if (child) collectWritten(*child, references, names);
 		}
 		for (const ExpressionPtr& argument: expression.arguments) {
-			collectWritten(*argument, names);
+			collectWritten(*argument, references, names);
 		}
 		for (const InitializerElement& element: expression.elements) {
-			collectWritten(*element.value, names);
+			collectWritten(*element.value, references, names);
 		}
 	}
 
-	void collectWritten(const Statement& statement, std::set<std::string>& names) {
+	void collectWritten(const Statement& statement, const ReferenceSlots& references, std::set<std::string>& names) {
 		for (const Expression* expression: { statement.expression.get(), statement.forCondition.get(),
 			statement.forIncrement.get(), statement.whileCondition.get() }) {
-			if (expression) collectWritten(*expression, names);
+			if (expression) collectWritten(*expression, references, names);
 		}
 		for (const std::optional<VariableDeclaration>* declaration: { &statement.declaration, &statement.forInitializer }) {
 			if (*declaration && (*declaration)->initializer) {
-				collectWritten(*(*declaration)->initializer, names);
+				collectWritten(*(*declaration)->initializer, references, names);
 				if ((*declaration)->isReference) {
 					const Expression& root = writtenRoot(*(*declaration)->initializer);
 					if (root.kind == ExpressionKind::Identifier) {
@@ -584,19 +606,19 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 			}
 		}
 		for (const StatementPtr& child: statement.children) {
-			collectWritten(*child, names);
+			collectWritten(*child, references, names);
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
-			if (nested) collectWritten(*nested, names);
+			if (nested) collectWritten(*nested, references, names);
 		}
 		for (const SwitchCase& kase: statement.switchCases) {
 			for (const StatementPtr& child: kase.body) {
-				collectWritten(*child, names);
+				collectWritten(*child, references, names);
 			}
 		}
 		for (const StatementPtr& child: statement.switchPreamble) {
-			collectWritten(*child, names);
+			collectWritten(*child, references, names);
 		}
 	}
 
@@ -10721,8 +10743,18 @@ namespace {
 	// it ([dcl.fct]: a parameter is an ordinary variable). The Input variable cannot be written, so one the body
 	// writes or binds a reference to is copied into a Function variable, converted as a read converts it.
 	void Emitter::copyWrittenBuiltins() {
+		ReferenceSlots references;
+		for (const FunctionDecl& function: _unit.helpers) {
+			// A member function's receiver is not among the call's arguments.
+			const size_t first = !function.parameters.empty() && function.parameters[0].name == "this" ? 1 : 0;
+			for (size_t i = first; i < function.parameters.size(); ++i) {
+				if (function.parameters[i].isMutableReference()) {
+					references.insert({ unqualifiedName(function.name), i - first });
+				}
+			}
+		}
 		std::set<std::string> written;
-		collectWritten(*_entryPoint->body, written);
+		collectWritten(*_entryPoint->body, references, written);
 		for (const Parameter& parameter: _entryPoint->parameters) {
 			const auto binding = _bindings.find(parameter.name);
 			if (!parameter.attributes.builtin || !written.count(parameter.name) || binding == _bindings.end()
@@ -10739,7 +10771,6 @@ namespace {
 				_types.pointer(spirv::StorageClass::Function, type), { static_cast<uint32_t>(spirv::StorageClass::Function) });
 			_builder.emit(spirv::OpStore, { variable, value });
 			bindLocal(parameter.name, variable, type, parameter.type);
-			_bindings[parameter.name].readOnly = parameter.type.isConst;
 		}
 	}
 
