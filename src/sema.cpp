@@ -6815,6 +6815,22 @@ namespace {
 				if (parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
 					throw refuse(i, "to a parameter that is an array or a texture");
 				}
+				// A T taken by value from a texture or a sampler is that texture's or sampler's type.
+				if (argument.kind == OverloadArgument::Kind::Resource && !parameter.isReference
+					&& !parameter.type.isVector() && !argument.binding->pointeeMsl.arrayLength) {
+					value = argument.binding->pointeeMsl;
+					value.isConst = false;
+					value.addressSpace = AddressSpace::None;
+					if (known[index]) {
+						if (!sameResourceType(deduced[index].type, value) || !deduced[index].type.isTexture() != !value.isTexture()) {
+							return false;
+						}
+						continue;
+					}
+					known[index] = true;
+					deduced[index].type = value;
+					continue;
+				}
 				if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
 					|| argument.pointerLike) {
 					throw refuse(i, "which is an array, a pointer or a texture");
