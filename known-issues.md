@@ -886,6 +886,11 @@ Apple accepts, and mslc refuses (each a loud error):
 
 - `auto&`, `const auto&`, `auto*`, `decltype(auto)` and a trailing return type (`auto f() -> T`).
 - A deduced return of an enum value (Apple deduces the enum), an array, a pointer or a resource.
-- A use that needs an auto function template's return type before the call is emitted (`f<T>(x).member` on a struct
-  it returns, argument-dependent lookup through its result): "not known before its arguments are evaluated".
+- A member of the result of a call whose auto return type is not known before the call is emitted: a function
+  template, an overloaded name, or a helper with a thread or threadgroup pointer parameter (`f(a).x` there; one
+  non-overloaded helper without such a parameter works). The diagnostic misleads: "\".x\" swizzles a value that is
+  not a vector". Assigning the call to a local first works.
+- `sizeof(f(x))` before any call of `f` ("sizeof of this expression is not lowered").
+- `return g();` where `g` returns void (C++ deduces void): "a call to \"g\" returns void and has no value".
+- An auto function declared with no body ("declared auto with no body here").
 - `auto` member functions of a struct.

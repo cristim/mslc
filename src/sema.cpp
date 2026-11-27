@@ -4997,11 +4997,31 @@ namespace {
 		// what the lifted code reads is not read
 		const auto functionConstantReads = _functionConstantReads;
 		const auto numSamplesReaders = _numSamplesReaders;
+		const auto deducedBefore = _deducedReturns;
 		emit();
 		_builder.takeFunctionsFrom(mark);
 		_builder.truncateLocals(locals);
+		// An auto function first called in the lifted code was emitted whole and is kept (deduceReturnType put
+		// its body aside), and it is not emitted again: what it reads stays read.
+		std::map<const FunctionDecl*, std::set<std::string>> keptReads;
+		std::set<const FunctionDecl*> keptReaders;
+		for (const auto& [function, type]: _deducedReturns) {
+			if (deducedBefore.count(function)) {
+				continue;
+			}
+			if (const auto reads = _functionConstantReads.find(function); reads != _functionConstantReads.end()) {
+				keptReads.insert(*reads);
+			}
+			if (_numSamplesReaders.count(function)) {
+				keptReaders.insert(function);
+			}
+		}
 		_functionConstantReads = functionConstantReads;
 		_numSamplesReaders = numSamplesReaders;
+		for (auto& [function, reads]: keptReads) {
+			_functionConstantReads[function].insert(reads.begin(), reads.end());
+		}
+		_numSamplesReaders.insert(keptReaders.begin(), keptReaders.end());
 		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
 		_currentBlock = block;
 		_terminated = terminated;
@@ -6784,7 +6804,18 @@ namespace {
 				&& (candidate->firstOrder > callerOrder() || definition.parameters.size() != call.arguments.size())) {
 				continue;
 			}
+			// Not deduced yet. The one function a call can name is emitted here to learn it; with overloads,
+			// emitting each would emit ones the call does not choose, and a thread or threadgroup pointer
+			// parameter is specialised on the call's own array, so those are known once the call is emitted.
 			if (returnTypeOf(definition).isAuto) {
+				const bool specialised = std::any_of(definition.parameters.begin(), definition.parameters.end(),
+					[](const Parameter& parameter) {
+						return parameter.type.isPointer && (parameter.type.addressSpace == AddressSpace::Thread
+							|| parameter.type.addressSpace == AddressSpace::Threadgroup);
+					});
+				if (total > 1 || specialised) {
+					return nullptr;
+				}
 				helperFunctionId(*candidate);
 			}
 			consider(returnTypeOf(definition));
@@ -8043,6 +8074,10 @@ namespace {
 		const FunctionDecl& definition = *helper.definition;
 		// "auto f(...)": emitted here, at its first call, to learn what it returns.
 		const bool deduce = returnTypeOf(definition).isAuto;
+		if (deduce && !definition.body) {
+			throw CompileError("\"" + definition.name + "\" is declared auto with no body here, so there is no "
+				"return to deduce its type from");
+		}
 		if (deduce && _deducing.count(&definition)) {
 			throw CompileError("\"" + definition.name + "\" is called in its own body before its return type is "
 				"deduced");
@@ -9324,7 +9359,8 @@ namespace {
 			}
 			const Id value = emitExpression(*statement.expression);
 			_deducedReturns[_helper] = deducedTypeOf(*statement.expression, value, quoted);
-			terminate(spirv::OpReturnValue, { value });
+			// A struct read from a buffer is the laid-out form; the function returns the value form.
+			terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(returnTypeOf(*_helper))) });
 			return;
 		}
 		if (_helper->returnType.isAuto && !returnsVoid(*_helper) && statement.expression) {
@@ -9335,7 +9371,7 @@ namespace {
 				throw CompileError(quoted + " is declared auto, and its returns deduce " + typeName(deduced)
 					+ " and " + typeName(here) + ", which have to be one type");
 			}
-			terminate(spirv::OpReturnValue, { value });
+			terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(deduced)) });
 			return;
 		}
 
@@ -16302,6 +16338,8 @@ namespace {
 			try {
 				linkageAttributes(helperFunctionId(_helpers.at(helperKey(helper, _overloadedNames))),
 					linkageName(helper), kLinkageExport);
+				// An auto export was emitted to deduce its type with no body open to follow.
+				flushDeferredFunctions();
 				for (size_t i = 0; i < _helperQueue.size(); ++i) {
 					emitHelper(*_helperQueue[i]);
 				}
