@@ -176,10 +176,10 @@ def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
 
 
 def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers, backend="vulkan",
-               base_vertex=0, base_instance=0, index_file=None, index_count=0):
+               base_vertex=0, base_instance=0, index_file=None, index_count=0, input_attachments=()):
     """`shape` plus the data both hosts read: `attr_files` {location: file}, `color_outs` {index: file},
     `buffers` [(stage, metal index, set, member, bytes, file[, out_file])], `textures` and `samplers` in
-    resources.seed's shape."""
+    resources.seed's shape, `input_attachments` [(color_index, set, binding)]."""
     lines = [l for l in shape if not l.startswith(("attr ", "color ", "depth"))]
     draw = "draw %d %d" % (len(points), instances)
     if base_vertex or base_instance:
@@ -196,6 +196,8 @@ def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_o
     if depth_out:
         lines.append("depth %r %s" % (DEPTH_CLEAR, depth_out))
     lines += ["gbuffer " + " ".join(str(x) for x in b) for b in buffers]
+    if backend != "apple":
+        lines += ["inputattachment %d %d %d" % ia for ia in input_attachments]
     return lines + resources.lines(textures, samplers, backend=backend)
 
 
@@ -249,7 +251,8 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         res.update(status="error", reason=str(e))
         return None, res
     compiled, problems = {}, []
-    allowed = {"vertex": {"Buffer", "VertexInput", "StageOutput", "Texture", "Sampler"}, "fragment": {"Buffer", "StageInput", "Texture", "Sampler"}}
+    allowed = {"vertex": {"Buffer", "VertexInput", "StageOutput", "Texture", "Sampler"},
+               "fragment": {"Buffer", "StageInput", "Texture", "Sampler", "InputAttachment"}}
     for stage, name in (("vertex", vs), ("fragment", fs)):
         spv, refl, error = hosts.run_mslc(opts.mslc, source, work, includes, stage)
         if error:
@@ -278,13 +281,34 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     except outputs.Unsupported as e:
         problems.append(str(e))
         colors, src_depth = {}, False
+    input_attachments = [b for b in compiled["fragment"][1]["bindings"] if b["kind"] == "InputAttachment"]
+    for b in input_attachments:
+        cidx = b["input_attachment_index"]
+        if cidx not in colors:
+            sc = b.get("scalar", "float")
+            if sc not in ("float", "int", "uint", "half") or not (0 <= cidx < MAX_COLOR):
+                problems.append("input attachment %s at colour %d has unsupported scalar %s" % (b["name"], cidx, sc))
+            else:
+                colors[cidx] = (sc, 4)
+    if input_attachments and params["instances"] > 1:
+        problems.append("a fragment function with framebuffer fetch has instances > 1 (overlapping primitives would be unordered)")
     depth = params["depth"] or src_depth
     problems += ["colour %d has 3 components, which no pixel format holds" % i for i, (_, c) in colors.items() if c == 3]
     if not colors and not depth:
         problems.append("the fragment function writes no colour or depth output")
     if problems:
         return None, _skipped(res, "unsupported: " + "; ".join(problems))
-    findings = outputs.cross_check(colors, src_depth, fif)
+    src_colors, _ = outputs.fragment_outputs(hostenv.read_text(source), fs)
+    findings = outputs.cross_check(src_colors, src_depth, fif)
+    for b in input_attachments:
+        cidx = b["input_attachment_index"]
+        if b["metal_index"] != cidx:
+            findings.append("fragment: input attachment %s has metal_index %d, expected %d" % (b["name"], b["metal_index"], cidx))
+        if cidx in src_colors:
+            want_sc = "float" if src_colors[cidx][0] == "half" else src_colors[cidx][0]
+            if b.get("scalar") != want_sc:
+                findings.append("fragment: input attachment %s at colour %d has scalar %s, output is %s" % (
+                    b["name"], cidx, b.get("scalar"), src_colors[cidx][0]))
     if findings:
         res.update(status="reflection-mismatch", reason="; ".join(findings))
         return None, res
@@ -332,7 +356,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         ep, a = compiled[stage][1], apple[stage]
         want_set = 0 if stage == "vertex" else 1
         for b in ep["bindings"]:
-            if b["kind"] in ("Buffer", "Texture", "Sampler") and b["descriptor"]["set"] != want_set:
+            if b["kind"] in ("Buffer", "Texture", "Sampler", "InputAttachment") and b["descriptor"]["set"] != want_set:
                 findings.append("%s: %s %s has descriptor set %d, expected %d" % (
                     stage, b["kind"].lower(), b["name"], b["descriptor"]["set"], want_set))
         bufs = [b for b in ep["bindings"] if b["kind"] == "Buffer"]
@@ -368,7 +392,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
     if indexes:
         index_file = os.path.join(work, "indices.bin")
         hostenv.write_bytes(index_file, index_data(indexes))
-    attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in plan["colors"].items()}
+    src_colors, _ = outputs.fragment_outputs(hostenv.read_text(source), fs)
+    attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in src_colors.items()}
     if plan["depth"]:
         attach[DEPTH_INDEX] = depth_layout()
     writable = {_wbuf_key(stage, b["metal_index"]): plan["layouts"][stage][b["metal_index"]]
@@ -383,6 +408,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
     if plan["depth"]:
         before[DEPTH_INDEX] = bytearray(struct.pack("<f", DEPTH_CLEAR) * pixels)
     ulp = compare.ulp_bound_for_source(hostenv.read_text(source))
+    ulp_float = compare.ulp_bound_for_source(hostenv.read_text(source), scalar="float")
     res["buffers"] = sorted([l["name"] for l in attach.values()] + [l["name"] for s in plan["layouts"].values() for l in s.values()])
     res["textures"] = sorted({t["name"] for s in ("vertex", "fragment") for t in plan["apple"][s]["textures"]})
     res["unused_textures"] = []  # graphics mode has no unused-texture pass; reject DIFFCHECK-UNUSED as unknown
@@ -422,9 +448,11 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                         for b in buffers if _wbuf_key(b[0], b[1]) in writable}
             backend_buffers = [b + ((buf_outs[_wbuf_key(b[0], b[1])],) if _wbuf_key(b[0], b[1]) in buf_outs else ())
                                for b in buffers]
+            input_attachments = [(b["input_attachment_index"], b["descriptor"]["set"], b["descriptor"]["binding"])
+                                 for b in plan["compiled"]["fragment"][1]["bindings"] if b["kind"] == "InputAttachment"]
             body = draw_lines(plan["shape"], plan["points"], params["instances"], attr_files, color_outs, plan["colors"],
                               depth_out, backend_buffers, textures, samplers, backend, base_vertex, base_instance,
-                              index_file, len(indexes or ()))
+                              index_file, len(indexes or ()), input_attachments)
             if backend == "apple":
                 text, binary = ["mode draw"] + plan["lines"] + body, opts.metal
             else:
@@ -449,14 +477,17 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         diffs = []
         for i, layout in sorted(compared.items()):
             exact, smooth = split_leaves(layout, outs["apple"][i], primitives)
-            bound = params["ulp"].get(layout["name"], ulp)
+            default_ulp = ulp if any(lf["scalar"] == "half" for lf in layout["leaves"]) else ulp_float
+            bound = params["ulp"].get(layout["name"], default_ulp)
             for leaves, (u, e) in ((exact, (bound, 0.0)), (smooth, tolerance(bound, True, "float"))):
                 if leaves:
                     sub = dict(layout, leaves=leaves)
                     diffs += [d.to_json() for d in compare.compare(sub, outs["apple"][i], outs["mslc"][i], u, eps=DEPTH_EPS if i == DEPTH_INDEX else e)]
         for k, layout in sorted(wcompared.items()):
-            bound = params["ulp"].get(layout["name"], ulp)
-            diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][k], outs["mslc"][k], bound)]
+            explicit = params["ulp"].get(layout["name"])
+            diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][k], outs["mslc"][k],
+                                                           ulp if explicit is None else explicit,
+                                                           float_ulp=ulp_float if explicit is None else explicit)]
         all_compared = {**compared, **wcompared}
         nonzero = nonzero or any(checks.written_nonzero(all_compared, case_before, outs[b]) for b in ("apple", "mslc"))
         control_ok = checks.control_holds([g for g in (compared, wcompared) if g], outs["mslc"], outs["apple"])

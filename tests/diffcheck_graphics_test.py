@@ -291,9 +291,34 @@ class Resources(unittest.TestCase):
         self.assertIn("esampler 1 1 0 3 1 1", vk)
         self.assertFalse(any(l.startswith("esampler ") for l in ap))
         indexed = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY[:4], 2, {}, {0: "c.bin"}, {0: ("float", 4)}, None,
-                                      [], [], [], "mslc", base_vertex=3, base_instance=5, index_file="idx.bin", index_count=6)
+                                      [], [], [], "mslc", base_vertex=3, base_instance=5, index_file="idx.bin", index_count=6,
+                                      input_attachments=[(0, 1, 2)])
         self.assertIn("draw 4 2 3 5", indexed)
         self.assertIn("index 6 idx.bin", indexed)
+        self.assertIn("inputattachment 0 1 2", indexed)
+        ap_ia = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY[:4], 1, {}, {0: "c.bin"}, {0: ("float", 4)}, None,
+                                    [], [], [], "apple", input_attachments=[(0, 1, 2)])
+        self.assertNotIn("inputattachment 0 1 2", ap_ia)
+
+    def test_prepare_handles_input_attachments_and_rejects_multi_instance_or_mismatch(self):
+        ia0 = {"kind": "InputAttachment", "metal_index": 0, "descriptor": {"set": 1, "binding": 0},
+               "input_attachment_index": 0, "scalar": "float", "name": "c0"}
+        ia2 = {"kind": "InputAttachment", "metal_index": 2, "descriptor": {"set": 1, "binding": 1},
+               "input_attachment_index": 2, "scalar": "float", "name": "c2"}
+        plan, early = self._run_prepare(self._refl(f_bindings=[ia0, ia2]), self._apple())
+        self.assertIsNone(early)
+        self.assertEqual(plan["colors"], {0: ("float", 4), 2: ("float", 4)})
+        _, skip_inst = self._run_prepare(self._refl(f_bindings=[ia0]), self._apple(), dict(self.PARAMS, instances=2))
+        self.assertEqual(skip_inst["status"], "skipped")
+        self.assertIn("instances > 1", skip_inst["reason"])
+        bad_idx = dict(ia0, metal_index=1)
+        _, mm_idx = self._run_prepare(self._refl(f_bindings=[bad_idx]), self._apple())
+        self.assertEqual(mm_idx["status"], "reflection-mismatch")
+        self.assertIn("metal_index 1, expected 0", mm_idx["reason"])
+        bad_sc = dict(ia0, scalar="uint")
+        _, mm_sc = self._run_prepare(self._refl(f_bindings=[bad_sc]), self._apple())
+        self.assertEqual(mm_sc["status"], "reflection-mismatch")
+        self.assertIn("has scalar uint, output is float", mm_sc["reason"])
 
     def test_prepare_accepts_vertex_resources_nonfloat_non2d_and_embedded_samplers(self):
         v_kinds = ("1d", "1d_array", "2d")

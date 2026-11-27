@@ -129,12 +129,12 @@ the audited transfer-write to host-read barrier of PR #148. Vertex-stage values 
 back (there is no transfer-feedback path), so a vertex miscompile shows only through what it
 puts in the attachments.
 
-Skipped with the reason (follow-up work): a writable `[[buffer]]` with `instances > 1`, writable
-textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures,
-framebuffer fetch. Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
+Skipped with the reason (follow-up work): a writable `[[buffer]]` or framebuffer fetch (`[[color(n)]]` fragment input) with `instances > 1`, writable
+textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures.
+Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 47
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 51
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
 

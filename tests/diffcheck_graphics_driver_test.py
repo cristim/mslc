@@ -90,6 +90,10 @@ MUTANTS = [
     ("texture_mip_lod", "fragment", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %float_1_5$", r"\1 %float_1"]]),
     ("texture_mip_lod", "fragment", [[r"(OpImageSampleImplicitLod %v4float %\d+ %\d+ Bias) %float_1$", r"\1 %float_0"]]),
     ("texture_mip_lod", "fragment", [[r"(OpImageFetch %v4uint %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]]),
+    ("framebuffer_fetch", "fragment", [["OpFSub %v3float", "OpFAdd %v3float"]]),
+    ("framebuffer_fetch", "fragment", [["OpFAdd %v4half", "OpFSub %v4half"]]),
+    ("framebuffer_fetch", "fragment", [["OpIAdd %v4int", "OpISub %v4int"]]),
+    ("framebuffer_fetch", "fragment", [["OpIAdd %v4uint", "OpISub %v4uint"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -100,7 +104,8 @@ if rc == 77:
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
              "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d",
-             "writable_buffer", "vertex_attr_half", "sparse_color_interp", "indexed_draw", "texture_mip_lod"):
+             "writable_buffer", "vertex_attr_half", "sparse_color_interp", "indexed_draw", "texture_mip_lod",
+             "framebuffer_fetch"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
