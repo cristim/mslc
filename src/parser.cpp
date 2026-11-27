@@ -5961,7 +5961,7 @@ StatementPtr Parser::parseStatement() {
 
 	// A GNU statement expression that is a statement of its own, "({ ... });", which Apple's compiler takes as
 	// clang does: its value is dropped, so it runs as the block it holds, in a scope of its own, and a break,
-	// continue or return in it acts as one in that block would. One whose value is used is refused (parsePrimary).
+	// continue or return in it acts as one in that block would. One in an expression is refused (parsePrimary), even where its value is dropped.
 	if (at(TokenKind::LParen) && lookahead().kind == TokenKind::LBrace) {
 		size_t depth = 0;
 		size_t close = 0;
@@ -7748,8 +7748,8 @@ ExpressionPtr Parser::parsePrimary() {
 
 	if (at(TokenKind::LParen)) {
 		if (lookahead().kind == TokenKind::LBrace) {
-			throw CompileError("a statement expression \"({ ... })\" whose value is used is not lowered; one that is a "
-				"statement of its own is");
+			throw CompileError("a statement expression \"({ ... })\" is lowered only as a statement of its own, "
+				"\"({ ... });\"; one in an expression is not lowered");
 		}
 		advance();
 		const RestoreFlag freshExpression(_noGreater, false);
