@@ -6696,6 +6696,17 @@ namespace {
 				pointerValueCandidates.push_back({ &candidate, std::move(deduced), pointerArgIndex });
 				continue;
 			}
+			if (candidate.declaration->constructorMember && arguments.size() == 1) {
+				TypeTable::StructForm argForm;
+				if (arguments[0].kind != OverloadArgument::Kind::Array
+					&& arguments[0].kind != OverloadArgument::Kind::Resource && !arguments[0].pointerLike
+					&& _types.structForm(_builder.typeOf(arguments[0].value), argForm)
+					&& argForm.name == candidate.declaration->memberOf) {
+					throw CompileError("copy construction of \"" + candidate.declaration->memberOf
+						+ "\" with parentheses when it declares a constructor template is not lowered yet; "
+						"copy it with \"=\" instead");
+				}
+			}
 			try {
 				HelperFunction* made = &templateInstance(*candidate.declaration, std::move(deduced)).helper;
 				candidates.push_back(made);

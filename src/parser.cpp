@@ -1169,14 +1169,35 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		|| name == "alignof" || name == "noexcept") {
 		throw notNameable();
 	}
+	if (declaration.constructorMember && (lookahead().kind == TokenKind::RParen
+			|| (lookahead().kind == TokenKind::Identifier && lookahead().text == "void"
+				&& lookahead(2).kind == TokenKind::RParen))) {
+		throw CompileError("constructor template \"" + name + "\" takes no arguments, which is not lowered yet");
+	}
 
 	skipBalanced(TokenKind::LParen, TokenKind::RParen);
 	if (!(at(TokenKind::EndOfFile) || at(TokenKind::LBrace) || at(TokenKind::Semicolon) || at(TokenKind::Assign)
-		|| at(TokenKind::Arrow) || atKeyword("__attribute__") || (member && atKeyword("const")))) {
+		|| at(TokenKind::Arrow) || atKeyword("__attribute__") || (member && atKeyword("const"))
+		|| (declaration.constructorMember && at(TokenKind::Colon)))) {
 		throw notNameable();
 	}
 	// To the body or ';'. A real parameter list is never followed by a second group
 	// before a trailing return type, so one means the first was a decltype or a name.
+	if (declaration.constructorMember && at(TokenKind::Colon)) {
+		advance();
+		while (kind() == TokenKind::Identifier
+			&& (lookahead().kind == TokenKind::LParen || lookahead().kind == TokenKind::LBrace)) {
+			advance();
+			if (at(TokenKind::LParen)) {
+				skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			} else {
+				skipBalanced(TokenKind::LBrace, TokenKind::RBrace);
+			}
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+	}
 	while (!at(TokenKind::LBrace) && !at(TokenKind::Semicolon)) {
 		if (at(TokenKind::EndOfFile)) {
 			throw CompileError("expected a body or ';' after the template function \"" + name + "\"");
@@ -1404,10 +1425,14 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	if (atKeyword("auto")) {
 		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
 	}
-	decl.returnType = parseType();
-	rejectUnloweredReturn(decl.returnType, quoted);
 	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
 		? 0 : declaration.name.rfind("::") + 2);
+	if (declaration.constructorMember) {
+		decl.returnType.namedType = declaration.memberOf;
+	} else {
+		decl.returnType = parseType();
+	}
+	rejectUnloweredReturn(decl.returnType, quoted);
 	if (kind() != TokenKind::Identifier || current().text != written) {
 		throw CompileError("the declaration of " + quoted + " is not a return type and a name that mslc reads "
 			"when it is instantiated (found \"" + std::string(current().text) + "\" where its name is)");
@@ -1421,10 +1446,12 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	const LocalScope parameters(*this);
 	_parameterBlock = _blocks.size() - 1;
 	// The object is a first parameter, as in a member function.
-	const bool object = member && !declaration.staticMember;
+	const bool object = member && !declaration.staticMember && !declaration.constructorMember;
 	const size_t objectParameters = object ? 1 : 0;
-	if (object) {
+	if (object || declaration.constructorMember) {
 		declareLocal("this");
+	}
+	if (object) {
 		Parameter self;
 		self.type.namedType = declaration.memberOf;
 		self.name = "this";
@@ -1464,6 +1491,9 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function that "
 			"could write it is not lowered (mark it const)");
 	}
+	if (declaration.constructorMember && matchIdentifier("const")) {
+		throw CompileError(quoted + " is a constructor and cannot be declared const");
+	}
 	// A struct the template's own tokens name has to be declared above it; one an argument brings is not
 	// looked up here (sema sees every struct, so it cannot tell the two apart).
 	std::set<std::string> bound;
@@ -1488,12 +1518,107 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	if (at(TokenKind::Arrow)) {
 		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
 	}
-	if (!withBody || match(TokenKind::Semicolon)) {
+	if (declaration.constructorMember && decl.parameters.empty()) {
+		throw CompileError("constructor template \"" + declaration.name + "\" takes no arguments, which is not lowered yet");
+	}
+	if (!withBody || (!declaration.constructorMember && match(TokenKind::Semicolon))) {
 		return decl;
+	}
+	std::vector<std::pair<std::string, ExpressionPtr>> initialisers;
+	if (declaration.constructorMember && match(TokenKind::Colon)) {
+		do {
+			if (kind() != TokenKind::Identifier) {
+				throw CompileError("expected a member name in the initialiser list of " + quoted);
+			}
+			const std::string field(advance().text);
+			if (!_memberFields->count(field)) {
+				throw CompileError("\"" + field + "\" in the initialiser list of " + quoted + " is not a member");
+			}
+			for (const auto& done: initialisers) {
+				if (done.first == field) {
+					throw CompileError("the member \"" + field + "\" is initialised twice in " + quoted);
+				}
+			}
+			if (!match(TokenKind::LParen)) {
+				throw CompileError("only \"member(value)\" is lowered in the initialiser list of " + quoted);
+			}
+			ExpressionPtr value = parseAssignment();
+			expect(TokenKind::RParen, "to close a member initialiser");
+			initialisers.emplace_back(field, std::move(value));
+		} while (match(TokenKind::Comma));
 	}
 	decl.body = parseCompoundStatement(true);
 	if (!at(TokenKind::EndOfFile)) {
 		throw CompileError("unexpected \"" + std::string(current().text) + "\" after the body of " + quoted);
+	}
+	if (declaration.constructorMember) {
+		const auto rewriteReturn = [&](const auto& self, Statement& s) -> void {
+			if (s.kind == StatementKind::Return) {
+				if (s.expression) {
+					throw CompileError(quoted + " is a constructor and cannot return a value");
+				}
+				s.expression = std::make_unique<Expression>();
+				s.expression->kind = ExpressionKind::Identifier;
+				s.expression->line = s.line;
+				s.expression->name = "this";
+			}
+			for (StatementPtr& child: s.children) { self(self, *child); }
+			if (s.thenBranch) { self(self, *s.thenBranch); }
+			if (s.elseBranch) { self(self, *s.elseBranch); }
+			if (s.forBody) { self(self, *s.forBody); }
+			if (s.whileBody) { self(self, *s.whileBody); }
+			for (SwitchCase& sc: s.switchCases) {
+				for (StatementPtr& child: sc.body) { self(self, *child); }
+			}
+			for (StatementPtr& child: s.switchPreamble) { self(self, *child); }
+		};
+		rewriteReturn(rewriteReturn, *decl.body);
+		auto wrapper = std::make_unique<Statement>();
+		wrapper->kind = StatementKind::Compound;
+		wrapper->line = decl.line;
+		auto selfLocal = std::make_unique<Statement>();
+		selfLocal->kind = StatementKind::DeclarationStatement;
+		selfLocal->line = decl.line;
+		selfLocal->declaration = VariableDeclaration();
+		selfLocal->declaration->type = decl.returnType;
+		selfLocal->declaration->name = "this";
+		wrapper->children.push_back(std::move(selfLocal));
+		for (const std::string& fieldName: declaration.memberFieldOrder) {
+			for (auto& [name, value]: initialisers) {
+				if (name != fieldName) {
+					continue;
+				}
+				auto assign = std::make_unique<Expression>();
+				assign->kind = ExpressionKind::Assign;
+				assign->line = decl.line;
+				assign->left = std::make_unique<Expression>();
+				assign->left->kind = ExpressionKind::Member;
+				assign->left->line = decl.line;
+				assign->left->left = std::make_unique<Expression>();
+				assign->left->left->kind = ExpressionKind::Identifier;
+				assign->left->left->line = decl.line;
+				assign->left->left->name = "this";
+				assign->left->memberName = name;
+				assign->left->height = 2;
+				assign->right = std::move(value);
+				measure(*assign);
+				auto statement = std::make_unique<Statement>();
+				statement->kind = StatementKind::ExpressionStatement;
+				statement->line = decl.line;
+				statement->expression = std::move(assign);
+				wrapper->children.push_back(std::move(statement));
+			}
+		}
+		wrapper->children.push_back(std::move(decl.body));
+		auto result = std::make_unique<Statement>();
+		result->kind = StatementKind::Return;
+		result->line = decl.line;
+		result->expression = std::make_unique<Expression>();
+		result->expression->kind = ExpressionKind::Identifier;
+		result->expression->line = decl.line;
+		result->expression->name = "this";
+		wrapper->children.push_back(std::move(result));
+		decl.body = std::move(wrapper);
 	}
 	return decl;
 }
@@ -2729,7 +2854,7 @@ void Parser::parseStructBody(StructDecl& decl) {
 // "template <...> R f(...) const {...}" in a struct body. Like a member function it is read once the struct
 // is complete, but as a function template: its tokens are kept, and a call that selects it has it read with
 // its arguments bound, the object being a first parameter called this (see parseInstance).
-void Parser::parseMemberTemplate(const StructDecl& decl) {
+void Parser::parseMemberTemplate(StructDecl& decl) {
 	const std::string quoted = "\"" + decl.name + "\"";
 	if (unqualifiedName(decl.name).empty()) {
 		throw CompileError("a member function template of an unnamed struct is not lowered");
@@ -2750,7 +2875,23 @@ void Parser::parseMemberTemplate(const StructDecl& decl) {
 		throw CompileError("a member template that is not a function is not lowered (in " + quoted + ")");
 	}
 	size_t ahead = 0;
-	for (; lookahead(ahead).kind == TokenKind::Identifier; ++ahead) {
+	for (;;) {
+		if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == "__attribute__"
+			&& lookahead(ahead + 1).kind == TokenKind::LParen) {
+			++ahead;
+			for (size_t open = 0; lookahead(ahead).kind != TokenKind::EndOfFile; ++ahead) {
+				open += lookahead(ahead).kind == TokenKind::LParen;
+				open -= lookahead(ahead).kind == TokenKind::RParen;
+				if (open == 0) {
+					++ahead;
+					break;
+				}
+			}
+			continue;
+		}
+		if (lookahead(ahead).kind != TokenKind::Identifier) {
+			break;
+		}
 		const std::string_view word = lookahead(ahead).text;
 		if (word == "static") {
 			declaration.staticMember = true;
@@ -2758,19 +2899,35 @@ void Parser::parseMemberTemplate(const StructDecl& decl) {
 		if (word == "explicit" || word == "virtual" || word == "friend") {
 			throw CompileError("a member template declared " + std::string(word) + " is not lowered (in " + quoted + ")");
 		}
-		if (word != "inline" && word != "constexpr") {
+		if (word != "inline" && word != "constexpr" && word != "static") {
 			break;
 		}
+		++ahead;
 	}
 	if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == unqualifiedName(decl.name)
 		&& lookahead(ahead + 1).kind == TokenKind::LParen) {
-		throw CompileError("a constructor template is not lowered (in " + quoted + ")");
+		if (declaration.staticMember) {
+			throw CompileError("a constructor template cannot be static (in " + quoted + ")");
+		}
+		declaration.constructorMember = true;
+		decl.hasConstructors = true;
 	}
 	const std::string name = readTemplateFunction(declaration, headerStart, true);
+	if (declaration.constructorMember && !declaration.hasBody) {
+		throw CompileError("constructor template \"" + decl.name + "::" + name + "\" is declared and never defined");
+	}
 	declaration.name = decl.name + "::" + name;
 	declaration.memberOf = decl.name;
 	declaration.order = declaration.bodyOrder = _functionOrder++;
 	declaration.globalsBefore = _unit.globals.size();
+	if (declaration.constructorMember) {
+		ConstructorInfo& constructors = _constructors[decl.name];
+		constructors.helper = declaration.name;
+		constructors.hasTemplate = true;
+		_unit.functionTemplates.insert(declaration.name);
+		_pendingMemberTemplates.push_back(std::move(declaration));
+		return;
+	}
 	if (const auto earlier = _memberFunctions.find(name);
 		earlier != _memberFunctions.end() && earlier->second != declaration.staticMember) {
 		throw CompileError("\"" + declaration.name + "\" is declared both static and not static, which Apple takes and mslc does not lower");
@@ -2887,21 +3044,32 @@ void Parser::finishStructFunctions(const StructDecl& decl) {
 
 	_memberStruct = decl.name;
 	std::set<std::string> fields;
+	std::vector<std::string> fieldOrder;
 	for (const StructField& field: decl.fields) {
 		fields.insert(field.name);
+		fieldOrder.push_back(field.name);
 	}
 
 	const size_t resume = _position;
+	const size_t helpersBefore = _unit.helpers.size();
 	_memberFields = &fields;
 	for (const size_t start: starts) {
 		parseStructMember(decl, start);
 	}
 	_memberFields = nullptr;
+	const size_t structOrder = _functionOrder++;
+	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
+		if (!_instanceHelpers.count(i)) {
+			_unit.helpers[i].order = structOrder;
+		}
+	}
 	// A member template is read where the struct ends, with every member it can name in hand.
 	if (!templates.empty()) {
 		const std::shared_ptr<const void> names = captureNames();
 		for (FunctionTemplate& member: templates) {
+			member.order = member.bodyOrder = structOrder;
 			member.names = names;
+			member.memberFieldOrder = fieldOrder;
 			member.memberFields = fields;
 			member.memberFunctions = _memberFunctions;
 			member.spellings = _spellings;
@@ -3049,12 +3217,31 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		constructors->hasDefault = true;
 		return;
 	}
-	if (!constructors->helper.empty()) {
+	if (constructors->hasNonTemplate) {
 		throw CompileError("overloading the constructors of \"" + decl.name + "\" is not lowered yet");
 	}
+	constructors->hasNonTemplate = true;
 	constructors->helper = fn.name;
 	constructors->parameters = fn.parameters.size();
-	constructors->hasDefault = constructors->hasDefault || fn.parameters.empty();
+
+	const auto rewriteReturn = [&](const auto& self, Statement& s) -> void {
+		if (s.kind == StatementKind::Return) {
+			if (s.expression) {
+				throw CompileError(quoted + " is a constructor and cannot return a value");
+			}
+			s.expression = makeIdentifier("this", s.line);
+		}
+		for (StatementPtr& child: s.children) { self(self, *child); }
+		if (s.thenBranch) { self(self, *s.thenBranch); }
+		if (s.elseBranch) { self(self, *s.elseBranch); }
+		if (s.forBody) { self(self, *s.forBody); }
+		if (s.whileBody) { self(self, *s.whileBody); }
+		for (SwitchCase& sc: s.switchCases) {
+			for (StatementPtr& child: sc.body) { self(self, *child); }
+		}
+		for (StatementPtr& child: s.switchPreamble) { self(self, *child); }
+	};
+	rewriteReturn(rewriteReturn, *fn.body);
 
 	auto wrapper = std::make_unique<Statement>();
 	wrapper->kind = StatementKind::Compound;
@@ -3109,7 +3296,9 @@ ExpressionPtr Parser::constructWithConstructor(const Type& type, std::vector<Exp
 	}
 
 	const ConstructorInfo& info = found->second;
-	const bool constructs = arguments.empty() ? info.parameters == 0 && !info.helper.empty() : !info.helper.empty();
+	const bool constructs = arguments.empty()
+		? (info.parameters == 0 || info.hasTemplate) && !info.helper.empty() && !info.hasDefault
+		: !info.helper.empty();
 	if (!constructs) {
 		if (arguments.empty() && info.hasDefault) {
 			return nullptr;
@@ -8049,19 +8238,19 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 
 		// A struct's name and an argument list call its constructor.
-		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
+		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _constructors.count(braced) && lookahead(spelledTokens).kind == TokenKind::LParen) {
 			const size_t atLine = line();
 			consumeName();
 			advance();
 			Type type;
-			type.namedType = resolved;
+			type.namedType = braced;
 			std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
 			ExpressionPtr call = constructWithConstructor(type, arguments, atLine);
 			if (call) {
 				call->namesConcreteStruct = resolved.rfind("<template ", 0) != 0;
 			}
 			if (!call) {
-				throw CompileError("\"" + resolved + "\" has a constructor with nothing to do, and a value of it is not lowered");
+				throw CompileError("\"" + braced + "\" has a constructor with nothing to do, and a value of it is not lowered");
 			}
 			return call;
 		}

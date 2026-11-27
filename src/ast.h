@@ -611,6 +611,8 @@ struct FunctionTemplate {
 	std::string memberOf;
 	// A static member template has no object: it is called as S::f<...>(...) and its body reads no this.
 	bool staticMember = false;
+	bool constructorMember = false;
+	std::vector<std::string> memberFieldOrder;
 	std::set<std::string> memberFields;
 	std::map<std::string, bool> memberFunctions;
 	std::shared_ptr<const ClassTemplate> ownerTemplate;

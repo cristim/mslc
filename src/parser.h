@@ -222,6 +222,8 @@ private:
 		std::string helper;
 		size_t parameters = 0;
 		bool hasDefault = false;
+		bool hasNonTemplate = false;
+		bool hasTemplate = false;
 	};
 	std::map<std::string, ConstructorInfo> _constructors;
 
@@ -358,7 +360,7 @@ private:
 	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
 	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
 	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
-	void parseMemberTemplate(const StructDecl& decl);
+	void parseMemberTemplate(StructDecl& decl);
 	std::vector<FunctionTemplate> _pendingMemberTemplates;
 	// The names of the member function templates declared so far, so that "v.f<float>(x)" reads its arguments.
 	std::set<std::string> _memberTemplateNames;
