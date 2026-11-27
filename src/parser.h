@@ -428,7 +428,7 @@ private:
 	// The library's resource type name that a library prefix qualifies, or 0.
 	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();
-	void parseStaticAssert();
+	std::string parseStaticAssert(bool inStatement);
 
 	bool peekQualifiedName(QualifiedName& out) const;
 	bool isDiscardFragment(QualifiedName& name) const;

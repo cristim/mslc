@@ -14116,6 +14116,9 @@ namespace {
 	}
 
 	void Emitter::emitStatement(const Statement& statement) {
+		if (!statement.refusal.empty()) {
+			throw CompileError(statement.refusal);
+		}
 		switch (statement.kind) {
 			case StatementKind::Compound: {
 				const BindingScope scope(_bindings);

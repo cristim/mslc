@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <map>
+#include <typeinfo>
 #include <unordered_map>
 
 namespace mslc {
@@ -523,7 +524,7 @@ void Parser::parseDeclaration() {
 	}
 
 	if (matchIdentifier("static_assert")) {
-		parseStaticAssert();
+		parseStaticAssert(false);
 		return;
 	}
 
@@ -2203,7 +2204,11 @@ ExpressionPtr Parser::tryParseTraitValue() {
 // static_assert(condition) or static_assert(condition, "message"), the keyword consumed ([dcl.pre]): the condition is
 // an integral constant expression, checked where it is read. A function template's body is read once per instance,
 // with its arguments bound, so each instance checks its own; a false one is an error naming the message.
-void Parser::parseStaticAssert() {
+// In a statement (inStatement), two checks are left to the statement's lowering, and returned as the error that
+// lowering it is: one in a member function of a class template's instance, whose body is instantiated only where
+// the function is used ([temp.inst]) although mslc reads it with the class, and a condition the evaluator cannot
+// fold, so a function never lowered is not refused for it.
+std::string Parser::parseStaticAssert(bool inStatement) {
 	const size_t assertLine = line();
 	expect(TokenKind::LParen, "after \"static_assert\"");
 	const ExpressionPtr condition = parseConditional();
@@ -2218,16 +2223,43 @@ void Parser::parseStaticAssert() {
 			if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
 				text = text.substr(1, text.size() - 2);
 			}
-			message += text;
+			// The simple escapes are read as the characters they stand for ([lex.ccon]); any other is kept as spelled.
+			for (size_t i = 0; i < text.size(); ++i) {
+				if (text[i] != '\\' || i + 1 == text.size()) {
+					message += text[i];
+					continue;
+				}
+				const char escaped = text[++i];
+				switch (escaped) {
+					case 'n': message += '\n'; break;
+					case 't': message += '\t'; break;
+					case '"': case '\'': case '\\': case '?': message += escaped; break;
+					default: message += '\\'; message += escaped; break;
+				}
+			}
 			advance();
 		}
 	}
+	std::string failure;
+	try {
+		if (evaluateConstant(*condition, false) == 0) {
+			failure = "static assertion failed" + (message.empty() ? std::string() : ": " + message)
+				+ " (line " + std::to_string(assertLine) + ")";
+		}
+	} catch (const CompileError& error) {
+		// Only the evaluator's own refusal: a subclass carries something its catcher acts on.
+		if (!inStatement || typeid(error) != typeid(CompileError)) {
+			throw;
+		}
+		failure = error.what();
+	}
+	const bool deferred = inStatement && (!_classInProgress.empty() || failure.rfind("static assertion failed", 0) != 0);
+	if (!failure.empty() && !deferred) {
+		throw CompileError(failure);
+	}
 	expect(TokenKind::RParen, "to close \"static_assert(\"");
 	expect(TokenKind::Semicolon, "after \"static_assert(...)\"");
-	if (evaluateConstant(*condition, false) == 0) {
-		throw CompileError("static assertion failed" + (message.empty() ? std::string() : ": " + message)
-			+ " (line " + std::to_string(assertLine) + ")");
-	}
+	return failure;
 }
 
 // enable_if, enable_if_t, make_scalar and make_scalar_t, the name consumed and "<" next.
@@ -6014,7 +6046,7 @@ StatementPtr Parser::parseStatement() {
 	}
 
 	if (matchIdentifier("static_assert")) {
-		parseStaticAssert();
+		statement->refusal = parseStaticAssert(true);
 		statement->kind = StatementKind::ExpressionStatement;
 		return statement;
 	}
