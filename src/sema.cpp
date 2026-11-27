@@ -9747,9 +9747,11 @@ namespace {
 	}
 
 	// as_type<T>(x): x's bits as a T, one OpBitcast. T and x are scalars or vectors of the same size in
-	// bytes; a three-component vector, which Metal stores as four, is taken only with another
-	// three-component vector of components of the same size, where the two agree however the padding
-	// is counted.
+	// bytes, a three-component vector being the size of four (MSL specification 2.23). To a
+	// three-component vector from another vector, T's components are the first three of the bits seen
+	// as four, as the specification's float4 to float3 example has it. From a three-component vector
+	// only another three-component vector is taken, since the fourth component it is stored with has
+	// no value.
 	Id Emitter::emitAsType(const Expression& call) {
 		const Expression& callee = *call.left;
 		if (callee.templateArguments.size() != 1 || !callee.templateArguments[0].isType || call.arguments.size() != 1) {
@@ -9784,18 +9786,24 @@ namespace {
 		}
 		const uint32_t toBits = asTypeComponentBits(target.scalar);
 		const uint32_t toWidth = target.vectorWidth ? target.vectorWidth : 1;
-		if ((fromWidth == 3 || toWidth == 3) && (fromWidth != toWidth || fromBits != toBits)) {
-			throw CompileError("as_type<" + spelled + "> with a three-component vector is lowered only from "
-				"another three-component vector of components of the same size");
-		}
-		if (fromBits * fromWidth != toBits * toWidth) {
+		const auto stored = [](uint32_t width) { return width == 3 ? 4u : width; };
+		if (fromBits * stored(fromWidth) != toBits * stored(toWidth)) {
 			throw CompileError("as_type<" + spelled + "> needs an operand of the same size: it is "
-				+ std::to_string(toBits * toWidth / 8) + " bytes, and the operand is "
-				+ std::to_string(fromBits * fromWidth / 8));
+				+ std::to_string(toBits * stored(toWidth) / 8) + " bytes, and the operand is "
+				+ std::to_string(fromBits * stored(fromWidth) / 8));
+		}
+		if (fromWidth == 3 && toWidth != 3) {
+			throw CompileError("as_type<" + spelled + "> of a three-component vector is lowered only to another "
+				"three-component vector: the fourth component it is stored with has no value");
 		}
 		const Id toType = declaredTypeOf(target);
 		if (toType == valueType) {
 			return value;
+		}
+		if (toWidth == 3 && fromWidth != 3) {
+			const Id four = _types.vector(target.scalar, 4);
+			const Id bits = _builder.emitTyped(spirv::OpBitcast, four, { value });
+			return _builder.emitTyped(spirv::OpVectorShuffle, toType, { bits, bits, 0, 1, 2 });
 		}
 		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
 	}
