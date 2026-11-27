@@ -463,6 +463,9 @@ struct Statement {
 
 	// ExpressionStatement with no expression: [[fallthrough]];
 	bool isFallthrough = false;
+	// ExpressionStatement with no expression: a static_assert whose check is left to lowering, which is then
+	// this error (see Parser::parseStaticAssert). Empty for any other statement.
+	std::string refusal;
 
 	// Compound
 	std::vector<StatementPtr> children;
