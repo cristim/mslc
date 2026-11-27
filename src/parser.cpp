@@ -5642,10 +5642,10 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 				param.type.addressSpace = AddressSpace::Thread;
 			}
 		}
-		// A pointer to the caller's local array; the emitter checks the argument.
+		// A pointer to the caller's local array, thread or threadgroup; the emitter checks the argument.
 		const bool threadPointer = param.type.isPointer && !param.isReference
-			&& param.type.addressSpace == AddressSpace::Thread && param.type.resource == ResourceKind::None
-			&& !param.type.isAtomic;
+			&& (param.type.addressSpace == AddressSpace::Thread || param.type.addressSpace == AddressSpace::Threadgroup)
+			&& param.type.resource == ResourceKind::None && !param.type.isAtomic;
 		// A pointer to a buffer in device or constant memory; the emitter passes the
 		// whole buffer the argument names.
 		const bool bufferPointer = param.type.isPointer && !param.isReference
@@ -5653,10 +5653,10 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 			&& (param.type.addressSpace == AddressSpace::Device
 				|| param.type.addressSpace == AddressSpace::Constant);
 		if (param.type.isPointer && !threadPointer && !bufferPointer) {
-			throw CompileError(what + "is a pointer outside the thread, device and constant address "
-				"spaces or to an atomic or a resource, which a helper function does not take yet; it "
-				"takes scalar, vector, matrix and struct values, a thread pointer to a local array, and "
-				"a device or constant pointer to a buffer");
+			throw CompileError(what + "is a pointer outside the thread, threadgroup, device and constant "
+				"address spaces or to an atomic or a resource, which a helper function does not take yet; it "
+				"takes scalar, vector, matrix and struct values, a thread or threadgroup pointer to a local "
+				"array, and a device or constant pointer to a buffer");
 		}
 		if (param.type.arrayLength && !param.type.isStdArray) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
@@ -5671,7 +5671,8 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 			param.type.isConst = true;
 		}
 		if (param.type.addressSpace != AddressSpace::None && !constantReference && !bufferPointer
-			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)) {
+			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)
+			&& !threadPointer) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}
