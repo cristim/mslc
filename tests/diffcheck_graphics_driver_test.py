@@ -145,10 +145,10 @@ with tempfile.TemporaryDirectory() as d:
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
          "fragment float4 fs(depth2d<float> t [[texture(0)]]) { return float4(t.read(uint2(0))); }\n"),
-        ("bad_esampler.metal", "mip_filter",
+        ("bad_esampler.metal", "differs from mag_filter",
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
-         "fragment float4 fs(texture2d<float> t [[texture(0)]]) { constexpr sampler s(mip_filter::linear); return t.sample(s, float2(0.5)); }\n"),
+         "fragment float4 fs(texture2d<float> t [[texture(0)]]) { constexpr sampler s(mag_filter::linear, min_filter::nearest); return t.sample(s, float2(0.5)); }\n"),
     ]
     for fname, needle, body in cases:
         p = os.path.join(d, fname)

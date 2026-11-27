@@ -11,9 +11,9 @@ Vertex data: the field named by // DIFFCHECK-POSITION carries the geometry (w = 
 stage_in field (including scalar and vector half), [[buffer]] argument and texture is seeded
 like a kernel's buffers. One tightly packed vertex buffer per attribute; the Metal vertex
 descriptor and the Vulkan one use the same bytes. A runtime sampler is nearest, normalised,
-no mips (address mode by Metal index); an embedded sampler is built on Vulkan from mslc's
+mip-nearest (address mode by Metal index); an embedded sampler is built on Vulkan from mslc's
 reflection. Textures may be 1d, 1d_array, 2d, 2d_array, 3d, cube or cube_array RGBA (float,
-half, int, uint, short or ushort; sample or access::read).
+half, int, uint, short or ushort; sample or access::read), with optional `// DIFFCHECK-MIPS`.
 
 Both hosts get one manifest body (graphics_manifest); Apple's gets the source lines, Vulkan's
 the SPIR-V. Attachments (color0, color1, ... and depth) and, at single instance, writable
@@ -319,7 +319,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         ep, a = compiled[stage][1], apple[stage]
         if a["unsupported"]:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
-        reasons = resources.unsupported(ep, a)
+        reasons = resources.unsupported(ep, a, params.get("mips"))
         if reasons:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(reasons)))
         layouts[stage] = {l["index"]: l for l in a["buffers"]}
@@ -384,6 +384,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         before[DEPTH_INDEX] = bytearray(struct.pack("<f", DEPTH_CLEAR) * pixels)
     ulp = compare.ulp_bound_for_source(hostenv.read_text(source))
     res["buffers"] = sorted([l["name"] for l in attach.values()] + [l["name"] for s in plan["layouts"].values() for l in s.values()])
+    res["textures"] = sorted({t["name"] for s in ("vertex", "fragment") for t in plan["apple"][s]["textures"]})
+    res["unused_textures"] = []  # graphics mode has no unused-texture pass; reject DIFFCHECK-UNUSED as unknown
     res["ulp_bound"] = ulp
     profiles = [opts.gfx_profiles[c % len(opts.gfx_profiles)] for c in range(params["cases"])]
     nonzero = False
@@ -409,7 +411,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                     case_before[k] = bytearray(data)
                 buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))
             stage_textures, stage_samplers = resources.seed(
-                ep["bindings"], rng, profile, base + stage + "-", ep["embedded_samplers"], plan["apple"][stage])
+                ep["bindings"], rng, profile, base + stage + "-", ep["embedded_samplers"], plan["apple"][stage], params.get("mips"))
             textures += stage_textures
             samplers += stage_samplers
         outs = {}

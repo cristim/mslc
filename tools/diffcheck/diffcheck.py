@@ -82,9 +82,10 @@ def unused_textures(run, params, textures, texels, bindings, compared, apple_out
             continue
         scalar = rest[0] if rest else "float"
         kind = rest[1] if len(rest) > 1 else "2d"
+        nmips = rest[2] if len(rest) > 2 else 1
         key, data = resources.texture_key(index), hostenv.read_bytes(path)
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
-        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar, kind)
+        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar, kind, nmips)
         hostenv.write_bytes(alt, alt_data)
         swapped = [(i, s, b, alt if i == index else f, a, *r) for i, s, b, f, a, *r in textures]
         again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)
@@ -142,7 +143,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     if apple["unsupported"]:
         result.update(status="skipped", reason="unsupported argument: " + "; ".join(apple["unsupported"]))
         return result
-    reasons = resources.unsupported(reflection, apple)
+    reasons = resources.unsupported(reflection, apple, params.get("mips"))
     if reasons:
         result.update(status="skipped", reason="unsupported argument: " + "; ".join(reasons))
         return result
@@ -196,7 +197,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
                                   params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
-        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"], apple)
+        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"], apple, params.get("mips"))
         data.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p))
                      for i, _, _, p, *_ in textures if resources.texture_key(i) in wlayouts})
         for i, l in sorted(layouts.items()):
@@ -246,20 +247,22 @@ def unknown_directives(opts, d, results):
     known = set().union(*(r.get("buffers", []) for r in results))
     ranged = set().union(*(r.get("range_buffers", r.get("buffers", [])) for r in results))
     textures = set().union(*(r.get("textures", []) for r in results))
+    unused_tex = set().union(*(r.get("unused_textures", r.get("textures", [])) for r in results))
     texel_buffers = set().union(*(r.get("texel_buffers", []) for r in results))
     errors = []
     if known:
         named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], ranged),
-                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], ranged), "DIFFCHECK-UNUSED": (d["unused"], textures),
-                 "DIFFCHECK-ULP": (d["ulp"], known), "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
+                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], ranged), "DIFFCHECK-UNUSED": (d["unused"], unused_tex),
+                 "DIFFCHECK-MIPS": (d["mips"], textures), "DIFFCHECK-ULP": (d["ulp"], known),
+                 "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
         if not opts.corpus:
             named["--range"] = (opts.ranges, ranged)
         for directive, (table, names) in named.items():
             unknown = sorted(set(table) - names)
             if unknown:
+                kind = "texture" if (names is textures or names is unused_tex) else "texture_buffer" if names is texel_buffers else "buffer"
                 errors.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
-                               "a %s (%s: %s)" % (directive, ", ".join(unknown), "texture" if names is textures else "texture_buffer" if names is texel_buffers else "buffer",
-                                                  "textures" if names is textures else "texture_buffers" if names is texel_buffers else "buffers", ", ".join(sorted(names)) or "none")})
+                               "a %s (%ss: %s)" % (directive, ", ".join(unknown), kind, kind, ", ".join(sorted(names)) or "none")})
     return errors
 
 
@@ -272,7 +275,7 @@ def check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_positi
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
               "geometry": d["geometry"], "indexes": d["indexes"], "position": d["position"], "depth": d["depth"],
-              "float_range": d["float_range"], "ulp": d["ulp"], "infer_position": infer_position}
+              "float_range": d["float_range"], "ulp": d["ulp"], "mips": d["mips"], "infer_position": infer_position}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
     return [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
@@ -334,7 +337,7 @@ def check_file(opts, path, std=None, run=None):
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
                 "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
                 "float_range": d["float_range"],
-                "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"],
+                "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"], "mips": d["mips"],
             }
             sub = os.path.join(work, "compute-%d" % i)
             os.makedirs(sub)

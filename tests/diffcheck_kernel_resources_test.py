@@ -188,12 +188,12 @@ class Resources(unittest.TestCase):
         plain0 = {"s_address": "Repeat", "t_address": "Repeat", "r_address": "Repeat", "mag_filter": "Nearest", "min_filter": "Nearest",
                   "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1,
                   "lod_min": 0, "lod_max": 65504}
-        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Bogus"}], "embedded_samplers": [dict(plain0, mip_filter="Linear")]}
+        entry = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": "Bogus"}], "embedded_samplers": [dict(plain0, mip_filter="Bogus")]}
         apple_side = {"textures": [{"name": "t", "type": "other", "data": "int", "access": "write"},
                                    {"name": "d", "type": "depth", "data": "float", "access": "read"},
                                    {"name": "u", "type": "3d", "data": "other", "access": "read"}]}
         text = "; ".join(resources.unsupported(entry, apple_side))
-        for needle in ("access Bogus", "unsupported type other", "unsupported type depth", "texture u has element type other", "embedded sampler mip_filter is Linear"):
+        for needle in ("access Bogus", "unsupported type other", "unsupported type depth", "texture u has element type other", "embedded sampler mip_filter is Bogus"):
             self.assertIn(needle, text)
         plain = {"s_address": "Repeat", "t_address": "ClampToEdge", "r_address": "MirrorRepeat", "mag_filter": "Linear",
                  "min_filter": "Linear", "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never", "anisotropy": 1,
@@ -223,6 +223,47 @@ class Resources(unittest.TestCase):
                 for dt in resources.TEXEL_TYPES:
                     ok = {"bindings": [{"kind": "Texture", "name": "t", "texture_access": ma}], "embedded_samplers": []}
                     self.assertEqual(resources.unsupported(ok, {"textures": [{"name": "t", "type": kind, "data": dt, "access": aa}]}), [])
+
+    def test_mipmaps_and_mip_filtered_embedded_samplers(self):
+        self.assertEqual(resources.texture_texels("2d", 3), 16 + 4 + 1)
+        self.assertEqual(resources.texture_texels("3d", 3), 32 + 4 + 1)
+        self.assertEqual(resources.texture_texels("cube", 3), (16 + 4 + 1) * 6)
+        self.assertEqual(resources.texture_texels("cube_array", 3), (16 + 4 + 1) * 12)
+        with tempfile.TemporaryDirectory() as d:
+            b = [{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "name": "m2", "texture_access": "Sample"},
+                 {"kind": "Texture", "metal_index": 1, "descriptor": {"set": 0, "binding": 1}, "name": "m3", "texture_access": "Read"}]
+            apple = {"textures": [{"index": 0, "type": "2d", "data": "float", "access": "read"},
+                                  {"index": 1, "type": "3d", "data": "half", "access": "read"}]}
+            texs, _ = resources.seed(b, random.Random(2), "moderate", os.path.join(d, "m-"), apple=apple, mips={"m2": 3, "m3": 2})
+            self.assertEqual(texs[0][4:], ("Sample", "float", "2d", 3))
+            self.assertEqual(texs[1][4:], ("Read", "half", "3d", 2))
+            with open(texs[0][3], "rb") as f2, open(texs[1][3], "rb") as f3:
+                self.assertEqual(len(f2.read()), 21 * 16)
+                self.assertEqual(len(f3.read()), (32 + 4) * 8)
+            self.assertEqual(resources.lines(texs, []), [
+                f"image 2d sample 0 0 0 4 4 1 1 float {texs[0][3]} mips=3",
+                f"image 3d read 1 0 1 4 4 2 1 half {texs[1][3]} mips=2",
+            ])
+        for mf, want_tok in (("Nearest", "1"), ("Linear", "2")):
+            emb = {"s_address": "Repeat", "t_address": "ClampToEdge", "r_address": "MirrorRepeat", "mag_filter": "Nearest",
+                   "min_filter": "Nearest", "mip_filter": mf, "normalized_coordinates": True, "compare_function": "Never",
+                   "anisotropy": 1, "lod_min": 0, "lod_max": 65504}
+            eb = [{"kind": "Sampler", "embedded_sampler": 0, "name": "s", "descriptor": {"set": 0, "binding": 2}}]
+            self.assertEqual(resources.unsupported({"bindings": eb, "embedded_samplers": [emb]}, {"textures": []}), [])
+            _, smps = resources.seed(eb, random.Random(1), "moderate", "x-", [emb])
+            self.assertEqual(resources.lines([], smps), [f"esampler 0 2 0 2 1 0 {want_tok}"])
+            self.assertEqual(resources.lines([], smps, "apple"), [])
+        bad_text = "; ".join(resources.unsupported(
+            {"bindings": [{"kind": "Texture", "name": "t1", "texture_access": "Sample"},
+                          {"kind": "Texture", "name": "tw", "texture_access": "Write"}], "embedded_samplers": []},
+            {"textures": [{"name": "t1", "type": "1d", "data": "float", "access": "read"},
+                          {"name": "t1a", "type": "1d_array", "data": "float", "access": "read"},
+                          {"name": "tw", "type": "2d", "data": "float", "access": "write"},
+                          {"name": "tb", "type": "texturebuffer", "data": "float", "access": "read"}]},
+            mips={"t1": 3, "t1a": 2, "tw": 3, "tb": 2}))
+        for needle in ("texture t1 is 1d, which has no mip levels", "texture t1a is 1d_array, which has no mip levels",
+                       "texture tw is writable and has DIFFCHECK-MIPS", "texture_buffer tb has no mip levels"):
+            self.assertIn(needle, bad_text)
 
     def test_cross_check(self):
         mine = [{"kind": "Texture", "metal_index": 0, "name": "t", "texture_access": "Write"},

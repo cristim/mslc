@@ -122,7 +122,15 @@ class Directives(unittest.TestCase):
                              "// DIFFCHECK-EXCLUDE: scratch reads uninitialised memory\nkernel void k() {}\n")
         self.assertEqual(d, {"run": {"grid": 64, "seed": 2}, "writes_zero": True,
                              "exclude": {"scratch": "reads uninitialised memory"},
-                             "range": {"which": (0, 3)}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "indexes": None, "position": None, "depth": False})
+                             "range": {"which": (0, 3)}, "float_range": {}, "ulp": {}, "texel": {}, "mips": {}, "unused": {}, "geometry": None, "indexes": None, "position": None, "depth": False})
+
+    def test_mips(self):
+        self.assertEqual(directives.parse("// DIFFCHECK-MIPS: a 2\n// DIFFCHECK-MIPS: b 3\n")["mips"], {"a": 2, "b": 3})
+        for bad in ("// DIFFCHECK-MIPS: a\n", "// DIFFCHECK-MIPS: a 1\n", "// DIFFCHECK-MIPS: a 4\n",
+                    "// DIFFCHECK-MIPS: a -1\n", "// DIFFCHECK-MIPS: a ²\n", "// DIFFCHECK-MIPS: 2 3\n",
+                    "// DIFFCHECK-MIPS: a 2 3\n"):
+            with self.assertRaises(ValueError, msg=bad):
+                directives.parse(bad)
 
     def test_float_range(self):
         self.assertEqual(directives.parse("// DIFFCHECK-FLOAT-RANGE: in 0 1\n")["float_range"], {"in": (0, 1)})

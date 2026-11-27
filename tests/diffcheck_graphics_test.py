@@ -351,10 +351,17 @@ class Resources(unittest.TestCase):
         self.assertIn("unsupported type depth", early["reason"])
 
         refl_bad_emb = self._refl(f_bindings=[{"kind": "Sampler", "descriptor": {"set": 1, "binding": 0}, "embedded_sampler": 0, "name": "s"}],
-                                  f_emb=[dict(self.EMBEDDED, mip_filter="Linear")])
+                                  f_emb=[dict(self.EMBEDDED, mip_filter="Bogus")])
         _, early = self._run_prepare(refl_bad_emb, self._apple())
         self.assertEqual(early["status"], "skipped")
-        self.assertIn("mip_filter is Linear", early["reason"])
+        self.assertIn("mip_filter is Bogus", early["reason"])
+
+        refl_1d_mip = self._refl(v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0},
+                                              "texture_access": "Sample", "name": "t1"}])
+        apple_1d = self._apple(v_tex=[{"index": 0, "name": "t1", "type": "1d", "data": "float", "access": "read"}])
+        _, early = self._run_prepare(refl_1d_mip, apple_1d, dict(self.PARAMS, mips={"t1": 3}))
+        self.assertEqual(early["status"], "skipped")
+        self.assertIn("which has no mip levels", early["reason"])
 
     def test_prepare_checks_stage_descriptor_set_and_unsupported_before_cross_check(self):
         refl_set = self._refl(v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0},
@@ -381,7 +388,7 @@ class Resources(unittest.TestCase):
             v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "texture_access": "Read", "name": "vt"}],
             f_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "texture_access": "Sample", "name": "ft"},
                         {"kind": "Sampler", "descriptor": {"set": 1, "binding": 1}, "embedded_sampler": 0, "name": "es"}],
-            f_emb=[self.EMBEDDED],
+            f_emb=[dict(self.EMBEDDED, mip_filter="Linear")],
         )
         apple = self._apple(
             v_tex=[{"index": 0, "name": "vt", "type": "2d", "data": "ushort", "access": "read"}],
@@ -411,15 +418,25 @@ class Resources(unittest.TestCase):
                  mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple), \
                  mock.patch.object(hosts, "run_metal", side_effect=run_host), \
                  mock.patch.object(hosts, "run_vulkan", side_effect=run_host):
-                res = graphics.check_pair(self.OPTS, src, "vs", "fs", self.PARAMS, d, [])
+                res = graphics.check_pair(self.OPTS, src, "vs", "fs", dict(self.PARAMS, mips={"ft": 3}), d, [])
             self.assertEqual(res["status"], "skipped")
+            self.assertEqual(res["textures"], ["ft", "vt"])
+            self.assertEqual(res["unused_textures"], [])
+            opts = type("O", (), {"corpus": False, "ranges": {}})()
+            d = {"exclude": {}, "range": {}, "float_range": {}, "unused": {"ft": "nope"}, "mips": {"ft": 3}, "ulp": {}, "texel": {}}
+            import diffcheck
+            self.assertEqual(len(diffcheck.unknown_directives(opts, d, [res])), 1)
+            self.assertIn("DIFFCHECK-UNUSED names ft, which is not a texture", diffcheck.unknown_directives(opts, d, [res])[0]["reason"])
+            d_tb = dict(d, unused={}, texel={"tb": 2})
+            self.assertIn("DIFFCHECK-TEXEL names tb, which is not a texture_buffer", diffcheck.unknown_directives(opts, d_tb, [res])[0]["reason"])
             self.assertIn("no storage feature", res["reason"])
             self.assertIn("texture 0 0 0 4 4 ", seen["metalhost"])
             self.assertIn("ushort", seen["metalhost"])
             self.assertNotIn("esampler ", seen["metalhost"])
-            self.assertIn("texture 0 1 0 4 4 ", seen["vkhost"])
-            self.assertIn("half", seen["vkhost"])
-            self.assertIn("esampler 1 1 0 3 1 1", seen["vkhost"])
+            self.assertIn("image 2d sample 0 1 0 4 4 1 1 half ", seen["vkhost"])
+            self.assertIn("mips=3", seen["vkhost"])
+            self.assertIn("mips=3", seen["metalhost"])
+            self.assertIn("esampler 1 1 0 3 1 1 2", seen["vkhost"])
 
     def test_prepare_upgrades_half_vertex_attributes_and_guards_position(self):
         refl = self._refl(v_bindings=[{"kind": "VertexInput", "location": 0, "name": "pos"},

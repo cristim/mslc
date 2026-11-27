@@ -12,6 +12,7 @@
                                                      name in graphics. Tightens a buffer a loose neighbour would hide.
   // DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>       components per texel of that texture_buffer (R, RG or RGBA;
                                                      4 when absent), so the one- and two-component formats are run
+  // DIFFCHECK-MIPS: <texture> <2|3>                 seed 2 or 3 mip levels for that read-only texture
   // DIFFCHECK-UNUSED: <texture> <reason>            the kernel legitimately ignores this texture (otherwise a
                                                      texture the output does not depend on is a failure)
   // DIFFCHECK-EXCLUDE: <buffer> <reason>            skip a buffer's comparison; the reason
@@ -62,7 +63,7 @@ def parse_run_pairs(pairs):
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "indexes": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "mips": {}, "unused": {}, "geometry": None, "indexes": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -125,6 +126,12 @@ def parse(source):
             if not m:
                 raise ValueError("bad DIFFCHECK-TEXEL line %r (want <texture_buffer> 1, 2 or 4)" % line.strip())
             result["texel"][m.group(1)] = int(m.group(2))
+            continue
+        if re.match(r"\s*//\s*DIFFCHECK-MIPS:", line):
+            m = re.match(r"\s*//\s*DIFFCHECK-MIPS:\s*(\S+)\s+([0-9]+)\s*$", line)
+            if not m or not re.fullmatch(r"[A-Za-z_]\w*", m.group(1)) or int(m.group(2)) not in (2, 3):
+                raise ValueError("bad DIFFCHECK-MIPS line %r (want <texture> <2|3>)" % line.strip())
+            result["mips"][m.group(1)] = int(m.group(2))
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-UNUSED:\s*(\S+)\s*(.*)$", line)
         if m:
