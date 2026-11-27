@@ -7052,8 +7052,10 @@ namespace {
 				// other pointer.
 				if (argument.pointerLike && argument.expression->kind == ExpressionKind::Identifier
 					&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
-					&& argument.binding->bufferPointeeType != InvalidId && !argument.expression->fileScope
-					&& (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+					&& argument.binding->bufferPointeeType != InvalidId && !argument.expression->fileScope) {
+					if (type.addressSpace != AddressSpace::Device && type.addressSpace != AddressSpace::Constant) {
+						return none;
+					}
 					const Binding& buffer = *argument.binding;
 					const Type& given = buffer.pointeeMsl;
 					const bool canWrite = type.addressSpace == AddressSpace::Device && !type.isConst;
@@ -7067,6 +7069,10 @@ namespace {
 					throw CompileError("a pointer argument other than a local array or a whole buffer (&x, a + n, "
 						"or a pointer) chooses among overloads, which is not lowered yet");
 				}
+				return none;
+			}
+			// A local array is in the thread address space and reaches no device or constant pointer.
+			if (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant) {
 				return none;
 			}
 			return !pointerFit(*argument.binding, type).matches || (argument.binding->readOnly && !type.isConst)
