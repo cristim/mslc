@@ -1,12 +1,12 @@
 // EXPECT: valid
 // RUN: grid=16 local=8 cases=3 elems=256
-// DISASM: OpConvertUToF %v4float
-// DISASM: OpConvertSToF %v4float
+// DISASM-MATCH: OpExtInst %v4int %[0-9]+ FindUMsb
+// DISASM-MATCH: OpExtInst %v4int %[0-9]+ SAbs
 // DISASM: OpShiftRightArithmetic %v4int
 // DISASM-MATCH: OpExtInst %v4float %[0-9]+ Pow
 // DISASM: OpFConvert %v4half
 // The 4x8 unpack functions of <metal_pack> (MSL specification 6.15.1): the first component in the lowest
-// byte, unorm as c / 255, snorm as max(-1, c / 127), and srgb converting the colour, not the alpha, to linear.
+// byte, unorm as c / 255, snorm as max(-1, c / 127), each correctly rounded, and srgb converting the colour, not the alpha, to linear.
 #include <metal_stdlib>
 #include <metal_pack>
 using namespace metal;

@@ -2211,7 +2211,7 @@ namespace {
 				declared(parameter.type);
 			}
 
-			if (findMathBuiltin(helper.name)) {
+			if (findMathBuiltin(helper.name) || findPackBuiltin(helper.name)) {
 				throw CompileError("helper function \"" + helper.name + "\" has the name of a builtin "
 					"function; Apple's compiler reports a call that matches both as ambiguous, "
 					"which mslc does not model");
@@ -2944,6 +2944,7 @@ namespace {
 		Id packFloatConstant(Id type, float value);
 		Id packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words);
 		Id glslInstruction(uint32_t instruction, Id type, const std::vector<Id>& operands);
+		Id normalizedQuotient(Id magnitudes, uint32_t period, uint32_t count);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
@@ -6382,7 +6383,7 @@ namespace {
 				if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
 					// The library's own overloads compete with it, which mslc does not model here.
 					// (A struct argument matches no library overload, so there is nothing to compete with.)
-					if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last))) {
+					if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last) || findPackBuiltin(last))) {
 						throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
 							"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
 							"does not model");
@@ -8108,7 +8109,8 @@ namespace {
 				// function beside it or argument-dependent lookup would need the arguments' types.
 				if (expression.left->kind != ExpressionKind::Identifier || expression.left->hasTemplateArguments
 					|| _bindings.count(expression.left->name) > 0
-					|| (expression.left->besideStdlib && findMathBuiltin(expression.left->name))) {
+					|| (expression.left->besideStdlib && (findMathBuiltin(expression.left->name)
+						|| findPackBuiltin(expression.left->name)))) {
 					return std::nullopt;
 				}
 				std::set<std::string> adl;
@@ -8672,14 +8674,58 @@ namespace {
 		return _builder.emitTyped(spirv::OpExtInst, type, words);
 	}
 
+	// a / (2^period - 1), correctly rounded, for each of count fields of a magnitude 0 <= a <= 2^period - 1.
+	// The quotient's binary expansion is a's period bits repeated without end, so its float is made from
+	// the bits rather than by a division, which Vulkan lets be 2.5 ULP out: L, the zeros ahead of a's top
+	// bit, puts the leading 1 at 2^-(L + 1), after which come a's bits rotated left by L, repeated. The
+	// first 32 of them give the 24 bits of the significand and the bit below, which rounds it up when set;
+	// the bits further on are never all 0, so there is no tie. 0 and 1 are their own values.
+	Id Emitter::normalizedQuotient(Id magnitudes, uint32_t period, uint32_t count) {
+		constexpr uint32_t kFindUMsb = 75;
+		const Id uintVector = _types.vector(ScalarKind::UInt, count);
+		const Id floatVector = _types.vector(ScalarKind::Float, count);
+		const Id boolVector = _types.vector(ScalarKind::Bool, count);
+		const auto splat = [&](uint32_t word) {
+			return packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(count, word));
+		};
+		const auto op = [&](spirv::Opcode opcode, Id a, Id b) { return _builder.emitTyped(opcode, uintVector, { a, b }); };
+		const uint32_t top = (1u << period) - 1;
+		const Id a = magnitudes;
+		// FindUMsb of 0 is -1: L is then period, whose shifts below stay in range; the lane is replaced.
+		const Id msb = _builder.emitTyped(spirv::OpBitcast, uintVector,
+			{ glslInstruction(kFindUMsb, _types.vector(ScalarKind::Int, count), { a }) });
+		const Id leading = op(spirv::OpISub, splat(period - 1), msb);
+		const Id rotated = op(spirv::OpBitwiseAnd, op(spirv::OpBitwiseOr, op(spirv::OpShiftLeftLogical, a, leading),
+			op(spirv::OpShiftRightLogical, a, op(spirv::OpISub, splat(period), leading))), splat(top));
+		Id window = InvalidId;
+		for (uint32_t k = 1;; ++k) {
+			const int shift = 32 - int(k * period);
+			const Id part = shift >= 0 ? op(spirv::OpShiftLeftLogical, rotated, splat(uint32_t(shift)))
+				: op(spirv::OpShiftRightLogical, rotated, splat(uint32_t(-shift)));
+			window = window == InvalidId ? part : op(spirv::OpBitwiseOr, window, part);
+			if (shift <= 0) {
+				break;
+			}
+		}
+		const Id significand = op(spirv::OpIAdd, op(spirv::OpShiftRightLogical, window, splat(8)),
+			op(spirv::OpBitwiseAnd, op(spirv::OpShiftRightLogical, window, splat(7)), splat(1)));
+		// The exponent field of 2^-(L + 1) is 126 - L; a significand that rounded up to 2^24 carries into it.
+		const Id bits = op(spirv::OpISub, op(spirv::OpIAdd, op(spirv::OpShiftLeftLogical,
+			op(spirv::OpISub, splat(126), leading), splat(23)), significand), splat(0x800000));
+		const Id quotient = _builder.emitTyped(spirv::OpBitcast, floatVector, { bits });
+		const Id isZero = _builder.emitTyped(spirv::OpIEqual, boolVector, { a, splat(0) });
+		const Id isOne = _builder.emitTyped(spirv::OpUGreaterThanEqual, boolVector, { a, splat(top) });
+		return _builder.emitTyped(spirv::OpSelect, floatVector, { isZero, packFloatConstant(floatVector, 0.0f),
+			_builder.emitTyped(spirv::OpSelect, floatVector, { isOne, packFloatConstant(floatVector, 1.0f), quotient }) });
+	}
+
 	// The <metal_pack> functions, written out as the conversions the MSL specification gives in 8.7.1
 	// (normalized integers) and 8.7.7 (sRGB), rather than with GLSL.std.450's Pack and Unpack
 	// instructions, whose rounding and precision Vulkan leaves to the implementation. Component i is
 	// held in bits [i * bits, (i + 1) * bits) of the uint, the first component in the lowest bits.
 	// The work is done in float; a half result is converted from it, a half argument converted to it.
-	// c / max is computed as c * (1 / max), which Vulkan rounds correctly where it allows OpFDiv 2.5 ULP:
-	// for every 8- and 16-bit field it is within 1 ULP of the quotient and exact at 0, -1 and 1, inside
-	// the 1.5 ULP and the exact corner cases of the specification's Table 8.6.
+	// c / max is the correctly rounded quotient (see normalizedQuotient), as 8.7.1.2 says Metal 2's
+	// conversions round, and so exact at 0, -1 and 1 as Table 8.6 asks.
 	Id Emitter::emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments) {
 		const std::string name = builtin.name;
 		if (arguments.size() != 1) {
@@ -8687,8 +8733,8 @@ namespace {
 		}
 		constexpr uint32_t kRoundEven = 2;
 		constexpr uint32_t kPow = 26;
-		constexpr uint32_t kNMax = 80;
 		constexpr uint32_t kNClamp = 81;
+		constexpr uint32_t kUMin = 38;
 		const uint32_t n = builtin.count;
 		const Id uintType = _types.scalar(ScalarKind::UInt);
 		const Id uintVector = _types.vector(ScalarKind::UInt, n);
@@ -8712,10 +8758,10 @@ namespace {
 		};
 
 		if (!builtin.pack) {
+			// The argument is a uint, any other scalar converted to one as a call converts it (MSL 2.24).
 			const Id value = emitExpression(*arguments[0]);
 			const Id valueType = _builder.typeOf(value);
-			const auto scalar = _types.scalarKindOf(valueType);
-			if (!scalar || (*scalar != ScalarKind::UInt && *scalar != ScalarKind::Int)) {
+			if (!_types.scalarKindOf(valueType) || _types.bitWidth(valueType) == 0) {
 				throw CompileError(name + " takes a uint");
 			}
 			const Id word = convert(value, valueType, uintType);
@@ -8732,18 +8778,22 @@ namespace {
 				const Id signedFields = _builder.emitTyped(spirv::OpShiftRightArithmetic, intVector,
 					{ _builder.emitTyped(spirv::OpBitcast, intVector, { raised }),
 						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, 32 - builtin.bits)) });
-				const Id asFloat = _builder.emitTyped(spirv::OpConvertSToF, floatVector, { signedFields });
-				const Id scaled = _builder.emitTyped(spirv::OpFMul, floatVector,
-					{ asFloat, packFloatConstant(floatVector, 1.0f / float(snormMax)) });
-				result = glslInstruction(kNMax, floatVector, { packFloatConstant(floatVector, -1.0f), scaled });
+				// max(-1, c / max): the magnitude, at most max, over max, with the field's sign.
+				constexpr uint32_t kSAbs = 5;
+				const Id magnitudes = glslInstruction(kUMin, uintVector,
+					{ _builder.emitTyped(spirv::OpBitcast, uintVector, { glslInstruction(kSAbs, intVector, { signedFields }) }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, snormMax)) });
+				const Id quotient = normalizedQuotient(magnitudes, builtin.bits - 1, n);
+				const Id negative = _builder.emitTyped(spirv::OpSLessThan, boolVector,
+					{ signedFields, packConstantVector(ScalarKind::Int, std::vector<uint32_t>(n, 0)) });
+				result = _builder.emitTyped(spirv::OpSelect, floatVector,
+					{ negative, _builder.emitTyped(spirv::OpFNegate, floatVector, { quotient }), quotient });
 			} else {
 				// c / max for each field.
 				const Id fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
 					{ _builder.emitTyped(spirv::OpShiftRightLogical, uintVector, { words, shifts }),
 						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
-				const Id asFloat = _builder.emitTyped(spirv::OpConvertUToF, floatVector, { fields });
-				result = _builder.emitTyped(spirv::OpFMul, floatVector,
-					{ asFloat, packFloatConstant(floatVector, 1.0f / float(unormMax)) });
+				result = normalizedQuotient(fields, builtin.bits, n);
 				if (builtin.encoding == PackEncoding::Srgb) {
 					// c <= 0.04045 ? c / 12.92 : powr((c + 0.055) / 1.055, 2.4)
 					const Id low = _builder.emitTyped(spirv::OpFDiv, floatVector,
@@ -8761,39 +8811,45 @@ namespace {
 			return builtin.floatKind == ScalarKind::Float ? result : convert(result, floatVector, floatTypeOut);
 		}
 
-		const Id value = emitExpression(*arguments[0]);
-		const Id valueType = _builder.typeOf(value);
+		// A scalar fills the vector, converted as a call converts it; a vector has to be of the type (MSL 2.24).
+		Id value = emitExpression(*arguments[0]);
+		Id valueType = _builder.typeOf(value);
+		if (_types.scalarKindOf(valueType) && _types.bitWidth(valueType) != 0) {
+			value = broadcast(convert(value, valueType, _types.scalar(builtin.floatKind)), floatTypeOut);
+			valueType = floatTypeOut;
+		}
 		if (valueType != floatTypeOut) {
 			throw CompileError(name + " takes a " + vectorName);
 		}
 		const Id floats = builtin.floatKind == ScalarKind::Float ? value : convert(value, valueType, floatVector);
 		const Id zero = packFloatConstant(floatVector, 0.0f);
+		// A NaN converts to 0 (8.7.1.2 and 8.7.7), by a select rather than by NClamp's handling of it.
+		const Id isNan = _builder.emitTyped(spirv::OpIsNan, boolVector, { floats });
+		const Id cleaned = _builder.emitTyped(spirv::OpSelect, floatVector, { isNan, zero, floats });
 		Id fields;
 		if (builtin.encoding == PackEncoding::Snorm) {
-			// min(max(f * max, -max), max), rounded to nearest even; a NaN gives 0.
+			// min(max(f * max, -max), max), rounded to nearest even.
 			const Id limit = packFloatConstant(floatVector, float(snormMax));
 			const Id clamped = glslInstruction(kNClamp, floatVector,
-				{ _builder.emitTyped(spirv::OpFMul, floatVector, { floats, limit }),
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { cleaned, limit }),
 					packFloatConstant(floatVector, -float(snormMax)), limit });
-			const Id isNan = _builder.emitTyped(spirv::OpIsNan, boolVector, { floats });
-			const Id rounded = glslInstruction(kRoundEven, floatVector,
-				{ _builder.emitTyped(spirv::OpSelect, floatVector, { isNan, zero, clamped }) });
+			const Id rounded = glslInstruction(kRoundEven, floatVector, { clamped });
 			fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
 				{ _builder.emitTyped(spirv::OpBitcast, uintVector,
 						{ _builder.emitTyped(spirv::OpConvertFToS, intVector, { rounded }) }),
 					packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
 		} else {
-			// min(max(f * max, 0), max), rounded to nearest even; NClamp takes a NaN to the lower bound, 0.
+			// min(max(f * max, 0), max), rounded to nearest even.
 			const Id limit = packFloatConstant(floatVector, float(unormMax));
 			const Id clamped = glslInstruction(kNClamp, floatVector,
-				{ _builder.emitTyped(spirv::OpFMul, floatVector, { floats, limit }), zero, limit });
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { cleaned, limit }), zero, limit });
 			fields = _builder.emitTyped(spirv::OpConvertFToU, uintVector,
 				{ glslInstruction(kRoundEven, floatVector, { clamped }) });
 			if (builtin.encoding == PackEncoding::Srgb) {
 				// The colour: c clamped to [0, 1] (a NaN to 0), then c < 0.0031308 ? 12.92 * c :
 				// 1.055 * powr(c, 1 / 2.4) - 0.055, scaled to 255, plus 0.5, its fraction dropped.
 				const Id one = packFloatConstant(floatVector, 1.0f);
-				const Id c = glslInstruction(kNClamp, floatVector, { floats, zero, one });
+				const Id c = glslInstruction(kNClamp, floatVector, { cleaned, zero, one });
 				const Id low = _builder.emitTyped(spirv::OpFMul, floatVector, { c, packFloatConstant(floatVector, 12.92f) });
 				const Id curve = glslInstruction(kPow, floatVector, { c, packFloatConstant(floatVector, 1.0f / 2.4f) });
 				const Id high = _builder.emitTyped(spirv::OpFSub, floatVector,

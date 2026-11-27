@@ -1,7 +1,7 @@
 // EXPECT: valid
 // RUN: grid=16 local=8 cases=3 elems=256
-// DISASM: OpConvertUToF %v2float
-// DISASM: OpConvertSToF %v2float
+// DISASM-MATCH: OpExtInst %v2int %[0-9]+ FindUMsb
+// DISASM-MATCH: OpExtInst %v2int %[0-9]+ SAbs
 // DISASM: OpFConvert %v2half
 // The 2x16 unpack functions of <metal_pack>: the first component in the low 16 bits.
 #include <metal_stdlib>
