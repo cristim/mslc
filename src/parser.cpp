@@ -1655,11 +1655,12 @@ TemplateArgument Parser::parseTemplateArgument() {
 
 namespace {
 
-// The <type_traits> transformations read as a type: make_scalar, make_signed and make_unsigned,
+// The <type_traits> transformations read as a type: make_scalar, make_signed, make_unsigned and conditional,
 // with or without the _t.
 bool isTransformationTrait(const std::string& library) {
 	return library == "make_scalar" || library == "make_scalar_t" || library == "make_signed"
-		|| library == "make_signed_t" || library == "make_unsigned" || library == "make_unsigned_t";
+		|| library == "make_signed_t" || library == "make_unsigned" || library == "make_unsigned_t"
+		|| library == "conditional" || library == "conditional_t";
 }
 
 // A trait's argument is a deduction marker: its value is not known until the type is.
@@ -2434,7 +2435,8 @@ static void changeSignedness(bool toSigned, const Type& operand, Type& result) {
 	}
 }
 
-// enable_if, make_scalar, make_signed and make_unsigned, or the _t alias of one, the name consumed and "<" next.
+// enable_if, make_scalar, make_signed, make_unsigned and conditional, or the _t alias of one, the name consumed and
+// "<" next. conditional<B, T, F> is T where the constant B holds and F where it does not ([meta.trans.other]).
 void Parser::parseTraitType(const std::string& name, Type& type) {
 	const bool alias = name.size() > 2 && name.compare(name.size() - 2, 2, "_t") == 0;
 	const bool enableIf = name.rfind("enable_if", 0) == 0;
@@ -2459,6 +2461,38 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 		if (!holds) {
 			throw SubstitutionFailure("enable_if is not satisfied");
 		}
+	} else if (name.rfind("conditional", 0) == 0) {
+		bool holds = false;
+		bool waits = false;
+		{
+			const RestoreFlag noGreater(_noGreater, true);
+			const RestoreFlag dependent(_dependentCondition, false);
+			const ExpressionPtr condition = parseConditional();
+			waits = _dependentCondition;
+			if (waits && !_inEnableIf) {
+				throw DependentTrait("conditional depends on a type that is not deduced yet");
+			}
+			// A condition read before T is deduced, inside an enable_if, holds for now: the instance's signature
+			// is read again with the type, and that read decides.
+			holds = waits || (condition->kind == ExpressionKind::BoolLiteral ? condition->boolValue
+				: evaluateConstant(*condition, false) != 0);
+		}
+		if (waits) {
+			_dependentCondition = true;
+		}
+		expect(TokenKind::Comma, ("after the condition of \"" + name + "<\"").c_str());
+		const Type chosen = parseType();
+		expect(TokenKind::Comma, ("between the types of \"" + name + "<\"").c_str());
+		const Type other = parseType();
+		closeAngle(("to close \"" + name + "<\"").c_str());
+		for (const Type* operand: { &chosen, &other }) {
+			if (operand->isPointer || operand->arrayLength || operand->resource != ResourceKind::None
+				|| operand->isAtomic || operand->addressSpace != AddressSpace::None) {
+				throw CompileError(name + " of a pointer, array, texture, sampler, atomic or address-space-qualified "
+					"type is not lowered");
+			}
+		}
+		result = holds ? chosen : other;
 	} else {
 		const Type operand = parseType();
 		closeAngle(("to close \"" + name + "<\"").c_str());
