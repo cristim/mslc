@@ -57,6 +57,7 @@ bool tagBesideObject(std::string_view a, std::string_view b);
 bool tagBesideNonTag(std::string_view a, std::string_view b);
 void rejectUnloweredReturn(const Type& returned, const std::string& quoted, bool allowStdArray = false);
 void takeReferenceReturn(FunctionDecl& decl, const std::string& quoted);
+bool isResourcePointer(const Type& type);
 Stage stageForKeyword(std::string_view word);
 
 class ClassTemplateError: public CompileError {

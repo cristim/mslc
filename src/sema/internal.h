@@ -167,6 +167,12 @@ struct Binding {
 	bool ownAddress = false;
 	bool constantValue = false;
 	bool unnormalizedSampler = false;
+	// A texture or sampler named through a pointer ("thread texture2d<float>* p = &t;"): the name is the
+	// descriptor's address, so *p and p-> reach it.
+	bool resourcePointer = false;
+	// A constexpr sampler, at file scope or local: a const object, so a pointer or reference that is not to
+	// const does not bind it (Apple: no matching function, or "cannot initialize ... with ... const").
+	bool embeddedSampler = false;
 	std::optional<FoldedConstant> folded;
 };
 

@@ -523,7 +523,7 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 	const Type& type = declaration.type;
 	if (type.resource != ResourceKind::Sampler) {
-		if (type.isPointer || type.arrayLength || (type.addressSpace != AddressSpace::None
+		if ((type.isPointer && !isResourcePointer(type)) || type.arrayLength || (type.addressSpace != AddressSpace::None
 			&& type.addressSpace != AddressSpace::Thread)) {
 			throw CompileError("a local texture \"" + declaration.name + "\" that is a pointer, an array or in an "
 				"address space other than thread is not lowered yet");
@@ -534,6 +534,16 @@ void Parser::parseSamplerLocal(VariableDeclaration& declaration) {
 			throw CompileError("the texture \"" + declaration.name + "\" needs an initialiser that names a "
 				"texture, as in \"texture2d<float> b = a;\": a texture local is another name for one, and "
 				"mslc does not lower one that is bound later");
+		}
+		declaration.initializer = parseAssignment();
+		expect(TokenKind::Semicolon, "after a declaration");
+		return;
+	}
+	// "thread sampler* q = &s;": another name for a sampler the function already names, as a texture pointer is.
+	if (isResourcePointer(type)) {
+		if (!match(TokenKind::Assign)) {
+			throw CompileError("the sampler pointer \"" + declaration.name + "\" needs an initialiser that is the "
+				"address of a sampler: mslc does not lower one that is bound later");
 		}
 		declaration.initializer = parseAssignment();
 		expect(TokenKind::Semicolon, "after a declaration");

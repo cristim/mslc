@@ -607,16 +607,26 @@ void takeReferenceReturn(FunctionDecl& decl, const std::string& quoted) {
 	if (decl.returnType.addressSpace == AddressSpace::None) {
 		throw CompileError(quoted + " returns a reference without an address space, which MSL requires");
 	}
-	if (decl.returnType.addressSpace != AddressSpace::Thread || decl.returnType.isPointer
-		|| decl.returnType.resource != ResourceKind::None) {
+	if (decl.returnType.addressSpace != AddressSpace::Thread || decl.returnType.isPointer) {
 		throw CompileError(quoted + " returns a reference to " + std::string(addressSpaceName(decl.returnType.addressSpace))
-			+ " memory or to a pointer or resource, which is not lowered yet; mslc lowers a thread reference");
+			+ " memory or to a pointer, which is not lowered yet; mslc lowers a thread reference");
 	}
 	decl.returnType.addressSpace = AddressSpace::None;
 	decl.returnsReference = true;
 }
 
+// A thread pointer to a texture or sampler is a return type: what the function returns is resolved while compiling
+// (see the emitter's resourceOf), as a texture local is.
+// MSL requires the address space (Apple: "pointer type must have explicit address space qualifier").
+bool isResourcePointer(const Type& type) {
+	return type.isPointer && type.resource != ResourceKind::None && !type.arrayLength
+		&& type.addressSpace == AddressSpace::Thread;
+}
+
 void rejectUnloweredReturn(const Type& returned, const std::string& quoted, bool allowStdArray) {
+	if (isResourcePointer(returned)) {
+		return;
+	}
 	if (returned.isPointer || (returned.arrayLength && !(allowStdArray && returned.isStdArray))
 		|| returned.resource != ResourceKind::None
 		|| returned.addressSpace != AddressSpace::None) {

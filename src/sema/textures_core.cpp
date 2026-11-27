@@ -305,15 +305,16 @@ Id Emitter::literalOffset(const Expression& expression, uint32_t width) {
 // The sampler a sample or gather names as its first argument. A coord::pixel sampler
 // is only lowered on a texture2d (Vulkan allows unnormalized coordinates on
 // non-arrayed 1D and 2D views only).
-const Binding& Emitter::samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName) {
-	if (argument.kind != ExpressionKind::Identifier) {
+Binding Emitter::samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName) {
+	const std::optional<ResolvedResource> resolved = resourceOf(argument);
+	if (!resolved && argument.kind != ExpressionKind::Identifier) {
 		throw CompileError("the first argument of " + callName + " has to name a sampler");
 	}
-	const Binding* samplerBinding = findResourceBinding(argument.name, argument.fileScope);
-	if (!samplerBinding || samplerBinding->pointeeMsl.resource != ResourceKind::Sampler) {
-		throw CompileError("\"" + argument.name + "\" is not a sampler, and " + callName + " takes one "
-			"as its first argument");
+	if (!resolved || resolved->pointer || resolved->binding.pointeeMsl.resource != ResourceKind::Sampler) {
+		throw CompileError((argument.kind == ExpressionKind::Identifier ? "\"" + argument.name + "\""
+			: std::string("that argument")) + " is not a sampler, and " + callName + " takes one as its first argument");
 	}
+	const Binding* samplerBinding = &resolved->binding;
 	if (kind != ResourceKind::Texture2D && samplerBinding->unnormalizedSampler) {
 		throw CompileError(std::string("a ") + resourceKindName(kind) + " cannot be sampled with a "
 			"coord::pixel sampler: mslc lowers unnormalized coordinates on texture2d only (Vulkan "

@@ -358,7 +358,16 @@ uint32_t descriptorSet() const {
 	void bindResourceAlias(const VariableDeclaration& declaration, const Type* declared);
 	void addReflectionEntry(const std::string& entry);
 	std::string descriptorJson(uint32_t binding) const;
-	const Binding& textureReceiver(const Expression& call);
+	Binding textureReceiver(const Expression& call);
+	// The descriptor an expression names, worked out while compiling, and whether the expression is its
+	// address rather than the texture or sampler itself.
+	struct ResolvedResource {
+		Binding binding;
+		bool pointer = false;
+	};
+	std::optional<ResolvedResource> resourceOf(const Expression& expression, unsigned depth = 0);
+	std::optional<ResolvedResource> resourceCall(const Expression& call, unsigned depth);
+	Binding resourceNamed(const Expression& expression, bool pointer, const std::string& what);
 	void emitTextureWrite(const Expression& call, const Binding& texture);
 	void emitTextureFence(const Expression& call, const Binding& texture);
 	Id emitTextureCall(const Expression& call);
@@ -367,7 +376,7 @@ uint32_t descriptorSet() const {
 	Id emitTextureRead(const Expression& call, const Binding& texture);
 	Id emitMultisampledCall(const Expression& call, const Binding& texture);
 	Id emitTextureGather(const Expression& call, const Binding& texture, bool compare = false);
-	const Binding& samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
+	Binding samplerArgument(const Expression& argument, ResourceKind kind, const std::string& callName);
 	Id samplingCoordinate(const Expression& coordinate, ResourceKind kind, const Expression* layer, const std::string& callName);
 	Id emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component);
 	Id literalOffset(const Expression& expression, uint32_t width);

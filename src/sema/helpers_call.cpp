@@ -400,16 +400,23 @@ Id Emitter::resourcePointee(const Type& type) {
 Id Emitter::resourceArgument(const Expression& argument, const Parameter& parameter,
 	const std::string& function) {
 	const std::string what = "the argument for parameter \"" + parameter.name + "\" of \"" + function + "\"";
-	if (argument.kind != ExpressionKind::Identifier) {
+	const std::optional<ResolvedResource> resolved = resourceOf(argument);
+	if (!resolved) {
 		throw CompileError(what + " has to name a texture or sampler parameter, a sampler declared "
-			"in the shader, or a texture or sampler parameter of the calling helper");
+			"in the shader, or a texture or sampler parameter of the calling helper (or its address, for a "
+			"pointer parameter)");
 	}
-
-	const Binding* binding = findResourceBinding(argument.name, argument.fileScope);
+	const Binding* binding = &resolved->binding;
 	const Type& wanted = parameter.type;
-	if (!binding || !sameResourceType(binding->pointeeMsl, wanted)) {
-		throw CompileError(what + " is \"" + argument.name + "\", which is not a "
-			+ typeName(wanted));
+	const std::string spelled = argument.kind == ExpressionKind::Identifier ? "\"" + argument.name + "\""
+		: std::string("that argument");
+	if (binding->embeddedSampler && (wanted.isPointer || parameter.isReference) && !wanted.isConst) {
+		throw CompileError(what + " is a constexpr sampler, which is const, and parameter \"" + parameter.name
+			+ "\" is a pointer or reference that is not to const");
+	}
+	if (!sameResourceType(binding->pointeeMsl, wanted) || resolved->pointer != wanted.isPointer) {
+		throw CompileError(what + " is " + spelled + ", which is not a " + typeName(wanted)
+			+ (resolved->pointer != wanted.isPointer ? (wanted.isPointer ? " pointer" : "") : ""));
 	}
 
 	// The helper samples with an implicit lod, which Vulkan refuses through an
@@ -456,7 +463,9 @@ Id Emitter::helperFunctionId(HelperFunction& helper) {
 				helper.parameterTypes.push_back(InvalidId);
 				continue;
 			}
-			if (parameter.type.isPointer
+			if (parameter.type.resource != ResourceKind::None) {
+				helper.parameterTypes.push_back(helperParameterType(parameter.type));
+			} else if (parameter.type.isPointer
 				&& (parameter.type.addressSpace == AddressSpace::Device
 					|| parameter.type.addressSpace == AddressSpace::Constant)) {
 				helper.parameterTypes.push_back(
@@ -701,7 +710,7 @@ Emitter::HelperFunction& Emitter::pointerSpecialisation(const Expression& call, 
 	bool any = false;
 	for (size_t i = 0; i < call.arguments.size(); ++i) {
 		const Parameter& parameter = definition.parameters[first + i];
-		if (!parameter.type.isPointer) {
+		if (!parameter.type.isPointer || parameter.type.resource != ResourceKind::None) {
 			continue;
 		}
 		any = true;
