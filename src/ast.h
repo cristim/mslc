@@ -31,6 +31,9 @@ enum class Stage {
 };
 
 // Scalar type kinds. Width is in bits; vectors are a count of one of these.
+// The largest index [[function_constant(n)]] takes.
+constexpr uint32_t kMaxFunctionConstantIndex = 65535;
+
 enum class ScalarKind {
 	Void,
 	Bool,
@@ -155,15 +158,26 @@ struct Type {
 			|| resource == ResourceKind::Texture1DArray || resource == ResourceKind::TextureCubeArray
 			|| resource == ResourceKind::TextureBuffer;
 	}
-	// A texture lowered to a storage image. A texture_buffer that is only read is a sampled
-	// texel buffer instead, fetched by index, so that its descriptor is a uniform texel buffer.
+	// A texture lowered to a storage image: one that is written. A texture that is only read
+	// (access::read) is a sampled image fetched by integer coordinate, as a storage image view has
+	// one mip level and read takes a lod; a texture_buffer that is only read is likewise a uniform
+	// texel buffer.
 	bool isStorageTexture() const {
-		return textureAccess != TextureAccess::Sample
-			&& !(resource == ResourceKind::TextureBuffer && textureAccess == TextureAccess::Read);
+		return textureAccess == TextureAccess::Write || textureAccess == TextureAccess::ReadWrite;
+	}
+	// An access::read cube or cube array, which is fetched from as the 2D array of its faces: a
+	// fetch takes no cube image.
+	bool isFetchedCube() const {
+		return textureAccess == TextureAccess::Read
+			&& (resource == ResourceKind::TextureCube || resource == ResourceKind::TextureCubeArray);
 	}
 };
 
 // One argument of a template: a type, or an integer constant (a bool is 0 or 1).
+// The callee of as_type<T>(x) as the parser reads it: a name no source can spell, so no declared
+// function is taken for the builtin.
+inline constexpr const char* kAsTypeCallee = "<builtin as_type>";
+
 struct TemplateArgument {
 	bool isType = true;
 	Type type;
@@ -202,6 +216,10 @@ struct ParameterAttributes {
 	// [[texture(n)]] and [[sampler(n)]]
 	std::optional<uint32_t> textureIndex;
 	std::optional<uint32_t> samplerIndex;
+
+	// [[function_constant(c)]]: the program-scope constant c says whether the argument is there. It is
+	// declared either way; a gated argument may share its index with another argument (see parseFunctionDeclaration).
+	std::string functionConstant;
 
 	// [[thread_position_in_grid]] and friends. Only the ones the subset
 	// supports are named; anything else is a hard error at parse time so an
@@ -368,8 +386,6 @@ struct Expression {
 
 	// Construct: the type being constructed
 	std::optional<Type> constructType;
-	// Construct: as_type<T>(x), a bit reinterpretation and not a conversion.
-	bool bitReinterpret = false;
 
 	// Line the expression started on, for diagnostics.
 	size_t line = 0;
@@ -454,6 +470,10 @@ struct VariableDeclaration {
 
 	// A sampler local: the state its options spell.
 	std::optional<SamplerState> sampler;
+
+	// A file-scope constant declared [[function_constant(n)]]: its index n. It has no initialiser; its value
+	// is given when a function is made from the library.
+	std::optional<uint32_t> functionConstantIndex;
 };
 
 struct Statement {
@@ -461,6 +481,9 @@ struct Statement {
 
 	// ExpressionStatement with no expression: [[fallthrough]];
 	bool isFallthrough = false;
+	// ExpressionStatement with no expression: a static_assert whose check is left to lowering, which is then
+	// this error (see Parser::parseStaticAssert). Empty for any other statement.
+	std::string refusal;
 
 	// Compound
 	std::vector<StatementPtr> children;
@@ -528,8 +551,13 @@ struct FieldAttributes {
 
 	// [[color(n)]]: the field is colour attachment n of a fragment output.
 	std::optional<uint32_t> colorIndex;
+	// [[function_constant(c)]] on a colour output: the program-scope constant c says whether the output is
+	// there. It is declared either way, and a pipeline with no attachment at its location drops what it writes.
+	std::string functionConstant;
 	std::optional<DepthMode> depthMode;
 	bool sampleMask = false;
+	// [[stencil]]: a fragment output's stencil reference value.
+	bool stencil = false;
 
 	// [[point_size]]: the field is the vertex output's BuiltIn PointSize.
 	bool pointSize = false;
@@ -621,6 +649,15 @@ struct FunctionTemplate {
 	std::vector<TemplateArgument> ownerArguments;
 	// Holds the spelling the tokens of an instance's name point into.
 	std::shared_ptr<const void> spellings;
+};
+
+// An explicit specialization of a function template, "template <> R f(...) { ... }" or "template <> R
+// f<int>(...) { ... }": a template of no parameters, its tokens without the explicit arguments, which
+// are kept apart. It is the body of the primary template's instance whose arguments it names, which
+// sema works out from its signature (see resolveSpecializations).
+struct ExplicitSpecialization {
+	FunctionTemplate declaration;
+	std::vector<TemplateArgument> given;
 };
 
 // A class template: "template <...> struct Name { ... };" kept as tokens, from the "struct" keyword to the
@@ -717,6 +754,9 @@ struct TranslationUnit {
 	// Entry-point templates (kernel, vertex, fragment), instantiated by explicit instantiation
 	// with [[host_name("...")]] rather than by call lookup.
 	std::vector<FunctionTemplate> entryTemplates;
+
+	// The explicit specializations of function templates, in declaration order.
+	std::vector<ExplicitSpecialization> specializations;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.

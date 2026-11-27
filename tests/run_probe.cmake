@@ -2,6 +2,8 @@
 # against the probe's own expectation line, one of
 #
 #   // EXPECT: valid              compiles and passes spirv-val
+#   // EXPECT: no module          compiles to a library with no functions, which has
+#                                 no module; only REFLECT needles apply
 #   // EXPECT: error <substring>  fails, with <substring> in the diagnostic
 #
 # A valid probe can also pin the disassembly, for a bug whose output validates
@@ -46,6 +48,8 @@
 #                              says a break goes to the merge block and not, say,
 #                              the continue block. It does not say which loop the
 #                              break leaves.
+#   // FLAG: <flag>               passes the flag to mslc, e.g. --mask-grid-size
+#   // DEFINE: NAME[=VALUE]       predefines the macro, as -D does (a name alone is 1)
 #   // DISASM-ENTRY-MODES: <entry> [<mode>[, <mode>]...]
 #                              the OpExecutionMode and OpExecutionModeId
 #                              instructions of the entry point named <entry> are
@@ -118,29 +122,56 @@ file(REMOVE "${spv}")
 set(reflection "${OUT_DIR}/${name}.json")
 file(REMOVE "${reflection}")
 
+# A probe can predefine macros as a compiler's -D would, one per line: "// DEFINE: NAME" or
+# "// DEFINE: NAME=VALUE"
+file(STRINGS "${PROBE}" defineLines REGEX "^// DEFINE: ")
+set(defineArguments)
+foreach(line IN LISTS defineLines)
+	string(REGEX REPLACE "^// DEFINE: " "" definition "${line}")
+	list(APPEND defineArguments "-D${definition}")
+endforeach()
+
+# A probe can pass flags to mslc, one per line: "// FLAG: --mask-grid-size"
+file(STRINGS "${PROBE}" flagLines REGEX "^// FLAG: ")
+set(flagArguments)
+foreach(line IN LISTS flagLines)
+	string(REGEX REPLACE "^// FLAG: " "" flag "${line}")
+	list(APPEND flagArguments "${flag}")
+endforeach()
+
 execute_process(
-	COMMAND "${MSLC}" -o "${spv}" --reflect "${reflection}" "${PROBE}"
+	COMMAND "${MSLC}" ${defineArguments} ${flagArguments} -o "${spv}" --reflect "${reflection}" "${PROBE}"
 	RESULT_VARIABLE status
 	OUTPUT_VARIABLE output
 	ERROR_VARIABLE output
 )
 
-if(expectation STREQUAL "valid")
+if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 	if(NOT status EQUAL 0)
 		message(FATAL_ERROR "${name}: expected to compile, mslc exited ${status}:\n${output}")
 	endif()
-	# Never skip: an unvalidated module must not count as a pass.
-	if(NOT SPIRV_VAL)
-		message(FATAL_ERROR "${name}: spirv-val not found; install SPIRV-Tools and re-run cmake")
-	endif()
-	execute_process(
-		COMMAND "${SPIRV_VAL}" --target-env vulkan1.3 "${spv}"
-		RESULT_VARIABLE status
-		OUTPUT_VARIABLE output
-		ERROR_VARIABLE output
-	)
-	if(NOT status EQUAL 0)
-		message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
+	if(expectation STREQUAL "no module")
+		if(EXISTS "${spv}")
+			message(FATAL_ERROR "${name}: expected no module, mslc wrote one")
+		endif()
+		file(STRINGS "${PROBE}" disasmLines REGEX "DISASM")
+		if(disasmLines)
+			message(FATAL_ERROR "${name}: a probe that expects no module has no disassembly to check")
+		endif()
+	else()
+		# Never skip: an unvalidated module must not count as a pass.
+		if(NOT SPIRV_VAL)
+			message(FATAL_ERROR "${name}: spirv-val not found; install SPIRV-Tools and re-run cmake")
+		endif()
+		execute_process(
+			COMMAND "${SPIRV_VAL}" --target-env vulkan1.3 "${spv}"
+			RESULT_VARIABLE status
+			OUTPUT_VARIABLE output
+			ERROR_VARIABLE output
+		)
+		if(NOT status EQUAL 0)
+			message(FATAL_ERROR "${name}: spirv-val rejected the module:\n${output}")
+		endif()
 	endif()
 
 	# A needle with a misspelt or unspaced prefix matches none of the collectors

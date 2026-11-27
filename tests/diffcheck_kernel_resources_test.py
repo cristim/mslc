@@ -145,7 +145,7 @@ class Resources(unittest.TestCase):
             self.assertEqual(len(first), 4 * 4 * 16)
             self.assertEqual(len(half_bytes), 4 * 4 * 8)
         lines = resources.lines(a[0], a[1])
-        self.assertTrue(lines[0].startswith("storagetexture 2 1 5 4 4 "), lines)  # access::read is a storage image
+        self.assertTrue(lines[0].startswith("texture 2 1 5 4 4 "), lines)  # access::read is a sampled image fetched from
         self.assertEqual(lines[1], "sampler 1 1 6")
         self.assertTrue(resources.lines([(0, 0, 0, "f", "Sample")], [])[0].startswith("texture 0 "))
         self.assertEqual(resources.lines([(0, 1, 2, "in.bin", "Write"), (3, 1, 4, "rw.bin", "ReadWrite", "half"),
@@ -153,7 +153,7 @@ class Resources(unittest.TestCase):
                                          outputs={0: "out.bin", 3: "rw-out.bin"}),
                          ["storagetexture 0 1 2 4 4 in.bin float write out.bin",
                           "storagetexture 3 1 4 4 4 rw.bin half readwrite rw-out.bin",
-                          "storagetexture 5 1 6 4 4 ri.bin int"])
+                          "texture 5 1 6 4 4 ri.bin int"])
         wlay = resources.texture_layouts({"textures": [{"index": 0, "name": "r", "type": "2d", "data": "float", "access": "read"},
                                                        {"index": 2, "name": "w", "type": "2d", "data": "half", "access": "write"},
                                                        {"index": 3, "name": "c", "type": "cube", "data": "uint", "access": "readwrite"},

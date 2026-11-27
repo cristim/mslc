@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <map>
+#include <typeinfo>
 #include <unordered_map>
 
 namespace mslc {
@@ -502,7 +503,7 @@ TranslationUnit Parser::parse() {
 			refuse("using declaration of");
 		}
 	}
-	if (!_unit.templates.empty() || !_unit.entryTemplates.empty()) {
+	if (!_unit.templates.empty() || !_unit.entryTemplates.empty() || !_unit.specializations.empty()) {
 		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
 		for (FunctionTemplate& declaration: _unit.templates) {
 			declaration.file = file;
@@ -511,6 +512,10 @@ TranslationUnit Parser::parse() {
 		for (FunctionTemplate& declaration: _unit.entryTemplates) {
 			declaration.file = file;
 			declaration.seeds = _seedList;
+		}
+		for (ExplicitSpecialization& specialization: _unit.specializations) {
+			specialization.declaration.file = file;
+			specialization.declaration.seeds = _seedList;
 		}
 	}
 	resolveEntryInstantiations();
@@ -525,6 +530,11 @@ void Parser::parseDeclaration() {
 
 	if (matchIdentifier("using")) {
 		parseUsing();
+		return;
+	}
+
+	if (matchIdentifier("static_assert")) {
+		parseStaticAssert(false);
 		return;
 	}
 
@@ -775,18 +785,25 @@ void Parser::parseUsing() {
 		expect(TokenKind::Semicolon, "after a using directive");
 
 		std::vector<std::string>& directives = _blocks.empty() ? _scopes[scope].directives : _blocks.back().directives;
+		// A directive for a namespace its scope already nominates changes no lookup ([namespace.udir]), so it is
+		// not recorded again: what counts the usings after a class template sees nothing new.
+		const auto record = [&directives](const std::string& nominated) {
+			if (std::find(directives.begin(), directives.end(), nominated) == directives.end()) {
+				directives.push_back(nominated);
+			}
+		};
 
 		const std::string target = namespaceOf(name, name.parts.size(), NamespaceLookup::NamespaceOnly);
 		// A lone "metal" no file namespace answers for is the standard library's own namespace,
 		// which nothing is looked up through; a nearer namespace of that name wins over it.
 		if (target.empty() && name.parts.size() == 1 && name.parts.front() == kStdlibNamespace) {
-			directives.push_back(kStdlibNamespace);
+			record(kStdlibNamespace);
 			return;
 		}
 		if (target.empty()) {
 			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 		}
-		directives.push_back(target);
+		record(target);
 		return;
 	}
 
@@ -999,6 +1016,7 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->constructors = _constructors;
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
+	names->constantIntArrays = _constantIntArrays;
 	names->memberTemplateNames = _memberTemplateNames;
 	names->seedKeys = _seedKeys;
 	return names;
@@ -1022,6 +1040,7 @@ void Parser::restoreNames(const Names& names) {
 	_constructors = names.constructors;
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
+	_constantIntArrays = names.constantIntArrays;
 	_memberTemplateNames = names.memberTemplateNames;
 	_seedKeys = names.seedKeys;
 	_frozenClasses = true;
@@ -1131,7 +1150,8 @@ Stage stageForKeyword(std::string_view word) {
 // The declarator of a function template, after its header, to the end of its body or ';': fills the
 // tokens, the signature and whether it has a body, and returns the name. A member also takes "const" after
 // its parameters.
-std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member) {
+std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member,
+	std::pair<size_t, size_t>* explicitArguments) {
 	// The declarator, up to the parameter list. The name is the identifier right before
 	// the first "(" outside angle brackets, and only a group that is followed by what a
 	// function can have after its parameters is taken as the list. Attributes are
@@ -1141,6 +1161,11 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 	const size_t declaratorStart = _position;
 	std::string name;
 	size_t angles = 0;
+	// An explicit specialization may name its arguments after the name, "f<int>(...)": the name before a
+	// "<" at the outermost level, and that group when the parameter list follows it.
+	std::string groupName;
+	size_t groupStart = 0;
+	size_t groupEnd = 0;
 	for (;;) {
 		if (at(TokenKind::EndOfFile) || at(TokenKind::Semicolon) || at(TokenKind::LBrace)
 			|| at(TokenKind::Assign)) {
@@ -1148,6 +1173,10 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		}
 		if (at(TokenKind::LParen)) {
 			if (angles == 0) {
+				if (explicitArguments && !groupName.empty() && name.empty() && groupEnd + 1 == _position) {
+					name = groupName;
+					*explicitArguments = { groupStart, groupEnd };
+				}
 				break;
 			}
 			// A "(" inside the return type's own angle brackets, as in enable_if<(N > 2)>.
@@ -1172,11 +1201,17 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 				+ "\" in an entry-point template is not lowered");
 		}
 		if (at(TokenKind::Less)) {
+			if (angles == 0) {
+				groupName = name;
+				groupStart = _position;
+			}
 			++angles;
 		} else if (at(TokenKind::Greater) && angles > 0) {
 			--angles;
+			groupEnd = angles == 0 ? _position : groupEnd;
 		} else if (at(TokenKind::ShiftRight) && angles > 1) {
 			angles -= 2;
+			groupEnd = angles == 0 ? _position : groupEnd;
 		}
 		name = kind() == TokenKind::Identifier ? std::string(current().text) : std::string();
 		advance();
@@ -1386,8 +1421,8 @@ void Parser::parseTemplateDeclaration() {
 		return;
 	}
 	if (lookahead().kind == TokenKind::Greater) {
-		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "
-			"mslc refuses it so that the primary template is never silently used in its place");
+		parseExplicitSpecialization(_position);
+		return;
 	}
 
 	FunctionTemplate declaration;
@@ -1447,6 +1482,63 @@ void Parser::parseTemplateDeclaration() {
 	targetList.push_back(std::move(declaration));
 }
 
+// "template <>" and a function: an explicit specialization of a function template declared above. It is
+// kept as a template of no parameters, the explicit arguments taken out of its declarator, for sema to
+// match against the primary templates of its name.
+void Parser::parseExplicitSpecialization(size_t headerStart) {
+	advance();
+	advance();
+	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
+		throw CompileError("an explicit specialization of a class template is not lowered; Apple accepts it, and "
+			"mslc refuses it so that the primary template is never silently used in its place");
+	}
+	if (atKeyword("template")) {
+		throw CompileError("an explicit specialization of a member template is not lowered");
+	}
+	ExplicitSpecialization specialization;
+	FunctionTemplate& declaration = specialization.declaration;
+	declaration.line = line();
+	std::pair<size_t, size_t> group { 0, 0 };
+	const size_t declaratorStart = _position;
+	const std::string name = readTemplateFunction(declaration, headerStart, false, &group);
+	const std::string qualified = qualify(name);
+	if (!_unit.functionTemplates.count(qualified)) {
+		throw CompileError("\"" + qualified + "\" is explicitly specialized, and no function template of that name "
+			"is declared above it");
+	}
+	if (!declaration.hasBody) {
+		throw CompileError("the explicit specialization of \"" + qualified + "\" is declared and not defined here; "
+			"a declaration without a body is not lowered");
+	}
+	const size_t end = _position;
+	if (group.second) {
+		_position = group.first + 1;
+		const size_t before = _tokens.size();
+		while (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight)) {
+			specialization.given.push_back(parseTemplateArgument());
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+		// closeAngle splits a ">>" that closes the last argument and this list into two tokens.
+		const size_t inserted = _tokens.size() - before;
+		if (_position != group.second + inserted || (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight))) {
+			throw CompileError("the template arguments of the explicit specialization of \"" + qualified
+				+ "\" are not lowered: expected \">\" where \"" + std::string(current().text) + "\" is");
+		}
+		_position = end + inserted;
+		// The tokens without the arguments, so the declarator reads as a function's.
+		const size_t from = group.first - declaratorStart;
+		const size_t to = group.second + 1 - declaratorStart;
+		declaration.tokens.erase(declaration.tokens.begin() + from, declaration.tokens.begin() + to);
+	}
+	declaration.name = qualified;
+	declaration.order = declaration.bodyOrder = _functionOrder++;
+	declaration.globalsBefore = _unit.globals.size();
+	declaration.endAt = _position;
+	_unit.specializations.push_back(std::move(specialization));
+}
+
 // Binds the template's parameters in the innermost block: a type is a typedef, a constant an
 // enumerator-like value, each under a key no spelling in the source can reach, and the
 // parameter's own name is mapped to it as a using declaration is, so a local of that name in a
@@ -1479,6 +1571,25 @@ void Parser::bindParameters(const std::string& owner, const std::vector<Template
 		}
 		_blocks.back().names[parameter.name] = key;
 	}
+}
+
+namespace {
+
+// A failure to read a class template instance. It is not swallowed where the parser backtracks, since
+// reading on past it would leave a half-declared struct behind.
+class ClassTemplateError: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
+// An instance of a class template whose arguments are a function template's parameters still to be deduced.
+class DependentClassInstance: public ClassTemplateError {
+public:
+	using ClassTemplateError::ClassTemplateError;
+};
+
+bool isDeductionMarker(const Type& type);
+
 }
 
 // One instance of a template as a helper. The declaration's tokens are the whole input.
@@ -1547,10 +1658,45 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	}
 	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
 		? 0 : declaration.name.rfind("::") + 2);
+	// The signature read to deduce the parameters, some of which stand for themselves: a return type that is
+	// an instance of a class template on those parameters cannot be made yet, and deduction does not need it.
+	// It is a dependent type, as a return type of T is; the instance a call chooses reads the real one.
+	const bool deducing = !withBody && std::any_of(arguments.begin(), arguments.end(), [](const TemplateArgument& argument) {
+		return argument.unbound || (argument.isType && isDeductionMarker(argument.type));
+	});
+	const size_t returnTypeStart = _position;
+	bool dependentReturn = false;
 	if (declaration.constructorMember) {
 		decl.returnType.namedType = declaration.memberOf;
 	} else {
-		decl.returnType = parseType();
+		try {
+			decl.returnType = parseType();
+		} catch (const DependentClassInstance&) {
+			if (!deducing) {
+				throw;
+			}
+			_position = returnTypeStart;
+			// A "<" or ">" inside parentheses, "(1 < 2)", is an operator, not a bracket.
+			size_t angles = 0;
+			size_t parentheses = 0;
+			while (!at(TokenKind::EndOfFile) && !(angles == 0 && parentheses == 0 && kind() == TokenKind::Identifier
+				&& current().text == written && lookahead().kind == TokenKind::LParen)) {
+				parentheses += at(TokenKind::LParen) ? 1 : 0;
+				parentheses -= at(TokenKind::RParen) && parentheses > 0 ? 1 : 0;
+				if (parentheses == 0) {
+					angles += at(TokenKind::Less) ? 1 : 0;
+					angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
+					angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+				}
+				advance();
+			}
+			if (at(TokenKind::EndOfFile)) {
+				throw;
+			}
+			decl.returnType = Type();
+			decl.returnType.namedType = "<dependent return type>";
+			dependentReturn = true;
+		}
 	}
 	if (declaration.stage == Stage::None) {
 		rejectUnloweredReturn(decl.returnType, quoted);
@@ -1635,7 +1781,9 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 			throw CompileError("unknown type name \"" + type.namedType + "\" in the declaration of " + quoted);
 		}
 	};
-	declared(decl.returnType);
+	if (!dependentReturn) {
+		declared(decl.returnType);
+	}
 	for (const Parameter& parameter: decl.parameters) {
 		declared(parameter.type);
 	}
@@ -1822,9 +1970,10 @@ TemplateArgument Parser::parseTemplateArgument() {
 	const bool named = kind() == TokenKind::Identifier || at(TokenKind::ColonColon);
 	const std::string name = named ? peekResolved(nameTokens) : std::string();
 	const bool localHides = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && isLocal(name);
+	size_t vecTokens = 0;
 	const bool isTypeArgument = (named && (resolveTypeName(name, probe) || isTypeQualifier(name)
 			|| (_unit.findStruct(name) != nullptr && !localHides)))
-		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text));
+		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) || atLibraryVec(vecTokens);
 	if (isTypeArgument) {
 		argument.type = parseType();
 		if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
@@ -1959,17 +2108,6 @@ void Parser::closeAngle(const char* what) {
 		_tokens.insert(_tokens.begin() + _position, _tokens[_position]);
 	}
 	expect(TokenKind::Greater, what);
-}
-
-namespace {
-
-// A failure to read a class template instance. It is not swallowed where the parser backtracks, since
-// reading on past it would leave a half-declared struct behind.
-class ClassTemplateError: public CompileError {
-public:
-	using CompileError::CompileError;
-};
-
 }
 
 void Parser::reserveSplits(std::vector<Token>& tokens) {
@@ -2227,7 +2365,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	bool dependent = false;
 	for (const TemplateArgument& argument: arguments) {
 		if (argument.unbound) {
-			throw ClassTemplateError("an instance of " + quoted + " that depends on a constant template parameter of a "
+			throw DependentClassInstance("an instance of " + quoted + " that depends on a constant template parameter of a "
 				"function template is not lowered yet");
 		}
 		dependent = dependent || (argument.isType && isDeductionMarker(argument.type));
@@ -2561,6 +2699,67 @@ ExpressionPtr Parser::tryParseTraitValue() {
 	return expression;
 }
 
+// static_assert(condition) or static_assert(condition, "message"), the keyword consumed ([dcl.pre]): the condition is
+// an integral constant expression, checked where it is read. A function template's body is read once per instance,
+// with its arguments bound, so each instance checks its own; a false one is an error naming the message.
+// In a statement (inStatement), two checks are left to the statement's lowering, and returned as the error that
+// lowering it is: one in a member function of a class template's instance, whose body is instantiated only where
+// the function is used ([temp.inst]) although mslc reads it with the class, and a condition the evaluator cannot
+// fold, so a function never lowered is not refused for it.
+std::string Parser::parseStaticAssert(bool inStatement) {
+	const size_t assertLine = line();
+	expect(TokenKind::LParen, "after \"static_assert\"");
+	const ExpressionPtr condition = parseConditional();
+	std::string message;
+	if (match(TokenKind::Comma)) {
+		if (!at(TokenKind::StringLiteral)) {
+			throw CompileError("the message of a static_assert has to be a string literal");
+		}
+		// Adjacent literals are one string ([lex.string]).
+		while (at(TokenKind::StringLiteral)) {
+			std::string_view text = current().text;
+			if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+				text = text.substr(1, text.size() - 2);
+			}
+			// The simple escapes are read as the characters they stand for ([lex.ccon]); any other is kept as spelled.
+			for (size_t i = 0; i < text.size(); ++i) {
+				if (text[i] != '\\' || i + 1 == text.size()) {
+					message += text[i];
+					continue;
+				}
+				const char escaped = text[++i];
+				switch (escaped) {
+					case 'n': message += '\n'; break;
+					case 't': message += '\t'; break;
+					case '"': case '\'': case '\\': case '?': message += escaped; break;
+					default: message += '\\'; message += escaped; break;
+				}
+			}
+			advance();
+		}
+	}
+	std::string failure;
+	try {
+		if (evaluateConstant(*condition, false) == 0) {
+			failure = "static assertion failed" + (message.empty() ? std::string() : ": " + message)
+				+ " (line " + std::to_string(assertLine) + ")";
+		}
+	} catch (const CompileError& error) {
+		// Only the evaluator's own refusal: a subclass carries something its catcher acts on.
+		if (!inStatement || typeid(error) != typeid(CompileError)) {
+			throw;
+		}
+		failure = error.what();
+	}
+	const bool deferred = inStatement && (!_classInProgress.empty() || failure.rfind("static assertion failed", 0) != 0);
+	if (!failure.empty() && !deferred) {
+		throw CompileError(failure);
+	}
+	expect(TokenKind::RParen, "to close \"static_assert(\"");
+	expect(TokenKind::Semicolon, "after \"static_assert(...)\"");
+	return failure;
+}
+
 // enable_if, enable_if_t, make_scalar and make_scalar_t, the name consumed and "<" next.
 void Parser::parseTraitType(const std::string& name, Type& type) {
 	const bool alias = name.size() > 2 && name.compare(name.size() - 2, 2, "_t") == 0;
@@ -2596,6 +2795,9 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 			type = operand;
 			if (!alias) {
 				expect(TokenKind::ColonColon, ("after \"" + name + "<...>\"").c_str());
+				if (!atKeyword("type")) {
+					throw CompileError("expected \"type\" after \"" + name + "<...>::\"");
+				}
 				advance();
 			}
 			return;
@@ -2875,11 +3077,39 @@ void Parser::parseGlobalDeclaration() {
 // The array suffix and the required initialiser of one file-scope constant.
 VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaration) {
 	bool deduceLength = false;
-	if (at(TokenKind::LBracket)) {
+	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		if (declaration.type.isPointer || declaration.type.arrayLength) {
 			throw CompileError("an array of pointers is not lowered yet");
 		}
 		deduceLength = parseArrayDimensions(declaration.type);
+	}
+
+	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+		const std::string what = "the function constant \"" + declaration.name + "\"";
+		std::set<std::string> seen;
+		parseAttributeList(seen, [&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+			if (name != "function_constant") {
+				throw CompileError("attribute \"" + name + "\" does not apply to a file-scope constant");
+			}
+			if (!argument || *argument > kMaxFunctionConstantIndex) {
+				throw CompileError(what + " needs an index from 0 to " + std::to_string(kMaxFunctionConstantIndex));
+			}
+			declaration.functionConstantIndex = *argument;
+		});
+		const Type& type = declaration.type;
+		if (type.arrayLength || deduceLength) {
+			throw CompileError(what + " is an array, and mslc lowers scalar function constants only");
+		}
+		if (type.isPointer || type.vectorWidth > 1 || type.isMatrix() || !type.namedType.empty()
+			|| !type.enumName.empty() || type.resource != ResourceKind::None || type.isAtomic
+			|| type.scalar == ScalarKind::Void || type.scalar == ScalarKind::Double) {
+			throw CompileError(what + " has the type " + typeName(type) + ", and mslc lowers scalar function "
+				"constants only");
+		}
+		if (at(TokenKind::Assign) || at(TokenKind::LBrace)) {
+			throw CompileError(what + " has an initialiser, but its value is given when a function is made");
+		}
+		return declaration;
 	}
 
 	// Apple takes the brace list in place of "=", so "constant int k{5}" and
@@ -3658,6 +3888,12 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.arrayLength = alias->second.arrayLength;
 	out.innerArrayLengths = alias->second.innerArrayLengths;
 	out.isStdArray = alias->second.isStdArray;
+	// Only a function template's type parameter deduced from a texture or a sampler argument is one here: a
+	// typedef of a resource type is refused where it is written.
+	out.resource = alias->second.resource;
+	out.textureAccess = alias->second.textureAccess;
+	out.isDepth = alias->second.isDepth;
+	out.isMultisampled = alias->second.isMultisampled;
 	out.isConst = out.isConst || alias->second.isConst;
 	return true;
 }
@@ -5040,6 +5276,9 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	// every enumerator of it is an unsigned int, the small ones too (Apple:
 	// "kSmall - 4 > 0" is true beside a 0xffffffff).
 	int64_t next = 0;
+	// Until the closing brace an enumerator has the type of its initializer, or the previous enumerator's
+	// when it has none ([dcl.enum]/5), so one given an unsigned value is unsigned in the initializers after it.
+	ScalarKind nextKind = ScalarKind::Int;
 	int64_t lowest = 0;
 	int64_t highest = 0;
 	std::vector<std::string> names;
@@ -5050,19 +5289,23 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 
 		const std::string name = qualify(std::string(advance().text));
 		int64_t value = next;
+		ScalarKind kind = nextKind;
 		if (match(TokenKind::Assign)) {
-			value = evaluateConstant(*parseAssignment(), false);
+			const ExpressionPtr initializer = parseAssignment();
+			value = evaluateConstant(*initializer, false);
+			kind = containsUnsigned(*initializer) ? ScalarKind::UInt : ScalarKind::Int;
 		}
 		if (value > UINT_MAX || value < -INT_MAX) {
 			throw CompileError("the enumerator \"" + name + "\" does not fit in an int or an unsigned int");
 		}
 
 		declareName(name, "enum constant");
-		_enumConstants[name] = {value, ScalarKind::Int, tag.empty() ? std::string("<anonymous>") : tag};
+		_enumConstants[name] = {value, kind, tag.empty() ? std::string("<anonymous>") : tag};
 		names.push_back(name);
 		lowest = std::min(lowest, value);
 		highest = std::max(highest, value);
 		next = value + 1;
+		nextKind = kind;
 
 		if (!match(TokenKind::Comma)) {
 			break;
@@ -5078,9 +5321,10 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 				"which mslc has no enum for");
 		}
 		underlying = ScalarKind::UInt;
-		for (const std::string& name : names) {
-			_enumConstants[name].kind = underlying;
-		}
+	}
+	// After it, every enumerator has the enum's type, which promotes to its underlying one.
+	for (const std::string& name : names) {
+		_enumConstants[name].kind = underlying;
 	}
 	_lastEnumUnderlying = underlying;
 	if (!tag.empty()) {
@@ -5089,20 +5333,45 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	return tag;
 }
 
-// Whether a sizeof is anywhere in a constant expression, which makes the operation around it
-// unsigned.
-static bool containsSizeof(const Expression& expression) {
+// Whether an unsigned operand (a sizeof, a u literal, or a named unsigned constant such as an unsigned template
+// parameter) is anywhere in a constant expression, which makes the operation around it unsigned ([expr.arith.conv]).
+// The evaluator works in signed arithmetic and refuses the operations whose unsigned result would differ.
+bool Parser::containsUnsigned(const Expression& expression) const {
 	if (expression.kind == ExpressionKind::IntLiteral) {
-		return expression.isSizeof;
+		return expression.isSizeof || expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong;
+	}
+	if (expression.kind == ExpressionKind::Identifier) {
+		const ConstantInt* found = findConstantInt(expression);
+		return found && (found->kind == ScalarKind::UInt || found->kind == ScalarKind::ULong);
 	}
 	if (expression.kind == ExpressionKind::Construct) {
 		// A cast to a type no wider than an int gives an int, which wraps nothing.
 		const ScalarKind target = expression.constructType ? expression.constructType->scalar : ScalarKind::Int;
 		return (target == ScalarKind::UInt || target == ScalarKind::ULong)
-			&& expression.arguments.size() == 1 && containsSizeof(*expression.arguments.front());
+			&& expression.arguments.size() == 1 && containsUnsigned(*expression.arguments.front());
 	}
-	return (expression.left && containsSizeof(*expression.left))
-		|| (expression.right && containsSizeof(*expression.right));
+	// A conditional's type is that of its two values after the usual arithmetic conversions ([expr.cond]): either
+	// one being unsigned makes it unsigned, whichever is chosen. Its condition does not take part.
+	if (expression.kind == ExpressionKind::Conditional) {
+		return expression.arguments.size() == 2
+			&& (containsUnsigned(*expression.arguments[0]) || containsUnsigned(*expression.arguments[1]));
+	}
+	return (expression.left && containsUnsigned(*expression.left))
+		|| (expression.right && containsUnsigned(*expression.right));
+}
+
+// The integer constant a name denotes, looked up as namedConstantValue looks it up, or nothing.
+const Parser::ConstantInt* Parser::findConstantInt(const Expression& identifier) const {
+	if (!identifier.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			if (scope->names.count(identifier.name)) {
+				const auto constant = scope->constants.find(identifier.name);
+				return constant == scope->constants.end() ? nullptr : &constant->second;
+			}
+		}
+	}
+	const auto constant = _constantInts.find(identifier.name);
+	return constant == _constantInts.end() ? nullptr : &constant->second;
 }
 
 // Whether a sizeof is anywhere under an expression, through casts of any type.
@@ -5157,9 +5426,8 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			if (expression.isSizeof) {
 				return fit(static_cast<int64_t>(expression.intValue));
 			}
-			if (nested && (expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong
-				|| expression.intValue > INT_MAX)) {
-				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+			if (nested && expression.intValue > INT_MAX) {
+				throw CompileError("an integer above INT_MAX inside a constant expression is not supported");
 			}
 			if (expression.intValue > INT64_MAX) {
 				throw CompileError("an integer constant is too large");
@@ -5174,12 +5442,14 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			return expression.boolValue ? 1 : 0;
 		case ExpressionKind::Identifier:
 			return namedConstantValue(expression, nested, attribute);
+		case ExpressionKind::Index:
+			return constantArrayElement(expression, nested, attribute);
 		case ExpressionKind::Unary: {
 			const int64_t operand = evaluateConstant(*expression.left, true, attribute);
 			if ((expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::BitNot)
-				&& containsSizeof(*expression.left)) {
-				throw CompileError("a sizeof is unsigned, and negating or complementing it wraps; "
-					"a constant expression that does so is not supported");
+				&& containsUnsigned(*expression.left)) {
+				throw CompileError("an unsigned operand (a sizeof, a u literal or an unsigned constant), negated or "
+					"complemented, wraps, and a constant expression that does so is not supported");
 			}
 			switch (expression.unaryOperator) {
 				case UnaryOperator::Negate: return fit(-operand);
@@ -5203,11 +5473,12 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			}
 
 			const int64_t right = evaluateConstant(*expression.right, true, attribute);
-			// A sizeof makes the operation unsigned, so a negative operand converts to a huge one
-			// and a negative result wraps; neither is modelled, and neither is guessed at.
-			if ((containsSizeof(*expression.left) || containsSizeof(*expression.right))
+			// An unsigned operand makes the operation unsigned, so a negative operand converts to a huge one
+			// and a negative result wraps; neither is modelled, and neither is guessed at. Otherwise the
+			// signed result of every operator here is the unsigned one.
+			if ((containsUnsigned(*expression.left) || containsUnsigned(*expression.right))
 				&& (left < 0 || right < 0 || (expression.binaryOperator == BinaryOperator::Subtract && left < right))) {
-				throw CompileError("a constant expression that mixes sizeof with a negative value or "
+				throw CompileError("a constant expression that mixes an unsigned operand with a negative value or "
 					"subtracts below zero would wrap as an unsigned one, which is not supported");
 			}
 			switch (expression.binaryOperator) {
@@ -5240,6 +5511,23 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 				case BinaryOperator::LogicalOr: return left != 0 || right != 0;
 			}
 			break;
+		}
+		case ExpressionKind::Conditional: {
+			// Only the value the condition chooses is evaluated ([expr.cond]), so the other may be one no constant
+			// expression holds, such as a division by zero.
+			if (expression.arguments.size() != 2) {
+				break;
+			}
+			// The condition is a bool, not the index, so a bool literal is fine there in an attribute index.
+			const int64_t condition = evaluateConstant(*expression.left, true, false);
+			const int64_t value = evaluateConstant(*expression.arguments[condition != 0 ? 0 : 1], nested, attribute);
+			// An unsigned value on either side makes the conditional unsigned, so a negative one chosen converts
+			// to a huge one, which is not modelled.
+			if (value < 0 && containsUnsigned(expression)) {
+				throw CompileError("a constant expression that mixes an unsigned operand with a negative value or "
+					"subtracts below zero would wrap as an unsigned one, which is not supported");
+			}
+			return value;
 		}
 		case ExpressionKind::Sizeof:
 			throw CompileError("the size of an expression is worked out after parsing, so it is not an "
@@ -5315,20 +5603,128 @@ int64_t Parser::namedConstantValue(const Expression& identifier, bool nested, bo
 	if (attribute && (found->kind == ScalarKind::Long || found->kind == ScalarKind::ULong)) {
 		throw CompileError("a long is not an index; use an int or a uint");
 	}
+	if (nested && (found->value > INT_MAX || found->value < -INT_MAX)) {
+		throw CompileError("an integer constant outside what an int holds inside a constant expression is not "
+			"supported");
+	}
+	return found->value;
+}
+
+// An element of a constant integer array, `table[2]`: the array is a const or constexpr one-dimensional
+// array of integers with a brace initialiser that folded (recordConstantArray), and the index is itself
+// a constant expression inside the array's bounds. The name is looked up the way namedConstantValue
+// looks up an integer constant, so a local or a member that hides the array is not one.
+int64_t Parser::constantArrayElement(const Expression& element, bool nested, bool attribute) const {
+	if (element.isDereference || !element.left || element.left->kind != ExpressionKind::Identifier
+		|| element.arguments.size() != 1) {
+		throw CompileError("not an integer constant expression");
+	}
+	const Expression& identifier = *element.left;
+	const std::string& name = identifier.name;
+	const ConstantIntArray* found = nullptr;
+	if (_structBody && !identifier.fileScope) {
+		for (const StructField& field: _structBody->fields) {
+			if (field.name == name) {
+				throw CompileError("\"" + name + "\" is a non-static data member, not a constant");
+			}
+		}
+	}
+	if (!identifier.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			if (!scope->names.count(name)) {
+				continue;
+			}
+			const auto array = scope->constantArrays.find(name);
+			if (array == scope->constantArrays.end()) {
+				throw CompileError("\"" + name + "\" is not a constant integer array: only a const or constexpr "
+					"array of integers with a constant brace initialiser is");
+			}
+			found = &array->second;
+			break;
+		}
+	}
+	if (!found) {
+		const auto array = _constantIntArrays.find(name);
+		if (array == _constantIntArrays.end()) {
+			throw CompileError("\"" + name + "\" is not a constant integer array this source declares before "
+				"this one (a const or constexpr array of integers with a constant brace initialiser is)");
+		}
+		found = &array->second;
+	}
+
+	const int64_t index = evaluateConstant(*element.arguments.front(), true, false);
+	if (index < 0 || static_cast<uint64_t>(index) >= found->values.size()) {
+		throw CompileError("the index " + std::to_string(index) + " is outside the array \"" + name
+			+ "\" of " + std::to_string(found->values.size()) + " elements");
+	}
+	if (attribute && (found->kind == ScalarKind::Long || found->kind == ScalarKind::ULong)) {
+		throw CompileError("a long is not an index; use an int or a uint");
+	}
+	// An element's unsignedness is not tracked (containsUnsigned does not look into arrays), so an unsigned or
+	// wider array is still taken only as the whole expression.
 	const bool intSized = found->kind != ScalarKind::UInt && found->kind != ScalarKind::Long
 		&& found->kind != ScalarKind::ULong;
 	if (nested && !intSized) {
-		throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+		throw CompileError("an element of an unsigned or wider array inside a constant expression is not supported");
 	}
-	return found->value;
+	return found->values[static_cast<size_t>(index)];
+}
+
+// A const or constexpr array of integers, one dimension, initialised by a brace list whose elements all
+// fold: the elements are kept so a constant expression can index the array. Elements the list leaves out
+// are zero, as C++ says. Anything else (a designator, a nested list, a value its type cannot hold, a list
+// longer than the array) leaves the array unrecorded, so indexing it in a constant expression is refused.
+void Parser::recordConstantArray(const VariableDeclaration& declaration, bool local) {
+	const Type& type = declaration.type;
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || type.arrayRank() != 1
+		|| type.vectorWidth != 0 || !declaration.initializer
+		|| declaration.initializer->kind != ExpressionKind::InitList) {
+		return;
+	}
+	int64_t low = 0;
+	int64_t high = 0;
+	if (!integerRange(type.scalar, low, high)) {
+		return;
+	}
+	const std::vector<InitializerElement>& elements = declaration.initializer->elements;
+	if (elements.size() > *type.arrayLength) {
+		return;
+	}
+	ConstantIntArray array;
+	array.kind = type.scalar;
+	array.values.assign(*type.arrayLength, 0);
+	for (size_t i = 0; i < elements.size(); ++i) {
+		if (!elements[i].fieldName.empty() || !elements[i].value) {
+			return;
+		}
+		int64_t value = 0;
+		try {
+			value = evaluateConstant(*elements[i].value, false);
+		} catch (const CompileError&) {
+			return;
+		}
+		if (value < low || value > high) {
+			return;
+		}
+		array.values[i] = value;
+	}
+	if (local) {
+		_blocks.back().constantArrays[declaration.name] = std::move(array);
+	} else {
+		_constantIntArrays[declaration.name] = std::move(array);
+	}
 }
 
 // An integer declared const or constexpr (or at file scope) with a constant initialiser may be
 // named by a later array length; a value its own type cannot hold is left out.
 void Parser::recordConstant(const VariableDeclaration& declaration, bool local) {
 	const Type& type = declaration.type;
+	if (type.arrayLength) {
+		recordConstantArray(declaration, local);
+		return;
+	}
 	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || (!local && type.isAtomic)
-		|| type.arrayLength || !type.isScalar() || !type.namedType.empty() || !declaration.initializer) {
+		|| !type.isScalar() || !type.namedType.empty() || !declaration.initializer) {
 		return;
 	}
 	int64_t low = 0;
@@ -5779,6 +6175,118 @@ void Parser::parseStdArray(Type& type, size_t nameTokens) {
 	type = element;
 }
 
+bool Parser::atAsType(size_t& nameTokens) const {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return false;
+	}
+	// metal::as_type through a namespace alias of metal, "namespace m = metal; m::as_type<T>(x)".
+	if (const size_t prefix = libraryPrefixTokens(); prefix && lookahead(prefix).kind == TokenKind::Identifier
+		&& lookahead(prefix).text == "as_type" && lookahead(prefix + 1).kind == TokenKind::Less) {
+		nameTokens = prefix + 1;
+		return true;
+	}
+	const Token& first = at(TokenKind::ColonColon) ? lookahead() : current();
+	if (first.kind != TokenKind::Identifier || (first.text != "as_type" && first.text != "metal")) {
+		return false;
+	}
+	// A local or a member of the enclosing struct named as_type hides the library's, unless qualified.
+	if (kind() == TokenKind::Identifier && current().text == "as_type" && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal("as_type") || memberHidesName("as_type"))) {
+		return false;
+	}
+	const std::string name = peekResolved(nameTokens);
+	if (name != "metal::as_type" && (name != "as_type" || _declared.count("as_type"))) {
+		return false;
+	}
+	return lookahead(nameTokens).kind == TokenKind::Less;
+}
+
+// as_type<T>(x) gives x's bits as a T. It is read as a call of the builtin kAsTypeCallee with T as
+// the template argument, so that it is lowered as a reinterpretation, never as the conversion a
+// constructor or a cast makes.
+ExpressionPtr Parser::parseAsType(size_t nameTokens) {
+	const size_t atLine = line();
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Less, "to open the template argument of as_type");
+	TemplateArgument target;
+	target.type = parseType(false, false);
+	expect(TokenKind::Greater, "to close the template argument of as_type");
+	expect(TokenKind::LParen, "for the operand of as_type");
+	auto call = std::make_unique<Expression>();
+	call->kind = ExpressionKind::Call;
+	call->line = atLine;
+	call->left = makeIdentifier(kAsTypeCallee, atLine);
+	call->left->hasTemplateArguments = true;
+	call->left->templateArguments.push_back(std::move(target));
+	call->arguments = parseArgumentList("to close the operand of as_type");
+	measure(*call);
+	return call;
+}
+
+bool Parser::atLibraryVec(size_t& nameTokens) const {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return false;
+	}
+	const Token& first = at(TokenKind::ColonColon) ? lookahead() : current();
+	if (first.kind != TokenKind::Identifier || (first.text != "vec" && first.text != "metal")) {
+		return false;
+	}
+	// A local or a member of the enclosing struct named vec hides the library's, unless qualified.
+	if (kind() == TokenKind::Identifier && current().text == "vec" && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal("vec") || memberHidesName("vec"))) {
+		return false;
+	}
+	const std::string name = peekResolved(nameTokens);
+	if (name != "metal::vec" && (name != "vec" || _declared.count("vec"))) {
+		return false;
+	}
+	return lookahead(nameTokens).kind == TokenKind::Less;
+}
+
+// metal::vec<T, N> is the library's name for the vector of N T: vec<float, 4> is float4, so it is
+// read as that vector. The qualifiers read before it apply to the vector.
+void Parser::parseLibraryVec(Type& type, size_t nameTokens) {
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Less, "to open the template arguments of vec");
+	const Type element = parseType(false, false);
+	// A function template's signature is read to deduce its arguments with each type parameter left to
+	// deduce as a marker, "<T>": vec<T, N> is then the marker with the vector's width, which deduction
+	// takes apart.
+	const bool marker = element.namedType.size() > 2 && element.namedType.front() == '<'
+		&& element.namedType.back() == '>';
+	if (element.isPointer || element.isConst || element.isConstexpr || element.isStatic
+		|| element.addressSpace != AddressSpace::None || element.isAtomic || element.isPacked || element.isVector()
+		|| element.isMatrix() || element.arrayLength || element.resource != ResourceKind::None
+		|| (!element.namedType.empty() && !marker) || !element.enumName.empty()
+		|| (!marker && (element.scalar == ScalarKind::Void || element.scalar == ScalarKind::Double))) {
+		throw CompileError("vec<T, N> takes a scalar type, bool or one of the integer, half and float types, as T");
+	}
+	expect(TokenKind::Comma, "between the element type and the length of vec");
+	const ExpressionPtr length = parseAdditive();
+	if (!at(TokenKind::Greater)) {
+		throw CompileError("this vec length is not lowered: a constant that is more than an arithmetic "
+			"expression needs parentheses");
+	}
+	advance();
+	if (length->kind == ExpressionKind::Identifier && length->name.rfind("<template ", 0) == 0
+		&& !_enumConstants.count(length->name)) {
+		throw CompileError("deducing the length N of vec<T, N> from an argument is not lowered; give the template "
+			"argument explicitly");
+	}
+	const int64_t count = evaluateConstant(*length, false);
+	if (count < 2 || count > 4) {
+		throw CompileError("vec<T, " + std::to_string(count) + "> is not lowered: Metal's vectors have 2, 3 or 4 "
+			"components");
+	}
+	type.scalar = element.scalar;
+	type.namedType = element.namedType;
+	type.vectorWidth = static_cast<uint32_t>(count);
+}
+
 Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
 	const size_t typenameAt = _position;
@@ -5846,10 +6354,16 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 		parseResourceType(type);
 	} else if (size_t arrayTokens = 0; atStdArray(arrayTokens)) {
 		parseStdArray(type, arrayTokens);
+	} else if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
+		parseLibraryVec(type, vecTokens);
 	} else if (!name.empty() && resolveTypeName(name, type)) {
 		if (type.isPointer && prefixQualified) {
 			throw CompileError("a const or an address space written before a pointer alias is not supported; "
 				"put it in the alias");
+		}
+		if (type.resource != ResourceKind::None && !allowResource) {
+			throw CompileError("\"" + std::string(current().text) + "\" is the type " + typeName(type) + ", a texture or sampler type, which "
+				"mslc takes as a parameter only, and a sampler also as a local");
 		}
 		consumeName();
 	} else if (atKeyword("enum")) {
@@ -5947,16 +6461,30 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	std::string component(current().text);
+	// A function template's type parameter while its signature is read to deduce it: the texture keeps the
+	// parameter's marker, from which deduction takes the argument texture's sampled type.
+	std::string deducedFrom;
 	if (isIntegerSpecifier(component)) {
 		Type channel;
 		parseSpecifierRun(channel);
 		component = typeName(channel);
 	} else {
 		advance();
+		// A template's type parameter is reached through the name its block binds.
+		const std::string spelled = component;
+		if (const std::string* bound = blockName(component); bound && !bound->empty() && _typedefs.count(*bound)) {
+			component = *bound;
+		}
 		Type alias;
 		if (!_enumTypes.count(component) && resolveTypeName(component, alias) && !alias.isVector() && !alias.isMatrix() && alias.namedType.empty()) {
 			alias.isConst = false;
 			component = typeName(alias);
+		} else if (!_enumTypes.count(component) && resolveTypeName(component, alias) && isDeductionMarker(alias)
+			&& !alias.isVector() && !alias.isMatrix() && !alias.isPointer && !alias.arrayLength) {
+			deducedFrom = alias.namedType;
+			component = "float";
+		} else {
+			component = spelled;
 		}
 	}
 	static const std::map<std::string_view, ScalarKind> elements = {
@@ -6029,6 +6557,7 @@ void Parser::parseResourceType(Type& type) {
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
 	type.scalar = element->second;
+	type.namedType = deducedFrom;
 }
 
 Parameter Parser::parseParameter(const std::string& helperName, bool allowUnnamed) {
@@ -6082,10 +6611,10 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 				param.type.addressSpace = AddressSpace::Thread;
 			}
 		}
-		// A pointer to the caller's local array; the emitter checks the argument.
+		// A pointer to the caller's local array, thread or threadgroup; the emitter checks the argument.
 		const bool threadPointer = param.type.isPointer && !param.isReference
-			&& param.type.addressSpace == AddressSpace::Thread && param.type.resource == ResourceKind::None
-			&& !param.type.isAtomic;
+			&& (param.type.addressSpace == AddressSpace::Thread || param.type.addressSpace == AddressSpace::Threadgroup)
+			&& param.type.resource == ResourceKind::None && !param.type.isAtomic;
 		// A pointer to a buffer in device or constant memory; the emitter passes the
 		// whole buffer the argument names.
 		const bool bufferPointer = param.type.isPointer && !param.isReference
@@ -6093,10 +6622,10 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 			&& (param.type.addressSpace == AddressSpace::Device
 				|| param.type.addressSpace == AddressSpace::Constant);
 		if (param.type.isPointer && !threadPointer && !bufferPointer) {
-			throw CompileError(what + "is a pointer outside the thread, device and constant address "
-				"spaces or to an atomic or a resource, which a helper function does not take yet; it "
-				"takes scalar, vector, matrix and struct values, a thread pointer to a local array, and "
-				"a device or constant pointer to a buffer");
+			throw CompileError(what + "is a pointer outside the thread, threadgroup, device and constant "
+				"address spaces or to an atomic or a resource, which a helper function does not take yet; it "
+				"takes scalar, vector, matrix and struct values, a thread or threadgroup pointer to a local "
+				"array, and a device or constant pointer to a buffer");
 		}
 		if (param.type.arrayLength && !param.type.isStdArray) {
 			throw CompileError(what + "is an array, which a helper function does not take yet");
@@ -6111,12 +6640,13 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 			param.type.isConst = true;
 		}
 		if (param.type.addressSpace != AddressSpace::None && !constantReference && !bufferPointer
-			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)) {
+			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)
+			&& !threadPointer) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}
 		if (at(TokenKind::LBracket)) {
-			throw CompileError(what + "has an attribute, which only an entry point's parameter can have");
+			checkHelperParameterAttributes(param, what);
 		}
 		recordObjectType(param.name, param.type);
 		return param;
@@ -6154,11 +6684,73 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 	return param;
 }
 
+// QUIRK: a parameter of a function that is not an entry point may carry the attributes an entry point's
+// parameter takes ([[buffer(n)]], [[texture(n)]], [[stage_in]], [[user(...)]], a builtin, ...), and they have no
+// effect: the argument is what the call passes, and indices may repeat. Some must still suit the type, else it
+// is an error: [[buffer(n)]] a pointer or reference to device or constant memory, [[threadgroup(n)]] one to
+// threadgroup memory, [[texture(n)]] a texture, [[sampler(n)]] a sampler, [[position]] a float4, and the
+// thread and threadgroup position, index and size builtins a uint or ushort scalar or vector. In a function
+// template the check is made on the instance, as a substitution failure. [[flat]] and the other interpolation
+// attributes apply to struct members only. The other attributes are accepted and dropped without a check of the
+// type. The MSL specification does not say. Evidence: black-box observation of Apple's compiler (tier 2; metal
+// 32023.883, macOS 26), which accepts the well-typed forms and reports "type ... is not valid for attribute",
+// "invalid address space qualification for buffer pointee type" or a substitution failure for the others.
+// Test: probes helper_parameter_attribute_*.
+void Parser::checkHelperParameterAttributes(const Parameter& param, const std::string& what) {
+	const size_t start = _position;
+	const Type& type = param.type;
+	// A type still to be deduced is checked on the instance.
+	const bool dependent = isDeductionMarker(type) || (type.isTexture() && !type.namedType.empty());
+	const bool place = type.isPointer || param.isReference;
+	const bool resource = type.resource != ResourceKind::None;
+	const bool integerBuiltinType = !type.isPointer && !type.arrayLength && !type.isMatrix() && type.namedType.empty()
+		&& (type.scalar == ScalarKind::UInt || type.scalar == ScalarKind::UShort) && type.vectorWidth <= 3;
+	std::string wrong;
+	std::set<std::string> seen;
+	parseAttributeList(seen, [&](const std::string& name, std::optional<uint32_t>, const std::string&) {
+		if (interpolationFromName(name)) {
+			throw CompileError(what + "has the attribute [[" + name + "]], which applies to a struct member only");
+		}
+		if (dependent || !wrong.empty()) {
+			return;
+		}
+		const bool fits = name == "buffer" ? place && !resource
+				&& (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)
+			: name == "threadgroup" ? place && !resource && type.addressSpace == AddressSpace::Threadgroup
+			: name == "texture" ? type.isTexture() && !type.isPointer && !type.arrayLength
+			: name == "sampler" ? type.resource == ResourceKind::Sampler && !type.isPointer && !type.arrayLength
+			: name == "position" ? !place && !resource && type.namedType.empty() && type.scalar == ScalarKind::Float
+				&& type.vectorWidth == 4 && !type.isMatrix() && !type.arrayLength
+			: builtinFromName(name) && name != "front_facing" && name != "vertex_id" && name != "instance_id"
+				&& name != "frag_coord" ? integerBuiltinType
+			: true;
+		if (!fits) {
+			wrong = name;
+		}
+	});
+	if (!wrong.empty()) {
+		_position = start;
+		const std::string message = what + "has an attribute, [[" + wrong + "]], that its type " + typeName(type)
+			+ " is not valid for";
+		if (_inInstance) {
+			throw SubstitutionFailure(message);
+		}
+		throw CompileError(message);
+	}
+}
+
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 	std::set<std::string> seen;
 
-	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument, const std::string& identifier) {
+		if (name == "function_constant") {
+			if (identifier.empty()) {
+				throw CompileError("[[function_constant]] on a parameter needs the name of a program-scope constant");
+			}
+			attributes.functionConstant = identifier;
+			return;
+		}
 		if (argument && (name == "buffer" || name == "texture" || name == "sampler" || name == "threadgroup")) {
 			checkAttributeIndex(name, *argument);
 		}
@@ -6185,6 +6777,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			attributes.samplerIndex = argument;
 		} else if (name == "depth") {
 			throw CompileError("[[depth]] is not valid on an input parameter");
+		} else if (name == "stencil") {
+			throw CompileError("[[stencil]] is not valid on an input parameter");
 		} else if (name == "sample_mask") {
 			throw CompileError("[[sample_mask]] on an input parameter is not lowered yet");
 		} else if (name == "invariant") {
@@ -6208,6 +6802,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 	do {
 		parseAttributeList(seen, visit);
 	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
+
+	if (!attributes.functionConstant.empty() && attributes.stageIn) {
+		throw CompileError("[[function_constant]] on a [[stage_in]] parameter is not lowered yet");
+	}
 
 	return attributes;
 }
@@ -6241,6 +6839,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("a struct field has more than one [[point_size]] attribute");
 			}
 			attributes.pointSize = true;
+		} else if (name == "stencil") {
+			if (attributes.stencil) {
+				throw CompileError("a struct field has more than one [[stencil]] attribute");
+			}
+			attributes.stencil = true;
 		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
@@ -6264,6 +6867,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("[[color]] needs an index");
 			}
 			attributes.colorIndex = argument;
+		} else if (name == "function_constant") {
+			if (identifier.empty()) {
+				throw CompileError("[[function_constant]] on a struct field needs the name of a program-scope constant");
+			}
+			attributes.functionConstant = identifier;
 		} else if (const auto interpolation = interpolationFromName(name)) {
 			if (attributes.interpolation != Interpolation::None) {
 				throw CompileError("a struct field has more than one interpolation attribute; "
@@ -6281,6 +6889,12 @@ FieldAttributes Parser::parseFieldAttributes() {
 	do {
 		parseAttributeList(seen, visit);
 	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
+
+	// A gated stage input or output other than a colour would change the interface between stages, which is
+	// fixed when a pipeline is made here.
+	if (!attributes.functionConstant.empty() && !attributes.colorIndex) {
+		throw CompileError("[[function_constant]] on a struct field is lowered on a [[color(n)]] field only");
+	}
 
 	return attributes;
 }
@@ -6305,7 +6919,7 @@ void Parser::parseAttributeList(std::set<std::string>& seen, const std::function
 		// [[user]], [[depth]], [[sample_mask]], [[point_size]] and the interpolation
 		// attributes say more than once in their own words, where the field is parsed.
 		if (!seen.insert(name).second && name != "user" && name != "depth" && name != "sample_mask"
-			&& name != "point_size" && !interpolationFromName(name)) {
+			&& name != "point_size" && name != "stencil" && !interpolationFromName(name)) {
 			throw CompileError("attribute \"" + name + "\" cannot appear more than once on a declaration");
 		}
 
@@ -6321,6 +6935,9 @@ void Parser::parseAttributeList(std::set<std::string>& seen, const std::function
 			if (name == "invariant") {
 				throw CompileError("[[invariant]] takes no argument");
 			}
+			if (name == "stencil") {
+				throw CompileError("[[stencil]] takes no argument");
+			}
 			advance();
 			if (name == "user" || name == "depth") {
 				if (kind() != TokenKind::Identifier) {
@@ -6328,6 +6945,8 @@ void Parser::parseAttributeList(std::set<std::string>& seen, const std::function
 						+ std::string(tokenKindName(kind())));
 				}
 				identifier = std::string(advance().text);
+			} else if (name == "function_constant") {
+				parseFunctionConstantArgument(argument, identifier);
 			} else {
 				argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\"", true));
 			}
@@ -6340,6 +6959,39 @@ void Parser::parseAttributeList(std::set<std::string>& seen, const std::function
 	}
 
 	expect(TokenKind::RBracket, "to close an attribute list");
+}
+
+// The argument of [[function_constant(...)]]. On a file-scope constant it is the constant's index, a constant
+// integer expression; anywhere else it names the program-scope constant that gates the declaration. Which one
+// is wanted is up to the caller, so both are worked out: index gets the value of an integer constant
+// expression and gate the name of a file-scope constant.
+void Parser::parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate) {
+	const size_t start = _position;
+	const ExpressionPtr expression = parseAssignment();
+	// The file-scope names, which the parser of a template's instance is given as well (restoreNames). A
+	// parameter or local of that name hides the constant, and is not a program-scope constant.
+	bool hidden = false;
+	for (const auto& block: _blocks) {
+		hidden = hidden || block.names.count(expression->name);
+	}
+	if (expression->kind == ExpressionKind::Identifier && !hidden) {
+		const auto declared = _declared.find(expression->name);
+		if (declared != _declared.end() && declared->second == "variable") {
+			gate = expression->name;
+		}
+	}
+	const size_t end = _position;
+	_position = start;
+	try {
+		index = static_cast<uint32_t>(parseConstantIndex("attribute \"function_constant\"", true));
+	} catch (const CompileError& error) {
+		if (gate.empty()) {
+			throw CompileError(std::string(error.what()) + "; on a declaration other than a file-scope constant, it "
+				"names a program-scope constant");
+		}
+		index.reset();
+	}
+	_position = end;
 }
 
 FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
@@ -6396,9 +7048,15 @@ void Parser::parseEntryParameterList(std::vector<Parameter>& out, const std::str
 }
 
 void Parser::checkUniqueResourceSlots(const FunctionDecl& decl) const {
-	// Two parameters of one kind cannot take the same slot.
+	// Two parameters of one kind cannot take the same slot, unless every one of them but one is gated by
+	// [[function_constant]]. Apple's compiler accepts such a slot, as when a function takes its source as a
+	// texture2d or a texture2d_array at texture(0) and a function constant picks one (metal 32023.883, macOS 26);
+	// each such parameter has a binding of its own here.
 	std::set<std::pair<std::string, uint32_t>> slots;
 	for (const Parameter& parameter: decl.parameters) {
+		if (!parameter.attributes.functionConstant.empty()) {
+			continue;
+		}
 		const std::pair<const char*, std::optional<uint32_t>> taken[] = {
 			{ "buffer", parameter.attributes.bufferIndex },
 			{ "texture", parameter.attributes.textureIndex },
@@ -6430,7 +7088,7 @@ bool sameFullType(Type lhs, Type rhs, bool checkTopConst) {
 }
 
 auto parameterAttributeKey(const ParameterAttributes& a) {
-	return std::tie(a.bufferIndex, a.threadgroupIndex, a.textureIndex, a.samplerIndex, a.builtin, a.stageIn, a.colorIndex);
+	return std::tie(a.bufferIndex, a.threadgroupIndex, a.textureIndex, a.samplerIndex, a.builtin, a.stageIn, a.colorIndex, a.functionConstant);
 }
 
 }
@@ -6785,6 +7443,37 @@ StatementPtr Parser::parseStatement() {
 		return parseCompoundStatement();
 	}
 
+	// A GNU statement expression that is a statement of its own, "({ ... });", which Apple's compiler takes as
+	// clang does: its value is dropped, so it runs as the block it holds, in a scope of its own, and a break,
+	// continue or return in it acts as one in that block would. One in an expression is refused (parsePrimary), even where its value is dropped.
+	if (at(TokenKind::LParen) && lookahead().kind == TokenKind::LBrace) {
+		size_t depth = 0;
+		size_t close = 0;
+		for (size_t k = 0;; ++k) {
+			const TokenKind tokenKind = lookahead(k).kind;
+			if (tokenKind == TokenKind::EndOfFile) {
+				break;
+			}
+			if (tokenKind == TokenKind::LParen || tokenKind == TokenKind::LBrace || tokenKind == TokenKind::LBracket) {
+				++depth;
+			} else if (tokenKind == TokenKind::RParen || tokenKind == TokenKind::RBrace
+				|| tokenKind == TokenKind::RBracket) {
+				if (--depth == 0) {
+					close = k;
+					break;
+				}
+			}
+		}
+		if (close && lookahead(close).kind == TokenKind::RParen && lookahead(close - 1).kind == TokenKind::RBrace
+			&& lookahead(close + 1).kind == TokenKind::Semicolon) {
+			advance();
+			StatementPtr block = parseCompoundStatement();
+			expect(TokenKind::RParen, "to close a statement expression");
+			expect(TokenKind::Semicolon, "after a statement expression");
+			return block;
+		}
+	}
+
 	if (at(TokenKind::Semicolon)) {
 		advance();
 		statement->kind = StatementKind::ExpressionStatement;
@@ -6802,6 +7491,12 @@ StatementPtr Parser::parseStatement() {
 		}
 		throw CompileError("a '" + label + "' label nested inside a compound statement, loop or if within a switch "
 			"body is not supported: put every label directly in the switch body");
+	}
+
+	if (matchIdentifier("static_assert")) {
+		statement->refusal = parseStaticAssert(true);
+		statement->kind = StatementKind::ExpressionStatement;
+		return statement;
 	}
 
 	if (atKeyword("namespace") && lookahead().kind == TokenKind::Identifier && lookahead(2).kind == TokenKind::Assign) {
@@ -6915,7 +7610,7 @@ StatementPtr Parser::parseStatement() {
 				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
 		size_t arrayTokens = 0;
 		const bool stdArrayType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-			&& !isLocal(name) && atStdArray(arrayTokens);
+			&& !isLocal(name) && (atStdArray(arrayTokens) || atLibraryVec(arrayTokens));
 		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
@@ -7373,10 +8068,12 @@ StatementPtr Parser::parseForStatement() {
 		// qualified with "::" (j8, j9; see parseStatement's identical guard).
 		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
 			&& isLocal(name);
+		size_t vecTokens = 0;
 		const bool looksLikeType = (kind() == TokenKind::Identifier
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)));
+				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)))
+			|| atLibraryVec(vecTokens);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -7895,7 +8592,7 @@ ExpressionPtr Parser::parseSizeof() {
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
 				&& !(kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && memberHidesName(name))
 				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
-					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && atStdArray(nameTokens))))
+					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && (atStdArray(nameTokens) || atLibraryVec(nameTokens)))))
 			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
 		if (startsType) {
 			Type type = parseType(true, false);
@@ -8070,9 +8767,9 @@ std::optional<Type> Parser::peekCastTargetName(size_t& nameTokens) {
 }
 
 // `(T)operand`, where T names a scalar, vector or matrix type, a typedef, an
-// enum or a struct, is the functional cast T(operand). A type name cannot begin a
-// parenthesised expression, so "(" followed by one is always a cast. Returns null
-// when the parenthesis opens an expression.
+// enum or a struct, is the functional cast T(operand). Returns null when the
+// parenthesis opens an expression, which includes one that starts with a functional
+// cast, "(int(x) * 2)": a type name followed by anything but ")" is not a C-style cast.
 ExpressionPtr Parser::parseCast() {
 	const Token& first = lookahead(1);
 	if (first.kind != TokenKind::Identifier && first.kind != TokenKind::ColonColon) {
@@ -8088,14 +8785,18 @@ ExpressionPtr Parser::parseCast() {
 			++skip;
 		}
 		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
-			if (skip == 1 && lookahead(2).kind == TokenKind::LParen) {
-				return nullptr;
-			}
+			const size_t open = _position;
 			advance();
 			Type type;
 			parseSpecifierRun(type);
 			if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
+			}
+			// "(int(x) * 2)": the type name starts a functional cast inside a parenthesised
+			// expression, not a C-style cast, so the parenthesis opens an expression.
+			if (!at(TokenKind::RParen)) {
+				_position = open;
+				return nullptr;
 			}
 			expect(TokenKind::RParen, "to close a cast");
 			auto expression = std::make_unique<Expression>();
@@ -8112,6 +8813,30 @@ ExpressionPtr Parser::parseCast() {
 	// Read the name, which may be namespace-qualified, from just past the '('.
 	const size_t open = _position;
 	++_position;
+	// (vec<T, N>)x; a parenthesis holding more than the type, "(vec<float, 4>(a).x)", is an expression.
+	if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
+		const size_t atLine = line();
+		Type target;
+		try {
+			target = parseType(false, false);
+		} catch (...) {
+			_position = open;
+			throw;
+		}
+		if (!at(TokenKind::RParen)) {
+			_position = open;
+			return nullptr;
+		}
+		advance();
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Construct;
+		expression->line = atLine;
+		expression->constructType = target;
+		const NestingScope scope(*this);
+		expression->arguments.push_back(parseUnary());
+		measure(*expression);
+		return expression;
+	}
 	size_t nameTokens = 0;
 	std::optional<Type> type;
 	try {
@@ -8168,9 +8893,6 @@ ExpressionPtr Parser::parseNamedCast() {
 	expression->kind = ExpressionKind::Construct;
 	expression->line = line();
 
-	const bool asType = atKeyword("as_type");
-	const std::string cast = asType ? "as_type" : "static_cast";
-	expression->bitReinterpret = asType;
 	advance();
 	advance();
 
@@ -8188,7 +8910,7 @@ ExpressionPtr Parser::parseNamedCast() {
 			if (nameTokens > 0 && lookahead(nameTokens).kind == TokenKind::Less) {
 				throw CompileError("a cast to a pointer, reference or template type is not supported");
 			}
-			throw CompileError("expected a type name in \"" + cast + "<\", found \""
+			throw CompileError("expected a type name in \"static_cast<\", found \""
 				+ std::string(current().text) + "\"");
 		}
 		type = *target;
@@ -8200,14 +8922,14 @@ ExpressionPtr Parser::parseNamedCast() {
 	if (at(TokenKind::Star) || at(TokenKind::Ampersand) || at(TokenKind::Less)) {
 		throw CompileError("a cast to a pointer, reference or template type is not supported");
 	}
-	expect(TokenKind::Greater, asType ? "to close the type of an as_type" : "to close the type of a static_cast");
-	expect(TokenKind::LParen, asType ? "for the operand of an as_type" : "for the operand of a static_cast");
+	expect(TokenKind::Greater, "to close the type of a static_cast");
+	expect(TokenKind::LParen, "for the operand of a static_cast");
 	{
 		const NestingScope scope(*this);
 		expression->arguments.push_back(parseExpression());
 	}
-	expect(TokenKind::RParen, asType ? "to close an as_type" : "to close a static_cast");
-	if (!asType) if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
+	expect(TokenKind::RParen, "to close a static_cast");
+	if (auto call = constructWithConstructor(type, expression->arguments, expression->line)) {
 		return call;
 	}
 	expression->constructType = type;
@@ -8536,7 +9258,7 @@ ExpressionPtr Parser::parsePrimary() {
 	}
 
 	if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Less) {
-		if (atKeyword("static_cast") || atKeyword("as_type")) {
+		if (atKeyword("static_cast")) {
 			return parseNamedCast();
 		}
 		if (atKeyword("reinterpret_cast") || atKeyword("const_cast")) {
@@ -8575,6 +9297,10 @@ ExpressionPtr Parser::parsePrimary() {
 	}
 
 	if (at(TokenKind::LParen)) {
+		if (lookahead().kind == TokenKind::LBrace) {
+			throw CompileError("a statement expression \"({ ... })\" is lowered only as a statement of its own, "
+				"\"({ ... });\"; one in an expression is not lowered");
+		}
 		advance();
 		const RestoreFlag freshExpression(_noGreater, false);
 		auto expression = parseExpression();
@@ -8614,6 +9340,28 @@ ExpressionPtr Parser::parsePrimary() {
 		list->constructType = type;
 		list->line = atLine;
 		return list;
+	}
+
+	if (size_t asTypeTokens = 0; atAsType(asTypeTokens)) {
+		return parseAsType(asTypeTokens);
+	}
+
+	// vec<T, N>(...) constructs the vector, as float4(...) does.
+	if (size_t vecTokens = 0; (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+		&& !isLocal(std::string(current().text)) && atLibraryVec(vecTokens)) {
+		const size_t atLine = line();
+		const Type type = parseType(false, false);
+		if (!at(TokenKind::LParen)) {
+			throw CompileError("expected '(' after type \"" + typeName(type) + "\"");
+		}
+		advance();
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Construct;
+		expression->line = atLine;
+		expression->constructType = type;
+		expression->arguments = parseArgumentList("to close a constructor's argument list");
+		measure(*expression);
+		return expression;
 	}
 
 	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {

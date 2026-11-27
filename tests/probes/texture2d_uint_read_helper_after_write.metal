@@ -1,7 +1,7 @@
 // EXPECT: valid
-// DISASM: OpCapability StorageImageReadWithoutFormat
+// DISASM-NOT: OpCapability StorageImageReadWithoutFormat
 // DISASM: OpCapability StorageImageWriteWithoutFormat
-// DISASM-MATCH: OpImageRead %v4uint
+// DISASM-MATCH: OpImageFetch %v4uint
 // DISASM: OpImageWrite
 #include <metal_stdlib>
 using namespace metal;

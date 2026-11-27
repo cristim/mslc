@@ -1,4 +1,4 @@
-// EXPECT: error is lowered only for numeric scalars, vectors and matrices
+// EXPECT: error ++ and -- do not apply to a bool
 //
 // Apple rejects incrementing a bool.
 kernel void step_bool_rejected(device int *out [[buffer(0)]],

@@ -219,7 +219,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         res.update(status="error", reason=str(e))
         return None, res
     compiled, problems = {}, []
-    allowed = {"vertex": {"Buffer", "VertexInput", "Texture", "Sampler"}, "fragment": {"Buffer", "Texture", "Sampler"}}
+    allowed = {"vertex": {"Buffer", "VertexInput", "StageOutput", "Texture", "Sampler"}, "fragment": {"Buffer", "StageInput", "Texture", "Sampler"}}
     for stage, name in (("vertex", vs), ("fragment", fs)):
         spv, refl, error = hosts.run_mslc(opts.mslc, source, work, includes, stage)
         if error:

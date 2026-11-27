@@ -125,9 +125,9 @@ VK_ADDRESS = {"Repeat": 0, "MirrorRepeat": 1, "ClampToEdge": 2, "ClampToZero": 3
 def seed(bindings, rng, profile, base, embedded=(), apple=None):
     """Writes one texture file per Texture binding to `base`+name and returns the manifest
     tuples ([(index, set, binding, file, access, scalar[, kind])], [(index, set, binding)]), in binding order;
-    `access` is mslc's texture_access: a `Read`, `Write` or `ReadWrite` texture is a storage image in SPIR-V,
-    a `Sample` one is sampled; `scalar` and `kind` come from Apple's reflection ("float" and "2d" when
-    `apple` is omitted, as in graphics, with `kind` appended when not "2d").
+    `access` is mslc's texture_access: a `Read` texture is a sampled image fetched from, like a `Sample` one,
+    while a `Write` or `ReadWrite` texture is a storage image in SPIR-V; `scalar` and `kind` come from Apple's
+    reflection ("float" and "2d" when `apple` is omitted, as in graphics, with `kind` appended when not "2d").
     A sampler tuple is (index, set, binding), or for an embedded sampler
     (None, set, binding, (s, t, r) modes, linear) from the entry's `embedded` states."""
     by_index = {t["index"]: (t["data"], t["type"]) for t in (apple or {}).get("textures", ()) if t["type"] != "texturebuffer"}
@@ -160,7 +160,7 @@ def lines(textures, samplers, backend="vulkan", outputs=None):
         kind = rest[1] if len(rest) > 1 else "2d"
         if kind == "2d":
             tail = " %s %s %s" % (scalar, a.lower(), outputs[i]) if i in outputs else (" " + scalar if scalar != "float" else "")
-            tex_lines.append("%s %d %d %d %d %d %s%s" % ("texture" if a == "Sample" else "storagetexture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f, tail))
+            tex_lines.append("%s %d %d %d %d %d %s%s" % ("texture" if a in ("Sample", "Read") else "storagetexture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f, tail))
         else:
             w, h, d, layers = TEXTURE_SHAPES[kind]
             tail = (" " + outputs[i]) if i in outputs else ""

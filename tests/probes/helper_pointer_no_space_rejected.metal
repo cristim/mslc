@@ -1,4 +1,4 @@
-// EXPECT: error parameter "p" of helper function "f" is a pointer outside the thread, device and constant address spaces
+// EXPECT: error parameter "p" of helper function "f" is a pointer outside the thread, threadgroup, device and constant address spaces
 #include <metal_stdlib>
 using namespace metal;
 float f(float* p) { return p[0]; }

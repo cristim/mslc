@@ -297,6 +297,8 @@ struct ModuleOptions {
 	uint32_t localSizeY = 1;
 	uint32_t localSizeZ = 1;
 	bool separateImageSet = false;
+	// Kernels without a barrier skip the threads outside a grid size given through specialization constants
+	bool maskGridSize = false;
 	// A Linkage object rather than a Vulkan executable: it may have no entry point,
 	// exports the helpers it defines, and may call a helper it only declares.
 	bool linkageObject = false;
@@ -332,6 +334,11 @@ struct ModuleOptions {
 // fragment's own pixel. A consumer binds the colour attachment's view as an input
 // attachment descriptor at that binding and maps pInputAttachments[n] to colour attachment n
 // in the subpass. A half4 is a float image; the module converts.
+// A "Texture" entry's "texture_access" says how the host binds it. "Sample" and "Read" are sampled
+// images (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) of every level of the texture: an access::read texture is
+// fetched from by integer coordinate and lod, and an access::read cube or cube array is declared as the
+// 2D array of its faces (layer * 6 + face), so the host binds a 2D array view of it. "Write" and
+// "ReadWrite" are storage images (VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) of one level.
 // A texture_buffer<T, access> parameter is its own kind, never "Texture":
 // { "kind": "TextureBuffer", "metal_index": n, "descriptor": { "set": s, "binding": b },
 // "descriptor_type": "UniformTexelBuffer"|"StorageTexelBuffer", "texture_access": "Read"|"Write"|"ReadWrite",
@@ -350,6 +357,13 @@ struct ModuleOptions {
 // writes constantID s = max(1, bytes / e) into VkSpecializationInfo when it creates the pipeline, where e
 // is Metal's element size (a float3 is 16). SpecIds 0 to 2 are the workgroup size; the arguments take
 // 3 upward in declaration order across the module, so two kernels never share one. There is no descriptor.
+// A vertex function's returned struct adds one { "kind": "StageOutput", "location": n, "name": user,
+// "type": "float4" } per field that is not [[position]] or [[point_size]], and a fragment function's
+// [[stage_in]] struct one { "kind": "StageInput", ... } the same way. name is the field's [[user(name)]],
+// or the field's own name without one, and location is the Location of the variable. Apple pairs a
+// vertex output with a fragment input by name and type when it builds the pipeline, whatever the fields'
+// positions, but each function is compiled on its own and gets its Locations from its own struct. A host
+// that builds the pipeline has to give a fragment input the Location its partner output has.
 // reflection_version stays 2 because bindings are additive: a consumer switches
 // on "kind" and ignores kinds it does not know.
 //

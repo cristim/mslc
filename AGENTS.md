@@ -128,6 +128,7 @@ leading comment block:
 | Needle | Meaning |
 | --- | --- |
 | `EXPECT: valid` | compiles, and the module passes `spirv-val --target-env vulkan1.3` |
+| `EXPECT: no module` | compiles to a library with no functions (no entry point), so no module is written; only `REFLECT` needles apply |
 | `EXPECT: error <text>` | compilation fails and the diagnostic contains `<text>` |
 | `DISASM: <text>` | the disassembly contains `<text>` |
 | `DISASM-NOT: <text>` | the disassembly does not contain `<text>` |

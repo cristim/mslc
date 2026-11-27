@@ -1,6 +1,6 @@
-// EXPECT: error an unsigned or wider integer inside a constant expression is not supported
+// EXPECT: error a constant expression that mixes an unsigned operand with a negative value
 //
-// Mixing u operands changes the arithmetic to unsigned, which the folder does not model.
+// -1 + 0u is unsigned arithmetic on a negative value, which wraps and which the folder does not model.
 #include <metal_stdlib>
 using namespace metal;
 enum One { A = -1 + 0u };

@@ -10,11 +10,16 @@ struct LegacyOptions {
 	const char* sourcePath;
 	const char* const* includeDirs;
 	size_t includeDirCount;
+	const char* const* macroNames;
+	const char* const* macroValues;
+	size_t macroCount;
+	uint32_t maskGridSize;
 };
 #define OFFSET(field) _Static_assert(offsetof(MslcOptions, field) == offsetof(struct LegacyOptions, field), #field)
 _Static_assert(sizeof(MslcOptions) == sizeof(struct LegacyOptions), "options ABI size");
 OFFSET(stage); OFFSET(localSizeX); OFFSET(localSizeY); OFFSET(localSizeZ);
 OFFSET(imageSetPolicy); OFFSET(sourcePath); OFFSET(includeDirs); OFFSET(includeDirCount);
+OFFSET(macroNames); OFFSET(macroValues); OFFSET(macroCount); OFFSET(maskGridSize);
 
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "line %d: %s\n", __LINE__, #condition); exit(1); } } while (0)
 
@@ -90,6 +95,17 @@ int main(int argc, char** argv) {
 		CHECK(bytes != NULL && size >= 56 && error == NULL);
 		mslc_free(bytes);
 	}
+	/* NUL characters are ignored, as clang does: after the last token (a length that counts the
+	 * terminator), between two tokens and inside a comment. */
+	{
+		static const char withNul[] = "float helper() { return\0 1; }\n// a\0b\n\0";
+		uint8_t* bytes = NULL;
+		size_t size = 0;
+		char* error = NULL;
+		CHECK(mslc_compile_library(withNul, sizeof(withNul), NULL, &bytes, &size, &error) == 0);
+		CHECK(bytes != NULL && size >= 56 && error == NULL);
+		mslc_free(bytes);
+	}
 	rejected(NULL, NULL, "no source given");
 	rejected("typedef Missing Alias;", NULL, NULL);
 	rejected("using namespace metal", NULL, NULL);
@@ -131,12 +147,43 @@ int main(int argc, char** argv) {
 		CHECK(mslc_compile_library(include, strlen(include), &options, &bytes, &size, &diagnostic) == 0);
 		CHECK(bytes != NULL && size > 56 && diagnostic == NULL);
 		mslc_free(bytes);
+  }
+	{
+		// A helper emitted once for two kernels: both list the function constant it reads.
+		const char* shared =
+			"constant int c [[function_constant(0)]];\n"
+			"template <typename T> T leaf() { return T(c); }\n"
+			"int shared() { return leaf<int>(); }\n"
+			"kernel void a(device int* out [[buffer(0)]]) { out[0] = shared(); }\n"
+			"kernel void b(device int* out [[buffer(0)]]) { out[0] = shared() + 1; }\n";
+		char* reflection = NULL;
+		char* error = NULL;
+		CHECK(mslc_translate(shared, strlen(shared), NULL, NULL, NULL, &reflection, &error) == 0 && reflection != NULL);
+		int listed = 0;
+		for (const char* at = reflection; (at = strstr(at, "{ \"name\": \"c\", \"type\": \"int\"")) != NULL; at++) {
+			listed++;
+		}
+		CHECK(listed == 2);
+		mslc_free(reflection);
 	}
+  // No entry point: a library with no functions, which has no module, and a reflection with no entry point.
+	const char* noEntryPoints[] = { "", "float helper() { return 1; }" };
+	for (size_t i = 0; i < sizeof(noEntryPoints) / sizeof(noEntryPoints[0]); i++) {
+		uint8_t* spirv = (uint8_t*)1;
+		size_t spirvSize = 99;
+		char* reflection = NULL;
+		char* error = NULL;
+		CHECK(mslc_translate(noEntryPoints[i], strlen(noEntryPoints[i]), NULL, &spirv, &spirvSize, &reflection, &error) == 0);
+		CHECK(spirv == NULL && spirvSize == 0 && error == NULL);
+		CHECK(reflection != NULL && strstr(reflection, "\"entry_points\": [\n\t]") != NULL);
+		mslc_free(reflection);
+	}
+  // A stage asked for is an entry point the source has to have.
+	MslcOptions kernel;
+	mslc_default_options(&kernel);
+	kernel.stage = MSLC_STAGE_KERNEL;
 	char* error = NULL;
-	CHECK(mslc_translate("", 0, NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
-	mslc_free(error);
-	const char* helper = "float helper() { return 1; }";
-	CHECK(mslc_translate(helper, strlen(helper), NULL, NULL, NULL, NULL, &error) == 1 && error != NULL);
+	CHECK(mslc_translate("", 0, &kernel, NULL, NULL, NULL, &error) == 1 && error != NULL);
 	mslc_free(error);
 	return 0;
 }

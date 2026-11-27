@@ -71,7 +71,10 @@ std::string typeName(const Type& type) {
 			const size_t array = kindName.find("_array");
 			kindName = array == std::string::npos ? kindName + "_ms" : kindName.substr(0, array) + "_ms_array";
 		}
-		return kindName + "<" + scalarKindName(type.scalar)
+		// A function template's parameter still to be deduced, "<T>", is spelled as its name.
+		const std::string sampled = type.namedType.size() > 2 && type.namedType.front() == '<'
+			? type.namedType.substr(1, type.namedType.size() - 2) : std::string(scalarKindName(type.scalar));
+		return kindName + "<" + sampled
 			+ (type.textureAccess == TextureAccess::Sample ? std::string(">")
 				: std::string(", access::") + textureAccessName(type.textureAccess) + ">");
 	}
@@ -87,6 +90,10 @@ std::string typeName(const Type& type) {
 		if (type.isPacked) {
 			name = "packed_" + name;
 		}
+	} else if (type.vectorWidth > 1 && type.namedType.size() > 2 && type.namedType.front() == '<'
+		&& type.namedType.back() == '>') {
+		// vec<T, N> of a template parameter still to deduce, whose marker is "<T>".
+		name = "vec<" + type.namedType.substr(1, type.namedType.size() - 2) + ", " + std::to_string(type.vectorWidth) + ">";
 	}
 	if (type.isAtomic) {
 		name = "atomic_" + name;

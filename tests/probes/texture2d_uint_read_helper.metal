@@ -1,7 +1,7 @@
 // EXPECT: valid
 // DISASM: OpFunctionCall
-// DISASM-MATCH: OpImageRead %v4uint
-// DISASM: OpImageQuerySize %v2uint
+// DISASM-MATCH: OpImageFetch %v4uint
+// DISASM: OpImageQuerySizeLod %v2uint
 #include <metal_stdlib>
 using namespace metal;
 uint4 load(texture2d<uint, access::read> src, uint2 p) { return src.read(p) + uint4(src.get_width()); }

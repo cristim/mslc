@@ -254,7 +254,7 @@ class Resources(unittest.TestCase):
         samp = [(1, 0, 1), (None, 1, 1, (0, 3, 1), True)]
         vk = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY, 1, {}, {0: "c.bin"}, {0: ("float", 4)}, None, [], tex, samp, "mslc")
         ap = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY, 1, {}, {0: "c.bin"}, {0: ("float", 4)}, None, [], tex, samp, "apple")
-        self.assertIn("storagetexture 0 0 0 4 4 vt.bin short", vk)
+        self.assertIn("texture 0 0 0 4 4 vt.bin short", vk)
         self.assertIn("texture 0 1 0 4 4 ft.bin half", vk)
         self.assertIn("image cube sample 1 1 1 4 4 1 1 float cube.bin", vk)
         self.assertIn("image cube sample 1 1 1 4 4 1 1 float cube.bin", ap)
@@ -381,7 +381,7 @@ class Resources(unittest.TestCase):
                 res = graphics.check_pair(self.OPTS, src, "vs", "fs", self.PARAMS, d, [])
             self.assertEqual(res["status"], "skipped")
             self.assertIn("no storage feature", res["reason"])
-            self.assertIn("storagetexture 0 0 0 4 4 ", seen["metalhost"])
+            self.assertIn("texture 0 0 0 4 4 ", seen["metalhost"])
             self.assertIn("ushort", seen["metalhost"])
             self.assertNotIn("esampler ", seen["metalhost"])
             self.assertIn("texture 0 1 0 4 4 ", seen["vkhost"])

@@ -115,6 +115,51 @@ int main(int argc, char** argv) {
 	options.includeDirCount = 1;
 	expectError("empty include directory", translate("#define VALUE 1\n" + kernel, options), "empty string");
 
+	// Predefined macros: a value, a missing value (1), an empty value, and a source that defines the
+	// name again.
+	const std::string useValue = "kernel void k(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]])\n"
+		"{ out[i] = VALUE; }\n";
+	const char* names[] = { "VALUE" };
+	const char* values[] = { "7" };
+	mslc_default_options(&options);
+	options.macroNames = names;
+	options.macroValues = values;
+	options.macroCount = 1;
+	expectSuccess("a predefined macro", translate(useValue, options));
+	expectSuccess("a predefined macro the source defines again", translate("#define VALUE 9\n" + useValue, options));
+	expectError("a predefined macro is visible to the source",
+		translate("#if VALUE == 7\n#error saw seven\n#endif\n" + useValue, options), "saw seven");
+
+	options.macroValues = nullptr;
+	expectSuccess("a predefined macro with no values is 1",
+		translate("#if VALUE != 1\n#error not one\n#endif\n" + useValue, options));
+	const char* nullValue[] = { nullptr };
+	options.macroValues = nullValue;
+	expectSuccess("a predefined macro with a NULL value is 1",
+		translate("#if VALUE != 1\n#error not one\n#endif\n" + useValue, options));
+
+	const char* emptyValue[] = { "" };
+	options.macroValues = emptyValue;
+	expectSuccess("a predefined macro with an empty value is defined",
+		translate("#ifndef VALUE\n#error not defined\n#endif\nkernel void k(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]])\n{ out[i] = VALUE 5; }\n", options));
+
+	const char* lineBreak[] = { "1\n#error injected" };
+	options.macroValues = lineBreak;
+	expectError("a line break in a value", translate(useValue, options), "line break");
+
+	const char* badNames[] = { "NOT-A-NAME" };
+	options.macroNames = badNames;
+	options.macroValues = values;
+	expectError("a name that is not an identifier", translate(useValue, options), "not an identifier");
+
+	const char* nullNames[] = { nullptr };
+	options.macroNames = nullNames;
+	expectError("a NULL name", translate(useValue, options), "NULL entry");
+
+	mslc_default_options(&options);
+	options.macroCount = 1;
+	expectError("a count without names", translate(useValue, options), "macroNames");
+
 	if (failures == 0) {
 		std::printf("mslc-api-test: all passed\n");
 	}

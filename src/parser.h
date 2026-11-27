@@ -80,6 +80,14 @@ class Parser {
 		ScalarKind kind;
 	};
 	std::map<std::string, ConstantInt> _constantInts;
+	// A const or constexpr one-dimensional array of integers whose elements all folded, so a
+	// constant expression may index it (an attribute index written xlt_remap[0]). Kept like
+	// _constantInts: file-scope ones here, local ones in the block that declares them.
+	struct ConstantIntArray {
+		std::vector<int64_t> values;
+		ScalarKind kind;
+	};
+	std::map<std::string, ConstantIntArray> _constantIntArrays;
 	// The struct whose body is being parsed, so an array length can tell a member from a constant.
 	const StructDecl* _structBody = nullptr;
 	std::map<std::string, ScalarKind> _enumUnderlying; // tag or anonymous typedef name -> underlying type
@@ -121,6 +129,7 @@ class Parser {
 		std::map<std::string, std::string> names;
 		std::map<std::string, std::string> aliases;
 		std::map<std::string, ConstantInt> constants;
+		std::map<std::string, ConstantIntArray> constantArrays;
 		// The declared type of each object whose type is final and sizeof can use; a name this block
 		// declares without an entry here is one whose type is not known (auto, a resource).
 		std::map<std::string, Type> objectTypes;
@@ -246,6 +255,7 @@ private:
 		std::set<std::string> helperNames;
 		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
 		std::map<std::string, ConstantInt> constantInts;
+		std::map<std::string, ConstantIntArray> constantIntArrays;
 		std::map<std::string, ConstructorInfo> constructors;
 		std::set<std::string> memberTemplateNames;
 		std::set<std::string> seedKeys;
@@ -359,7 +369,9 @@ private:
 	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
-	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
+	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member,
+		std::pair<size_t, size_t>* explicitArguments = nullptr);
+	void parseExplicitSpecialization(size_t headerStart);
 	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
 	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
 	void parseMemberTemplate(StructDecl& decl);
@@ -444,11 +456,22 @@ private:
 	bool atStdArray(size_t& nameTokens) const;
 	// array<T, N> after its qualifiers, folded into type as the array T[N] with isStdArray set.
 	void parseStdArray(Type& type, size_t nameTokens);
+	// Whether the cursor is at metal::as_type<, spelled with or without the namespace unless the file
+	// declares its own as_type or a local hides it; nameTokens is how many tokens the name takes.
+	bool atAsType(size_t& nameTokens) const;
+	// as_type<T>(x), read as a call of the builtin kAsTypeCallee with T as its template argument.
+	ExpressionPtr parseAsType(size_t nameTokens);
+	// Whether the cursor is at metal::vec<, spelled with or without the namespace unless the file
+	// declares its own vec; nameTokens is how many tokens the name takes.
+	bool atLibraryVec(size_t& nameTokens) const;
+	// vec<T, N> after its qualifiers, folded into type as the vector of N T.
+	void parseLibraryVec(Type& type, size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.
 	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();
+	std::string parseStaticAssert(bool inStatement);
 
 	bool peekQualifiedName(QualifiedName& out) const;
 	bool isDiscardFragment(QualifiedName& name) const;
@@ -508,6 +531,10 @@ private:
 	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
 	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
 	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	const ConstantInt* findConstantInt(const Expression& identifier) const;
+	bool containsUnsigned(const Expression& expression) const;
+	int64_t constantArrayElement(const Expression& index, bool nested, bool attribute) const;
+	void recordConstantArray(const VariableDeclaration& declaration, bool local);
 	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
 	// current block's, otherwise the file's.
 	void recordConstant(const VariableDeclaration& declaration, bool local);
@@ -521,6 +548,7 @@ private:
 	// is one.
 	ExpressionPtr foldStdArrayCall(ExpressionPtr& receiver);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
+	void parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	void checkUniqueResourceSlots(const FunctionDecl& decl) const;
 	void parseEntryParameterList(std::vector<Parameter>& out, const std::string& quoted, bool allowUnnamed);
@@ -599,6 +627,9 @@ private:
 	// than an entry point's: no attribute, no resource, no pointer or reference.
 	Parameter parseParameter(const std::string& helperName = std::string(), bool allowUnnamed = false);
 	ParameterAttributes parseParameterAttributes();
+	// The attributes on a parameter of a function that is not an entry point: read, checked against the
+	// parameter's type, and dropped.
+	void checkHelperParameterAttributes(const Parameter& param, const std::string& what);
 
 	// Struct fields
 	FieldAttributes parseFieldAttributes();
