@@ -64,9 +64,10 @@ A file whose `// RUN:` line names a vertex and a fragment function (or `--vertex
 is drawn instead of dispatched:
 
 ```
-// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 cases=2
+// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 base_vertex=0 base_instance=0 cases=2
 // DIFFCHECK-POSITION: pos          the stage_in field that carries the position, or `none`
-// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list, pixels, `x,y` or `x,y,z` (optional)
+// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list (or vertex list with DIFFCHECK-INDEXES), pixels, `x,y` or `x,y,z`
+// DIFFCHECK-INDEXES: 0 1 2 0 2 3 ...       optional uint32 triangle index list into the geometry vertices
 // DIFFCHECK: depth                 read a depth target back (implied by [[depth(any)]])
 ```
 
@@ -129,11 +130,10 @@ puts in the attachments.
 
 Skipped with the reason (follow-up work): a writable `[[buffer]]` with `instances > 1`, writable
 textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures,
-framebuffer fetch. Not covered: indexed draws, blending, stencil, multisampling,
-sample-rate varyings, tessellation.
+framebuffer fetch. Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 36
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 39
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
 

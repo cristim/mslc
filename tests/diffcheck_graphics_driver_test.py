@@ -77,6 +77,11 @@ MUTANTS = [
     ("sparse_color_interp", "fragment", [["OpIMul %uint", "OpIAdd %uint"]]),
     ("sparse_color_interp", "vertex", [["OpFAdd %v2float", "OpFSub %v2float"]]),
     ("sparse_color_interp", "fragment", [[r"^\s*OpDecorate %\d+ NoPerspective\n", ""]]),
+    ("indexed_draw", "vertex", [["BuiltIn VertexIndex", "BuiltIn SubgroupSize"],
+                                ["BuiltIn InstanceIndex", "BuiltIn VertexIndex"],
+                                ["BuiltIn SubgroupSize", "BuiltIn InstanceIndex"]]),
+    ("indexed_draw", "vertex", [["OpBitwiseXor %uint", "OpBitwiseOr %uint"]]),
+    ("indexed_draw", "vertex", [["OpConstant %uint 16", "OpConstant %uint 17"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -87,7 +92,7 @@ if rc == 77:
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
              "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d",
-             "writable_buffer", "vertex_attr_half", "sparse_color_interp"):
+             "writable_buffer", "vertex_attr_half", "sparse_color_interp", "indexed_draw"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
@@ -168,4 +173,21 @@ with tempfile.TemporaryDirectory() as d:
         os.chmod(stub, 0o755)
         rc, out, data = run(probe("flat_colour"), "--timeout", "20" if name == "crash" else "3", vk=stub)
         assert rc == 2 and data["status"] == "error" and expect in data["reason"], (name, rc, out)
+
+# Non-indexed draw with non-zero base_vertex and base_instance must match on both hosts.
+with tempfile.TemporaryDirectory() as d:
+    base_k = os.path.join(d, "base_nonindexed.metal")
+    with open(base_k, "w") as f:
+        f.write("// RUN: vertex=vs fragment=fs instances=2 base_vertex=2 base_instance=4 cases=1\n"
+                "// DIFFCHECK-POSITION: pos\n"
+                "// DIFFCHECK-GEOMETRY: 4,4 24,4 4,25\n"
+                "#include <metal_stdlib>\nusing namespace metal;\n"
+                "struct VIn { float2 pos [[attribute(0)]]; uint tag [[attribute(1)]]; };\n"
+                "struct VOut { float4 pos [[position]]; uint4 val [[flat]]; };\n"
+                "vertex VOut vs(VIn in [[stage_in]], uint vid [[vertex_id]], uint iid [[instance_id]]) {\n"
+                "  VOut o; o.pos = float4(in.pos.x + 0.125f * float(iid - 4u), in.pos.y, 0.5f, 1.0f);\n"
+                "  o.val = uint4(vid, iid, in.tag, 7u); return o;\n}\n"
+                "fragment uint4 fs(VOut in [[stage_in]]) { return in.val; }\n")
+    rc, out, data = run(base_k)
+    assert rc == 0 and data["status"] == "matched", (rc, out, data)
 print("PASS")
