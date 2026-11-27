@@ -44,7 +44,8 @@ def mutated(path, edits):
 
 
 BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write",
-             "texture_nonfloat_read", "texture_nonfloat_write", "sampler_modes",
+             "texture_nonfloat_read", "texture_nonfloat_write", "texture_non2d_read", "texture_non2d_write",
+             "texture_cube_read_write", "sampler_modes",
              "layout_unread_member", "ulp_per_buffer", "ulp_per_field", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
              "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
              "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
@@ -70,6 +71,28 @@ MUTANTS = [
     ("texture_nonfloat_write", [[r"(OpCompositeConstruct %v4int) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
     # non-float 2D texture, write: the int and half write-only 2D textures change bindings
     ("texture_nonfloat_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # non-2D textures, read: 1D array coordinate and layer swapped
+    ("texture_non2d_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, read: 3D y and z coordinates swapped
+    ("texture_non2d_read", [[r"(OpCompositeConstruct %v3uint %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, read: 1D array get_array_size reads width (lane 0) instead of layer count (lane 1)
+    ("texture_non2d_read", [[r"(OpImageQuerySize %v2uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]], "mismatched"),
+    # non-2D textures, read: 2D array get_array_size and 3D get_depth read height (lane 1) instead of lane 2
+    ("texture_non2d_read", [[r"(OpImageQuerySize %v3uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]], "mismatched"),
+    # non-2D textures, write: 1D float write components x and y swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 1D array / 2D array write coordinates swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 2D array uint write components x and y swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v4uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 3D read_write x and z coordinates swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v3uint) (%\d+) (%\d+) (%\d+)", r"\1 \4 \3 \2"]], "mismatched"),
+    # cube/cube_array: cube array layer-face stride 5 instead of 6
+    ("texture_cube_read_write", [[r"(OpIMul %uint %\d+) %uint_6\b", r"\1 %uint_5"]], "mismatched"),
+    # cube/cube_array: half cube write components x and y swapped
+    ("texture_cube_read_write", [[r"(OpCompositeConstruct %v4half) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # cube/cube_array: cube sample face 0 direction altered
+    ("texture_cube_read_write", [[r"(OpCompositeConstruct %v3float) %float_1 (%\d+)", r"\1 \2 \2"]], "mismatched"),
     # texture: the two textures change bindings
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
@@ -170,7 +193,7 @@ with tempfile.TemporaryDirectory() as d:
     assert rc != 0 and data is not None and data["status"] == "mismatched" and "exact" in json.dumps(data), (
         "the per-buffer bound no longer holds the exact buffer", rc, out)
 
-# A texture the output does not depend on fails unless declared; a non-2D texture and an unknown name are refused.
+# A texture the output does not depend on fails unless declared; a multisampled texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_unused_read_write"))
@@ -180,7 +203,9 @@ assert rc == 2 and data["status"] == "error" and "used" in data["reason"], (rc, 
 rc, out, data = run(fixture("texture_write_kernel"))
 assert rc == 0 and data["status"] == "matched", (rc, out)
 rc, out, data = run(fixture("texture_3d_kernel"))
-assert rc == 3 and "not a 2D texture" in data["reason"], (rc, out)
+assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(fixture("texture_multisample_kernel"))
+assert rc == 3 and "unsupported type other" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_read_write"))
@@ -197,6 +222,33 @@ with tempfile.TemporaryDirectory() as d:
         dst.write(src.read().replace("UNUSED: ignored", "UNUSED: ignord"))
     rc, out, data = run(typo)
     assert rc == 2 and "ignord" in out, (rc, out)
+
+# A depth texture reflects as depth (not 2d/2d_array/cube) and is skipped; >8 textures or samplers on vkhost skips cleanly.
+with tempfile.TemporaryDirectory() as d:
+    depth_k = os.path.join(d, "depth.metal")
+    with open(depth_k, "w") as f:
+        f.write("#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void k(depth2d<float> d [[texture(0)]], sampler s [[sampler(0)]],"
+                " device float *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = d.sample(s, float2(0.5f)); }\n")
+    rc, out, data = run(depth_k)
+    assert rc == 3 and "unsupported type depth" in data["reason"], (rc, out, data)
+    many_k = os.path.join(d, "many_tex.metal")
+    params = ", ".join(f"texture2d<float, access::read> t{n} [[texture({n})]]" for n in range(9))
+    reads = " + ".join(f"t{n}.read(uint2(0))" for n in range(9))
+    with open(many_k, "w") as f:
+        f.write(f"#include <metal_stdlib>\nusing namespace metal;\n"
+                f"kernel void k({params}, device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ o[i] = {reads}; }}\n")
+    rc, out, data = run(many_k)
+    assert rc == 3 and "too many textures" in data["reason"], (rc, out, data)
+    many_s = os.path.join(d, "many_smp.metal")
+    sparams = ", ".join(f"sampler s{n} [[sampler({n})]]" for n in range(9))
+    sreads = " + ".join(f"t.sample(s{n}, float2(0.5f))" for n in range(9))
+    with open(many_s, "w") as f:
+        f.write(f"#include <metal_stdlib>\nusing namespace metal;\n"
+                f"kernel void k(texture2d<float, access::sample> t [[texture(0)]], {sparams},"
+                f" device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ o[i] = {sreads}; }}\n")
+    rc, out, data = run(many_s)
+    assert rc == 3 and "too many samplers" in data["reason"], (rc, out, data)
 
 # A host that says it cannot make the texel buffer (a format or feature the device lacks) is a skip with that reason,
 # never a pass.

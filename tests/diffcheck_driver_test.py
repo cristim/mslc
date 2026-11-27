@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory() as d:
     listing = os.path.join(d, "list.txt")
     open(listing, "w").write("# comment\n%s\n%s std=3.1\n%s\n%s\n%s\n%s\n" % (
         kernel("fma_kernel.metal"), kernel("struct_kernel.metal"), kernel("texture_write_kernel.metal"),
-        kernel("texture_3d_kernel.metal"), os.path.join(d, "missing.metal"), kernel("zero_declared_kernel.metal")))
+        kernel("texture_multisample_kernel.metal"), os.path.join(d, "missing.metal"), kernel("zero_declared_kernel.metal")))
     open(os.path.join(d, "missing.metal"), "w").write("kernel void k() { nope(); }\n")
     report = os.path.join(d, "r.json")
     base = [sys.executable, DRIVER, "--corpus", listing, "--mslc", mslc, "--metalhost", metalhost,
@@ -99,7 +99,7 @@ with tempfile.TemporaryDirectory() as d:
     assert r.returncode == 0, r
     assert "6 kernels: 4 compared, 4 matched, 2 skipped" in r.stdout, r.stdout
     reasons = {os.path.basename(x["file"]): x["reason"] for x in json.load(open(report))["results"] if x["status"] == "skipped"}
-    assert "not a 2D texture" in reasons["texture_3d_kernel.metal"], reasons
+    assert "unsupported type other" in reasons["texture_multisample_kernel.metal"], reasons
     assert "nope" in reasons["missing.metal"] or "mslc" in reasons["missing.metal"], reasons
     open(listing, "a").write("%s\n" % kernel("zero_kernel.metal"))
     r = subprocess.run(base, capture_output=True, text=True)
