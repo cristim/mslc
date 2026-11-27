@@ -53,6 +53,7 @@ MUTANTS = [
     # A constant output component sits next to interpolated ones: one and forty ULP must both show.
     ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500003"]]),
     ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500119"]]),
+    ("half_fwidth_special", "fragment", [["OpFAdd %half", "OpFSub %half"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -61,10 +62,15 @@ if rc == 77:
     sys.exit(77)
 
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
-             "multi_target", "mixed_components", "half_fwidth"):
+             "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
+rc, out, data = run(os.path.join(HERE, "half_fwidth_wide.metal"))
+assert rc == 0 and data["status"] == "matched" and all(c["negative_control"] for c in data["cases"]), (rc, out)
+rc, out, data = run(os.path.join(HERE, "half_fwidth_wide.metal"), mslc_cmd=MUTATE,
+                    env={"MSLC_REAL": mslc, "MUT": json.dumps([["OpFAdd %half", "OpFSub %half"]]), "MUT_STAGE": "fragment"})
+assert rc == 1 and data["status"] == "mismatched", (rc, out)
 
 for name, stage, edits, *expect in MUTANTS:
     env = {"MSLC_REAL": mslc, "MUT": json.dumps(edits), "MUT_STAGE": stage}
