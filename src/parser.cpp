@@ -80,6 +80,7 @@ namespace {
 			{ "uint32_t", ScalarKind::UInt },
 			{ "int64_t", ScalarKind::Long },
 			{ "uint64_t", ScalarKind::ULong },
+			{ "size_t", ScalarKind::ULong },
 		};
 
 		return table;
@@ -3067,10 +3068,16 @@ bool Parser::parseStructFunction(StructDecl& decl) {
 		try {
 			_position = start + ahead;
 			parseType();
-			if (kind() == TokenKind::Identifier) {
-				if (current().text == "operator") {
+			if (at(TokenKind::Ampersand) && lookahead().kind == TokenKind::Identifier && lookahead().text == "operator") {
+				throw CompileError("an operator overload returning a reference is not lowered (in " + quoted + ")");
+			}
+			if (atKeyword("operator")) {
+				if (isStatic || lookahead(1).kind != TokenKind::LBracket
+					|| lookahead(2).kind != TokenKind::RBracket || lookahead(3).kind != TokenKind::LParen) {
 					throw CompileError("an operator overload is not lowered (in " + quoted + ")");
 				}
+				_position += 3; functionName = "operator[]"; isFunction = true;
+			} else if (kind() == TokenKind::Identifier) {
 				functionName = std::string(advance().text);
 				isFunction = at(TokenKind::LParen);
 			}
@@ -3221,7 +3228,14 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		advance();
 	} else {
 		fn.returnType = parseType();
-		memberName = std::string(advance().text);
+		if (atKeyword("operator")) {
+			advance();
+			expect(TokenKind::LBracket, "after 'operator'");
+			expect(TokenKind::RBracket, "after '['");
+			memberName = "operator[]";
+		} else {
+			memberName = std::string(advance().text);
+		}
 	}
 	advance();
 
@@ -3243,6 +3257,9 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		fn.parameters.push_back(std::move(object));
 	}
 	parseHelperParameters(fn, quoted);
+	if (memberName == "operator[]" && fn.parameters.size() != 2) {
+		throw CompileError(quoted + " must take exactly one parameter");
+	}
 
 	std::vector<std::pair<std::string, ExpressionPtr>> initialisers;
 	if (isConstructor && match(TokenKind::Colon)) {
@@ -3269,10 +3286,30 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 	}
 
 	if (!isConstructor && !isStatic) {
-		if (!matchIdentifier("const")) {
+		bool sawConst = false;
+		AddressSpace space = AddressSpace::None;
+		for (; kind() == TokenKind::Identifier; advance()) {
+			const std::string_view word = current().text;
+			if (word == "const") {
+				if (sawConst) { throw CompileError("duplicate 'const' qualifier on " + quoted); }
+				sawConst = true;
+			} else if (word == "volatile") {
+				throw CompileError("a volatile member function is not lowered (" + quoted + ")");
+			} else if (const auto found = addressSpaceFor(word)) {
+				if (space != AddressSpace::None) { throw CompileError("duplicate address-space qualifier on " + quoted); }
+				if (*found != AddressSpace::Thread && *found != AddressSpace::Constant) {
+					throw CompileError(quoted + " is qualified " + std::string(word) + "; only thread and constant member functions are lowered");
+				}
+				space = *found;
+			} else { break; }
+		}
+		if (!sawConst) {
 			throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function "
 				"that could write it is not lowered (mark it const)");
 		}
+		fn.parameters[0].type.isConst = true;
+		fn.parameters[0].type.addressSpace = space == AddressSpace::Constant ? AddressSpace::Constant : AddressSpace::Thread;
+		fn.parameters[0].isReference = space == AddressSpace::Constant;
 	}
 
 	ConstructorInfo* constructors = isConstructor ? &_constructors[decl.name] : nullptr;
@@ -8015,6 +8052,9 @@ ExpressionPtr Parser::parsePostfix() {
 			const bool keyword = atKeyword("template") && lookahead().kind == TokenKind::Identifier;
 			if (keyword) {
 				advance();
+			}
+			if (atKeyword("operator")) {
+				throw CompileError("calling an operator with member syntax is not lowered; write s[i]");
 			}
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a member name after '" + op + "'");

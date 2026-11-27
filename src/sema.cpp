@@ -2626,7 +2626,7 @@ namespace {
 			std::optional<BinaryOperator> compound);
 		Id emitPlaceAddress(const Expression& left);
 		const Expression& storeRoot(const Expression& target) const;
-		void requireStorable(const Expression& target) const;
+		void requireStorable(const Expression& target);
 		void emitSwizzleStore(const Expression& target, const Expression& valueExpression,
 			std::optional<BinaryOperator> compound);
 		void emitVariableDeclaration(const VariableDeclaration& declaration, bool storageOnly = false);
@@ -2713,7 +2713,14 @@ namespace {
 		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
 		bool readsRuntimeValue(const Expression& expression) const;
 		void requireSameReferent(const VariableDeclaration& declaration, const Type& type, Id referent);
-		Id emitIndex(const Expression& expression, bool asAddress);
+		std::optional<Type> arrayExpressionType(const Expression& expression);
+		const StructDecl* indexOperatorOwner(const Expression& expression);
+		HelperFunction* indexOperatorHelper(const StructDecl& owner);
+		bool validMemberReceiver(const FunctionDecl& definition, const Expression& receiver);
+		bool isComputedValue(const Expression& expression);
+		bool isTemporaryPart(const Expression& target);
+		bool isStructValue(const Expression& expression);
+		Id emitIndex(const Expression& expression, bool asAddress, bool allowVoid = false);
 		bool isElementAccess(const Expression& expression) const;
 		Id emitElementAccess(const Expression& expression, bool asAddress);
 		struct ElementIndex {
@@ -2740,7 +2747,7 @@ namespace {
 		std::vector<HelperFunction*> helpersNamed(const std::string& name);
 		std::vector<std::string> namesOfCall(const Expression& call, std::set<std::string>* adlOnly = nullptr);
 		const StructDecl* adlStructOf(const Expression& argument);
-		bool inConstantSpace(const Expression& place) const;
+		bool inConstantSpace(const Expression& place);
 		std::optional<Type> placeType(const Expression& place);
 		std::optional<Type> sizeofPlaceType(const Expression& place);
 		std::optional<Type> sizeofExpressionType(const Expression& expression);
@@ -2846,7 +2853,7 @@ namespace {
 		void linkageAttributes(Id function, const std::string& name, uint32_t type);
 		Id helperParameterType(const Type& type);
 		void rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-			size_t first) const;
+			size_t first);
 		HelperFunction& pointerSpecialisation(const Expression& call, HelperFunction& generic,
 			size_t first, std::vector<Id>& arrays);
 		// The pointer value a device or constant pointer argument passes: the whole
@@ -3507,7 +3514,103 @@ namespace {
 		return asAddress ? address : loadFrom(address, type);
 	}
 
-	Id Emitter::emitIndex(const Expression& expression, bool asAddress) {
+	std::optional<Type> Emitter::arrayExpressionType(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::Identifier: {
+				const auto& table = expression.fileScope ? _fileScopeBound : _bindings;
+				const auto it = table.find(expression.name);
+				return it != table.end() && !it->second.isBuffer && it->second.pointeeMsl.arrayLength
+					? std::optional<Type>(it->second.pointeeMsl) : std::nullopt;
+			}
+			case ExpressionKind::Member:
+				if (!arrayExpressionType(*expression.left) || expression.isArrow) {
+					if (const StructDecl* decl = structOf(*expression.left)) {
+						for (const StructField& f: decl->fields) {
+							if (f.name == expression.memberName && f.type.arrayLength) return f.type;
+						}
+					}
+				}
+				return std::nullopt;
+			case ExpressionKind::Index: {
+				if (expression.left->kind == ExpressionKind::Identifier && !expression.left->fileScope) {
+					const auto it = _bindings.find(expression.left->name);
+					if (it != _bindings.end() && it->second.isBuffer) {
+						return it->second.pointeeMsl.arrayLength ? std::optional<Type>(it->second.pointeeMsl) : std::nullopt;
+					}
+				}
+				std::optional<Type> base = arrayExpressionType(*expression.left);
+				if (base) base->dropOuterDimension();
+				return base && base->arrayLength ? base : std::nullopt;
+			}
+			case ExpressionKind::InitList:
+			case ExpressionKind::Construct:
+				return expression.constructType && expression.constructType->arrayLength ? expression.constructType : std::nullopt;
+			case ExpressionKind::Conditional: {
+				const auto yes = arrayExpressionType(*expression.arguments[0]);
+				return yes ? yes : arrayExpressionType(*expression.arguments[1]);
+			}
+			case ExpressionKind::Comma: return arrayExpressionType(*expression.right);
+			case ExpressionKind::Call: {
+				const Type* returned = nullptr;
+				if (expression.left->kind == ExpressionKind::Identifier) {
+					returned = returningType(expression, [](const Type& t) { return t.arrayLength && !t.isPointer ? typeName(t) : std::string(); });
+				} else if (expression.left->kind == ExpressionKind::Member) {
+					const StructDecl* owner = structOf(*expression.left->left);
+					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName) : _helpers.end();
+					returned = found == _helpers.end() ? nullptr : &found->second.definition->returnType;
+				}
+				return returned && returned->arrayLength && !returned->isPointer ? std::optional<Type>(*returned) : std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	const StructDecl* Emitter::indexOperatorOwner(const Expression& expression) {
+		if (expression.kind != ExpressionKind::Index || expression.isDereference) return nullptr;
+		if (expression.left->kind == ExpressionKind::Identifier && !expression.left->fileScope) {
+			const auto it = _bindings.find(expression.left->name);
+			if (it != _bindings.end() && it->second.isBuffer) return nullptr;
+		}
+		return arrayExpressionType(*expression.left) ? nullptr : structOf(*expression.left);
+	}
+
+	Emitter::HelperFunction* Emitter::indexOperatorHelper(const StructDecl& owner) {
+		const auto found = _helpers.find(owner.name + "::operator[]");
+		return found == _helpers.end() ? nullptr : &found->second;
+	}
+
+	bool Emitter::validMemberReceiver(const FunctionDecl& definition, const Expression& receiver) {
+		if (!isComputedValue(receiver)) {
+			const Expression& root = storeRoot(receiver);
+			if (root.kind == ExpressionKind::Comma) return validMemberReceiver(definition, *root.right);
+			if (root.kind == ExpressionKind::Conditional)
+				return validMemberReceiver(definition, *root.arguments[0]) && validMemberReceiver(definition, *root.arguments[1]);
+		}
+		const AddressSpace space = definition.parameters[0].type.addressSpace;
+		if (space == AddressSpace::Constant) return inConstantSpace(receiver);
+		if (space != AddressSpace::Thread) return true;
+		const OverloadArgument object = classifyArgument(receiver);
+		return !(object.kind == OverloadArgument::Kind::Variable && !object.inThread);
+	}
+
+	Id Emitter::emitIndex(const Expression& expression, bool asAddress, bool allowVoid) {
+		if (const StructDecl* owner = indexOperatorOwner(expression)) {
+			if (asAddress) throw CompileError("expression is not assignable");
+			HelperFunction* op = indexOperatorHelper(*owner);
+			if (!op) throw CompileError("struct \"" + owner->name + "\" has no operator[]");
+			if (op->definition == _helper)
+				throw CompileError("recursive call: \"" + op->definition->name
+					+ "\" calls itself; SPIR-V for Vulkan forbids recursion (Apple's compiler accepts it)");
+			if (expression.arguments.size() != 1)
+				throw CompileError("expected exactly one index, found " + std::to_string(expression.arguments.size()));
+			if (!allowVoid && returnsVoid(*op->definition))
+				throw CompileError("a call to \"" + op->definition->name + "\" returns void and has no value");
+			const Id savedObject = std::exchange(_pendingObject, InvalidId);
+			const Id result = emitHelperCall(expression, *op, expression.left.get(), {});
+			_pendingObject = savedObject;
+			return result;
+		}
+
 		size_t depth = 0;
 		if (arrayRootBinding(expression, depth)) {
 			return emitLocalArrayIndex(expression, asAddress);
@@ -3889,8 +3992,9 @@ namespace {
 	const StructDecl* Emitter::structOf(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: {
-				const auto it = _bindings.find(expression.name);
-				if (it != _bindings.end()) {
+				const auto& table = expression.fileScope ? _fileScopeBound : _bindings;
+				const auto it = table.find(expression.name);
+				if (it != table.end()) {
 					const std::string& name = it->second.pointeeMsl.namedType;
 					return name.empty() ? nullptr : _unit.findStruct(name);
 				}
@@ -3909,8 +4013,21 @@ namespace {
 					: _unit.findStruct(parent->fields[field].type.namedType);
 			}
 
-			// An element of a buffer has the buffer's own type.
-			case ExpressionKind::Index: return structOf(*expression.left);
+			// An element of a buffer has the buffer's own type; a struct's operator[] yields its return type.
+			case ExpressionKind::Index: {
+				if (const StructDecl* owner = indexOperatorOwner(expression)) {
+					const HelperFunction* op = indexOperatorHelper(*owner);
+					const Type* returned = op ? &op->definition->returnType : nullptr;
+					return !returned || returned->namedType.empty() || returned->isPointer || returned->arrayLength
+						? nullptr : _unit.findStruct(returned->namedType);
+				}
+				if (std::optional<Type> arr = arrayExpressionType(*expression.left)) {
+					arr->dropOuterDimension();
+					return arr->arrayLength || arr->isPointer || arr->namedType.empty()
+						? nullptr : _unit.findStruct(arr->namedType);
+				}
+				return structOf(*expression.left);
+			}
 
 			// Either arm of c ? a : b names the struct both arms share.
 			case ExpressionKind::Conditional: {
@@ -3922,7 +4039,8 @@ namespace {
 
 			// S{...} is a value of the struct it names.
 			case ExpressionKind::InitList:
-				return expression.constructType && !expression.constructType->namedType.empty()
+				return expression.constructType && !expression.constructType->arrayLength
+					&& !expression.constructType->namedType.empty()
 					? _unit.findStruct(expression.constructType->namedType) : nullptr;
 
 			// A helper that returns a struct, including a struct's constructor, which
@@ -4069,17 +4187,18 @@ namespace {
 		if (rank == 0 || indices > rank) {
 			return std::nullopt;
 		}
+		const Expression* base = &expression;
+		while (base->kind == ExpressionKind::Index) {
+			base = base->left.get();
+		}
 		if (indices < rank) {
-			const Expression* base = &expression;
-			while (base->kind == ExpressionKind::Index) {
-				base = base->left.get();
-			}
 			const std::optional<Type> member = placeType(*base);
 			if (!member || !member->isStdArray) {
 				throw CompileError("an array member indexed this far is still an array, which is not a value: "
 					"index it down to an element");
 			}
 		}
+		if (!asAddress && isComputedValue(*base->left)) return std::nullopt;
 		Id fieldType = InvalidId;
 		const Id address = emitMemberAddress(expression, fieldType);
 		if (asAddress) {
@@ -4097,12 +4216,13 @@ namespace {
 	// A struct that is computed rather than named: a call, S{...}, a conditional or
 	// comma of them, or a member of one. It has no address to walk, so its members
 	// are taken from the value.
-	static bool isStructValue(const Expression& expression) {
+	bool Emitter::isStructValue(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Call:
 			case ExpressionKind::InitList:
 			case ExpressionKind::Conditional:
 			case ExpressionKind::Comma: return true;
+			case ExpressionKind::Index: return isComputedValue(expression) && structOf(expression) != nullptr;
 			case ExpressionKind::Member: return isStructValue(*expression.left);
 			default: return false;
 		}
@@ -4124,8 +4244,10 @@ namespace {
 					+ expression.memberName + "\"");
 			}
 			const Id value = emitExpression(*expression.left);
+			const Type& fieldType = decl->fields[field].type;
 			return _builder.emitTyped(spirv::OpCompositeExtract,
-				declaredTypeOf(decl->fields[field].type), { value, static_cast<uint32_t>(field) });
+				fieldType.arrayLength ? arrayTypeOf(fieldType) : declaredTypeOf(fieldType),
+				{ value, static_cast<uint32_t>(field) });
 		}
 
 		const ConstantBinding* constant = constantFor(expression.left.get());
@@ -6502,9 +6624,9 @@ namespace {
 		// A conditional or a comma with a place for an operand may be an lvalue, in any address space; the
 		// ranking below takes every one for a thread prvalue and could pick the wrong function. One made of
 		// values only is a prvalue.
-		const auto placeLike = [](const auto& self, const Expression& e) -> bool {
+		const auto placeLike = [this](const auto& self, const Expression& e) -> bool {
 			switch (e.kind) {
-				case ExpressionKind::Identifier: case ExpressionKind::Index: case ExpressionKind::Member: return true;
+				case ExpressionKind::Identifier: case ExpressionKind::Index: case ExpressionKind::Member: return !isComputedValue(e);
 				case ExpressionKind::Comma: return self(self, *e.right);
 				// One place arm is enough to refuse: Apple binds `c ? la : 2.0f` to a non-const reference
 				// parameter (measured), so it is not a plain prvalue.
@@ -7343,11 +7465,18 @@ namespace {
 	Emitter::OverloadArgument Emitter::classifyArgument(const Expression& expression) {
 		OverloadArgument argument;
 		argument.expression = &expression;
-		const bool place = expression.kind == ExpressionKind::Identifier || expression.kind == ExpressionKind::Index
-			|| expression.kind == ExpressionKind::Member;
+		const bool place = (expression.kind == ExpressionKind::Identifier
+			|| expression.kind == ExpressionKind::Index || expression.kind == ExpressionKind::Member)
+			&& !isComputedValue(expression);
 		argument.kind = place ? OverloadArgument::Kind::Variable : OverloadArgument::Kind::Value;
+		const auto lookupBinding = [&](const Expression& id) -> const Binding* {
+			if (!id.fileScope) { return findResourceBinding(id.name); }
+			if (const auto arr = _fileScopeBound.find(id.name); arr != _fileScopeBound.end()) { return &arr->second; }
+			const auto sampler = _fileScopeSamplerBindings.find(id.name);
+			return sampler != _fileScopeSamplerBindings.end() ? &sampler->second : nullptr;
+		};
 		if (expression.kind == ExpressionKind::Identifier) {
-			if (const Binding* binding = findResourceBinding(expression.name)) {
+			if (const Binding* binding = lookupBinding(expression)) {
 				const bool array = binding->isPointer && binding->pointeeMsl.arrayLength
 					&& binding->storageClass == spirv::StorageClass::Function && !binding->isAddress;
 				if (binding->pointeeMsl.resource != ResourceKind::None) {
@@ -7364,7 +7493,8 @@ namespace {
 		}
 		if (argument.kind == OverloadArgument::Kind::Variable) {
 			const Expression& root = storeRoot(expression);
-			const Binding* local = root.kind == ExpressionKind::Identifier ? findResourceBinding(root.name) : nullptr;
+			const Binding* local = root.kind == ExpressionKind::Identifier && !root.fileScope
+				? findResourceBinding(root.name) : nullptr;
 			argument.inConstant = inConstantSpace(expression);
 			argument.inThread = local && !local->isBuffer && local->bufferPointeeType == InvalidId
 				&& local->storageClass == spirv::StorageClass::Function && !argument.inConstant;
@@ -7674,6 +7804,12 @@ namespace {
 		const size_t first = receiver ? 1 : 0;
 		rejectAliasedReferenceArguments(call, definition, first);
 		if (first) {
+			if (!validMemberReceiver(definition, *receiver)) {
+				throw CompileError(definition.parameters[0].type.addressSpace == AddressSpace::Constant
+					? "the member function \"" + definition.name + "\" is marked constant, and the object is not in the constant address space"
+					: "the member function \"" + definition.name + "\" is called on an object in device, constant or threadgroup memory, "
+						"which Apple rejects (mark it constant, or copy the object to a local first)");
+			}
 			const Id object = _pendingObject != InvalidId ? _pendingObject : emitExpression(*receiver);
 			_pendingObject = InvalidId;
 			operands.push_back(convertImplicit(object, helper.parameterTypes[0]));
@@ -7894,7 +8030,7 @@ namespace {
 	// the same storage would have its write overwritten by the stale copy. Two
 	// bare variables are the same pointer and alias as C++ does.
 	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
-		size_t first) const {
+		size_t first) {
 		struct Passed { std::string root; bool temporary; std::vector<AccessStep> steps; };
 		std::vector<Passed> passed;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
@@ -7907,7 +8043,7 @@ namespace {
 				continue;
 			}
 			const Expression& root = storeRoot(argument);
-			if (root.kind != ExpressionKind::Identifier) {
+			if (root.kind != ExpressionKind::Identifier || isComputedValue(argument)) {
 				continue;
 			}
 			const auto bound = _bindings.find(root.name);
@@ -8017,11 +8153,11 @@ namespace {
 
 	// A struct value that is computed rather than named: S{...}, a call, or a conditional with
 	// such an arm. A conditional of named arms may yield a place, so it is not one.
-	static bool isComputedValue(const Expression& expression) {
+	bool Emitter::isComputedValue(const Expression& expression) {
 		switch (expression.kind) {
 			case ExpressionKind::Identifier: return false;
-			case ExpressionKind::Member:
-			case ExpressionKind::Index: return isComputedValue(*expression.left);
+			case ExpressionKind::Member: return isComputedValue(*expression.left);
+			case ExpressionKind::Index: return indexOperatorOwner(expression) != nullptr || isComputedValue(*expression.left);
 			case ExpressionKind::Comma: return isComputedValue(*expression.right);
 			// One prvalue arm makes the whole conditional a prvalue.
 			case ExpressionKind::Conditional:
@@ -8034,7 +8170,7 @@ namespace {
 
 	// A member or element of a computed value: a prvalue, so nothing can be stored to it
 	// or bound to a reference.
-	static bool isTemporaryPart(const Expression& target) {
+	bool Emitter::isTemporaryPart(const Expression& target) {
 		return (target.kind == ExpressionKind::Member || target.kind == ExpressionKind::Index)
 			&& isComputedValue(target);
 	}
@@ -8081,6 +8217,10 @@ namespace {
 		rejectPlaceThroughConditional(argument, "passing by reference");
 
 		const Expression& root = storeRoot(argument);
+		if (root.kind == ExpressionKind::Identifier && isComputedValue(argument)) {
+			throw CompileError(what + " is a member or element of a temporary, which parameter \""
+				+ parameter.name + "\" cannot bind as a reference");
+		}
 		if (root.kind == ExpressionKind::Identifier) {
 			const auto binding = _bindings.find(root.name);
 			if (binding != _bindings.end() && binding->second.readOnly) {
@@ -8121,13 +8261,12 @@ namespace {
 
 	// Whether a name, an element or a member lives in the constant address space: a constant buffer, a
 	// file-scope constant, or a constant reference parameter of the function being emitted.
-	bool Emitter::inConstantSpace(const Expression& place) const {
+	bool Emitter::inConstantSpace(const Expression& place) {
+		if (isComputedValue(place)) { return false; }
 		const Expression& root = storeRoot(place);
-		if (root.kind != ExpressionKind::Identifier) {
-			return false;
-		}
-		const auto binding = _bindings.find(root.name);
-		if (binding != _bindings.end()) {
+		if (root.kind != ExpressionKind::Identifier) { return false; }
+		const auto& table = root.fileScope ? _fileScopeBound : _bindings;
+		if (const auto binding = table.find(root.name); binding != table.end()) {
 			return binding->second.pointeeMsl.addressSpace == AddressSpace::Constant;
 		}
 		return _constants.count(root.name) > 0;
@@ -8178,6 +8317,11 @@ namespace {
 				return field == decl->fields.size() ? std::nullopt : std::optional<Type>(decl->fields[field].type);
 			}
 			case ExpressionKind::Index: {
+				if (const StructDecl* owner = indexOperatorOwner(place)) {
+					const HelperFunction* op = indexOperatorHelper(*owner);
+					return !op || place.arguments.size() != 1 || returnsVoid(*op->definition)
+						? std::nullopt : std::optional<Type>(op->definition->returnType);
+				}
 				std::optional<Type> type = placeType(*place.left);
 				if (!type) {
 					return std::nullopt;
@@ -8202,7 +8346,8 @@ namespace {
 	// place is an unpacked vector of its length.
 	std::optional<Type> Emitter::sizeofPlaceType(const Expression& place) {
 		if (place.kind == ExpressionKind::Member && !structOf(*place.left)) {
-			std::optional<Type> base = sizeofPlaceType(*place.left);
+			std::optional<Type> base = isComputedValue(*place.left)
+				? sizeofExpressionType(*place.left) : sizeofPlaceType(*place.left);
 			if (base && !base->namedType.empty() && !base->isPointer) {
 				// structOf found the struct of a local that hides "::name"; placeType reads the file-scope one.
 				return placeType(place);
@@ -8224,6 +8369,8 @@ namespace {
 			base->vectorWidth = lanes > 1 ? static_cast<uint32_t>(lanes) : 0;
 			return base;
 		}
+		if ((place.kind == ExpressionKind::Member || place.kind == ExpressionKind::Index)
+			&& isComputedValue(*place.left) && !sizeofExpressionType(*place.left)) return std::nullopt;
 		return placeType(place);
 	}
 
@@ -8367,6 +8514,18 @@ namespace {
 					if (_helper && namesPointerParameter(expression.name)) {
 						return std::nullopt;
 					}
+				} else if (expression.kind == ExpressionKind::Index) {
+					if (const StructDecl* owner = indexOperatorOwner(expression)) {
+						const HelperFunction* op = indexOperatorHelper(*owner);
+						if (!op || expression.arguments.size() != 1 || returnsVoid(*op->definition)
+							|| !sizeofExpressionType(*expression.left) || !validMemberReceiver(*op->definition, *expression.left)) {
+							return std::nullopt;
+						}
+						const Parameter& idx = op->definition->parameters[1];
+						const std::optional<Type> arg = sizeofExpressionType(*expression.arguments[0]);
+						return !arg || idx.isReference || idx.type.addressSpace != AddressSpace::None || !converts(idx.type, *arg)
+							? std::nullopt : std::optional<Type>(op->definition->returnType);
+					}
 				}
 				return sizeofPlaceType(expression);
 			}
@@ -8506,7 +8665,7 @@ namespace {
 				}
 				const std::optional<Type> place = sizeofExpressionType(*expression.left);
 				const std::optional<Type> value = sizeofExpressionType(*expression.right);
-				if (!place || !value || place->isConst || readOnly(*expression.left)
+				if (!place || !value || place->isConst || isComputedValue(*expression.left) || readOnly(*expression.left)
 					|| (!expression.compoundOperator && !converts(*place, *value))) {
 					return std::nullopt;
 				}
@@ -8541,7 +8700,7 @@ namespace {
 						const ExpressionKind target = expression.left->kind;
 						return (target == ExpressionKind::Identifier || target == ExpressionKind::Member
 							|| target == ExpressionKind::Index) && operand->scalar != ScalarKind::Bool && !operand->isConst
-							&& !readOnly(*expression.left) ? operand : std::nullopt;
+							&& !isComputedValue(*expression.left) && !readOnly(*expression.left) ? operand : std::nullopt;
 					}
 					case UnaryOperator::BitNot:
 						return isFloatKind(operand->scalar) || operand->scalar == ScalarKind::Bool ? std::nullopt
@@ -8600,7 +8759,12 @@ namespace {
 				: std::nullopt;
 		}
 		if (part.kind != ExpressionKind::Index) {
-			return std::nullopt;
+			return arrayExpressionType(part);
+		}
+		if (const StructDecl* owner = indexOperatorOwner(part)) {
+			const HelperFunction* op = indexOperatorHelper(*owner);
+			return !op || returnsVoid(*op->definition) ? std::nullopt
+				: std::optional<Type>(op->definition->returnType);
 		}
 		std::optional<Type> type = computedPartType(*part.left);
 		if (!type) {
@@ -8627,6 +8791,7 @@ namespace {
 			if (node->kind != ExpressionKind::Index) {
 				continue;
 			}
+			if (indexOperatorOwner(*node)) return true;
 			// An element of a base that cannot be typed here (a call or a conditional) might be a matrix
 			// column, so only a base known not to be a matrix may say temporary.
 			const std::optional<Type> base = computedPartType(*node->left);
@@ -11269,6 +11434,30 @@ namespace {
 		std::set<const FunctionDecl*> naming;
 		std::vector<const FunctionDecl*> pending { _entryPoint };
 		callees[_entryPoint];
+		std::vector<const FunctionDecl*> subscriptHelpers;
+		for (const auto& [name, entry]: _helpers) {
+			if (entry.definition->body && name.size() > 12 && name.compare(name.size() - 12, 12, "::operator[]") == 0)
+				subscriptHelpers.push_back(entry.definition);
+		}
+		const auto hasIdx = [](const auto& self, const Expression* e) -> bool {
+			return e && ((e->kind == ExpressionKind::Index && !e->isDereference) || self(self, e->left.get()) || self(self, e->right.get())
+				|| std::any_of(e->arguments.begin(), e->arguments.end(), [&](const auto& a) { return self(self, a.get()); })
+				|| std::any_of(e->elements.begin(), e->elements.end(), [&](const auto& el) { return self(self, el.value.get()); }));
+		};
+		const auto hasIdxStmt = [&](const auto& self, const Statement* s) -> bool {
+			if (!s) return false;
+			if (hasIdx(hasIdx, s->expression.get()) || hasIdx(hasIdx, s->forCondition.get()) || hasIdx(hasIdx, s->forIncrement.get())
+				|| hasIdx(hasIdx, s->whileCondition.get()) || (s->declaration && hasIdx(hasIdx, s->declaration->initializer.get()))
+				|| (s->forInitializer && hasIdx(hasIdx, s->forInitializer->initializer.get())) || self(self, s->thenBranch.get())
+				|| self(self, s->elseBranch.get()) || self(self, s->forBody.get()) || self(self, s->whileBody.get())) return true;
+			for (const auto* list: { &s->children, &s->switchPreamble })
+				for (const auto& c: *list) if (self(self, c.get())) return true;
+			for (const SwitchCase& k: s->switchCases) {
+				if (hasIdx(hasIdx, k.value.get())) return true;
+				for (const auto& c: k.body) if (self(self, c.get())) return true;
+			}
+			return false;
+		};
 		while (!pending.empty()) {
 			const FunctionDecl* function = pending.back();
 			pending.pop_back();
@@ -11283,6 +11472,15 @@ namespace {
 						if (scan(*callee)) {
 							naming.insert(callee);
 						}
+					}
+				}
+			}
+			if (!subscriptHelpers.empty() && hasIdxStmt(hasIdxStmt, function->body.get())) {
+				for (const FunctionDecl* callee: subscriptHelpers) {
+					callees[function].push_back(callee);
+					if (callees.try_emplace(callee).second) {
+						pending.push_back(callee);
+						if (scan(*callee)) { naming.insert(callee); }
 					}
 				}
 			}
@@ -13152,19 +13350,22 @@ namespace {
 				"an element or a member; binding it to a value is not lowered yet");
 		}
 
-		if (isVectorComponent(place)) {
+		const bool vectorComponent = isVectorComponent(place);
+		if (vectorComponent || (bindsTemporary(place) && declaration.type.isConst
+			&& declaration.type.addressSpace == AddressSpace::Thread)) {
 			// A reference to a component of a vector has no storage to name. Apple refuses a non-const
 			// one, and binds a const one to a temporary copy of the component.
-			if (!declaration.type.isConst) {
+			if (vectorComponent && !declaration.type.isConst) {
 				throw CompileError("the reference \"" + declaration.name + "\" is bound to a component of a "
 					"vector, which a non-const reference cannot name (Apple refuses it too); copy the "
 					"component or bind a const reference");
 			}
-			if (declaration.type.addressSpace != AddressSpace::Thread) {
+			if (vectorComponent && declaration.type.addressSpace != AddressSpace::Thread) {
 				throw CompileError("the reference \"" + declaration.name + "\" to a component of a vector has to be "
 					"spelled thread: Apple refuses a reference with no address space, and one in another space "
 					"cannot bind the thread copy");
 			}
+			if (!vectorComponent) rejectPlaceThroughConditional(place, "binding a reference to");
 			const Id value = emitExpression(place);
 			const Type referenced = declaration.type.isAuto
 				? deduceAutoType(declaration.type, _builder.typeOf(value), declaration.name) : declaration.type;
@@ -13184,7 +13385,7 @@ namespace {
 		rejectPlaceThroughConditional(place, "binding a reference to");
 
 		const Expression& root = storeRoot(place);
-		if (root.kind != ExpressionKind::Identifier) {
+		if (root.kind != ExpressionKind::Identifier || isComputedValue(place)) {
 			throw CompileError("the reference \"" + declaration.name + "\" is bound to a place mslc "
 				"cannot name");
 		}
@@ -13463,9 +13664,17 @@ namespace {
 					: std::optional<std::string>(returned.enumName);
 			}
 			case ExpressionKind::Index: {
+				if (const StructDecl* owner = indexOperatorOwner(expression)) {
+					const HelperFunction* op = indexOperatorHelper(*owner);
+					if (!op) { return std::nullopt; }
+					const Type& returned = op->definition->returnType;
+					return returned.isPointer || returned.arrayLength ? std::nullopt
+						: std::optional<std::string>(returned.enumName);
+				}
 				if (expression.left->kind != ExpressionKind::Identifier) return std::nullopt;
-				const auto local = _bindings.find(expression.left->name);
-				if (local == _bindings.end()) return std::nullopt;
+				const auto& table = expression.left->fileScope ? _fileScopeBound : _bindings;
+				const auto local = table.find(expression.left->name);
+				if (local == table.end()) return std::nullopt;
 				return local->second.pointeeMsl.enumName;
 			}
 			default:
@@ -14194,6 +14403,8 @@ namespace {
 			}
 		}
 
+		if (expression.kind == ExpressionKind::Index && indexOperatorOwner(expression)) { emitIndex(expression, false, true); return; }
+
 		// An assignment yields an address rather than a value, so it is
 		// handled here rather than through emitExpression.
 		if (expression.kind != ExpressionKind::Assign) {
@@ -14216,7 +14427,7 @@ namespace {
 
 	// A store to something that is not a variable of the entry point: a literal,
 	// which is what an enumerator is by now, or a file-scope constant.
-	void Emitter::requireStorable(const Expression& target) const {
+	void Emitter::requireStorable(const Expression& target) {
 		const Expression& root = storeRoot(target);
 		if (root.kind == ExpressionKind::IntLiteral || root.kind == ExpressionKind::FloatLiteral
 			|| root.kind == ExpressionKind::BoolLiteral) {
