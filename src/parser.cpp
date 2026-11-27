@@ -1413,6 +1413,12 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 
 	for (;;) {
 		skipAttributes();
+		if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+			if (skipStandardFunctionAttribute(true)) {
+				continue;
+			}
+			break;
+		}
 		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
 			advance();
 			continue;
@@ -2519,20 +2525,84 @@ void Parser::skipFunctionAttribute() {
 	}
 }
 
+bool Parser::skipStandardFunctionAttribute(bool forTemplateInstance) {
+	const size_t start = _position;
+	expect(TokenKind::LBracket, "to open an attribute list");
+	expect(TokenKind::LBracket, "to open an attribute");
+
+	// On a template instance, an unknown [[...]] restores _position so parseInstance reports its own diagnostic.
+	if (!at(TokenKind::RBracket)) {
+		if (atKeyword("using")) {
+			if (forTemplateInstance) {
+				_position = start;
+				return false;
+			}
+			advance();
+			const std::string scope = kind() == TokenKind::Identifier ? std::string(advance().text) : std::string();
+			throw CompileError("an attribute namespace ("
+				+ (scope.empty() ? std::string("using") : "using " + scope + ":")
+				+ ") in [[...]] is not lowered; only [[maybe_unused]] is accepted and dropped");
+		}
+		for (;;) {
+			if (kind() != TokenKind::Identifier || atKeyword("using")) {
+				throw CompileError("expected an attribute name in [[...]]");
+			}
+			std::string name(advance().text);
+			if (at(TokenKind::ColonColon)) {
+				if (forTemplateInstance) {
+					_position = start;
+					return false;
+				}
+				while (match(TokenKind::ColonColon)) {
+					if (kind() != TokenKind::Identifier) {
+						throw CompileError("expected an attribute name in [[...]]");
+					}
+					name += "::" + std::string(advance().text);
+				}
+				throw CompileError("the function attribute \"" + name + "\" is not lowered; only always_inline, "
+					"noinline, unused, used and [[maybe_unused]] are accepted and dropped");
+			}
+			if (name != "maybe_unused") {
+				if (forTemplateInstance) {
+					_position = start;
+					return false;
+				}
+				throw CompileError("the function attribute \"" + name + "\" is not lowered; only always_inline, "
+					"noinline, unused, used and [[maybe_unused]] are accepted and dropped");
+			}
+			if (at(TokenKind::LParen)) {
+				throw CompileError("[[maybe_unused]] takes no argument");
+			}
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+	}
+
+	expect(TokenKind::RBracket, "to close an attribute");
+	expect(TokenKind::RBracket, "to close an attribute list");
+	return true;
+}
+
 bool Parser::tryParseHelperFunction() {
-	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)
+		&& !(at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket)) {
 		return false;
 	}
 
 	const size_t start = _position;
 	FunctionDecl decl;
 	decl.line = line();
+	bool sawStandardAttribute = false;
 
 	// inline, static, constexpr and attributes in any order, ahead of the return type. A refused
 	// attribute throws here, outside the try below, so that it is not read as "not a function".
 	for (;;) {
 		if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
 			skipFunctionAttribute();
+		} else if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+			skipStandardFunctionAttribute(false);
+			sawStandardAttribute = true;
 		} else if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
 			decl.isLocal = true;
 			advance();
@@ -2541,21 +2611,23 @@ bool Parser::tryParseHelperFunction() {
 		}
 	}
 
+	bool isHelper = false;
 	try {
-		decl.returnType = parseType();
-		if (kind() != TokenKind::Identifier) {
-			_position = start;
-			return false;
-		}
-
-		decl.name = std::string(advance().text);
-		if (!at(TokenKind::LParen)) {
-			_position = start;
-			return false;
+		if (!(sawStandardAttribute && (atKeyword("kernel") || atKeyword("vertex") || atKeyword("fragment")))) {
+			decl.returnType = parseType();
+			if (kind() == TokenKind::Identifier) {
+				decl.name = std::string(advance().text);
+				isHelper = at(TokenKind::LParen);
+			}
 		}
 	} catch (const ClassTemplateError&) {
 		throw;
 	} catch (const CompileError&) {
+	}
+	if (!isHelper) {
+		if (sawStandardAttribute) {
+			throw CompileError("[[maybe_unused]] at file or namespace scope is only lowered ahead of a helper function");
+		}
 		_position = start;
 		return false;
 	}
@@ -2876,16 +2948,31 @@ void Parser::parseMemberTemplate(StructDecl& decl) {
 	}
 	size_t ahead = 0;
 	for (;;) {
-		if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == "__attribute__"
-			&& lookahead(ahead + 1).kind == TokenKind::LParen) {
-			++ahead;
-			for (size_t open = 0; lookahead(ahead).kind != TokenKind::EndOfFile; ++ahead) {
-				open += lookahead(ahead).kind == TokenKind::LParen;
-				open -= lookahead(ahead).kind == TokenKind::RParen;
-				if (open == 0) {
+		if (lookahead(ahead).kind == TokenKind::LBracket && lookahead(ahead + 1).kind == TokenKind::LBracket) {
+			int depth = 0;
+			while (lookahead(ahead).kind != TokenKind::EndOfFile) {
+				if (lookahead(ahead).kind == TokenKind::LBracket) {
+					++depth;
+				} else if (lookahead(ahead).kind == TokenKind::RBracket && --depth == 0) {
 					++ahead;
 					break;
 				}
+				++ahead;
+			}
+			continue;
+		}
+		if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == "__attribute__"
+			&& lookahead(ahead + 1).kind == TokenKind::LParen) {
+			++ahead;
+			int depth = 0;
+			while (lookahead(ahead).kind != TokenKind::EndOfFile) {
+				if (lookahead(ahead).kind == TokenKind::LParen) {
+					++depth;
+				} else if (lookahead(ahead).kind == TokenKind::RParen && --depth == 0) {
+					++ahead;
+					break;
+				}
+				++ahead;
 			}
 			continue;
 		}
@@ -2895,14 +2982,17 @@ void Parser::parseMemberTemplate(StructDecl& decl) {
 		const std::string_view word = lookahead(ahead).text;
 		if (word == "static") {
 			declaration.staticMember = true;
+			++ahead;
+			continue;
 		}
 		if (word == "explicit" || word == "virtual" || word == "friend") {
 			throw CompileError("a member template declared " + std::string(word) + " is not lowered (in " + quoted + ")");
 		}
-		if (word != "inline" && word != "constexpr" && word != "static") {
-			break;
+		if (word == "inline" || word == "constexpr") {
+			++ahead;
+			continue;
 		}
-		++ahead;
+		break;
 	}
 	if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == unqualifiedName(decl.name)
 		&& lookahead(ahead + 1).kind == TokenKind::LParen) {

@@ -525,6 +525,7 @@ private:
 	void parseExplicitInstantiation();
 	void skipBalanced(TokenKind open, TokenKind close);
 	void skipFunctionAttribute();
+	bool skipStandardFunctionAttribute(bool forTemplateInstance = false);
 	// The <type_traits> subset (is_same, is_floating_point, enable_if, make_scalar ...), folded
 	// where the types are known.
 	void closeAngle(const char* what);
