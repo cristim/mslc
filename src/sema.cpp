@@ -2835,11 +2835,18 @@ namespace {
 			HelperFunction helper;
 			size_t depth = 0;
 			bool committed = false;
+			// instantiationOrder() for the calls in the instance: set when it is first committed.
+			size_t rootOrder = 0;
 		};
 		std::map<std::string, std::vector<const FunctionTemplate*>> _templatesByName;
 		std::map<std::string, std::unique_ptr<TemplateInstance>> _instances;
 		std::map<const FunctionDecl*, TemplateInstance*> _instanceOf;
 		std::map<std::string, std::unique_ptr<FunctionDecl>> _patterns;
+		// The explicit specialization that is the body of an instance, by the instance's key.
+		std::map<std::string, const ExplicitSpecialization*> _specializationOf;
+		std::string instanceKey(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments) const;
+		void resolveSpecializations();
+		const ExplicitSpecialization* specializationFor(const TemplateInstance& instance) const;
 		std::vector<const FunctionTemplate*> templatesNamed(const std::string& name) const;
 		std::vector<const FunctionTemplate*> visibleTemplates(const std::vector<std::string>& names,
 			const std::set<std::string>& adl) const;
@@ -2868,6 +2875,12 @@ namespace {
 		std::set<std::string> _memberTemplateNames;
 		const Type* returningType(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
+		// Where a call is instantiated, as clang places it: for a call in a template's instance, after the function
+		// outside any template whose call led to the instance; for any other call, the caller.
+		size_t instantiationOrder() const {
+			const auto instance = _helper ? _instanceOf.find(_helper) : _instanceOf.end();
+			return instance == _instanceOf.end() ? callerOrder() : instance->second->rootOrder;
+		}
 		void noteCall(const FunctionDecl& callee);
 		bool isPlainVariable(const Expression& expression) const;
 		bool isWholeVariable(const Expression& expression) const;
@@ -6919,13 +6932,149 @@ namespace {
 		return true;
 	}
 
-	// The instance for complete arguments, signature read and body not: one per argument list.
-	Emitter::TemplateInstance& Emitter::templateInstance(const FunctionTemplate& declaration,
-		std::vector<TemplateArgument> arguments) {
+	std::string Emitter::instanceKey(const FunctionTemplate& declaration,
+		const std::vector<TemplateArgument>& arguments) const {
 		std::string key = std::to_string(&declaration - _unit.templates.data()) + "<";
 		for (const TemplateArgument& argument: arguments) {
 			key += templateArgumentName(argument) + ",";
 		}
+		return key;
+	}
+
+	// Which instance each explicit specialization is the body of. Its arguments are the explicit ones it
+	// names and, for the rest, the types its parameters have where the primary template's name a type
+	// parameter, as C++ deduces them from the specialization's own declaration ([temp.expl.spec],
+	// [temp.deduct.decl]); defaults fill what is left. It specializes the primary templates of its name
+	// declared above it whose instance for those arguments has its return and parameter types: exactly
+	// one has to, or it is refused, as is a second specialization of one instance.
+	void Emitter::resolveSpecializations() {
+		for (const ExplicitSpecialization& specialization: _unit.specializations) {
+			const FunctionTemplate& written = specialization.declaration;
+			const FunctionDecl signature = instantiateTemplate(written, {}, false);
+			// The function types are compared as C++ does: a by-value parameter's top-level const is not part of it,
+			// and the address space and enum are, which typeName does not spell.
+			const auto sameParameter = [](const Parameter& a, const Parameter& b) {
+				Type left = a.type;
+				Type right = b.type;
+				if (!a.isReference && !left.isPointer) {
+					left.isConst = false;
+				}
+				if (!b.isReference && !right.isPointer) {
+					right.isConst = false;
+				}
+				return a.isReference == b.isReference && typeName(left) == typeName(right)
+					&& left.addressSpace == right.addressSpace && left.enumName == right.enumName;
+			};
+			std::vector<std::pair<const FunctionTemplate*, std::vector<TemplateArgument>>> matches;
+			const auto found = _templatesByName.find(written.name);
+			for (const FunctionTemplate* primary: found == _templatesByName.end()
+					? std::vector<const FunctionTemplate*>() : found->second) {
+				if (primary->order > written.order || !primary->memberOf.empty()) {
+					continue;
+				}
+				std::vector<TemplateArgument> arguments;
+				const FunctionDecl* pattern = templatePattern(*primary, specialization.given, arguments);
+				if (!pattern || pattern->parameters.size() != signature.parameters.size()) {
+					continue;
+				}
+				std::vector<bool> known(arguments.size(), false);
+				for (size_t j = 0; j < specialization.given.size(); ++j) {
+					known[j] = true;
+				}
+				bool fits = true;
+				for (size_t i = 0; i < pattern->parameters.size() && fits; ++i) {
+					const Type& wanted = pattern->parameters[i].type;
+					if (!isTemplateMarker(wanted) || wanted.isPointer || wanted.arrayLength) {
+						continue;
+					}
+					for (size_t j = 0; j < primary->parameters.size(); ++j) {
+						if (!primary->parameters[j].isType || wanted.namedType != templateMarker(primary->parameters[j])) {
+							continue;
+						}
+						Type value = signature.parameters[i].type;
+						value.isConst = false;
+						value.addressSpace = AddressSpace::None;
+						// A call cannot give these as an argument either (parseTemplateArgument, deduceTemplateArguments),
+						// and the instance's key does not tell an enum from its underlying type.
+						if (value.isPointer || value.arrayLength || value.resource != ResourceKind::None
+							|| !value.enumName.empty() || value.isVolatile) {
+							throw CompileError("the explicit specialization of \"" + written.name + "\" at line "
+								+ std::to_string(written.line) + " gives the template parameter \"" + primary->parameters[j].name
+								+ "\" a pointer, array, resource, enum or volatile type, which is not lowered");
+						}
+						if (known[j]) {
+							fits = sameValueType(arguments[j].type, value);
+						} else {
+							arguments[j].type = value;
+							known[j] = true;
+						}
+					}
+				}
+				for (size_t j = 0; j < primary->parameters.size() && fits; ++j) {
+					if (known[j] || (!primary->parameters[j].isType && !arguments[j].unbound)) {
+						continue;
+					}
+					if (!primary->parameters[j].hasDefault) {
+						fits = false;
+						break;
+					}
+					try {
+						arguments[j] = templateDefault(*primary, j, arguments);
+					} catch (const SubstitutionFailure&) {
+						fits = false;
+					}
+				}
+				if (!fits) {
+					continue;
+				}
+				FunctionDecl instance;
+				try {
+					instance = instantiateTemplate(*primary, arguments, false);
+				} catch (const SubstitutionFailure&) {
+					continue;
+				}
+				if (typeName(instance.returnType) != typeName(signature.returnType)
+					|| !std::equal(instance.parameters.begin(), instance.parameters.end(),
+						signature.parameters.begin(), signature.parameters.end(), sameParameter)) {
+					continue;
+				}
+				matches.emplace_back(primary, std::move(arguments));
+			}
+			const std::string where = "the explicit specialization of \"" + written.name + "\" at line "
+				+ std::to_string(written.line);
+			if (matches.empty()) {
+				throw CompileError(where + " matches no function template of that name declared above it");
+			}
+			if (matches.size() > 1) {
+				throw CompileError(where + " matches more than one function template of that name, and choosing "
+					"among them by partial ordering is not lowered");
+			}
+			const std::string key = instanceKey(*matches[0].first, matches[0].second);
+			if (!_specializationOf.emplace(key, &specialization).second) {
+				throw CompileError(where + " specializes an instance that is already explicitly specialized");
+			}
+		}
+	}
+
+	// The explicit specialization that is the instance's body, or null for the primary template's.
+	// Apple refuses one declared after a use of the instance, so it never stands in silently.
+	const ExplicitSpecialization* Emitter::specializationFor(const TemplateInstance& instance) const {
+		const auto found = _specializationOf.find(instanceKey(*instance.declaration, instance.arguments));
+		if (found == _specializationOf.end()) {
+			return nullptr;
+		}
+		if (found->second->declaration.order > instantiationOrder()) {
+			throw CompileError("the explicit specialization of \"" + instance.declaration->name + "\" at line "
+				+ std::to_string(found->second->declaration.line) + " is declared after a use of the instance it "
+				"specializes");
+		}
+		return found->second;
+	}
+
+	// The instance for complete arguments, signature read and body not: one per argument list.
+	Emitter::TemplateInstance& Emitter::templateInstance(const FunctionTemplate& declaration,
+		std::vector<TemplateArgument> arguments) {
+		const std::string key = instanceKey(declaration, arguments);
 		std::unique_ptr<TemplateInstance>& slot = _instances[key];
 		if (slot) {
 			return *slot;
@@ -6943,16 +7092,18 @@ namespace {
 
 	// The instance is the function a call chose: its body is read now.
 	void Emitter::commitInstance(TemplateInstance& instance) {
+		const ExplicitSpecialization* specialization = specializationFor(instance);
 		if (instance.committed) {
 			return;
 		}
+		instance.rootOrder = instantiationOrder();
 		const FunctionTemplate& declaration = *instance.declaration;
 		std::string spelled = declaration.name + "<";
 		for (size_t i = 0; i < instance.arguments.size(); ++i) {
 			spelled += (i ? ", " : "") + templateArgumentName(instance.arguments[i]);
 		}
 		spelled += ">";
-		if (!declaration.hasBody) {
+		if (!declaration.hasBody && !specialization) {
 			throw CompileError("the function template \"" + declaration.name + "\" is declared and never defined");
 		}
 		const auto caller = _instanceOf.find(_helper);
@@ -6961,7 +7112,8 @@ namespace {
 			throw CompileError("template instantiation depth exceeds " + std::to_string(kMaxInstantiationDepth)
 				+ " (instantiating " + spelled + "); Apple's limit is 1024");
 		}
-		instance.decl = instantiateTemplate(declaration, instance.arguments, true);
+		instance.decl = specialization ? instantiateTemplate(specialization->declaration, {}, true)
+			: instantiateTemplate(declaration, instance.arguments, true);
 		instance.depth = depth;
 		instance.committed = true;
 
@@ -14950,6 +15102,7 @@ namespace {
 		_functionTypes[{ _voidType }] = functionType;
 
 		_overloadedNames = overloadedNames(_unit);
+		resolveSpecializations();
 		// Where each name is first declared, so a call that finds it among several names can tell
 		// whether it is visible yet.
 		std::map<std::string, size_t> firstDeclared;

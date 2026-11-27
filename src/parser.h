@@ -339,7 +339,9 @@ private:
 	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
-	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
+	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member,
+		std::pair<size_t, size_t>* explicitArguments = nullptr);
+	void parseExplicitSpecialization(size_t headerStart);
 	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
 	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
 	void parseMemberTemplate(const StructDecl& decl);
