@@ -2571,8 +2571,8 @@ namespace {
 		void declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex);
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
-		// Whether it reserved any.
-		bool reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
+		// Whether it found any; reserve false only looks.
+		bool reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used, bool reserve = true);
 		void reserveThreadgroupLocals(const Statement& statement);
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
@@ -7279,7 +7279,7 @@ namespace {
 	}
 
 	// A helper with a body is emitted once per stage that reaches it, or once per entry point
-	// when it names a file-scope sampler, which is that entry point's own variable. One the unit
+	// when it names a file-scope sampler or declares a constexpr one, which is that entry point's own variable. One the unit
 	// only declares, and one a library exports, belong to no stage.
 	std::pair<Stage, const FunctionDecl*> Emitter::helperScope(const HelperFunction& helper) const {
 		if (!helper.definition->body) {
@@ -7295,10 +7295,12 @@ namespace {
 		const FunctionDecl& definition = *generic.definition;
 		noteCall(definition);
 		// The scan before emission does not follow argument-dependent lookup or template instances, so a
-		// caller it did not mark would share one body between entry points and call the first one's sampler.
-		if (_helper && _samplerDependent.count(&definition) && !_samplerDependent.count(_helper)) {
+		// caller it did not mark would share one body between entry points and call the first one's sampler. With
+		// one entry point there is no other to share it with.
+		if (_helper && _entryPoints.size() > 1 && _samplerDependent.count(&definition)
+			&& !_samplerDependent.count(_helper)) {
 			throw CompileError("\"" + _helper->name + "\" reaches \"" + definition.name + "\", which names a "
-				"file-scope sampler, only through argument-dependent lookup or a template instance; pass the sampler "
+				"file-scope sampler or declares a constexpr one, only through argument-dependent lookup or a template instance; pass the sampler "
 				"as a parameter or call it by a qualified name");
 		}
 		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
@@ -10778,26 +10780,28 @@ namespace {
 	//
 	// Every one in the body is reserved before the entry point is emitted, since
 	// the variable has to be in the OpEntryPoint interface, which comes first.
-	bool Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
+	bool Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used, bool reserve) {
 		bool any = false;
 		if (statement.declaration && statement.declaration->sampler
 			&& used.count(statement.declaration->name)) {
-			reserveSampler(*statement.declaration);
+			if (reserve) {
+				reserveSampler(*statement.declaration);
+			}
 			any = true;
 		}
 
 		for (const StatementPtr& child: statement.children) {
-			any = reserveLocalSamplers(*child, used) || any;
+			any = reserveLocalSamplers(*child, used, reserve) || any;
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
-				any = reserveLocalSamplers(*nested, used) || any;
+				any = reserveLocalSamplers(*nested, used, reserve) || any;
 			}
 		}
 		for (const SwitchCase& kase: statement.switchCases) {
 			for (const StatementPtr& child: kase.body) {
-				any = reserveLocalSamplers(*child, used) || any;
+				any = reserveLocalSamplers(*child, used, reserve) || any;
 			}
 		}
 		return any;
@@ -10912,6 +10916,9 @@ namespace {
 		// or calls one that does, is emitted per entry point (helperScope).
 		std::map<const FunctionDecl*, std::vector<const FunctionDecl*>> callees;
 		std::set<const FunctionDecl*> naming;
+		// The helpers that declare a named constexpr sampler, in the order they are reached; theirs are reserved after
+		// the file-scope ones, which keep the bindings they had before helpers' own were lowered.
+		std::vector<const FunctionDecl*> declaring;
 		std::vector<const FunctionDecl*> pending { _entryPoint };
 		callees[_entryPoint];
 		while (!pending.empty()) {
@@ -10933,8 +10940,9 @@ namespace {
 						if (callee->body) {
 							std::set<std::string> used;
 							collectIdentifiers(*callee->body, used);
-							if (reserveLocalSamplers(*callee->body, used)) {
+							if (reserveLocalSamplers(*callee->body, used, false)) {
 								naming.insert(callee);
+								declaring.push_back(callee);
 							}
 						}
 					}
@@ -10960,6 +10968,11 @@ namespace {
 				reserveSampler(global);
 				_fileScopeSamplerBindings[global.name] = embeddedSamplerBinding(global);
 			}
+		}
+		for (const FunctionDecl* helper: declaring) {
+			std::set<std::string> used;
+			collectIdentifiers(*helper->body, used);
+			reserveLocalSamplers(*helper->body, used);
 		}
 	}
 
