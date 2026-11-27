@@ -113,18 +113,7 @@ def unused_textures(run, params, textures, texels, bindings, compared, apple_out
     return unused
 
 
-def control_holds(groups, mine, apple):
-    """The negative control: in each group of layouts (device buffers, texel buffers) that has a writable
-    one, a copy of mslc's result with one leaf changed must compare unequal to Apple's, or the comparison
-    could not have told a miscompile from a match. False when nothing could be perturbed at all."""
-    held = []
-    for g in groups:
-        fired = checks.perturb(g, mine, apple)
-        if fired:
-            copy, name, _ = fired
-            index = next(i for i, l in g.items() if l["name"] == name)
-            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
-    return bool(held) and all(held)
+control_holds = checks.control_holds
 
 
 def check_entry(opts, source, spv, reflection, entry, params, work, includes):
@@ -231,8 +220,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
                 case_diffs.append(d.to_json())
         both = {**compared, **tcompared, **wcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])
-        # Negative control (control_holds): excluded buffers are not candidates, perturbing one would test nothing.
-        control_ok = control_holds([compared, tcompared, wcompared], outs["mslc"], outs["apple"])
+        # Negative control (checks.control_holds): excluded buffers are not candidates, perturbing one would test nothing.
+        control_ok = checks.control_holds([compared, tcompared, wcompared], outs["mslc"], outs["apple"])
         result["cases"].append({"case": case, "profile": profile, "diffs": case_diffs[:16],
                                 "diff_count": len(case_diffs), "negative_control": control_ok})
         if case == 0:
@@ -277,11 +266,13 @@ def unknown_directives(opts, d, results):
 def check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_position=False):
     run = d["run"]
     params = {"width": opts.width or run.get("width", graphics.DEFAULT_SIZE), "height": opts.height or run.get("height", graphics.DEFAULT_SIZE),
-              "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
+              "instances": opts.instances or run.get("instances", 1),
+              "base_vertex": run.get("base_vertex", 0), "base_instance": run.get("base_instance", 0),
+              "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
-              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"], "ulp": d["ulp"],
-              "infer_position": infer_position}
+              "geometry": d["geometry"], "indexes": d["indexes"], "position": d["position"], "depth": d["depth"],
+              "float_range": d["float_range"], "ulp": d["ulp"], "infer_position": infer_position}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
     return [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]

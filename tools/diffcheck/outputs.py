@@ -42,14 +42,22 @@ def fragment_outputs(source, fragment):
         raise Unsupported("the return type %s of %s is not defined in this file" % (ret, fragment))
     colors, depth = {}, False
     for member in body.group(1).split(";"):
+        if not member.strip():
+            continue
         c = re.search(r"\[\[\s*color\s*\(\s*(\d+)\s*\)\s*\]\]", member)
+        has_depth = bool(re.search(r"\[\[\s*depth\s*\(", member))
+        if not c and not has_depth or len(re.findall(r"\bcolor\s*\(", member)) > 1:
+            raise Unsupported("unsupported fragment output member %r" % member.strip())
         if c:
+            idx = int(c.group(1))
+            if idx in colors:
+                raise Unsupported("duplicate colour output %d" % idx)
             decl = re.match(r"\s*([\w:]+)\s+\w+", member)
-            colors[int(c.group(1))] = _type(decl.group(1)) if decl else _type("?")
-        elif re.search(r"\[\[\s*depth\s*\(", member):
+            colors[idx] = _type(decl.group(1)) if decl else _type("?")
+        if has_depth:
             depth = True
-    if sorted(colors) != list(range(len(colors))) or len(colors) > 8:
-        raise Unsupported("colour outputs %s are not 0..n-1" % sorted(colors))
+    if any(i >= 8 for i in colors):
+        raise Unsupported("colour outputs %s are not in 0..7" % sorted(colors))
     return colors, depth
 
 

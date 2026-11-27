@@ -64,9 +64,10 @@ A file whose `// RUN:` line names a vertex and a fragment function (or `--vertex
 is drawn instead of dispatched:
 
 ```
-// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 cases=2
+// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 base_vertex=0 base_instance=0 cases=2
 // DIFFCHECK-POSITION: pos          the stage_in field that carries the position, or `none`
-// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list, pixels, `x,y` or `x,y,z` (optional)
+// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list (or vertex list with DIFFCHECK-INDEXES), pixels, `x,y` or `x,y,z`
+// DIFFCHECK-INDEXES: 0 1 2 0 2 3 ...       optional uint32 triangle index list into the geometry vertices
 // DIFFCHECK: depth                 read a depth target back (implied by [[depth(any)]])
 ```
 
@@ -75,9 +76,13 @@ one triangle list (default: a 20x10 and an 18x13 rectangle and a thin triangle i
 no edge passes through a pixel centre) times `instances`, into colour targets chosen from the
 fragment's outputs (float: 32F, int: 32I, uint: 32U, half: 16F; R, RG or RGBA to match the
 component count), cleared to values no plausible output equals, and an optional D32 depth target (always-pass depth test).
-The set of colour targets, their types and the depth output are read from the Metal source
-(`[[color(n)]]`, `[[depth]]`, or the plain return type), never from mslc's module: an output mslc
-drops, retypes or moves is reported as a `reflection-mismatch`, not left out of the comparison.
+The set of colour targets (`[[color(n)]]` for any subset of `0..7`), their types and the depth
+output are read from the Metal source (`[[color(n)]]`, `[[depth]]`, or the plain return type),
+never from mslc's module: an output mslc drops, retypes or moves is reported as a
+`reflection-mismatch`, not left out of the comparison. Both `noperspective` and `centroid`
+stage-interface varyings (`[[center_no_perspective]]`, `[[centroid_perspective]]`,
+`[[centroid_no_perspective]]`) are drawn inside the unclipped target; Vulkan keeps unused colour
+attachment slots as `VK_FORMAT_UNDEFINED` / `VK_NULL_HANDLE`.
 A return type the harness cannot read from the file (a typedef, a struct from an `#include`, a
 3-component output, which no pixel format holds) is skipped with the reason.
 Everything must stay inside the target: lavapipe returns NaN for `noperspective` varyings on a
@@ -125,11 +130,10 @@ puts in the attachments.
 
 Skipped with the reason (follow-up work): a writable `[[buffer]]` with `instances > 1`, writable
 textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures,
-framebuffer fetch, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws,
-blending, stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
+framebuffer fetch. Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 32
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 39
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
 
