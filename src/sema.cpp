@@ -1424,6 +1424,10 @@ uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 		// A pointer held in a buffer, as a struct's pointer member is: 8 bytes.
 		return 8;
 	}
+	// An array is as aligned as its element: an array of structs holding a long is 8-aligned, not 4.
+	if (const Id element = bits == 0 ? arrayElement(type) : InvalidId; element != InvalidId) {
+		return alignmentOf(element, packed);
+	}
 	if (bits == 0) {
 		// A struct is as aligned as its most aligned member, which spirv-val needs
 		// to be at least its largest scalar: 8 for a long.
