@@ -3086,7 +3086,11 @@ namespace {
 		Id emitSelectCall(const Expression& expression);
 		Id emitAllAnyCall(const Expression& expression, const std::string& name);
 		void emitBarrierCall(const Expression& expression);
-		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
+		// floatVariant: the qualified name of a metal::fast or metal::precise call, whose arguments are
+		// converted to float (see floatVariantResult).
+		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments,
+			const std::string* floatVariant = nullptr);
+		Id floatVariantResult(Id value, const std::string& function);
 		Id emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id packFloatConstant(Id type, float value);
 		Id packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words);
@@ -6065,20 +6069,35 @@ namespace {
 			{ bufferBase(binding), constantU32(0), indexId });
 	}
 
+	// The function a call of metal::fast::name or metal::precise::name is: "name", when the library declares
+	// it in those scopes, or else nothing. Of the functions mslc lowers, Apple's compiler accepts exactly these
+	// in both scopes (black-box: a call of each in each scope, xcrun metal, macOS 26); dot, mix, step,
+	// smoothstep, sign, cross, reflect, refract and the derivatives are not members.
+	static std::string floatVariantFunction(const std::string& name) {
+		static const std::set<std::string_view> members = {
+			"abs", "acos", "asin", "atan", "atan2", "ceil", "clamp", "cos", "distance", "exp", "exp2", "floor",
+			"fma", "fmod", "fract", "length", "log", "log2", "max", "min", "normalize", "pow", "powr", "rint",
+			"round", "rsqrt", "saturate", "select", "sin", "sqrt", "tan", "trunc",
+		};
+		for (const std::string_view scope : { std::string_view("metal::fast::"), std::string_view("metal::precise::") }) {
+			if (name.compare(0, scope.size(), scope) == 0 && members.count(std::string_view(name).substr(scope.size())) > 0) {
+				return name.substr(scope.size());
+			}
+		}
+		return std::string();
+	}
+
 	static std::string builtinCalleeName(const std::string& name) {
 		constexpr std::string_view prefix = "metal::";
 		if (name.compare(0, prefix.size(), prefix) == 0
 			&& name.find("::", prefix.size()) == std::string::npos) {
 			return name.substr(prefix.size());
 		}
-		// The library's fast and precise variants of a function (metal::fast::normalize,
-		// metal::precise::sqrt, metal::fast::select) lower as the function itself. Implementation limit:
-		// SPIR-V's extended instructions carry Vulkan's precision, which neither variant's bound in the MSL
-		// specification is promised to match.
-		for (const std::string_view scope : { std::string_view("metal::fast::"), std::string_view("metal::precise::") }) {
-			if (name.compare(0, scope.size(), scope) == 0 && name.find("::", scope.size()) == std::string::npos) {
-				return name.substr(scope.size());
-			}
+		// The library's fast and precise variants of a function lower as the function itself, on float
+		// operands (see emitCall). Implementation limit: SPIR-V's extended instructions carry Vulkan's
+		// precision, which neither variant's bound in the MSL specification is promised to match.
+		if (std::string function = floatVariantFunction(name); !function.empty()) {
+			return function;
 		}
 		return name;
 	}
@@ -6298,8 +6317,17 @@ namespace {
 			return emitAtomicCall(expression);
 		}
 
+		// The fast and precise scopes declare float overloads only: a scalar of another type converts to float
+		// (Apple types metal::fast::clamp(5, 0, 3) as float), and a vector of another type matches nothing.
+		const bool floatOnly = !floatVariantFunction(expression.left->name).empty();
+
 		if (name == "select") {
-			return emitSelectCall(expression);
+			const Id selected = emitSelectCall(expression);
+			if (!floatOnly) {
+				return selected;
+			}
+			// Converting the chosen operand is converting both and then choosing.
+			return floatVariantResult(selected, expression.left->name);
 		}
 
 		if (name == "all" || name == "any") {
@@ -6316,7 +6344,19 @@ namespace {
 				"recognises, and it is not a function declared in this file");
 		}
 
-		return emitMathBuiltin(*builtin, expression.arguments);
+		return emitMathBuiltin(*builtin, expression.arguments, floatOnly ? &expression.left->name : nullptr);
+	}
+
+	Id Emitter::floatVariantResult(Id value, const std::string& function) {
+		const Id type = _builder.typeOf(value);
+		if (_types.isFloat(type) && _types.bitWidth(type) == 32) {
+			return value;
+		}
+		if (_types.vectorWidth(type) > 1 || _types.matrixInfo(type) || (!_types.isFloat(type) && _types.bitWidth(type) < 8)) {
+			throw CompileError("no overload of \"" + function + "\" takes this argument: the fast and precise "
+				"variants take float scalars and vectors, and a vector of another type does not convert");
+		}
+		return convert(value, type, _types.scalar(ScalarKind::Float));
 	}
 
 	// select(a, b, c): b where c holds, else a. Apple's library declares it only for a
@@ -9171,7 +9211,7 @@ namespace {
 	}
 
 	Id Emitter::emitMathBuiltin(const MathBuiltin& builtin,
-		const std::vector<ExpressionPtr>& arguments) {
+		const std::vector<ExpressionPtr>& arguments, const std::string* floatVariant) {
 
 		const std::string name = builtin.name;
 		if (arguments.size() != builtin.arity) {
@@ -9197,7 +9237,7 @@ namespace {
 			if (!_types.isFloat(type) && _types.bitWidth(type) < 8) {
 				throw CompileError(name + " takes numeric scalars or vectors");
 			}
-			values.push_back(value);
+			values.push_back(floatVariant ? floatVariantResult(value, *floatVariant) : value);
 		}
 
 		if (isDerivative) {

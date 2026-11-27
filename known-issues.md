@@ -857,8 +857,11 @@ Apple's value is undefined.
 
 ## `metal::fast::` and `metal::precise::` lower as the plain functions
 
-`metal::fast::sqrt`, `metal::precise::normalize`, `fast::select` and the rest of those two scopes are the
-library's functions without the prefix: the same GLSL.std.450 instructions, with the precision Vulkan gives
-them. Neither variant's bound in the MSL specification is promised; the fast variants are what Apple's default
-fast math compiles the plain names to, so they are the closer of the two. Test:
-`tests/probes/math_fast_and_precise_variants.metal`.
+A call of one of the functions both scopes declare (of those mslc lowers: abs, acos, asin, atan, atan2, ceil,
+clamp, cos, distance, exp, exp2, floor, fma, fmod, fract, length, log, log2, max, min, normalize, pow, powr,
+rint, round, rsqrt, saturate, select, sin, sqrt, tan and trunc) is that function on float: a scalar of another
+type converts to float and a vector of another type is refused, as Apple's float-only overloads do. The
+instructions are the plain function's, with the precision Vulkan gives them. Neither variant's bound in the
+MSL specification is promised; the fast variants are what Apple's default fast math compiles the plain names
+to, so they are the closer of the two. A function both scopes declare that mslc does not lower (sinh, cospi
+and so on) is refused like its plain name. Tests: `tests/probes/math_fast_*`.
