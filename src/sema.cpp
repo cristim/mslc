@@ -2861,6 +2861,7 @@ namespace {
 		std::string descriptorJson(uint32_t binding) const;
 		const Binding& textureReceiver(const Expression& call);
 		void emitTextureWrite(const Expression& call, const Binding& texture);
+		void emitTextureFence(const Expression& call, const Binding& texture);
 		Id emitTextureCall(const Expression& call);
 		Id emitTextureSample(const Expression& call, const Binding& texture, bool compare = false);
 		Id compareValue(const Expression& argument, const std::string& callName);
@@ -9769,6 +9770,10 @@ namespace {
 			emitTextureWrite(call, textureReceiver(call));
 			return true;
 		}
+		if (call.left->kind == ExpressionKind::Member && call.left->memberName == "fence") {
+			emitTextureFence(call, textureReceiver(call));
+			return true;
+		}
 		return false;
 	}
 
@@ -13368,6 +13373,21 @@ namespace {
 		_builder.emit(spirv::OpImageWrite, { image, coordinate, texel });
 	}
 
+	// texture.fence(): orders prior image operations in Device scope. Apple defines
+	// fence() on colour textures and texture_buffer across all accesses, and omits it on
+	// depth and multisampled textures.
+	void Emitter::emitTextureFence(const Expression& call, const Binding& texture) {
+		if (texture.pointeeMsl.isDepth || texture.pointeeMsl.isMultisampled) {
+			throw CompileError("the " + typeName(texture.pointeeMsl) + " method \"fence\" is not lowered: "
+				"depth and multisampled textures have no fence");
+		}
+		if (!call.arguments.empty()) {
+			throw CompileError("texture fence takes no arguments");
+		}
+		// Device (1), AcquireRelease (0x8) | ImageMemory (0x800) = 2056.
+		_builder.emit(spirv::OpMemoryBarrier, { constantU32(1), constantU32(8 | 2048) });
+	}
+
 	Id Emitter::emitTextureCall(const Expression& call) {
 		const Binding& texture = textureReceiver(call);
 		const std::string& method = call.left->memberName;
@@ -13375,6 +13395,13 @@ namespace {
 		const TextureAccess access = texture.pointeeMsl.textureAccess;
 		if (method == "write") {
 			throw CompileError("texture write returns void and has no value");
+		}
+		if (method == "fence") {
+			if (texture.pointeeMsl.isDepth || texture.pointeeMsl.isMultisampled) {
+				throw CompileError("the " + typeName(texture.pointeeMsl) + " method \"fence\" is not lowered: "
+					"depth and multisampled textures have no fence");
+			}
+			throw CompileError("texture fence returns void and has no value");
 		}
 		if (texture.pointeeMsl.isMultisampled) {
 			return emitMultisampledCall(call, texture);
