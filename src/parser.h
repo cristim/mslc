@@ -339,7 +339,9 @@ private:
 	std::string instantiateClass(const ClassTemplate& declaration, std::vector<TemplateArgument> arguments);
 	TemplateArgument parseTemplateArgument();
 	void parseTemplateHeader(FunctionTemplate& declaration);
-	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member);
+	std::string readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member,
+		std::pair<size_t, size_t>* explicitArguments = nullptr);
+	void parseExplicitSpecialization(size_t headerStart);
 	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
 	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
 	void parseMemberTemplate(const StructDecl& decl);
@@ -428,11 +430,17 @@ private:
 	bool atAsType(size_t& nameTokens) const;
 	// as_type<T>(x), read as a call of the builtin kAsTypeCallee with T as its template argument.
 	ExpressionPtr parseAsType(size_t nameTokens);
+	// Whether the cursor is at metal::vec<, spelled with or without the namespace unless the file
+	// declares its own vec; nameTokens is how many tokens the name takes.
+	bool atLibraryVec(size_t& nameTokens) const;
+	// vec<T, N> after its qualifiers, folded into type as the vector of N T.
+	void parseLibraryVec(Type& type, size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.
 	size_t libraryResourcePrefixTokens() const;
 	void parseUsing();
+	std::string parseStaticAssert(bool inStatement);
 
 	bool peekQualifiedName(QualifiedName& out) const;
 	bool isDiscardFragment(QualifiedName& name) const;
@@ -484,6 +492,8 @@ private:
 	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
 	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
 	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	const ConstantInt* findConstantInt(const Expression& identifier) const;
+	bool containsUnsigned(const Expression& expression) const;
 	int64_t constantArrayElement(const Expression& index, bool nested, bool attribute) const;
 	void recordConstantArray(const VariableDeclaration& declaration, bool local);
 	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
@@ -558,6 +568,9 @@ private:
 	// than an entry point's: no attribute, no resource, no pointer or reference.
 	Parameter parseParameter(const std::string& helperName = std::string());
 	ParameterAttributes parseParameterAttributes();
+	// The attributes on a parameter of a function that is not an entry point: read, checked against the
+	// parameter's type, and dropped.
+	void checkHelperParameterAttributes(const Parameter& param, const std::string& what);
 
 	// Struct fields
 	FieldAttributes parseFieldAttributes();

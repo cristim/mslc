@@ -22,6 +22,10 @@ namespace {
 			case OpCapability:
 				return Section::Capabilities;
 
+			// Likewise an extension, which follows the capabilities.
+			case OpExtension:
+				return Section::Extensions;
+
 			case OpTypeVoid:
 			case OpTypeBool:
 			case OpTypeInt:
