@@ -5457,7 +5457,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 				+ " address space, which a helper function does not take yet");
 		}
 		if (at(TokenKind::LBracket)) {
-			throw CompileError(what + "has an attribute, which only an entry point's parameter can have");
+			checkHelperParameterAttributes(param, what);
 		}
 		recordObjectType(param.name, param.type);
 		return param;
@@ -5493,6 +5493,30 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		recordObjectType(param.name, param.type);
 	}
 	return param;
+}
+
+// QUIRK: a parameter of a function that is not an entry point may carry the attributes an entry point's
+// parameter takes ([[buffer(n)]], [[texture(n)]], [[stage_in]], a builtin, ...), and they have no effect: the
+// argument is what the caller passes, and indices may repeat. A binding attribute must still suit the type:
+// [[buffer(n)]] a pointer or reference, [[texture(n)]] a texture, [[sampler(n)]] a sampler, else it is an
+// error. The MSL specification does not say. Evidence: black-box observation of Apple's compiler (tier 2;
+// metal 32023.883, macOS 26), which accepts the well-typed forms and reports "type ... is not valid for
+// attribute" for the others. Test: probes helper_parameter_attribute_*.
+void Parser::checkHelperParameterAttributes(const Parameter& param, const std::string& what) {
+	const size_t start = _position;
+	const ParameterAttributes attributes = parseParameterAttributes();
+	const Type& type = param.type;
+	const bool texture = type.isTexture() && !type.isPointer && !type.arrayLength;
+	const bool sampler = type.resource == ResourceKind::Sampler && !type.isPointer && !type.arrayLength;
+	const bool buffer = (type.isPointer || param.isReference) && type.resource == ResourceKind::None;
+	const char* wrong = attributes.bufferIndex && !buffer ? "buffer"
+		: attributes.textureIndex && !texture ? "texture"
+		: attributes.samplerIndex && !sampler ? "sampler" : nullptr;
+	if (wrong) {
+		_position = start;
+		throw CompileError(what + "has an attribute, [[" + wrong + "(n)]], that its type " + typeName(type)
+			+ " is not valid for");
+	}
 }
 
 ParameterAttributes Parser::parseParameterAttributes() {

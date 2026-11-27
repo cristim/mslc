@@ -553,6 +553,9 @@ private:
 	// than an entry point's: no attribute, no resource, no pointer or reference.
 	Parameter parseParameter(const std::string& helperName = std::string());
 	ParameterAttributes parseParameterAttributes();
+	// The attributes on a parameter of a function that is not an entry point: read, checked against the
+	// parameter's type, and dropped.
+	void checkHelperParameterAttributes(const Parameter& param, const std::string& what);
 
 	// Struct fields
 	FieldAttributes parseFieldAttributes();
