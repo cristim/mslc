@@ -103,9 +103,10 @@ argument must not use those); `[[buffer]]` arguments are seeded like kernel buff
 `DIFFCHECK-ULP` / source ULP bounds); a texture (`1d`, `1d_array`, `2d`, `2d_array`, `3d`,
 `cube` or `cube_array`) is RGBA of `float`, `half`, `int`, `uint`, `short` or `ushort` (`sample`
 or `access::read`), a runtime sampler is nearest,
-normalised, no mips with address mode picked by its Metal index (`0` clamp-to-edge, `1` repeat,
+normalised, mip-nearest with address mode picked by its Metal index (`0` clamp-to-edge, `1` repeat,
 `2` mirrored repeat), and an embedded (`constexpr`) sampler is built on Vulkan from mslc's
-reflection. Probes should sample at a texel centre (or 1/1024-grid coordinates for linear filtering).
+reflection (`mip_filter::none`, `nearest`, or `linear`). Probes should sample at a texel centre (or 1/1024-grid coordinates for linear filtering).
+`// DIFFCHECK-MIPS: <texture> <2|3>` seeds 2 or 3 mip levels on non-1D read-only textures across both stages.
 Graphics defaults to the `moderate` profile and two cases: `wide` values interpolate to magnitudes
 where any tolerance is meaningless.
 
@@ -133,11 +134,9 @@ textures (`access::write` or `access::read_write`) in either stage, depth or mul
 framebuffer fetch. Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 39
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 47
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
-
-Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tracked in #372).
 
 ## Comparison rules (`compare.py`)
 
@@ -177,6 +176,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   expressions stored into it automatically. It cannot loosen the interpolation tolerance of a
   graphics attachment.
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
+- `// DIFFCHECK-MIPS: <texture> <2|3>` seeds 2 or 3 mip levels for a non-1D read-only texture (default 1; kernel and graphics).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
 - Not supported yet in kernel mode, skipped with the reason: argument buffers,
   multisample and depth textures. Graphics pairs have their
@@ -219,15 +219,14 @@ bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
 Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index,
 name and access, and the element type and texture kind come from Apple's reflection. After the dispatch, every `write` or
 `read_write` texture's texels are read back and compared leaf by leaf (4 leaves of T per texel, so texels no
-thread writes must keep their seed), and the negative control perturbs one writable texture as its own group. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
+thread writes must keep their seed), and the negative control perturbs one writable texture as its own group. Adding `// DIFFCHECK-MIPS: <name> <2|3>` seeds 2 or 3 mip levels for a non-1D read-only (`sample` or `access::read`) texture in level-major order (`4x4` -> `2x2` -> `1x1`, or `4x4x2` -> `2x2x1` -> `1x1x1` for 3D). A sampler is nearest, normalised, mip-nearest, and its address mode follows its Metal index: 0 clamp to
 edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample at texel centres.
 Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
 binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
 unit square; the filter is always nearest, so a wrong filter state is not detected (#374).
 
 An embedded (`constexpr`) sampler in a kernel is in Apple's shader, so Apple gets no binding for it; the Vulkan
-host builds it from mslc's `embedded_samplers` state (address modes, nearest or linear). A state it cannot build (mips,
-compare, unnormalised coordinates, anisotropy, a min filter that differs from the mag filter, a lod range) is skipped
+host builds it from mslc's `embedded_samplers` state (address modes, nearest or linear, `mip_filter::none`, `nearest`, or `linear`). A state it cannot build (compare, unnormalised coordinates, anisotropy, a min filter that differs from the mag filter, non-transparent border colour, a lod range) is skipped
 with the reason. Known gap: a linear filter on a format without the linear-filter feature bit is not checked.
 
 Vacuity guard: in case 0 the texels of each `sample`, `read` or `read_write` texture are replaced by others and Apple's output must

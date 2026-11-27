@@ -45,7 +45,7 @@ def mutated(path, edits):
 
 BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write",
              "texture_nonfloat_read", "texture_nonfloat_write", "texture_non2d_read", "texture_non2d_write",
-             "texture_cube_read_write", "sampler_modes", "atomic_device_ops", "atomic_buffer_only",
+             "texture_cube_read_write", "texture_mip_lod", "sampler_modes", "atomic_device_ops", "atomic_buffer_only",
              "layout_unread_member", "ulp_per_buffer", "ulp_per_field", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
              "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
              "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
@@ -93,6 +93,15 @@ MUTANTS = [
     ("texture_cube_read_write", [[r"(OpCompositeConstruct %v4half) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
     # cube/cube_array: cube sample face 0 direction altered
     ("texture_cube_read_write", [[r"(OpCompositeConstruct %v3float) %float_1 (%\d+)", r"\1 \2 \2"]], "mismatched"),
+    # multi-mip textures: get_num_mip_levels collapsed to 1, min_lod_clamp dropped, fractional lod rounded to 1,
+    # explicit lod/bias collapsed to 0, 2d/3d/cube mip read collapsed to 0, and get_depth(lod) collapsed to level 0
+    ("texture_mip_lod", [[r"OpImageQueryLevels %uint %\d+$", "OpCopyObject %uint %uint_1"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Grad\|MinLod %\d+ %\d+) %float_2$", r"\1 %float_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %float_1_5$", r"\1 %float_1"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %\d+$", r"\1 %float_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageFetch %v4float %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageFetch %v4uint %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageQuerySizeLod %v3uint %\d+) %\d+(\n\s+%\d+ = OpCompositeExtract %uint %\d+ 2)", r"\1 %uint_0\2"]], "mismatched"),
     # texture: the two textures change bindings
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
@@ -239,6 +248,27 @@ with tempfile.TemporaryDirectory() as d:
         dst.write(src.read().replace("UNUSED: ignored", "UNUSED: ignord"))
     rc, out, data = run(typo)
     assert rc == 2 and "ignord" in out, (rc, out)
+    mips_typo = os.path.join(d, "mips_typo.metal")
+    with open(probe("texture_mip_lod")) as src, open(mips_typo, "w") as dst:
+        dst.write(src.read().replace("DIFFCHECK-MIPS: s2 3", "DIFFCHECK-MIPS: ss2 3"))
+    rc, out, data = run(mips_typo)
+    assert rc == 2 and "ss2" in out, (rc, out)
+    for fname, needle, body in (
+        ("mips_1d.metal", "has no mip levels",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture1d<float> t [[texture(0)]], sampler s [[sampler(0)]], device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = t.sample(s, 0.5f); }\n"),
+        ("mips_writable.metal", "writable",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture2d<float, access::write> t [[texture(0)]], uint i [[thread_position_in_grid]]) { t.write(float4(1.0f), uint2(i & 3u, 0u)); }\n"),
+        ("mips_tb.metal", "has no mip levels",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture_buffer<float, access::read> t [[texture(0)]], device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = t.read(i & 3u); }\n"),
+    ):
+        p = os.path.join(d, fname)
+        with open(p, "w") as f:
+            f.write(body)
+        rc, out, data = run(p)
+        assert rc == 3 and data["status"] == "skipped" and needle in data["reason"], (fname, rc, out)
 
 # A depth texture reflects as depth (not 2d/2d_array/cube) and is skipped; >8 textures or samplers on vkhost skips cleanly.
 with tempfile.TemporaryDirectory() as d:

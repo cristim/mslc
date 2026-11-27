@@ -82,6 +82,14 @@ MUTANTS = [
                                 ["BuiltIn SubgroupSize", "BuiltIn InstanceIndex"]]),
     ("indexed_draw", "vertex", [["OpBitwiseXor %uint", "OpBitwiseOr %uint"]]),
     ("indexed_draw", "vertex", [["OpConstant %uint 16", "OpConstant %uint 17"]]),
+    ("texture_mip_lod", "vertex", [[r"OpImageQueryLevels %uint %\d+$", "OpCopyObject %uint %uint_1"]]),
+    ("texture_mip_lod", "vertex", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %\d+$", r"\1 %float_0_125"]]),
+    ("texture_mip_lod", "vertex", [[r"(OpImageFetch %v4uint %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]]),
+    ("texture_mip_lod", "fragment", [[r"OpImageQueryLevels %uint %\d+$", "OpCopyObject %uint %uint_1"]]),
+    ("texture_mip_lod", "fragment", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Grad\|MinLod %\d+ %\d+) %float_2$", r"\1 %float_0"]]),
+    ("texture_mip_lod", "fragment", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %float_1_5$", r"\1 %float_1"]]),
+    ("texture_mip_lod", "fragment", [[r"(OpImageSampleImplicitLod %v4float %\d+ %\d+ Bias) %float_1$", r"\1 %float_0"]]),
+    ("texture_mip_lod", "fragment", [[r"(OpImageFetch %v4uint %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -92,7 +100,7 @@ if rc == 77:
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
              "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d",
-             "writable_buffer", "vertex_attr_half", "sparse_color_interp", "indexed_draw"):
+             "writable_buffer", "vertex_attr_half", "sparse_color_interp", "indexed_draw", "texture_mip_lod"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
@@ -149,6 +157,10 @@ with tempfile.TemporaryDirectory() as d:
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
          "fragment float4 fs(texture2d<float> t [[texture(0)]]) { constexpr sampler s(mag_filter::linear, min_filter::nearest); return t.sample(s, float2(0.5)); }\n"),
+        ("mips_1d.metal", "has no mip levels",
+         "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
+         "fragment float4 fs(texture1d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { return t.sample(s, 0.5f); }\n"),
     ]
     for fname, needle, body in cases:
         p = os.path.join(d, fname)
@@ -156,6 +168,17 @@ with tempfile.TemporaryDirectory() as d:
             f.write(body)
         rc, out, data = run(p)
         assert rc == 3 and data["status"] == "skipped" and needle in data["reason"], (fname, rc, out)
+
+    mips_typo = os.path.join(d, "mips_typo.metal")
+    with open(probe("texture_mip_lod")) as src, open(mips_typo, "w") as dst:
+        dst.write(src.read().replace("DIFFCHECK-MIPS: ft 3", "DIFFCHECK-MIPS: fft 3"))
+    rc, out, data = run(mips_typo)
+    assert rc == 2 and "fft" in out, (rc, out)
+    unused_gfx = os.path.join(d, "unused_gfx.metal")
+    with open(probe("texture_mip_lod")) as src, open(unused_gfx, "w") as dst:
+        dst.write("// DIFFCHECK-UNUSED: ft unused\n" + src.read())
+    rc, out, data = run(unused_gfx)
+    assert rc == 2 and "DIFFCHECK-UNUSED names ft" in out, (rc, out)
 
     stub = os.path.join(d, "refuse-vk")
     with open(stub, "w") as f:
