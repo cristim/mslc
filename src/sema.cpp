@@ -13390,7 +13390,8 @@ namespace {
 			throw CompileError("write-only textures lower only the size queries and statement "
 				"write(value, coordinate); \"" + method + "\" is not lowered yet");
 		}
-		if (access != TextureAccess::Sample && access != TextureAccess::Write && method != "read" && !sized) {
+		if (access != TextureAccess::Sample && access != TextureAccess::Write && method != "read" && !sized
+			&& !(access == TextureAccess::Read && method == "get_num_mip_levels")) {
 			if (method == "get_num_mip_levels") {
 				throw CompileError(std::string("access::") + textureAccessName(access) + " textures lower only read(), "
 					"the size queries and statement write(); \"get_num_mip_levels\" is refused because a Vulkan "
@@ -13398,8 +13399,8 @@ namespace {
 					"answers its full level count");
 			}
 			throw CompileError(std::string("access::") + textureAccessName(access) + " textures lower only read(), "
-				+ (access == TextureAccess::ReadWrite ? "statement write() and " : "") + "the size queries; \""
-				+ method + "\" is not lowered yet");
+				+ (access == TextureAccess::Read ? "get_num_mip_levels() and " : "statement write() and ")
+				+ "the size queries; \"" + method + "\" is not lowered yet");
 		}
 		if (method == "sample" && access == TextureAccess::Sample) {
 			return emitTextureSample(call, texture);
@@ -13413,7 +13414,7 @@ namespace {
 		if (method == "gather_compare" && access == TextureAccess::Sample && texture.pointeeMsl.isDepth) {
 			return emitTextureGather(call, texture, true);
 		}
-		if (method == "get_num_mip_levels" && access == TextureAccess::Sample) {
+		if (method == "get_num_mip_levels" && !texture.pointeeMsl.isStorageTexture()) {
 			if (!call.arguments.empty()) {
 				throw CompileError("get_num_mip_levels takes no arguments");
 			}

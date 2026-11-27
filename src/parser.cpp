@@ -6497,9 +6497,9 @@ void Parser::parseResourceType(Type& type) {
 			"sampled types float, half, int, uint, short and ushort");
 	}
 
-	// Apple's texture_buffer is access::read unless it says otherwise, and has no sampled form.
+	// Apple's texture_buffer and multisampled textures are access::read unless spelled otherwise.
 	const bool isBuffer = color != textures.end() && color->second == ResourceKind::TextureBuffer;
-	std::string access = isBuffer ? "read" : "sample";
+	std::string access = (isBuffer || isMultisampled) ? "read" : "sample";
 	bool accessSpelled = false;
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
@@ -6544,16 +6544,18 @@ void Parser::parseResourceType(Type& type) {
 	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
 	type.isMultisampled = isMultisampled;
-	if (isMultisampled && (access != "sample" || accessSpelled) && access != "read") {
+	if (type.isDepth && element->second != ScalarKind::Float) {
+		throw CompileError(name + "<" + component + (accessSpelled ? ", access::" + access : "")
+			+ "> is not lowered yet; mslc lowers depth textures of float (Apple has no depth half)");
+	}
+	if (isMultisampled && access != "read" && !(isDepth && access == "sample")) {
 		throw CompileError(name + " access::" + access + " is not lowered yet; a multisampled texture is read-only");
 	}
-	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
-		throw CompileError(name + "<" + component + (access == "sample" ? "" : ", access::" + access)
-			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample"
-			+ (access == "sample" ? " (Apple has no depth half)" : ""));
+	if (type.isDepth && access != "sample" && access != "read") {
+		throw CompileError(name + "<" + component + ", access::" + access
+			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample or access::read");
 	}
-	// A multisampled texture is a sampled image whichever way read is spelled.
-	type.textureAccess = isMultisampled ? TextureAccess::Sample : access == "write" ? TextureAccess::Write
+	type.textureAccess = access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
 	type.scalar = element->second;
