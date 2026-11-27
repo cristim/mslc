@@ -874,3 +874,18 @@ Where this differs from Apple:
   the same before the qualified spelling was lowered.
 - False refusals: `fast::select` of two scalars of different types (`select(1, 2.0h, c)`), and a bool argument
   (`fast::select(true, false, c)`, `fast::abs(true)`). Apple converts each to float.
+
+## Deduced return types (`auto f(...)`)
+
+A helper or function template declared `auto f(...)` takes the type of its first return's value, as C++ deduces it
+([dcl.spec.auto]); a later return has to give the same type, and a function no return gives a value to returns void.
+The body is emitted at the first call, inside the caller's, so the type is known there; it is put after the caller's
+body. Tests: `tests/probes/helper_auto_return_*`.
+
+Apple accepts, and mslc refuses (each a loud error):
+
+- `auto&`, `const auto&`, `auto*`, `decltype(auto)` and a trailing return type (`auto f() -> T`).
+- A deduced return of an enum value (Apple deduces the enum), an array, a pointer or a resource.
+- A use that needs an auto function template's return type before the call is emitted (`f<T>(x).member` on a struct
+  it returns, argument-dependent lookup through its result): "not known before its arguments are evaluated".
+- `auto` member functions of a struct.

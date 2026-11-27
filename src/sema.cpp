@@ -2651,6 +2651,14 @@ namespace {
 		std::map<std::vector<Id>, Id> _functionTypes;
 		// The helper whose body is being emitted, or null inside an entry point.
 		const FunctionDecl* _helper = nullptr;
+		// The return type of each function declared "auto f(...)", once its first return has been emitted.
+		std::map<const FunctionDecl*, Type> _deducedReturns;
+		// The functions being emitted to deduce their return type, innermost last.
+		std::set<const FunctionDecl*> _deducing;
+		// Functions emitted inside another's body to deduce their return type, put after that body ends; and how
+		// many such emissions are under way.
+		std::vector<spirv::Instruction> _deferredFunctions;
+		unsigned _nestedHelpers = 0;
 
 	public:
 		Emitter(spirv::Builder& builder, const TranslationUnit& unit,
@@ -3078,6 +3086,10 @@ namespace {
 		bool emitVoidCall(const Expression& call, const std::string* returnedBy);
 		void emitVoidConditional(const Expression& expression, const std::string* returnedBy);
 		bool returnsVoid(const FunctionDecl& function) const;
+		const Type& returnTypeOf(const FunctionDecl& function) const;
+		void deduceReturnType(HelperFunction& helper);
+		Type deducedTypeOf(const Expression& returned, Id value, const std::string& quoted);
+		void flushDeferredFunctions();
 		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
 		Id emitSignExact(Id value, Id type, uint32_t bits);
 		Id atomicAddress(const Expression& argument, const std::string& function, bool& isSigned);
@@ -4220,7 +4232,8 @@ namespace {
 					const StructDecl* owner = structOf(*expression.left->left);
 					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName)
 						: _helpers.end();
-					returnedType = found == _helpers.end() ? nullptr : &found->second.definition->returnType;
+					returnedType = found == _helpers.end() || returnTypeOf(*found->second.definition).isAuto ? nullptr
+						: &returnTypeOf(*found->second.definition);
 					if (owner && found == _helpers.end()) {
 						// A member function template returns a struct known once its arguments are.
 						for (const FunctionTemplate* declaration:
@@ -6765,13 +6778,16 @@ namespace {
 			}
 			chosen = &returned;
 		};
-		for (const HelperFunction* candidate: named) {
+		for (HelperFunction* candidate: named) {
 			const FunctionDecl& definition = *candidate->definition;
 			if (total > 1
 				&& (candidate->firstOrder > callerOrder() || definition.parameters.size() != call.arguments.size())) {
 				continue;
 			}
-			consider(definition.returnType);
+			if (returnTypeOf(definition).isAuto) {
+				helperFunctionId(*candidate);
+			}
+			consider(returnTypeOf(definition));
 		}
 		for (const FunctionTemplate* declaration: templates) {
 			if (total > 1 && declaration->order > callerOrder()) {
@@ -6781,6 +6797,10 @@ namespace {
 			const FunctionDecl* pattern = templatePattern(*declaration, call.left->templateArguments, arguments);
 			if (!pattern || (total > 1 && pattern->parameters.size() != call.arguments.size())) {
 				continue;
+			}
+			// What an auto template returns is known once an instance is emitted, not here.
+			if (pattern->returnType.isAuto) {
+				return nullptr;
 			}
 			consider(pattern->returnType);
 		}
@@ -7548,7 +7568,7 @@ namespace {
 			return type.namedType.empty() && type.enumName.empty() && type.resource == ResourceKind::None;
 		};
 		for (const HelperFunction* helper: helpersCalled(call)) {
-			if (!scalarOrVector(helper->definition->returnType)) {
+			if (returnTypeOf(*helper->definition).isAuto || !scalarOrVector(returnTypeOf(*helper->definition))) {
 				return false;
 			}
 		}
@@ -7558,6 +7578,9 @@ namespace {
 				: templatePattern(*declaration, call.left->templateArguments, arguments);
 			if (!pattern) {
 				continue;
+			}
+			if (pattern->returnType.isAuto) {
+				return false;
 			}
 			if (!isTemplateMarker(pattern->returnType)) {
 				if (!scalarOrVector(pattern->returnType)) {
@@ -7821,7 +7844,139 @@ namespace {
 	}
 
 	bool Emitter::returnsVoid(const FunctionDecl& function) const {
-		return function.returnType.scalar == ScalarKind::Void && function.returnType.namedType.empty();
+		const Type& returned = returnTypeOf(function);
+		return !returned.isAuto && returned.scalar == ScalarKind::Void && returned.namedType.empty();
+	}
+
+	// What a function returns: as declared, or for "auto f(...)" as its first return deduced it. A function
+	// whose return type is not deduced yet answers the auto placeholder.
+	const Type& Emitter::returnTypeOf(const FunctionDecl& function) const {
+		if (function.returnType.isAuto) {
+			if (const auto found = _deducedReturns.find(&function); found != _deducedReturns.end()) {
+				return found->second;
+			}
+		}
+		return function.returnType;
+	}
+
+	// "auto f(...)" returns the type of the value its first return gives, decayed ([dcl.spec.auto]): the body is
+	// emitted at the first call, inside the caller's, to learn it, and put after the caller's body. The caller's
+	// state of emission is set aside meanwhile and put back.
+	void Emitter::deduceReturnType(HelperFunction& helper) {
+		const FunctionDecl& definition = *helper.definition;
+		if (!_deducing.insert(&definition).second) {
+			throw CompileError("\"" + definition.name + "\" is called in its own body before its return type is "
+				"deduced");
+		}
+
+		struct Saved {
+			std::map<std::string, Binding> bindings;
+			std::map<std::string, Binding> fileScopeBound;
+			FileScopeView::Stack views;
+			std::vector<JumpTarget> jumps;
+			bool terminated;
+			Id block;
+			uint32_t depth;
+			const FunctionDecl* helper;
+			Id pending;
+			Id functionId;
+			spirv::Section section;
+			Id builderFunction;
+		};
+		Saved saved { std::move(_bindings), std::move(_fileScopeBound), std::move(_fileScopeViews),
+			std::move(_jumpTargets), _terminated, _currentBlock, _controlDepth, _helper, _pendingObject, _functionId,
+			_builder.section(), _builder.currentFunction() };
+		_bindings.clear();
+		_fileScopeBound.clear();
+		_fileScopeViews.clear();
+		_jumpTargets.clear();
+		_pendingObject = InvalidId;
+		const auto restore = [&] {
+			_bindings = std::move(saved.bindings);
+			_fileScopeBound = std::move(saved.fileScopeBound);
+			_fileScopeViews = std::move(saved.views);
+			_jumpTargets = std::move(saved.jumps);
+			_terminated = saved.terminated;
+			_currentBlock = saved.block;
+			_controlDepth = saved.depth;
+			_helper = saved.helper;
+			_pendingObject = saved.pending;
+			_functionId = saved.functionId;
+			_builder.setSection(saved.section);
+			_builder.setCurrentFunction(saved.builderFunction);
+			--_nestedHelpers;
+			_deducing.erase(&definition);
+		};
+
+		const size_t mark = _builder.functionsMark();
+		++_nestedHelpers;
+		try {
+			emitHelper(helper);
+		} catch (...) {
+			restore();
+			throw;
+		}
+		std::vector<spirv::Instruction> body = _builder.takeFunctionsFrom(mark);
+		restore();
+
+		// The function was emitted returning void; its header takes the deduced type now.
+		helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(returnTypeOf(definition));
+		std::vector<Id> signature { helper.returnType };
+		signature.insert(signature.end(), helper.parameterTypes.begin(), helper.parameterTypes.end());
+		signature.erase(std::remove(signature.begin() + 1, signature.end(), InvalidId), signature.end());
+		const auto slot = _functionTypes.emplace(signature, InvalidId);
+		if (slot.second) {
+			slot.first->second = _builder.emitDecl(spirv::OpTypeFunction, signature);
+		}
+		helper.type = slot.first->second;
+		if (body.empty() || body.front().opcode != spirv::OpFunction) {
+			throw CompileError("internal: the function emitted to deduce the return type of \"" + definition.name
+				+ "\" does not start with its header");
+		}
+		body.front().words[0] = helper.returnType;
+		body.front().words[3] = helper.type;
+		_builder.setType(body.front().words[1], helper.returnType);
+		_deferredFunctions.insert(_deferredFunctions.end(), std::make_move_iterator(body.begin()),
+			std::make_move_iterator(body.end()));
+	}
+
+	// The functions emitted while another's body was open, once no body is.
+	void Emitter::flushDeferredFunctions() {
+		if (_nestedHelpers == 0 && !_deferredFunctions.empty()) {
+			_builder.appendFunctions(std::move(_deferredFunctions));
+			_deferredFunctions.clear();
+		}
+	}
+
+	// The type an auto return type deduces from the value a return gives: a scalar, a vector, a matrix or a
+	// struct, decayed as C++ decays it. A packed vector stays packed (sizeof is Apple's 12 for a
+	// packed_float3); an enum, an array, a pointer or a resource is refused rather than deduced as something
+	// close to it.
+	Type Emitter::deducedTypeOf(const Expression& returned, Id value, const std::string& quoted) {
+		const Id type = _builder.typeOf(value);
+		const std::string refused = quoted + " is declared auto, and mslc does not deduce its return type from ";
+		if (const auto tag = enumOf(returned); tag && !tag->empty()) {
+			throw CompileError(refused + "an enum value");
+		}
+		Type deduced;
+		if (const auto kind = _types.scalarKindOf(type)) {
+			deduced.scalar = *kind;
+		} else if (const Id component = _types.componentOf(type); component != InvalidId && _types.scalarKindOf(component)) {
+			deduced.scalar = *_types.scalarKindOf(component);
+			deduced.vectorWidth = _types.vectorWidth(type);
+		} else if (const TypeTable::MatrixInfo* matrix = _types.matrixInfo(type)) {
+			deduced.scalar = matrix->scalar;
+			deduced.matrixColumns = matrix->columns;
+			deduced.vectorWidth = matrix->rows;
+		} else if (bool laidOut = false; const std::string* name = _types.structNameOf(type, &laidOut)) {
+			deduced.namedType = *name;
+		} else {
+			throw CompileError(refused + "a value of this type (an array, a pointer or a resource)");
+		}
+		if (const std::optional<Type> written = sizeofExpressionType(returned); written && written->isPacked) {
+			deduced.isPacked = true;
+		}
+		return deduced;
 	}
 
 	// A texture or sampler parameter is a pointer to the UniformConstant variable
@@ -7886,8 +8041,14 @@ namespace {
 	// declares is one id for the whole module, so it is declared once.
 	Id Emitter::helperFunctionId(HelperFunction& helper) {
 		const FunctionDecl& definition = *helper.definition;
+		// "auto f(...)": emitted here, at its first call, to learn what it returns.
+		const bool deduce = returnTypeOf(definition).isAuto;
+		if (deduce && _deducing.count(&definition)) {
+			throw CompileError("\"" + definition.name + "\" is called in its own body before its return type is "
+				"deduced");
+		}
 		if (helper.type == InvalidId) {
-			helper.returnType = returnsVoid(definition) ? _voidType : declaredTypeOf(definition.returnType);
+			helper.returnType = deduce || returnsVoid(definition) ? _voidType : declaredTypeOf(returnTypeOf(definition));
 			std::vector<Id> signature { helper.returnType };
 			for (size_t i = 0; i < definition.parameters.size(); ++i) {
 				const Parameter& parameter = definition.parameters[i];
@@ -7923,6 +8084,11 @@ namespace {
 		const auto slot = helper.ids.emplace(helperScope(helper), InvalidId);
 		if (slot.second) {
 			slot.first->second = _builder.nextId();
+			if (deduce) {
+				const Id id = slot.first->second;
+				deduceReturnType(helper);
+				return id;
+			}
 			_helperQueue.push_back(&helper);
 		}
 
@@ -8754,7 +8920,10 @@ namespace {
 						return std::nullopt;
 					}
 				}
-				const Type& result = set.front()->definition->returnType;
+				const Type& result = returnTypeOf(*set.front()->definition);
+				if (result.isAuto) {
+					return std::nullopt;
+				}
 				return result.scalar == ScalarKind::Void && result.namedType.empty() && !result.isPointer
 					? std::nullopt : std::optional<Type>(result);
 			}
@@ -9045,6 +9214,11 @@ namespace {
 
 		emitFunctionBody(*definition.body);
 
+		// An auto function no return gave a value to returns void.
+		if (returnTypeOf(definition).isAuto) {
+			_deducedReturns[&definition] = Type();
+		}
+
 		// A path that reaches the end of a function returning a value is undefined
 		// in C++ and Apple only warns for it, so it is not made up a value. A block
 		// left open by a structured if whose branches all return is dead, and this
@@ -9055,6 +9229,7 @@ namespace {
 		_builder.emit(spirv::OpFunctionEnd, { });
 
 		_helper = nullptr;
+		flushDeferredFunctions();
 	}
 
 	// The operand of a return in a function returning void: an expression of type void, such as a call to another
@@ -9135,6 +9310,35 @@ namespace {
 	void Emitter::emitHelperReturn(const Statement& statement) {
 		const std::string quoted = "\"" + _helper->name + "\"";
 
+		// The first return of an auto function gives it its type; a later one has to give the same type
+		// ([dcl.spec.auto]: each return deduces, and the deductions have to agree). A braced list deduces none.
+		if (_helper->returnType.isAuto && statement.expression
+			&& statement.expression->kind == ExpressionKind::InitList && !statement.expression->constructType) {
+			throw CompileError(quoted + " is declared auto, and a braced list deduces no return type");
+		}
+		if (returnTypeOf(*_helper).isAuto) {
+			if (!statement.expression) {
+				_deducedReturns[_helper] = Type();
+				terminate(spirv::OpReturn, { });
+				return;
+			}
+			const Id value = emitExpression(*statement.expression);
+			_deducedReturns[_helper] = deducedTypeOf(*statement.expression, value, quoted);
+			terminate(spirv::OpReturnValue, { value });
+			return;
+		}
+		if (_helper->returnType.isAuto && !returnsVoid(*_helper) && statement.expression) {
+			const Id value = emitExpression(*statement.expression);
+			const Type& deduced = returnTypeOf(*_helper);
+			const Type here = deducedTypeOf(*statement.expression, value, quoted);
+			if (typeName(here) != typeName(deduced)) {
+				throw CompileError(quoted + " is declared auto, and its returns deduce " + typeName(deduced)
+					+ " and " + typeName(here) + ", which have to be one type");
+			}
+			terminate(spirv::OpReturnValue, { value });
+			return;
+		}
+
 		if (returnsVoid(*_helper)) {
 			if (statement.expression) {
 				emitVoidReturnValue(*statement.expression, quoted);
@@ -9145,11 +9349,11 @@ namespace {
 		}
 
 		if (!statement.expression) {
-			throw CompileError(quoted + " returns " + typeName(_helper->returnType)
+			throw CompileError(quoted + " returns " + typeName(returnTypeOf(*_helper))
 				+ ", so a return needs a value");
 		}
 
-		if (!_helper->returnType.enumName.empty()) {
+		if (!returnTypeOf(*_helper).enumName.empty()) {
 			requireEnumValue(_helper->returnType.enumName, *statement.expression, "the value " + quoted + " returns");
 		}
 		const bool braced = statement.expression->kind == ExpressionKind::InitList && !statement.expression->constructType;
@@ -16005,6 +16209,7 @@ namespace {
 			terminate(spirv::OpReturn, { });
 		}
 		_builder.emit(spirv::OpFunctionEnd, { });
+		flushDeferredFunctions();
 
 		// The helpers this entry point called, and the ones those called.
 		for (size_t i = 0; i < _helperQueue.size(); ++i) {

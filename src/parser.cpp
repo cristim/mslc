@@ -1445,11 +1445,9 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("an attribute in the declaration of " + quoted + " is not lowered yet");
 	}
-	if (atKeyword("auto")) {
-		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
-	}
 	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
 		? 0 : declaration.name.rfind("::") + 2);
+	const bool deducedReturn = deducedReturnAhead(quoted);
 	// The signature read to deduce the parameters, some of which stand for themselves: a return type that is
 	// an instance of a class template on those parameters cannot be made yet, and deduction does not need it.
 	// It is a dependent type, as a return type of T is; the instance a call chooses reads the real one.
@@ -1459,7 +1457,11 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	const size_t returnTypeStart = _position;
 	bool dependentReturn = false;
 	try {
-		decl.returnType = parseType();
+		if (deducedReturn) {
+			decl.returnType = deducedReturnType();
+		} else {
+			decl.returnType = parseType();
+		}
 	} catch (const DependentClassInstance&) {
 		if (!deducing) {
 			throw;
@@ -2708,6 +2710,27 @@ void Parser::skipFunctionAttribute() {
 	}
 }
 
+// "auto f(" ahead: a return type deduced from the function's return statements ([dcl.spec.auto]). Any other
+// declaration that starts with auto (auto&, auto*, a trailing return type) is refused.
+bool Parser::deducedReturnAhead(const std::string& quoted) {
+	if (!atKeyword("auto")) {
+		return false;
+	}
+	if (lookahead().kind == TokenKind::Identifier && lookahead(2).kind == TokenKind::LParen) {
+		return true;
+	}
+	throw CompileError("the return type of " + quoted + " starts with auto and is not a plain auto, which mslc "
+		"deduces only as \"auto f(...)\" (not auto&, auto* or a trailing return type)");
+}
+
+// The placeholder a deduced return type has until sema reads the first return statement.
+Type Parser::deducedReturnType() {
+	advance();
+	Type type;
+	type.isAuto = true;
+	return type;
+}
+
 bool Parser::tryParseHelperFunction() {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
@@ -2731,8 +2754,13 @@ bool Parser::tryParseHelperFunction() {
 	}
 
 	bool referenceReturn = false;
+	const bool deducedReturn = deducedReturnAhead("a helper function");
 	try {
-		decl.returnType = parseType();
+		if (deducedReturn) {
+			decl.returnType = deducedReturnType();
+		} else {
+			decl.returnType = parseType();
+		}
 		referenceReturn = match(TokenKind::Ampersand);
 		if (kind() != TokenKind::Identifier) {
 			_position = start;
