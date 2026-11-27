@@ -1345,6 +1345,25 @@ void Parser::bindParameters(const std::string& owner, const std::vector<Template
 	}
 }
 
+namespace {
+
+// A failure to read a class template instance. It is not swallowed where the parser backtracks, since
+// reading on past it would leave a half-declared struct behind.
+class ClassTemplateError: public CompileError {
+public:
+	using CompileError::CompileError;
+};
+
+// An instance of a class template whose arguments are a function template's parameters still to be deduced.
+class DependentClassInstance: public ClassTemplateError {
+public:
+	using ClassTemplateError::ClassTemplateError;
+};
+
+bool isDeductionMarker(const Type& type);
+
+}
+
 // One instance of a template as a helper. The declaration's tokens are the whole input.
 FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
 	bool withBody) {
@@ -1397,10 +1416,45 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	if (atKeyword("auto")) {
 		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
 	}
-	decl.returnType = parseType();
-	rejectUnloweredReturn(decl.returnType, quoted);
 	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
 		? 0 : declaration.name.rfind("::") + 2);
+	// The signature read to deduce the parameters, some of which stand for themselves: a return type that is
+	// an instance of a class template on those parameters cannot be made yet, and deduction does not need it.
+	// It is a dependent type, as a return type of T is; the instance a call chooses reads the real one.
+	const bool deducing = !withBody && std::any_of(arguments.begin(), arguments.end(), [](const TemplateArgument& argument) {
+		return argument.unbound || (argument.isType && isDeductionMarker(argument.type));
+	});
+	const size_t returnTypeStart = _position;
+	bool dependentReturn = false;
+	try {
+		decl.returnType = parseType();
+	} catch (const DependentClassInstance&) {
+		if (!deducing) {
+			throw;
+		}
+		_position = returnTypeStart;
+		// A "<" or ">" inside parentheses, "(1 < 2)", is an operator, not a bracket.
+		size_t angles = 0;
+		size_t parentheses = 0;
+		while (!at(TokenKind::EndOfFile) && !(angles == 0 && parentheses == 0 && kind() == TokenKind::Identifier
+			&& current().text == written && lookahead().kind == TokenKind::LParen)) {
+			parentheses += at(TokenKind::LParen) ? 1 : 0;
+			parentheses -= at(TokenKind::RParen) && parentheses > 0 ? 1 : 0;
+			if (parentheses == 0) {
+				angles += at(TokenKind::Less) ? 1 : 0;
+				angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
+				angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+			}
+			advance();
+		}
+		if (at(TokenKind::EndOfFile)) {
+			throw;
+		}
+		decl.returnType = Type();
+		decl.returnType.namedType = "<dependent return type>";
+		dependentReturn = true;
+	}
+	rejectUnloweredReturn(decl.returnType, quoted);
 	if (kind() != TokenKind::Identifier || current().text != written) {
 		throw CompileError("the declaration of " + quoted + " is not a return type and a name that mslc reads "
 			"when it is instantiated (found \"" + std::string(current().text) + "\" where its name is)");
@@ -1467,7 +1521,9 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 			throw CompileError("unknown type name \"" + type.namedType + "\" in the declaration of " + quoted);
 		}
 	};
-	declared(decl.returnType);
+	if (!dependentReturn) {
+		declared(decl.returnType);
+	}
 	for (const Parameter& parameter: decl.parameters) {
 		declared(parameter.type);
 	}
@@ -1696,17 +1752,6 @@ void Parser::closeAngle(const char* what) {
 		_tokens.insert(_tokens.begin() + _position, _tokens[_position]);
 	}
 	expect(TokenKind::Greater, what);
-}
-
-namespace {
-
-// A failure to read a class template instance. It is not swallowed where the parser backtracks, since
-// reading on past it would leave a half-declared struct behind.
-class ClassTemplateError: public CompileError {
-public:
-	using CompileError::CompileError;
-};
-
 }
 
 void Parser::reserveSplits(std::vector<Token>& tokens) {
@@ -1961,7 +2006,7 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	}
 	for (const TemplateArgument& argument: arguments) {
 		if (argument.unbound || (argument.isType && isDeductionMarker(argument.type))) {
-			throw ClassTemplateError("an instance of " + quoted + " that depends on the parameters of a function "
+			throw DependentClassInstance("an instance of " + quoted + " that depends on the parameters of a function "
 				"template is not lowered yet");
 		}
 	}
