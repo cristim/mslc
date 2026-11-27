@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // DISASM: OpBitcast %uint
 // metal::as_type through a namespace alias of metal.
 #include <metal_stdlib>

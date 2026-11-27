@@ -1,5 +1,6 @@
 // EXPECT: valid
 // RUN: grid=16 local=8 cases=3 elems=256
+// DIFFCHECK: writes-zero
 // DISASM-MATCH: OpExtInst %v2int %[0-9]+ FindUMsb
 // DISASM-NOT: OpFDiv
 // c / max is the correctly rounded quotient, made from its repeating bits rather than by a division

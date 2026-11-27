@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A function whose name starts like a trait's, overloaded through two using-directives, is still a call: only
 // make_scalar, make_signed and make_unsigned followed by "<" are read as a type. On an RTX 3060 out is 6.
 #include <metal_stdlib>

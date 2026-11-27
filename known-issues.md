@@ -31,14 +31,16 @@ the front end can see (not across statements, where Apple does not fuse). `tools
 compiles the Apple side with `contract(off)` to compare like with like. Not scheduled: no
 corpus kernel depends on the last bit.
 
-Also open, tracked in #371:
+Also tracked in #371:
 
-- indium (`src/indium/indium.cpp`) never queries `VkPhysicalDeviceFloatControlsProperties`. The
-  execution modes need `shaderSignedZeroInfNanPreserveFloat32` (VUID 06294) and, for mode 16,
-  `shaderSignedZeroInfNanPreserveFloat16` (VUID 06293). Mode 16 is module-wide: every entry point
-  gets it once any code declares half.
-- Consumer side, not in this repo: `src/indium` does not exist here, so the property query lives in
-  darlinghq/indium (the bullet above).
+- `SignedZeroInfNanPreserve` execution modes require `shaderSignedZeroInfNanPreserveFloat32`
+  (VUID 06294) on every module and, when any code declares `half`,
+  `shaderSignedZeroInfNanPreserveFloat16` (VUID 06293; mode 16 is module-wide). Consumer side in
+  indium (`src/indium/device.cpp` and `src/indium/library.cpp`, tested in
+  `test/mslc-reflection/mslc-reflection-test.cpp`): `initGlobalDeviceList()` filters out physical
+  devices without 32-bit `shaderSignedZeroInfNanPreserveFloat32`, and `PrivateLibrary` checks
+  `spirvDeclaresFloat16()` and refuses modules declaring `OpCapability Float16` on devices without
+  `shaderSignedZeroInfNanPreserveFloat16`.
 
 Float operations beyond add/sub/mul (#371), measured with `xcrun metal -fno-fast-math -S
 -emit-llvm` (safe math; Apple's default is fast math, where every op below is `fast`). Rule: an
@@ -61,7 +63,17 @@ Open gap: Apple's `length`/`normalize`/`distance` rescale by powers of two befor
 | `matrix * vector`, `matrix * matrix` | `llvm.fmuladd` | not decorated: Apple allows fusing |
 | `smoothstep` | inlined: `fdiv`, `fmul`, `llvm.fmuladd` | ext inst, not decorated: Apple fuses inside it |
 | `mix` | opaque `air.mix` call | ext inst, not decorated |
-| `length`, `normalize`, `distance` | inlined: `air.dot` + `air.sqrt`/`rsqrt` with power-of-two rescaling for range | GLSL.std.450 ext insts, not decorated; open gap (below) |
+| `length`, `normalize`, `distance` | inlined: `air.dot` + `air.sqrt`/`rsqrt` with power-of-two rescaling for range | GLSL.std.450 ext insts, not decorated; open gap (above) |
+
+## Half divide is not correctly rounded on Apple or lavapipe (#389)
+
+MSL Specification section 8.4 Table 8.3 (p373) states that half-precision `x / y` and `1.0 / x`
+are correctly rounded, but neither Apple's GPU nor lavapipe (plain `OpFDiv`) is: for `a = 0x397b`
+divided by `3.0h`, the exact quotient is `1870.667` ULP (`0x334f` rounded to nearest-even), while
+Apple returns `0x334e` and lavapipe returns `0x3350` (2 ULP apart). Because neither backend is an
+exact oracle for half division, `tools/diffcheck/compare.py` applies `HALF_DIVIDE_ULP = 2` to
+`half` leaves of a source that names `half` and `/`, while keeping `float` leaves in the same
+kernel bit-exact.
 
 ## lavapipe cannot execute any mslc module on this machine (RESOLVED, stale)
 
@@ -103,14 +115,17 @@ entry, since the original cause was never identified.
 ## Framebuffer fetch ([[color(n)]] input) limits (#118)
 
 mslc lowers a fragment `[[color(n)]]` parameter or stage-in field to a SubpassData input
-attachment. What it does not cover:
+attachment, verified by differential execution in `tests/diffcheck/graphics/framebuffer_fetch.metal`.
+What it does not cover:
 
 - The image is always single-sample (MS 0). A consumer with a multisampled colour attachment
   gets an invalid pipeline, where Metal's fetch reads per sample.
 - Same-subpass programmable blending, where the fragment reads the attachment it writes, needs
   a GENERAL feedback-loop layout and rasterization-order attachment access when primitives
-  overlap. The module is the same; the consumer (indium) must provide both. indium binds no
-  input attachment yet.
+  overlap within a single draw. The module is the same; the consumer (indium, and `vkhost` in
+  `tools/diffcheck`) binds the colour attachments as `VK_IMAGE_LAYOUT_GENERAL` input attachments
+  in a render-pass subpass with a self-dependency, and `diffcheck` requires `instances == 1` so
+  primitives do not overlap within one draw.
 - `float`, `float2`, `float3`, `short4` and `[[color(n)]]` combined with another attribute
   (`[[color(0), flat]]`) are refused as policy: Apple accepts some of them, so these are not
   Apple's rules.

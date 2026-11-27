@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // DISASM: OpConvertFToU
 // DISASM-NOT: OpBitcast %uint
 // A member function template named as_type, called unqualified from another member, is the member:

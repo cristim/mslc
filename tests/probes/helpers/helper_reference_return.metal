@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A helper that returns a thread reference, read as a value: ANGLE's addAssignInt and subAssignInt return the
 // parameter they assign, and the caller assigns the result back. Reading the result reads the referred object as
 // the return leaves it. C++ gives out = 15 22 1 8 12, and so does an RTX 3060.

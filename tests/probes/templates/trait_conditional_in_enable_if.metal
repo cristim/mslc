@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A conditional whose condition depends on T, inside an enable_if in a function template's return type: read
 // before T is deduced it holds for now, and the instance decides. f(2u) picks the template, f(2.0f) the float
 // overload. On an RTX 3060 out is 2 7.

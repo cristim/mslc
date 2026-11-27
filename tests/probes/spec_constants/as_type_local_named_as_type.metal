@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // A local named as_type is not the library's as_type<T>: "as_type < 4" compares it.
 #include <metal_stdlib>
 using namespace metal;

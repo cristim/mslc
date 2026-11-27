@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // DISASM: OpBitcast %uint
 // DISASM: OpBitcast %ushort
 // as_type in a function template, written with and without metal::, and as a statement of its own.

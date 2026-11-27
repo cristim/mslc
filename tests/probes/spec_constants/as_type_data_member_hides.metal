@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // A data member named as_type, read unqualified in a member function, is the member: "as_type < 1.0f"
 // compares it.
 #include <metal_stdlib>

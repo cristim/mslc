@@ -14,6 +14,7 @@
 // Apple's compiler gives the same offsets and sizes (offsetof and sizeof read back through a template
 // argument). Every member is read through the buffer and through a copied local.
 #include <metal_stdlib>
+using namespace metal;
 
 struct Empty
 {

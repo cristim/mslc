@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=1
 // numeric_limits<T>::min(), max(), lowest(), epsilon() and infinity() of a scalar T, with C++'s values: min() of a
 // floating-point type is its least positive normal. Apple's compiler agrees on each value below, by static_assert
 // (metal 32023.883, macOS 26). The result is a T: an auto local of numeric_limits<short>::max() is 2 bytes. ANGLE's

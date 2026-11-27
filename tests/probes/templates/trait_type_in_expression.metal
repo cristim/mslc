@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A transformation trait names a type wherever one can start an expression or a statement: a functional cast
 // make_unsigned_t<Y>(y), a C cast (make_unsigned_t<int>)x, and a declaration make_scalar_t<T> s. ANGLE's shift
 // helper is the first function: a shift by 32 or more, or by a negative count, gives 0. On an RTX 3060 out is

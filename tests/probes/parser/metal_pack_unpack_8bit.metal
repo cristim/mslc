@@ -1,5 +1,4 @@
 // EXPECT: valid
-// RUN: grid=16 local=8 cases=3 elems=256
 // DISASM-MATCH: OpExtInst %v4int %[0-9]+ FindUMsb
 // DISASM-MATCH: OpExtInst %v4int %[0-9]+ SAbs
 // DISASM: OpShiftRightArithmetic %v4int

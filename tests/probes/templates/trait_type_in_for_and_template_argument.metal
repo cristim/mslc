@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A transformation trait names a type in a for-init declaration and as an explicit template argument too. On an
 // RTX 3060 out is 3 4294967294.
 #include <metal_stdlib>

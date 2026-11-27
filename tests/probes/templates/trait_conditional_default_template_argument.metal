@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // A default template argument chosen with conditional_t from the parameters before it, as ANGLE's imul helper
 // writes it: the product is X for a scalar Y and Y for a vector one. On an RTX 3060 out is 6 8 4294967295 12.
 #include <metal_stdlib>

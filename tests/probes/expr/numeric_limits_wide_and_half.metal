@@ -1,5 +1,5 @@
 // EXPECT: valid
-// RUN: grid=1
+// RUN: grid=1 local=1
 // The 64-bit and half limits, with C++'s values: long min and max and ulong max as their bit patterns, and half's
 // min, lowest, epsilon and infinity as theirs (0x0400, 0xFBFF, 0x1400, 0x7C00). On an RTX 3060 out is
 // 1 1 1 1024 64511 5120 31744.
