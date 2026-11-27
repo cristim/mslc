@@ -53,7 +53,8 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 	# needles, a wrong decoration, an inverted select or a swapped lane changes the result.
 	# Graphics probes (tests/diffcheck/graphics) are drawn on both backends the same way.
 	function(diffcheck_probe_tests directory prefix)
-		file(GLOB diffcheck_probes CONFIGURE_DEPENDS ${directory}/*.metal)
+		file(GLOB_RECURSE diffcheck_probes CONFIGURE_DEPENDS ${directory}/*.metal)
+		list(FILTER diffcheck_probes EXCLUDE REGEX "/include/")
 		foreach(probe IN LISTS diffcheck_probes)
 			file(STRINGS ${probe} run_line LIMIT_COUNT 1 REGEX "^// RUN:")
 			if(run_line)

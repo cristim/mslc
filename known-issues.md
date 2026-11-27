@@ -187,7 +187,7 @@ bound such buffers by the old `metal_index` placed them where Apple code never r
 needing an index above 30 is refused, as Apple refuses it.
 
 Checked against Apple by name over `tests/**/*.metal` (a capped sweep that stopped early, through
-`tests/probes/buffer_implicit_*`; `pp_macro_expansion_bomb_rejected.metal` makes Apple's compiler run
+`tests/probes/types/buffer_implicit_*`; `pp_macro_expansion_bomb_rejected.metal` makes Apple's compiler run
 away and is skipped): before the fix the only mismatches were the new `buffer_implicit_*` probes
 (8 buffers); after it, none. A byte-compare of reflection and SPIR-V over all `tests/**/*.metal`
 against the previous build changed only those probes.
@@ -200,7 +200,7 @@ argument, a brace leaf, a conditional or a return) compiles. Apple rejects it:
 type 'Anon'". `requireEnumValue` lets `"<anonymous>"` through at every target,
 because mslc cannot tell an untagged enumerator from the target enum's own one;
 closing it needs anonymous-enum identity tracking, which does not exist.
-Pinned by `tests/probes/enum_element_argument_and_brace_accepted.metal`.
+Pinned by `tests/probes/types/enum_element_argument_and_brace_accepted.metal`.
 
 A file-scope enum constant initialised with a conditional
 (`constant Mode km = c ? MA : MB;`) is also refused as "not a value that can be
@@ -232,7 +232,7 @@ it. mslc type-checks it by emitting it and lifting the instructions out, so:
   `i++`/`i--`, `i += 1`, an assignment such as `out[1] = 5.0f` ("cannot be used
   as a value"), a void call `g()`, a bare buffer name `in`, `discard_fragment()`.
   `int x{{in[1], i++}}` leaves `i` unchanged in Apple. Pinned by
-  `tests/probes/brace_local_scalar_nested_excess_increment_not_lowered.metal`.
+  `tests/probes/construct/brace_local_scalar_nested_excess_increment_not_lowered.metal`.
 - The lift leaves unused OpConstant and OpType declarations, a GLSL.std450
   import, and one unused OpVariable in the call case. A half operation in an
   ignored element adds OpCapability Float16 to a module that does not otherwise
@@ -912,7 +912,7 @@ type converts to float and a vector of another type is refused, as Apple's float
 instructions are the plain function's, with the precision Vulkan gives them. Neither variant's bound in the
 MSL specification is promised; the fast variants are what Apple's default fast math compiles the plain names
 to, so they are the closer of the two. A function both scopes declare that mslc does not lower (sinh, cospi
-and so on) is refused like its plain name. Tests: `tests/probes/math_fast_*`.
+and so on) is refused like its plain name. Tests: `tests/probes/builtins/math_fast_*`.
 
 Where this differs from Apple:
 
@@ -928,7 +928,7 @@ Where this differs from Apple:
 A helper or function template declared `auto f(...)` takes the type of its first return's value, as C++ deduces it
 ([dcl.spec.auto]); a later return has to give the same type, and a function no return gives a value to returns void.
 The body is emitted at the first call, inside the caller's, so the type is known there; it is put after the caller's
-body. Tests: `tests/probes/helper_auto_return_*`.
+body. Tests: `tests/probes/helpers/helper_auto_return_*`.
 
 Apple accepts, and mslc refuses (each a loud error):
 
