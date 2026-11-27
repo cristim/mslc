@@ -63,6 +63,10 @@ MUTANTS = [
     ("embedded_sampler", "vertex", [["OpConstant %float 1.375", "OpConstant %float 0.375"]]),
     ("embedded_sampler", "fragment", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]]),
     ("embedded_sampler", "fragment", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]]),
+    ("texture_non2d", "vertex", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]]),
+    ("texture_non2d", "vertex", [[r"(OpImageQuerySize %v2uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]]),
+    ("texture_non2d", "fragment", [[r"(OpCompositeConstruct %v3uint %\S+) (%\S+) (%\S+)", r"\1 \3 \2"]]),
+    ("texture_non2d", "fragment", [[r"(OpImageQuerySize %v3uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -72,7 +76,7 @@ if rc == 77:
 
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
-             "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler"):
+             "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
@@ -119,10 +123,10 @@ with tempfile.TemporaryDirectory() as d:
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
          "fragment float4 fs(texture2d<float, access::write> t [[texture(0)]]) { t.write(float4(1), uint2(0)); return float4(1); }\n"),
-        ("tex3d.metal", "not a 2D texture",
+        ("depth2d.metal", "unsupported type depth",
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
-         "fragment float4 fs(texture3d<float> t [[texture(0)]]) { return t.read(uint3(0)); }\n"),
+         "fragment float4 fs(depth2d<float> t [[texture(0)]]) { return float4(t.read(uint2(0))); }\n"),
         ("bad_esampler.metal", "mip_filter",
          "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
          "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
