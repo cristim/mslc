@@ -2886,8 +2886,8 @@ namespace {
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
 		void emitVoidReturnValue(const Expression& expression, const std::string& quoted);
-		// Set by emitVoidReturnValue for the one call it emits: a call to a helper returning void is then allowed.
-		bool _voidCallAllowed = false;
+		bool emitVoidCall(const Expression& call, const std::string* returnedBy);
+		void emitVoidConditional(const Expression& expression, const std::string* returnedBy);
 		bool returnsVoid(const FunctionDecl& function) const;
 		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
 		Id emitSignExact(Id value, Id type, uint32_t bits);
@@ -5989,8 +5989,6 @@ namespace {
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
-		// Taken before any argument is evaluated, so only this call, and none in its arguments, may be void.
-		const bool voidAllowed = std::exchange(_voidCallAllowed, false);
 		const Expression* receiver = nullptr;
 		std::vector<Id> prepared;
 		HelperFunction* helper = findHelper(expression, receiver, prepared);
@@ -6003,7 +6001,7 @@ namespace {
 		}
 
 		if (helper) {
-			if (returnsVoid(*helper->definition) && !voidAllowed) {
+			if (returnsVoid(*helper->definition)) {
 				throw CompileError("a call to \"" + helper->definition->name + "\" returns void and has "
 					"no value");
 			}
@@ -8380,20 +8378,77 @@ namespace {
 
 	// The operand of a return in a function returning void: an expression of type void, such as a call to another
 	// function returning void, is allowed and evaluated ([stmt.return]); any other value is an error.
+	// A comma's left operand is a statement of its own, and each value of a conditional is a return operand too.
 	void Emitter::emitVoidReturnValue(const Expression& expression, const std::string& quoted) {
-		if (isVoidValued(expression)) {
+		if (isVoidCast(expression)) {
 			emitExpressionStatement(expression);
 			return;
 		}
-		if (expression.kind == ExpressionKind::Call) {
-			_voidCallAllowed = true;
-			const Id value = emitExpression(expression);
-			_voidCallAllowed = false;
-			if (_builder.typeOf(value) == _voidType) {
-				return;
-			}
+		if (expression.kind == ExpressionKind::Comma) {
+			emitExpressionStatement(*expression.left);
+			emitVoidReturnValue(*expression.right, quoted);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Conditional) {
+			emitVoidConditional(expression, &quoted);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Call && emitVoidCall(expression, &quoted)) {
+			return;
 		}
 		throw CompileError(quoted + " returns void, so its return cannot carry a value");
+	}
+
+	// A call that has no value, or whose value is dropped: a helper, or a builtin returning void (an atomic store,
+	// a barrier, a texture write). Returns false for any other call, which is then an expression. With
+	// returnedBy, the call is the operand of a return in that function, so a helper has to return void.
+	bool Emitter::emitVoidCall(const Expression& call, const std::string* returnedBy) {
+		const Expression* receiver = nullptr;
+		std::vector<Id> prepared;
+		if (HelperFunction* helper = findHelper(call, receiver, prepared)) {
+			if (returnedBy && !returnsVoid(*helper->definition)) {
+				throw CompileError(*returnedBy + " returns void, so its return cannot carry a value");
+			}
+			emitHelperCall(call, *helper, receiver, prepared);
+			return true;
+		}
+		const std::string name = call.left->kind == ExpressionKind::Identifier
+			? builtinCalleeName(call.left->name) : std::string();
+		if (name == "atomic_store_explicit") {
+			emitAtomicCall(call);
+			return true;
+		}
+		if (name == "threadgroup_barrier" || name == "simdgroup_barrier") {
+			emitBarrierCall(call);
+			return true;
+		}
+		if (call.left->kind == ExpressionKind::Member && call.left->memberName == "write") {
+			emitTextureWrite(call, textureReceiver(call));
+			return true;
+		}
+		return false;
+	}
+
+	// c ? a : b with no value, as the if it stands for. With returnedBy, each value is a return operand.
+	void Emitter::emitVoidConditional(const Expression& expression, const std::string* returnedBy) {
+		const Id condition = asCondition(emitExpression(*expression.left));
+		const Id thenLabel = _builder.nextId();
+		const Id elseLabel = _builder.nextId();
+		const Id mergeLabel = _builder.nextId();
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+
+		const ControlDepthScope depth(_controlDepth);
+		for (size_t i = 0; i < 2; ++i) {
+			beginBlock(i == 0 ? thenLabel : elseLabel);
+			if (returnedBy) {
+				emitVoidReturnValue(*expression.arguments.at(i), *returnedBy);
+			} else {
+				emitExpressionStatement(*expression.arguments.at(i));
+			}
+			branchUnlessTerminated(mergeLabel);
+		}
+		beginBlock(mergeLabel);
 	}
 
 	void Emitter::emitHelperReturn(const Statement& statement) {
@@ -13765,21 +13820,7 @@ namespace {
 
 		// c ? (void)a : (void)b has no value, so it runs as the if it stands for.
 		if (expression.kind == ExpressionKind::Conditional && isVoidValued(expression)) {
-			const Id condition = asCondition(emitExpression(*expression.left));
-			const Id thenLabel = _builder.nextId();
-			const Id elseLabel = _builder.nextId();
-			const Id mergeLabel = _builder.nextId();
-			_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
-			terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
-
-			const ControlDepthScope depth(_controlDepth);
-			beginBlock(thenLabel);
-			emitExpressionStatement(*expression.arguments.at(0));
-			branchUnlessTerminated(mergeLabel);
-			beginBlock(elseLabel);
-			emitExpressionStatement(*expression.arguments.at(1));
-			branchUnlessTerminated(mergeLabel);
-			beginBlock(mergeLabel);
+			emitVoidConditional(expression, nullptr);
 			return;
 		}
 
@@ -13801,28 +13842,8 @@ namespace {
 		}
 
 		// A call whose value is dropped, which is the only way to call a void helper.
-		if (expression.kind == ExpressionKind::Call) {
-			const Expression* receiver = nullptr;
-			std::vector<Id> prepared;
-			if (HelperFunction* helper = findHelper(expression, receiver, prepared)) {
-				emitHelperCall(expression, *helper, receiver, prepared);
-				return;
-			}
-			const std::string name = expression.left->kind == ExpressionKind::Identifier
-				? builtinCalleeName(expression.left->name) : std::string();
-			if (name == "atomic_store_explicit") {
-				emitAtomicCall(expression);
-				return;
-			}
-			if (expression.left->kind == ExpressionKind::Identifier
-				&& (name == "threadgroup_barrier" || name == "simdgroup_barrier")) {
-				emitBarrierCall(expression);
-				return;
-			}
-			if (expression.left->kind == ExpressionKind::Member && expression.left->memberName == "write") {
-				emitTextureWrite(expression, textureReceiver(expression));
-				return;
-			}
+		if (expression.kind == ExpressionKind::Call && emitVoidCall(expression, nullptr)) {
+			return;
 		}
 
 		// An assignment yields an address rather than a value, so it is
