@@ -48,6 +48,8 @@ namespace {
 			case OpSpecConstant:
 			case OpSpecConstantTrue:
 			case OpSpecConstantFalse:
+			case OpSpecConstantComposite:
+			case OpSpecConstantOp:
 			case OpVariable:
 			case OpUndef:
 				return Section::TypesGlobals;
