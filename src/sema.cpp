@@ -2469,6 +2469,11 @@ namespace {
 			// array bound to each parameter (zero for any other): the helper is
 			// emitted once per distinct list, so its pointer is to the whole array.
 			std::vector<uint32_t> arrayLengths;
+			// For a threadgroup pointer parameter, the caller's threadgroup variable (InvalidId for any other).
+			// A Workgroup variable is the module's own, so the helper is emitted once per list of them and names
+			// each directly rather than taking a pointer: drivers mishandle a Workgroup pointer parameter (the
+			// NVIDIA one loses stores made through one), and glslang never emits one.
+			std::vector<Id> threadgroupVariables;
 			// Where the first declaration of this signature sits (FunctionDecl::order):
 			// an overload is a candidate only from there down.
 			size_t firstOrder = 0;
@@ -7243,6 +7248,10 @@ namespace {
 			std::vector<Id> signature { helper.returnType };
 			for (size_t i = 0; i < definition.parameters.size(); ++i) {
 				const Parameter& parameter = definition.parameters[i];
+				if (i < helper.threadgroupVariables.size() && helper.threadgroupVariables[i] != InvalidId) {
+					helper.parameterTypes.push_back(InvalidId);
+					continue;
+				}
 				if (parameter.type.isPointer
 					&& (parameter.type.addressSpace == AddressSpace::Device
 						|| parameter.type.addressSpace == AddressSpace::Constant)) {
@@ -7328,7 +7337,9 @@ namespace {
 			}
 
 			if (parameter.type.isPointer) {
-				operands.push_back(arrays[first + i]);
+				if (helper.parameterTypes[first + i] != InvalidId) {
+					operands.push_back(arrays[first + i]);
+				}
 				continue;
 			}
 
@@ -7464,6 +7475,7 @@ namespace {
 		size_t first, std::vector<Id>& arrays) {
 		const FunctionDecl& definition = *generic.definition;
 		std::vector<uint32_t> lengths(definition.parameters.size(), 0);
+		std::vector<Id> variables(definition.parameters.size(), InvalidId);
 		bool any = false;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
 			const Parameter& parameter = definition.parameters[first + i];
@@ -7484,13 +7496,24 @@ namespace {
 				continue;
 			}
 
+			// A threadgroup pointer takes a threadgroup local array in the same way, in Workgroup storage.
+			const bool threadgroup = parameter.type.addressSpace == AddressSpace::Threadgroup;
+			const spirv::StorageClassValue storage = threadgroup
+				? spirv::StorageClass::Workgroup : spirv::StorageClass::Function;
 			const auto binding = argument.kind == ExpressionKind::Identifier
 				? _bindings.find(argument.name) : _bindings.end();
 			if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.pointeeMsl.arrayLength
-				|| binding->second.storageClass != spirv::StorageClass::Function || binding->second.isAddress) {
-				throw CompileError(what + " has to name a local array (or a pointer parameter of the calling "
-					"helper), since parameter \"" + parameter.name + "\" is a pointer to its elements; "
-					"&x, a + n and pointers into a buffer are not lowered yet");
+				|| binding->second.storageClass != storage || binding->second.isAddress) {
+				throw CompileError(what + " has to name a " + (threadgroup ? "threadgroup " : "") + "local array "
+					"(or a pointer parameter of the calling helper), since parameter \"" + parameter.name
+					+ "\" is a " + (threadgroup ? "threadgroup " : "") + "pointer to its elements; &x, a + n and "
+					"pointers into a buffer are not lowered yet");
+			}
+			// A kernel's [[threadgroup(n)]] argument is sized when the pipeline is made, so no helper
+			// specialised on a length can take it.
+			if (*binding->second.pointeeMsl.arrayLength == UINT32_MAX) {
+				throw CompileError(what + " is a threadgroup argument of the kernel, whose length the pipeline "
+					"sets, and a threadgroup pointer parameter takes only a threadgroup local array yet");
 			}
 
 			const PointerFit fit = pointerFit(binding->second, parameter.type);
@@ -7514,15 +7537,21 @@ namespace {
 
 			lengths[first + i] = *binding->second.pointeeMsl.arrayLength;
 			arrays[first + i] = binding->second.id;
+			if (threadgroup) {
+				variables[first + i] = binding->second.id;
+			}
 		}
 
 		if (!any) {
 			return generic;
 		}
 
-		const auto slot = _pointerSpecialisations.emplace(std::make_pair(generic.definition, lengths), generic);
+		std::vector<uint32_t> key = lengths;
+		key.insert(key.end(), variables.begin(), variables.end());
+		const auto slot = _pointerSpecialisations.emplace(std::make_pair(generic.definition, key), generic);
 		if (slot.second) {
 			slot.first->second.arrayLengths = lengths;
+			slot.first->second.threadgroupVariables = variables;
 		}
 		return slot.first->second;
 	}
@@ -8278,6 +8307,10 @@ namespace {
 
 		std::vector<Id> values;
 		for (size_t i = 0; i < helper.parameterTypes.size(); ++i) {
+			if (helper.parameterTypes[i] == InvalidId) {
+				values.push_back(helper.threadgroupVariables[i]);
+				continue;
+			}
 			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, helper.parameterTypes[i], { }));
 
 			// SPV_KHR_physical_storage_buffer wants exactly one of Aliased or Restrict on a
@@ -8342,7 +8375,9 @@ namespace {
 					continue;
 				}
 				const Type array = boundArray(parameter.type, helper.arrayLengths[i]);
-				bindLocal(parameter.name, values[i], arrayTypeOf(array), array);
+				bindLocal(parameter.name, values[i], arrayTypeOf(array), array,
+					parameter.type.addressSpace == AddressSpace::Threadgroup
+						? spirv::StorageClass::Workgroup : spirv::StorageClass::Function);
 				continue;
 			}
 
