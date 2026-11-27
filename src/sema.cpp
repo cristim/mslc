@@ -535,6 +535,71 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 		}
 	}
 
+	// The variables an expression or statement stores to or binds a reference to: the head of an assignment's
+	// target, of an increment's or decrement's operand, and of a reference's initialiser.
+	const Expression& writtenRoot(const Expression& target) {
+		const Expression* root = &target;
+		while ((root->kind == ExpressionKind::Member || root->kind == ExpressionKind::Index) && root->left) {
+			root = root->left.get();
+		}
+		return *root;
+	}
+
+	void collectWritten(const Expression& expression, std::set<std::string>& names) {
+		const bool step = expression.kind == ExpressionKind::Unary
+			&& (expression.unaryOperator == UnaryOperator::PreIncrement || expression.unaryOperator == UnaryOperator::PreDecrement
+				|| expression.unaryOperator == UnaryOperator::PostIncrement
+				|| expression.unaryOperator == UnaryOperator::PostDecrement);
+		if ((expression.kind == ExpressionKind::Assign || step) && expression.left) {
+			const Expression& root = writtenRoot(*expression.left);
+			if (root.kind == ExpressionKind::Identifier) {
+				names.insert(root.name);
+			}
+		}
+		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
+			if (child) collectWritten(*child, names);
+		}
+		for (const ExpressionPtr& argument: expression.arguments) {
+			collectWritten(*argument, names);
+		}
+		for (const InitializerElement& element: expression.elements) {
+			collectWritten(*element.value, names);
+		}
+	}
+
+	void collectWritten(const Statement& statement, std::set<std::string>& names) {
+		for (const Expression* expression: { statement.expression.get(), statement.forCondition.get(),
+			statement.forIncrement.get(), statement.whileCondition.get() }) {
+			if (expression) collectWritten(*expression, names);
+		}
+		for (const std::optional<VariableDeclaration>* declaration: { &statement.declaration, &statement.forInitializer }) {
+			if (*declaration && (*declaration)->initializer) {
+				collectWritten(*(*declaration)->initializer, names);
+				if ((*declaration)->isReference) {
+					const Expression& root = writtenRoot(*(*declaration)->initializer);
+					if (root.kind == ExpressionKind::Identifier) {
+						names.insert(root.name);
+					}
+				}
+			}
+		}
+		for (const StatementPtr& child: statement.children) {
+			collectWritten(*child, names);
+		}
+		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
+			statement.forBody.get(), statement.whileBody.get() }) {
+			if (nested) collectWritten(*nested, names);
+		}
+		for (const SwitchCase& kase: statement.switchCases) {
+			for (const StatementPtr& child: kase.body) {
+				collectWritten(*child, names);
+			}
+		}
+		for (const StatementPtr& child: statement.switchPreamble) {
+			collectWritten(*child, names);
+		}
+	}
+
 	// Whether a threadgroup or simdgroup barrier is called anywhere in an expression or statement. The callee
 	// is not among the names collectIdentifiers returns, so it is looked for here.
 	bool callsBarrier(const Expression& expression) {
@@ -2571,6 +2636,7 @@ namespace {
 		void declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex);
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
+		void copyWrittenBuiltins();
 		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
 		void reserveThreadgroupLocals(const Statement& statement);
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
@@ -10651,6 +10717,32 @@ namespace {
 
 	// A UniformConstant variable of the pointee's type at the next descriptor
 	// binding of this entry point's set.
+	// A builtin parameter is a local of the entry point that starts as the builtin's value, so the body may store to
+	// it ([dcl.fct]: a parameter is an ordinary variable). The Input variable cannot be written, so one the body
+	// writes or binds a reference to is copied into a Function variable, converted as a read converts it.
+	void Emitter::copyWrittenBuiltins() {
+		std::set<std::string> written;
+		collectWritten(*_entryPoint->body, written);
+		for (const Parameter& parameter: _entryPoint->parameters) {
+			const auto binding = _bindings.find(parameter.name);
+			if (!parameter.attributes.builtin || !written.count(parameter.name) || binding == _bindings.end()
+				|| binding->second.storageClass != spirv::StorageClass::Input) {
+				continue;
+			}
+			Expression read;
+			read.kind = ExpressionKind::Identifier;
+			read.name = parameter.name;
+			const Id type = declaredTypeOf(parameter.type);
+			const Id loaded = emitExpression(read);
+			const Id value = convert(loaded, _builder.typeOf(loaded), type);
+			const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
+				_types.pointer(spirv::StorageClass::Function, type), { static_cast<uint32_t>(spirv::StorageClass::Function) });
+			_builder.emit(spirv::OpStore, { variable, value });
+			bindLocal(parameter.name, variable, type, parameter.type);
+			_bindings[parameter.name].readOnly = parameter.type.isConst;
+		}
+	}
+
 	Id Emitter::declareDescriptorVariable(Id pointee, uint32_t binding) {
 		const Id variable = _builder.emitDeclTyped(spirv::OpVariable,
 			_types.pointer(spirv::StorageClass::UniformConstant, pointee),
@@ -14442,6 +14534,7 @@ namespace {
 		preloadBufferBases();
 		loadStageInputs();
 		loadThreadsPerThreadgroup();
+		copyWrittenBuiltins();
 		emitGridMask();
 		emitFunctionBody(*_entryPoint->body);
 		if (!_terminated) {
