@@ -12346,7 +12346,7 @@ namespace {
 				throw CompileError(what + " has [[point_size]], which is only valid on a vertex output");
 			}
 			if (!field.attributes.colorIndex) {
-				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
+				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]], [[sample_mask]] or [[stencil]]; every field of a "
 					"fragment function's returned struct needs one");
 			}
 
