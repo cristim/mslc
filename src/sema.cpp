@@ -2885,6 +2885,9 @@ namespace {
 		Id resourcePointee(const Type& type);
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
+		void emitVoidReturnValue(const Expression& expression, const std::string& quoted);
+		// Set by emitVoidReturnValue for the one call it emits: a call to a helper returning void is then allowed.
+		bool _voidCallAllowed = false;
 		bool returnsVoid(const FunctionDecl& function) const;
 		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
 		Id emitSignExact(Id value, Id type, uint32_t bits);
@@ -5986,6 +5989,8 @@ namespace {
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {
+		// Taken before any argument is evaluated, so only this call, and none in its arguments, may be void.
+		const bool voidAllowed = std::exchange(_voidCallAllowed, false);
 		const Expression* receiver = nullptr;
 		std::vector<Id> prepared;
 		HelperFunction* helper = findHelper(expression, receiver, prepared);
@@ -5998,7 +6003,7 @@ namespace {
 		}
 
 		if (helper) {
-			if (returnsVoid(*helper->definition)) {
+			if (returnsVoid(*helper->definition) && !voidAllowed) {
 				throw CompileError("a call to \"" + helper->definition->name + "\" returns void and has "
 					"no value");
 			}
@@ -8373,15 +8378,30 @@ namespace {
 		_helper = nullptr;
 	}
 
+	// The operand of a return in a function returning void: an expression of type void, such as a call to another
+	// function returning void, is allowed and evaluated ([stmt.return]); any other value is an error.
+	void Emitter::emitVoidReturnValue(const Expression& expression, const std::string& quoted) {
+		if (isVoidValued(expression)) {
+			emitExpressionStatement(expression);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Call) {
+			_voidCallAllowed = true;
+			const Id value = emitExpression(expression);
+			_voidCallAllowed = false;
+			if (_builder.typeOf(value) == _voidType) {
+				return;
+			}
+		}
+		throw CompileError(quoted + " returns void, so its return cannot carry a value");
+	}
+
 	void Emitter::emitHelperReturn(const Statement& statement) {
 		const std::string quoted = "\"" + _helper->name + "\"";
 
 		if (returnsVoid(*_helper)) {
 			if (statement.expression) {
-				if (!isVoidValued(*statement.expression)) {
-					throw CompileError(quoted + " returns void, so its return cannot carry a value");
-				}
-				emitExpressionStatement(*statement.expression);
+				emitVoidReturnValue(*statement.expression, quoted);
 			}
 
 			terminate(spirv::OpReturn, { });
@@ -12568,11 +12588,7 @@ namespace {
 		}
 
 		if (_outputs.empty()) {
-			if (!isVoidValued(*statement.expression)) {
-				throw CompileError("\"" + _entryPoint->name + "\" returns void, so its return "
-					"cannot carry a value");
-			}
-			emitExpressionStatement(*statement.expression);
+			emitVoidReturnValue(*statement.expression, "\"" + _entryPoint->name + "\"");
 			terminate(spirv::OpReturn, { });
 			return;
 		}
