@@ -5,13 +5,16 @@ compare's epsilon). No GPU needed."""
 import os
 import struct
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "diffcheck"))
 import checks  # noqa: E402
 import compare  # noqa: E402
 import directives  # noqa: E402
 import graphics  # noqa: E402
+import hosts  # noqa: E402
 import outputs  # noqa: E402
 import spirvio  # noqa: E402
 
@@ -197,6 +200,155 @@ class Tolerance(unittest.TestCase):
         self.assertFalse(compare.leaf_equal(FLOAT(1.0), FLOAT(1.001), "float", ulp, eps))
         self.assertFalse(compare.leaf_equal(FLOAT(1.0), FLOAT(float("nan")), "float", ulp, eps))
         self.assertFalse(compare.leaf_equal(FLOAT(3.4e38), FLOAT(float("inf")), "float", ulp, eps))
+
+
+class Resources(unittest.TestCase):
+    EMBEDDED = {"s_address": "Repeat", "t_address": "ClampToZero", "r_address": "MirrorRepeat", "mag_filter": "Linear",
+                "min_filter": "Linear", "mip_filter": "None", "normalized_coordinates": True, "compare_function": "Never",
+                "anisotropy": 1, "lod_min": 0, "lod_max": 65504}
+    PARAMS = {"width": 32, "height": 32, "instances": 1, "seed": 1, "cases": 1, "elems": None, "std": None,
+              "exclude": {}, "range": {}, "writes_zero": False, "geometry": None, "position": "none",
+              "depth": False, "float_range": {}, "ulp": {}}
+    OPTS = type("Opts", (), {"mslc": "mslc", "metal": "metalhost", "vk": "vkhost", "apple_contract": False,
+                             "gfx_profiles": ["moderate"], "corrupt_mslc": None})()
+    SOURCE = "vertex float4 vs() { return float4(0); }\nfragment float4 fs() { return float4(0); }\n"
+    IFACE = {"inputs": {}, "outputs": {0: {"scalar": "float", "comps": 4, "flat": False}}, "frag_depth": False, "unsupported": []}
+
+    def _refl(self, v_bindings=(), f_bindings=(), v_emb=(), f_emb=()):
+        return {
+            "vertex": {"entry_points": [{"name": "vs", "stage": "vertex", "bindings": list(v_bindings), "embedded_samplers": list(v_emb)}]},
+            "fragment": {"entry_points": [{"name": "fs", "stage": "fragment", "bindings": list(f_bindings), "embedded_samplers": list(f_emb)}]},
+        }
+
+    def _apple(self, v_tex=(), v_samp=(), f_tex=(), f_samp=()):
+        return {
+            "vertex_attributes": [],
+            "vertex": {"buffers": [], "textures": list(v_tex), "samplers": list(v_samp), "unsupported": []},
+            "fragment": {"buffers": [], "textures": list(f_tex), "samplers": list(f_samp), "unsupported": []},
+        }
+
+    def _run_prepare(self, refl, apple):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write(self.SOURCE)
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: ("s.spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", return_value=""), \
+                 mock.patch.object(spirvio, "interface", return_value=self.IFACE), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple):
+                return graphics._prepare(self.OPTS, src, "vs", "fs", self.PARAMS, d, [])
+
+    def test_draw_lines_forwards_backend_for_esampler_and_nonfloat(self):
+        shape = graphics.pipeline_lines(32, 32, "vs", "fs", {}, {0: ("float", 4)}, False)
+        tex = [(0, 0, 0, "vt.bin", "Read", "short"), (0, 1, 0, "ft.bin", "Sample", "half")]
+        samp = [(1, 0, 1), (None, 1, 1, (0, 3, 1), True)]
+        vk = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY, 1, {}, {0: "c.bin"}, {0: ("float", 4)}, None, [], tex, samp, "mslc")
+        ap = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY, 1, {}, {0: "c.bin"}, {0: ("float", 4)}, None, [], tex, samp, "apple")
+        self.assertIn("storagetexture 0 0 0 4 4 vt.bin short", vk)
+        self.assertIn("texture 0 1 0 4 4 ft.bin half", vk)
+        self.assertIn("sampler 1 0 1", vk)
+        self.assertIn("esampler 1 1 0 3 1 1", vk)
+        self.assertFalse(any(l.startswith("esampler ") for l in ap))
+
+    def test_prepare_accepts_vertex_resources_nonfloat_read_and_embedded_samplers(self):
+        refl = self._refl(
+            v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "texture_access": "Read", "name": "vt"},
+                        {"kind": "Sampler", "descriptor": {"set": 0, "binding": 1}, "embedded_sampler": 0, "name": "vs_emb"}],
+            f_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "texture_access": "Sample", "name": "ft"},
+                        {"kind": "Sampler", "metal_index": 0, "descriptor": {"set": 1, "binding": 1}, "name": "fs_rt"}],
+            v_emb=[self.EMBEDDED],
+        )
+        apple = self._apple(
+            v_tex=[{"index": 0, "name": "vt", "type": "2d", "data": "short", "access": "read"}],
+            f_tex=[{"index": 0, "name": "ft", "type": "2d", "data": "half", "access": "read"}],
+            f_samp=[{"index": 0, "name": "fs_rt"}],
+        )
+        plan, early = self._run_prepare(refl, apple)
+        self.assertIsNone(early)
+        self.assertEqual(plan["apple"], apple)
+
+    def test_prepare_skips_writable_non2d_and_bad_embedded_samplers(self):
+        refl_w = self._refl(f_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "texture_access": "Write", "name": "w"}])
+        _, early = self._run_prepare(refl_w, self._apple())
+        self.assertEqual((early["status"], early["reason"]), ("skipped", "unsupported: texture w access Write"))
+
+        refl_3d = self._refl(v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "texture_access": "Sample", "name": "t3"}])
+        apple_3d = self._apple(v_tex=[{"index": 0, "name": "t3", "type": "3d", "data": "float", "access": "read"}])
+        _, early = self._run_prepare(refl_3d, apple_3d)
+        self.assertEqual(early["status"], "skipped")
+        self.assertIn("not a 2D texture", early["reason"])
+
+        refl_bad_emb = self._refl(f_bindings=[{"kind": "Sampler", "descriptor": {"set": 1, "binding": 0}, "embedded_sampler": 0, "name": "s"}],
+                                  f_emb=[dict(self.EMBEDDED, mip_filter="Linear")])
+        _, early = self._run_prepare(refl_bad_emb, self._apple())
+        self.assertEqual(early["status"], "skipped")
+        self.assertIn("mip_filter is Linear", early["reason"])
+
+    def test_prepare_checks_stage_descriptor_set_and_unsupported_before_cross_check(self):
+        refl_set = self._refl(v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0},
+                                           "texture_access": "Sample", "name": "vt"}])
+        apple_ok = self._apple(v_tex=[{"index": 0, "name": "vt", "type": "2d", "data": "float", "access": "read"}])
+        _, early = self._run_prepare(refl_set, apple_ok)
+        self.assertEqual(early["status"], "reflection-mismatch")
+        self.assertIn("descriptor set 1, expected 0", early["reason"])
+
+        refl_both = self._refl(
+            v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "texture_access": "Sample", "name": "vt"}],
+            f_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "texture_access": "Sample", "name": "ft"}],
+        )
+        apple_mismatch_plus_skip = self._apple(
+            v_tex=[{"index": 0, "name": "wrong", "type": "2d", "data": "float", "access": "read"}],
+            f_tex=[{"index": 0, "name": "ft", "type": "3d", "data": "float", "access": "read"}],
+        )
+        _, early = self._run_prepare(refl_both, apple_mismatch_plus_skip)
+        self.assertEqual(early["status"], "skipped")
+        self.assertIn("not a 2D texture", early["reason"])
+
+    def test_check_pair_seeds_per_stage_and_skips_host_refusal(self):
+        refl = self._refl(
+            v_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 0, "binding": 0}, "texture_access": "Read", "name": "vt"}],
+            f_bindings=[{"kind": "Texture", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "texture_access": "Sample", "name": "ft"},
+                        {"kind": "Sampler", "descriptor": {"set": 1, "binding": 1}, "embedded_sampler": 0, "name": "es"}],
+            f_emb=[self.EMBEDDED],
+        )
+        apple = self._apple(
+            v_tex=[{"index": 0, "name": "vt", "type": "2d", "data": "ushort", "access": "read"}],
+            f_tex=[{"index": 0, "name": "ft", "type": "2d", "data": "half", "access": "read"}],
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write(self.SOURCE)
+            seen = {}
+
+            def run_host(binary, manifest):
+                with open(manifest) as mf:
+                    text = mf.read()
+                seen[binary] = text
+                if binary == "vkhost":
+                    raise hosts.Refused("unsupported: lavapipe: no storage feature")
+                for line in text.splitlines():
+                    if line.startswith("color "):
+                        with open(line.split()[-1], "wb") as out:
+                            out.write(bytes(32 * 32 * 16))
+
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: ("s.spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", return_value=""), \
+                 mock.patch.object(spirvio, "interface", return_value=self.IFACE), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple), \
+                 mock.patch.object(hosts, "run_metal", side_effect=run_host), \
+                 mock.patch.object(hosts, "run_vulkan", side_effect=run_host):
+                res = graphics.check_pair(self.OPTS, src, "vs", "fs", self.PARAMS, d, [])
+            self.assertEqual(res["status"], "skipped")
+            self.assertIn("no storage feature", res["reason"])
+            self.assertIn("storagetexture 0 0 0 4 4 ", seen["metalhost"])
+            self.assertIn("ushort", seen["metalhost"])
+            self.assertNotIn("esampler ", seen["metalhost"])
+            self.assertIn("texture 0 1 0 4 4 ", seen["vkhost"])
+            self.assertIn("half", seen["vkhost"])
+            self.assertIn("esampler 1 1 0 3 1 1", seen["vkhost"])
 
 
 if __name__ == "__main__":

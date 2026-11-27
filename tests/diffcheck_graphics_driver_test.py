@@ -54,6 +54,15 @@ MUTANTS = [
     ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500003"]]),
     ("mixed_components", "fragment", [["OpConstant %float 0.375", "OpConstant %float 0.37500119"]]),
     ("half_fwidth_special", "fragment", [["OpFAdd %half", "OpFSub %half"]]),
+    ("vertex_texture_sampler", "vertex", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]]),
+    ("vertex_texture_sampler", "vertex", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]]),
+    ("vertex_texture_sampler", "fragment", [["OpConstant %float 1.375", "OpConstant %float 0.375"]]),
+    ("texture_nonfloat", "fragment", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]]),
+    ("texture_nonfloat", "fragment", [["Binding 4$", "Binding 9"], ["Binding 5$", "Binding 4"], ["Binding 9$", "Binding 5"]]),
+    ("texture_nonfloat", "fragment", [["OpFAdd %v4half", "OpFSub %v4half"]]),
+    ("embedded_sampler", "vertex", [["OpConstant %float 1.375", "OpConstant %float 0.375"]]),
+    ("embedded_sampler", "fragment", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]]),
+    ("embedded_sampler", "fragment", [["Binding 2$", "Binding 9"], ["Binding 3$", "Binding 2"], ["Binding 9$", "Binding 3"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -62,7 +71,8 @@ if rc == 77:
     sys.exit(77)
 
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
-             "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special"):
+             "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
+             "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
@@ -101,6 +111,36 @@ rc, out, data = run(fixture("gfx_off_grid_geometry"))
 assert rc == 2 and "subpixel grid" in data["reason"], (rc, out)
 rc, out, data = run(fixture("gfx_writable_buffer"))
 assert rc == 3 and "writable" in data["reason"], (rc, out)
+
+# Unsupported graphics textures/samplers and host refusals skip with the reason, never error or pass.
+with tempfile.TemporaryDirectory() as d:
+    cases = [
+        ("write_tex.metal", "access Write",
+         "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
+         "fragment float4 fs(texture2d<float, access::write> t [[texture(0)]]) { t.write(float4(1), uint2(0)); return float4(1); }\n"),
+        ("tex3d.metal", "not a 2D texture",
+         "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
+         "fragment float4 fs(texture3d<float> t [[texture(0)]]) { return t.read(uint3(0)); }\n"),
+        ("bad_esampler.metal", "mip_filter",
+         "// RUN: vertex=vs fragment=fs\n// DIFFCHECK-POSITION: pos\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "struct VIn { float4 pos [[attribute(0)]]; };\nvertex float4 vs(VIn in [[stage_in]]) { return in.pos; }\n"
+         "fragment float4 fs(texture2d<float> t [[texture(0)]]) { constexpr sampler s(mip_filter::linear); return t.sample(s, float2(0.5)); }\n"),
+    ]
+    for fname, needle, body in cases:
+        p = os.path.join(d, fname)
+        with open(p, "w") as f:
+            f.write(body)
+        rc, out, data = run(p)
+        assert rc == 3 and data["status"] == "skipped" and needle in data["reason"], (fname, rc, out)
+
+    stub = os.path.join(d, "refuse-vk")
+    with open(stub, "w") as f:
+        f.write("#!/bin/sh\necho 'vkhost: unsupported: no storage image feature' >&2\nexit 2\n")
+    os.chmod(stub, 0o755)
+    rc, out, data = run(probe("texture_nonfloat"), vk=stub)
+    assert rc == 3 and data["status"] == "skipped" and "no storage image feature" in data["reason"], (rc, out)
 
 # A host that crashes or hangs is an error naming the cause, not a skip or a pass.
 with tempfile.TemporaryDirectory() as d:
