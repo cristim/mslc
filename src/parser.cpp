@@ -5525,6 +5525,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			attributes.samplerIndex = argument;
 		} else if (name == "depth") {
 			throw CompileError("[[depth]] is not valid on an input parameter");
+		} else if (name == "stencil") {
+			throw CompileError("[[stencil]] is not valid on an input parameter");
 		} else if (name == "sample_mask") {
 			throw CompileError("[[sample_mask]] on an input parameter is not lowered yet");
 		} else if (name == "stage_in") {
@@ -5575,6 +5577,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("a struct field has more than one [[point_size]] attribute");
 			}
 			attributes.pointSize = true;
+		} else if (name == "stencil") {
+			if (attributes.stencil) {
+				throw CompileError("a struct field has more than one [[stencil]] attribute");
+			}
+			attributes.stencil = true;
 		} else if (name == "user") {
 			if (identifier.empty()) {
 				throw CompileError("[[user]] needs a name: [[user(name)]]");
@@ -5635,7 +5642,7 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 		// [[user]], [[depth]], [[sample_mask]], [[point_size]] and the interpolation
 		// attributes say more than once in their own words, where the field is parsed.
 		if (!seen.insert(name).second && name != "user" && name != "depth" && name != "sample_mask"
-			&& name != "point_size" && !interpolationFromName(name)) {
+			&& name != "point_size" && name != "stencil" && !interpolationFromName(name)) {
 			throw CompileError("attribute \"" + name + "\" cannot appear more than once on a declaration");
 		}
 
@@ -5647,6 +5654,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 			}
 			if (name == "point_size") {
 				throw CompileError("[[point_size]] takes no argument");
+			}
+			if (name == "stencil") {
+				throw CompileError("[[stencil]] takes no argument");
 			}
 			advance();
 			if (name == "user" || name == "depth") {
