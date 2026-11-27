@@ -1356,12 +1356,18 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 			throw;
 		}
 		_position = returnTypeStart;
+		// A "<" or ">" inside parentheses, "(1 < 2)", is an operator, not a bracket.
 		size_t angles = 0;
-		while (!at(TokenKind::EndOfFile) && !(angles == 0 && kind() == TokenKind::Identifier && current().text == written
-			&& lookahead().kind == TokenKind::LParen)) {
-			angles += at(TokenKind::Less) ? 1 : 0;
-			angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
-			angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+		size_t parentheses = 0;
+		while (!at(TokenKind::EndOfFile) && !(angles == 0 && parentheses == 0 && kind() == TokenKind::Identifier
+			&& current().text == written && lookahead().kind == TokenKind::LParen)) {
+			parentheses += at(TokenKind::LParen) ? 1 : 0;
+			parentheses -= at(TokenKind::RParen) && parentheses > 0 ? 1 : 0;
+			if (parentheses == 0) {
+				angles += at(TokenKind::Less) ? 1 : 0;
+				angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
+				angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+			}
 			advance();
 		}
 		if (at(TokenKind::EndOfFile)) {
