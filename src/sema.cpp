@@ -2466,6 +2466,7 @@ namespace {
 		bool _gatherExtendedDeclared = false;
 		bool _minLodDeclared = false;
 		std::map<int32_t, Id> _intConstants;
+		bool _stencilExportDeclared = false;
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -12345,6 +12346,9 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.stencil) {
+				throw CompileError(what + " has [[stencil]], which is only valid on a fragment output");
+			}
 			if (field.attributes.sampleMask) {
 				throw CompileError(isInput
 					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
@@ -12482,6 +12486,9 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.stencil) {
+				throw CompileError(what + " has [[stencil]], which is only valid on a fragment output");
+			}
 			if (field.attributes.sampleMask) {
 				throw CompileError(what + " has [[sample_mask]], which is not valid on a vertex input");
 			}
@@ -12539,10 +12546,44 @@ namespace {
 		std::set<uint32_t> used;
 		bool hasDepth = false;
 		bool hasSampleMask = false;
+		bool hasStencil = false;
 
 		for (const StructField& field: decl.fields) {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.stencil) {
+				// The stencil reference value, which Vulkan exports with SPV_EXT_shader_stencil_export.
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
+					|| field.attributes.sampleMask || field.attributes.depthMode) {
+					throw CompileError(what + " has an incompatible stencil attribute combination");
+				}
+				if (field.attributes.attributeIndex || field.attributes.userName
+					|| field.attributes.interpolation != Interpolation::None) {
+					throw CompileError(what + " combines stencil with an attribute index, user or interpolation, "
+						"which mslc does not lower");
+				}
+				if (hasStencil) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[stencil]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::UInt || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[stencil]], which has to be a scalar uint");
+				}
+				hasStencil = true;
+				if (!_stencilExportDeclared) {
+					_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::StencilExportEXT) });
+					std::vector<uint32_t> extension;
+					spirv::Builder::appendString(extension, "SPV_EXT_shader_stencil_export");
+					_builder.emit(spirv::OpExtension, extension);
+					_stencilExportDeclared = true;
+				}
+				variables.push_back(declareStageVariable(type, spirv::StorageClass::Output, what));
+				_builder.emit(spirv::OpDecorate, { variables.back().variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::FragStencilRefEXT) });
+				continue;
+			}
 			if (field.attributes.depthMode) {
 				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
 					|| field.attributes.sampleMask) {
@@ -12611,7 +12652,7 @@ namespace {
 				throw CompileError(what + " has [[point_size]], which is only valid on a vertex output");
 			}
 			if (!field.attributes.colorIndex) {
-				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
+				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]], [[sample_mask]] or [[stencil]]; every field of a "
 					"fragment function's returned struct needs one");
 			}
 
@@ -14725,6 +14766,11 @@ namespace {
 				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
 			if (const StructDecl* decl = structValue(_entryPoint->returnType)) {
 				for (const StructField& field: decl->fields) {
+					if (field.attributes.stencil) {
+						_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+							static_cast<uint32_t>(spirv::ExecutionMode::StencilRefReplacingEXT) });
+						continue;
+					}
 					if (!field.attributes.depthMode) {
 						continue;
 					}

@@ -531,6 +531,8 @@ struct FieldAttributes {
 	std::optional<uint32_t> colorIndex;
 	std::optional<DepthMode> depthMode;
 	bool sampleMask = false;
+	// [[stencil]]: a fragment output's stencil reference value.
+	bool stencil = false;
 
 	// [[point_size]]: the field is the vertex output's BuiltIn PointSize.
 	bool pointSize = false;
