@@ -5943,8 +5943,9 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
+	std::set<std::string> seen;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
 		if (argument && (name == "buffer" || name == "texture" || name == "sampler" || name == "threadgroup")) {
 			checkAttributeIndex(name, *argument);
 		}
@@ -5973,6 +5974,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			throw CompileError("[[depth]] is not valid on an input parameter");
 		} else if (name == "sample_mask") {
 			throw CompileError("[[sample_mask]] on an input parameter is not lowered yet");
+		} else if (name == "invariant") {
+			throw CompileError("[[invariant]] is only valid on a vertex output's [[position]] field");
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
 		} else if (name == "color") {
@@ -5988,15 +5991,19 @@ ParameterAttributes Parser::parseParameterAttributes() {
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\"");
 		}
-	});
+	};
+	do {
+		parseAttributeList(seen, visit);
+	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
 
 	return attributes;
 }
 
 FieldAttributes Parser::parseFieldAttributes() {
 	FieldAttributes attributes;
+	std::set<std::string> seen;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument,
+	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument,
 		const std::string& identifier) {
 		if (name == "depth") {
 			if (attributes.depthMode) {
@@ -6031,6 +6038,8 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.userName = identifier;
 		} else if (name == "position") {
 			attributes.position = true;
+		} else if (name == "invariant") {
+			attributes.invariant = true;
 		} else if (name == "attribute") {
 			if (!argument) {
 				throw CompileError("[[attribute]] needs an index");
@@ -6050,22 +6059,24 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
+				"field; only [[position]], [[invariant]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
 		}
-	});
+	};
+	do {
+		parseAttributeList(seen, visit);
+	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
 
 	return attributes;
 }
 
-void Parser::parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>,
-	const std::string&)>& visit) {
+void Parser::parseAttributeList(std::set<std::string>& seen, const std::function<void(const std::string&,
+	std::optional<uint32_t>, const std::string&)>& visit) {
 	expect(TokenKind::LBracket, "to open an attribute list");
 	expect(TokenKind::LBracket, "to open an attribute");
 
-	std::set<std::string> seen;
 	while (!at(TokenKind::EndOfFile)) {
 		if (match(TokenKind::RBracket)) {
 			break;
@@ -6093,6 +6104,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 			}
 			if (name == "point_size") {
 				throw CompileError("[[point_size]] takes no argument");
+			}
+			if (name == "invariant") {
+				throw CompileError("[[invariant]] takes no argument");
 			}
 			advance();
 			if (name == "user" || name == "depth") {

@@ -516,6 +516,7 @@ struct FieldAttributes {
 	// [[position]]: the field is the stage's own position. On a vertex output
 	// that is the BuiltIn Position; on a fragment input it is the FragCoord.
 	bool position = false;
+	bool invariant = false;
 
 	// [[attribute(n)]]: the field is a vertex buffer input or a user output at
 	// location n.

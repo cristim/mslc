@@ -12302,6 +12302,10 @@ namespace {
 			const StructField& field = decl.fields[index];
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.invariant && (isInput || !field.attributes.position
+				|| field.attributes.colorIndex || field.attributes.pointSize)) {
+				throw CompileError(what + " has [[invariant]], which is only valid on a vertex output's [[position]] field");
+			}
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
@@ -12375,6 +12379,10 @@ namespace {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
 					static_cast<uint32_t>(isInput ? spirv::BuiltIn::FragCoord : spirv::BuiltIn::Position) });
+				if (!isInput && field.attributes.invariant) {
+					_builder.emit(spirv::OpDecorate, { variable.variable,
+						static_cast<uint32_t>(spirv::Decoration::Invariant) });
+				}
 			} else if (field.attributes.pointSize) {
 				_builder.emit(spirv::OpDecorate, { variable.variable,
 					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
@@ -12432,6 +12440,9 @@ namespace {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 			const Type& type = field.type;
 
+			if (field.attributes.invariant) {
+				throw CompileError(what + " has [[invariant]], which is only valid on a vertex output's [[position]] field");
+			}
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
@@ -12496,6 +12507,9 @@ namespace {
 		for (const StructField& field: decl.fields) {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.invariant) {
+				throw CompileError(what + " has [[invariant]], which is only valid on a vertex output's [[position]] field");
+			}
 			if (field.attributes.depthMode) {
 				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
 					|| field.attributes.sampleMask) {
