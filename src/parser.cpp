@@ -5676,7 +5676,7 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 				+ " address space, which a helper function does not take yet");
 		}
 		if (at(TokenKind::LBracket)) {
-			throw CompileError(what + "has an attribute, which only an entry point's parameter can have");
+			checkHelperParameterAttributes(param, what);
 		}
 		recordObjectType(param.name, param.type);
 		return param;
@@ -5712,6 +5712,60 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 		recordObjectType(param.name, param.type);
 	}
 	return param;
+}
+
+// QUIRK: a parameter of a function that is not an entry point may carry the attributes an entry point's
+// parameter takes ([[buffer(n)]], [[texture(n)]], [[stage_in]], [[user(...)]], a builtin, ...), and they have no
+// effect: the argument is what the call passes, and indices may repeat. Some must still suit the type, else it
+// is an error: [[buffer(n)]] a pointer or reference to device or constant memory, [[threadgroup(n)]] one to
+// threadgroup memory, [[texture(n)]] a texture, [[sampler(n)]] a sampler, [[position]] a float4, and the
+// thread and threadgroup position, index and size builtins a uint or ushort scalar or vector. In a function
+// template the check is made on the instance, as a substitution failure. [[flat]] and the other interpolation
+// attributes apply to struct members only. The other attributes are accepted and dropped without a check of the
+// type. The MSL specification does not say. Evidence: black-box observation of Apple's compiler (tier 2; metal
+// 32023.883, macOS 26), which accepts the well-typed forms and reports "type ... is not valid for attribute",
+// "invalid address space qualification for buffer pointee type" or a substitution failure for the others.
+// Test: probes helper_parameter_attribute_*.
+void Parser::checkHelperParameterAttributes(const Parameter& param, const std::string& what) {
+	const size_t start = _position;
+	const Type& type = param.type;
+	// A type still to be deduced is checked on the instance.
+	const bool dependent = isDeductionMarker(type) || (type.isTexture() && !type.namedType.empty());
+	const bool place = type.isPointer || param.isReference;
+	const bool resource = type.resource != ResourceKind::None;
+	const bool integerBuiltinType = !type.isPointer && !type.arrayLength && !type.isMatrix() && type.namedType.empty()
+		&& (type.scalar == ScalarKind::UInt || type.scalar == ScalarKind::UShort) && type.vectorWidth <= 3;
+	std::string wrong;
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t>, const std::string&) {
+		if (interpolationFromName(name)) {
+			throw CompileError(what + "has the attribute [[" + name + "]], which applies to a struct member only");
+		}
+		if (dependent || !wrong.empty()) {
+			return;
+		}
+		const bool fits = name == "buffer" ? place && !resource
+				&& (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)
+			: name == "threadgroup" ? place && !resource && type.addressSpace == AddressSpace::Threadgroup
+			: name == "texture" ? type.isTexture() && !type.isPointer && !type.arrayLength
+			: name == "sampler" ? type.resource == ResourceKind::Sampler && !type.isPointer && !type.arrayLength
+			: name == "position" ? !place && !resource && type.namedType.empty() && type.scalar == ScalarKind::Float
+				&& type.vectorWidth == 4 && !type.isMatrix() && !type.arrayLength
+			: builtinFromName(name) && name != "front_facing" && name != "vertex_id" && name != "instance_id"
+				&& name != "frag_coord" ? integerBuiltinType
+			: true;
+		if (!fits) {
+			wrong = name;
+		}
+	});
+	if (!wrong.empty()) {
+		_position = start;
+		const std::string message = what + "has an attribute, [[" + wrong + "]], that its type " + typeName(type)
+			+ " is not valid for";
+		if (_inInstance) {
+			throw SubstitutionFailure(message);
+		}
+		throw CompileError(message);
+	}
 }
 
 ParameterAttributes Parser::parseParameterAttributes() {
