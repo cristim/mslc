@@ -210,6 +210,10 @@ struct ParameterAttributes {
 	std::optional<uint32_t> textureIndex;
 	std::optional<uint32_t> samplerIndex;
 
+	// [[function_constant(c)]]: the program-scope constant c says whether the argument is there. It is
+	// declared either way; a gated argument may share its index with another argument (see parseFunctionDeclaration).
+	std::string functionConstant;
+
 	// [[thread_position_in_grid]] and friends. Only the ones the subset
 	// supports are named; anything else is a hard error at parse time so an
 	// unsupported builtin cannot be silently ignored.
@@ -536,6 +540,9 @@ struct FieldAttributes {
 
 	// [[color(n)]]: the field is colour attachment n of a fragment output.
 	std::optional<uint32_t> colorIndex;
+	// [[function_constant(c)]] on a colour output: the program-scope constant c says whether the output is
+	// there. It is declared either way, and a pipeline with no attachment at its location drops what it writes.
+	std::string functionConstant;
 	std::optional<DepthMode> depthMode;
 	bool sampleMask = false;
 	// [[stencil]]: a fragment output's stencil reference value.
