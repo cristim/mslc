@@ -526,6 +526,7 @@ private:
 	void closeAngle(const char* what);
 	std::string libraryName(const std::string& resolved) const;
 	ExpressionPtr tryParseTraitValue();
+	ExpressionPtr tryParseNumericLimit();
 	void parseTraitType(const std::string& name, Type& type);
 	bool _noGreater = false;
 	bool _inEnableIf = false;

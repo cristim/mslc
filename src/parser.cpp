@@ -2292,6 +2292,126 @@ std::string Parser::libraryName(const std::string& resolved) const {
 	return std::string();
 }
 
+// numeric_limits<T>::min(), max(), lowest(), epsilon() and infinity() of a scalar T, as a constant T(value), with
+// the values C++ gives them ([numeric.limits.members]): min() of a floating-point type is its least positive normal
+// value. Only a spelling whose last name is numeric_limits and is followed by "<" is resolved.
+ExpressionPtr Parser::tryParseNumericLimit() {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return nullptr;
+	}
+	size_t last = at(TokenKind::ColonColon) ? 1 : 0;
+	while (lookahead(last).kind == TokenKind::Identifier && lookahead(last + 1).kind == TokenKind::ColonColon) {
+		last += 2;
+	}
+	if (lookahead(last).kind != TokenKind::Identifier || lookahead(last).text != "numeric_limits"
+		|| lookahead(last + 1).kind != TokenKind::Less) {
+		return nullptr;
+	}
+	if (kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal("numeric_limits") || memberHidesName("numeric_limits"))) {
+		return nullptr;
+	}
+	size_t nameTokens = 0;
+	if (libraryName(peekResolved(nameTokens)) != "numeric_limits") {
+		return nullptr;
+	}
+	const size_t atLine = line();
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Less, "after \"numeric_limits\"");
+	Type type;
+	{
+		const RestoreFlag noGreater(_noGreater, true);
+		type = parseType();
+	}
+	closeAngle("to close \"numeric_limits<\"");
+	expect(TokenKind::ColonColon, "after \"numeric_limits<...>\"");
+	if (kind() != TokenKind::Identifier) {
+		throw CompileError("expected a member of numeric_limits after \"numeric_limits<...>::\"");
+	}
+	const std::string member(advance().text);
+	if (isDeductionMarker(type)) {
+		throw DependentTrait("numeric_limits depends on a type that is not deduced yet");
+	}
+	const bool lowered = member == "min" || member == "max" || member == "lowest" || member == "epsilon"
+		|| member == "infinity";
+	if (!lowered) {
+		throw CompileError("numeric_limits<...>::" + member + " is not lowered yet; mslc lowers min(), max(), "
+			"lowest(), epsilon() and infinity()");
+	}
+	expect(TokenKind::LParen, ("after \"numeric_limits<...>::" + member + "\"").c_str());
+	expect(TokenKind::RParen, ("to close \"numeric_limits<...>::" + member + "(\"").c_str());
+	if (type.isPointer || type.arrayLength || type.resource != ResourceKind::None || type.isAtomic
+		|| !type.namedType.empty() || !type.enumName.empty() || type.isMatrix() || type.vectorWidth > 0
+		|| type.scalar == ScalarKind::Void) {
+		throw CompileError("numeric_limits of " + typeName(type) + " is not lowered; mslc takes a scalar "
+			"integer, bool or floating-point type");
+	}
+
+	auto literal = std::make_unique<Expression>();
+	literal->line = atLine;
+	const ScalarKind scalar = type.scalar;
+	const bool floating = scalar == ScalarKind::Half || scalar == ScalarKind::Float || scalar == ScalarKind::Double;
+	if (scalar == ScalarKind::Bool) {
+		if (member == "epsilon" || member == "infinity") {
+			throw CompileError("numeric_limits<bool>::" + member + "() is false; it is not lowered");
+		}
+		literal->kind = ExpressionKind::BoolLiteral;
+		literal->boolValue = member == "max";
+		return literal;
+	}
+	if (scalar == ScalarKind::Double) {
+		throw CompileError("numeric_limits<double> is not lowered yet; mslc has no double literal to hold its values");
+	}
+	if (floating) {
+		const int mantissa = scalar == ScalarKind::Half ? 10 : scalar == ScalarKind::Float ? 23 : 52;
+		const int maxExponent = scalar == ScalarKind::Half ? 15 : scalar == ScalarKind::Float ? 127 : 1023;
+		const double largest = std::ldexp(2.0 - std::ldexp(1.0, -mantissa), maxExponent);
+		literal->kind = ExpressionKind::FloatLiteral;
+		literal->floatIsHalf = scalar == ScalarKind::Half;
+		literal->floatValue = member == "max" ? largest : member == "lowest" ? -largest
+			: member == "min" ? std::ldexp(1.0, 1 - maxExponent) : member == "epsilon" ? std::ldexp(1.0, -mantissa)
+			: std::numeric_limits<double>::infinity();
+	} else {
+		if (member == "epsilon" || member == "infinity") {
+			throw CompileError("numeric_limits<" + typeName(type) + ">::" + member + "() is zero for an integer "
+				"type; it is not lowered");
+		}
+		const bool isSigned = scalar == ScalarKind::Char || scalar == ScalarKind::Short || scalar == ScalarKind::Int
+			|| scalar == ScalarKind::Long;
+		const int bits = scalar == ScalarKind::Char || scalar == ScalarKind::UChar ? 8
+			: scalar == ScalarKind::Short || scalar == ScalarKind::UShort ? 16
+			: scalar == ScalarKind::Int || scalar == ScalarKind::UInt ? 32 : 64;
+		const bool high = member == "max";
+		uint64_t value = 0;
+		if (isSigned) {
+			const int64_t extreme = bits == 64 ? (high ? INT64_MAX : INT64_MIN)
+				: (high ? (int64_t(1) << (bits - 1)) - 1 : -(int64_t(1) << (bits - 1)));
+			value = static_cast<uint64_t>(extreme);
+		} else {
+			value = high ? (bits == 64 ? UINT64_MAX : (uint64_t(1) << bits) - 1) : 0;
+		}
+		// A limit of a type up to 32 bits is an int or uint literal holding its bits, so it needs no 64-bit
+		// integers and can take part in a function constant's initialiser.
+		literal->kind = ExpressionKind::IntLiteral;
+		literal->intValue = bits == 64 ? value : static_cast<uint32_t>(value);
+		literal->intKind = bits == 64 ? (isSigned ? ScalarKind::Long : ScalarKind::ULong)
+			: (isSigned ? ScalarKind::Int : ScalarKind::UInt);
+	}
+	auto expression = std::make_unique<Expression>();
+	expression->kind = ExpressionKind::Construct;
+	expression->line = atLine;
+	Type result = type;
+	result.isConst = false;
+	result.isVolatile = false;
+	result.addressSpace = AddressSpace::None;
+	expression->constructType = result;
+	expression->arguments.push_back(std::move(literal));
+	measure(*expression);
+	return expression;
+}
+
 // "is_same<A, B>::value", "is_same_v<A, B>" and the other one- and two-type predicates, as a bool.
 ExpressionPtr Parser::tryParseTraitValue() {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
@@ -8451,6 +8571,10 @@ ExpressionPtr Parser::parsePrimary() {
 		list->constructType = type;
 		list->line = atLine;
 		return list;
+	}
+
+	if (ExpressionPtr limit = tryParseNumericLimit()) {
+		return limit;
 	}
 
 	if (size_t asTypeTokens = 0; atAsType(asTypeTokens)) {
