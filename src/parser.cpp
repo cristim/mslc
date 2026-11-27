@@ -4340,20 +4340,39 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	return tag;
 }
 
-// Whether a sizeof is anywhere in a constant expression, which makes the operation around it
-// unsigned.
-static bool containsSizeof(const Expression& expression) {
+// Whether an unsigned operand (a sizeof, a u literal, or a named unsigned constant such as an unsigned template
+// parameter) is anywhere in a constant expression, which makes the operation around it unsigned ([expr.arith.conv]).
+// The evaluator works in signed arithmetic and refuses the operations whose unsigned result would differ.
+bool Parser::containsUnsigned(const Expression& expression) const {
 	if (expression.kind == ExpressionKind::IntLiteral) {
-		return expression.isSizeof;
+		return expression.isSizeof || expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong;
+	}
+	if (expression.kind == ExpressionKind::Identifier) {
+		const ConstantInt* found = findConstantInt(expression);
+		return found && (found->kind == ScalarKind::UInt || found->kind == ScalarKind::ULong);
 	}
 	if (expression.kind == ExpressionKind::Construct) {
 		// A cast to a type no wider than an int gives an int, which wraps nothing.
 		const ScalarKind target = expression.constructType ? expression.constructType->scalar : ScalarKind::Int;
 		return (target == ScalarKind::UInt || target == ScalarKind::ULong)
-			&& expression.arguments.size() == 1 && containsSizeof(*expression.arguments.front());
+			&& expression.arguments.size() == 1 && containsUnsigned(*expression.arguments.front());
 	}
-	return (expression.left && containsSizeof(*expression.left))
-		|| (expression.right && containsSizeof(*expression.right));
+	return (expression.left && containsUnsigned(*expression.left))
+		|| (expression.right && containsUnsigned(*expression.right));
+}
+
+// The integer constant a name denotes, looked up as namedConstantValue looks it up, or nothing.
+const Parser::ConstantInt* Parser::findConstantInt(const Expression& identifier) const {
+	if (!identifier.fileScope) {
+		for (auto scope = _blocks.rbegin(); scope != _blocks.rend(); ++scope) {
+			if (scope->names.count(identifier.name)) {
+				const auto constant = scope->constants.find(identifier.name);
+				return constant == scope->constants.end() ? nullptr : &constant->second;
+			}
+		}
+	}
+	const auto constant = _constantInts.find(identifier.name);
+	return constant == _constantInts.end() ? nullptr : &constant->second;
 }
 
 // Whether a sizeof is anywhere under an expression, through casts of any type.
@@ -4408,9 +4427,8 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			if (expression.isSizeof) {
 				return fit(static_cast<int64_t>(expression.intValue));
 			}
-			if (nested && (expression.intKind == ScalarKind::UInt || expression.intKind == ScalarKind::ULong
-				|| expression.intValue > INT_MAX)) {
-				throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+			if (nested && expression.intValue > INT_MAX) {
+				throw CompileError("an integer above INT_MAX inside a constant expression is not supported");
 			}
 			if (expression.intValue > INT64_MAX) {
 				throw CompileError("an integer constant is too large");
@@ -4430,9 +4448,9 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 		case ExpressionKind::Unary: {
 			const int64_t operand = evaluateConstant(*expression.left, true, attribute);
 			if ((expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::BitNot)
-				&& containsSizeof(*expression.left)) {
-				throw CompileError("a sizeof is unsigned, and negating or complementing it wraps; "
-					"a constant expression that does so is not supported");
+				&& containsUnsigned(*expression.left)) {
+				throw CompileError("an unsigned operand (a sizeof, a u literal or an unsigned constant), negated or "
+					"complemented, wraps, and a constant expression that does so is not supported");
 			}
 			switch (expression.unaryOperator) {
 				case UnaryOperator::Negate: return fit(-operand);
@@ -4456,11 +4474,12 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 			}
 
 			const int64_t right = evaluateConstant(*expression.right, true, attribute);
-			// A sizeof makes the operation unsigned, so a negative operand converts to a huge one
-			// and a negative result wraps; neither is modelled, and neither is guessed at.
-			if ((containsSizeof(*expression.left) || containsSizeof(*expression.right))
+			// An unsigned operand makes the operation unsigned, so a negative operand converts to a huge one
+			// and a negative result wraps; neither is modelled, and neither is guessed at. Otherwise the
+			// signed result of every operator here is the unsigned one.
+			if ((containsUnsigned(*expression.left) || containsUnsigned(*expression.right))
 				&& (left < 0 || right < 0 || (expression.binaryOperator == BinaryOperator::Subtract && left < right))) {
-				throw CompileError("a constant expression that mixes sizeof with a negative value or "
+				throw CompileError("a constant expression that mixes an unsigned operand with a negative value or "
 					"subtracts below zero would wrap as an unsigned one, which is not supported");
 			}
 			switch (expression.binaryOperator) {
@@ -4568,10 +4587,9 @@ int64_t Parser::namedConstantValue(const Expression& identifier, bool nested, bo
 	if (attribute && (found->kind == ScalarKind::Long || found->kind == ScalarKind::ULong)) {
 		throw CompileError("a long is not an index; use an int or a uint");
 	}
-	const bool intSized = found->kind != ScalarKind::UInt && found->kind != ScalarKind::Long
-		&& found->kind != ScalarKind::ULong;
-	if (nested && !intSized) {
-		throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+	if (nested && (found->value > INT_MAX || found->value < -INT_MAX)) {
+		throw CompileError("an integer constant outside what an int holds inside a constant expression is not "
+			"supported");
 	}
 	return found->value;
 }
@@ -4626,10 +4644,12 @@ int64_t Parser::constantArrayElement(const Expression& element, bool nested, boo
 	if (attribute && (found->kind == ScalarKind::Long || found->kind == ScalarKind::ULong)) {
 		throw CompileError("a long is not an index; use an int or a uint");
 	}
+	// An element's unsignedness is not tracked (containsUnsigned does not look into arrays), so an unsigned or
+	// wider array is still taken only as the whole expression.
 	const bool intSized = found->kind != ScalarKind::UInt && found->kind != ScalarKind::Long
 		&& found->kind != ScalarKind::ULong;
 	if (nested && !intSized) {
-		throw CompileError("an unsigned or wider integer inside a constant expression is not supported");
+		throw CompileError("an element of an unsigned or wider array inside a constant expression is not supported");
 	}
 	return found->values[static_cast<size_t>(index)];
 }

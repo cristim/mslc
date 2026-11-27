@@ -479,6 +479,8 @@ private:
 	int64_t evaluateConstant(const Expression& expression, bool nested, bool attribute = false) const;
 	// The value of a named integer constant in scope, or a CompileError saying why it is not one.
 	int64_t namedConstantValue(const Expression& identifier, bool nested, bool attribute) const;
+	const ConstantInt* findConstantInt(const Expression& identifier) const;
+	bool containsUnsigned(const Expression& expression) const;
 	int64_t constantArrayElement(const Expression& index, bool nested, bool attribute) const;
 	void recordConstantArray(const VariableDeclaration& declaration, bool local);
 	// Remembers a const or constexpr integer declaration whose initialiser folds; local is the
