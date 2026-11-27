@@ -10380,6 +10380,35 @@ namespace {
 		}
 	}
 
+	static bool sameArrayType(const Type& expected, const Type& got) {
+		return expected.isStdArray && got.isStdArray
+			&& expected.arrayLength == got.arrayLength
+			&& expected.innerArrayLengths == got.innerArrayLengths
+			&& expected.scalar == got.scalar
+			&& expected.vectorWidth == got.vectorWidth
+			&& expected.matrixColumns == got.matrixColumns
+			&& expected.isPacked == got.isPacked
+			&& expected.namedType == got.namedType
+			&& expected.enumName == got.enumName
+			&& expected.isPointer == got.isPointer
+			&& expected.isAtomic == got.isAtomic
+			&& expected.resource == got.resource;
+	}
+
+	static void requireArrayElementMatch(const Type& expected, const Expression& expression) {
+		if (expression.kind != ExpressionKind::InitList || !expression.constructType) {
+			return;
+		}
+		const Type& got = *expression.constructType;
+		const bool match = expected.arrayLength
+			? sameArrayType(expected, got)
+			: (!got.arrayLength && got.namedType == expected.namedType);
+		if (!match) {
+			throw CompileError("cannot initialize \"" + typeName(expected) + "\" from \""
+				+ typeName(got) + "\"");
+		}
+	}
+
 	// A file-scope constant array is a Private variable with a constant initialiser, which
 	// no store reaches. Vulkan has no way to index a constant composite by a run-time index,
 	// so the alternative is a Function copy at every use; one module-scope variable is read
@@ -10390,9 +10419,10 @@ namespace {
 			throw CompileError("a file-scope array of pointers, atomics or resources is not lowered yet");
 		}
 		if (!declaration.initializer || declaration.initializer->kind != ExpressionKind::InitList
-			|| declaration.initializer->constructType) {
+			|| (declaration.initializer->constructType && !type.isStdArray)) {
 			throw CompileError("array initializer must be an initializer list");
 		}
+		requireArrayElementMatch(type, *declaration.initializer);
 
 		ArrayLeaves leaves;
 		leaves.element = [&](const Type& leaf, const Expression* entry) {
@@ -13712,12 +13742,17 @@ namespace {
 	// list is consumed from position, and a braced list that leaves entries over is an error.
 	Id Emitter::emitArrayInit(const Type& type, const std::vector<InitializerElement>& entries,
 		size_t& position, bool braced, const ArrayLeaves& leaves) {
-		// array<T, N> a = {{1, 2, 3}}: the outer braces are the struct's and the inner ones the
-		// array member's, where {1, 2, 3} reaches the member by brace elision.
-		if (type.isStdArray && braced && entries.size() == 1 && entries[0].fieldName.empty()
-			&& entries[0].value->kind == ExpressionKind::InitList) {
-			size_t inner = 0;
-			return emitArrayInit(type, entries[0].value->elements, inner, true, leaves);
+		// array<T, N> a = {{1, 2, 3}} or {array<T, N>{{1, 2, 3}}}: peel any matching array<T, N>{...}
+		// copy-list-init wrapper first, then unwrap an untyped wrapper at most once per dimension.
+		const std::vector<InitializerElement>* list = &entries;
+		while (type.isStdArray && braced && list->size() == 1 && (*list)[0].fieldName.empty()
+			&& (*list)[0].value->kind == ExpressionKind::InitList && (*list)[0].value->constructType
+			&& sameArrayType(type, *(*list)[0].value->constructType)) {
+			list = &(*list)[0].value->elements;
+		}
+		if (type.isStdArray && braced && list->size() == 1 && (*list)[0].fieldName.empty()
+			&& (*list)[0].value->kind == ExpressionKind::InitList && !(*list)[0].value->constructType) {
+			list = &(*list)[0].value->elements;
 		}
 		Type element = type;
 		element.dropOuterDimension();
@@ -13725,24 +13760,28 @@ namespace {
 		const uint32_t length = *type.arrayLength;
 
 		std::vector<uint32_t> parts;
-		while (parts.size() < length && position < entries.size()) {
-			const InitializerElement& entry = entries[position];
+		while (parts.size() < length && position < list->size()) {
+			const InitializerElement& entry = (*list)[position];
 			if (!entry.fieldName.empty()) {
 				throw CompileError("a field designator requires a struct initializer");
 			}
-			if (rows && entry.value->kind != ExpressionKind::InitList) {
-				parts.push_back(emitArrayInit(element, entries, position, false, leaves));
+			const bool nonArrayTypedList = entry.value->kind == ExpressionKind::InitList
+				&& entry.value->constructType && entry.value->constructType->arrayRank() < element.arrayRank();
+			if (rows && (entry.value->kind != ExpressionKind::InitList || nonArrayTypedList)) {
+				parts.push_back(emitArrayInit(element, *list, position, false, leaves));
 				continue;
 			}
 			++position;
 			if (rows) {
+				requireArrayElementMatch(element, *entry.value);
 				size_t inner = 0;
 				parts.push_back(emitArrayInit(element, entry.value->elements, inner, true, leaves));
 			} else {
+				requireArrayElementMatch(element, *entry.value);
 				parts.push_back(leaves.element(element, entry.value.get()));
 			}
 		}
-		if (braced && position < entries.size()) {
+		if (braced && position < list->size()) {
 			throw CompileError("excess elements in array initializer");
 		}
 		while (parts.size() < length) {
@@ -13758,6 +13797,7 @@ namespace {
 
 	// The value of an array built from a braced list, in the function's own storage.
 	Id Emitter::emitArrayListValue(const Type& type, const Expression& list) {
+		requireArrayElementMatch(type, list);
 		Expression none;
 		none.kind = ExpressionKind::InitList;
 		ArrayLeaves leaves;
