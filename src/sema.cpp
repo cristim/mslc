@@ -316,18 +316,20 @@ namespace {
 		uint32_t floatInstruction;
 		uint32_t signedInstruction;
 		uint32_t unsignedInstruction;
+		bool inFastPrecise = true;
 	};
 
 	constexpr MathBuiltin kMathBuiltins[] = {
 		{ "trunc", 1, MathShape::Componentwise, 3, kNoInstruction, kNoInstruction },
 		{ "abs", 1, MathShape::Componentwise, 4, 5, kNoInstruction },
+		{ "fabs", 1, MathShape::Componentwise, 4, kNoInstruction, kNoInstruction },
 		{ "floor", 1, MathShape::Componentwise, 8, kNoInstruction, kNoInstruction },
 		{ "ceil", 1, MathShape::Componentwise, 9, kNoInstruction, kNoInstruction },
 		{ "fract", 1, MathShape::Componentwise, 10, kNoInstruction, kNoInstruction },
 		{ "fmod", 2, MathShape::FloatRemainder, kNoInstruction, kNoInstruction, kNoInstruction },
 		{ "round", 1, MathShape::RoundHalfAway, 3, kNoInstruction, kNoInstruction },
 		{ "rint", 1, MathShape::Componentwise, 2, kNoInstruction, kNoInstruction },
-		{ "sign", 1, MathShape::SignExact, 6, kNoInstruction, kNoInstruction },
+		{ "sign", 1, MathShape::SignExact, 6, kNoInstruction, kNoInstruction, false },
 		{ "sin", 1, MathShape::Componentwise, 13, kNoInstruction, kNoInstruction },
 		{ "cos", 1, MathShape::Componentwise, 14, kNoInstruction, kNoInstruction },
 		{ "tan", 1, MathShape::Componentwise, 15, kNoInstruction, kNoInstruction },
@@ -346,22 +348,24 @@ namespace {
 		// FMin and FMax leave that case open.
 		{ "min", 2, MathShape::Componentwise, 79, 39, 38 },
 		{ "max", 2, MathShape::Componentwise, 80, 42, 41 },
+		{ "fmin", 2, MathShape::Componentwise, 79, kNoInstruction, kNoInstruction },
+		{ "fmax", 2, MathShape::Componentwise, 80, kNoInstruction, kNoInstruction },
 		// NClamp (81) turns a NaN operand into the lower bound, as Metal does, where FClamp is
 		// undefined for it; saturate below is a clamp to [0, 1].
 		{ "clamp", 3, MathShape::Componentwise, 81, 45, 44 },
 		{ "saturate", 1, MathShape::Saturate, 81, kNoInstruction, kNoInstruction },
-		{ "mix", 3, MathShape::Componentwise, 46, kNoInstruction, kNoInstruction },
-		{ "step", 2, MathShape::Componentwise, 48, kNoInstruction, kNoInstruction },
-		{ "smoothstep", 3, MathShape::Componentwise, 49, kNoInstruction, kNoInstruction },
+		{ "mix", 3, MathShape::Componentwise, 46, kNoInstruction, kNoInstruction, false },
+		{ "step", 2, MathShape::Componentwise, 48, kNoInstruction, kNoInstruction, false },
+		{ "smoothstep", 3, MathShape::Componentwise, 49, kNoInstruction, kNoInstruction, false },
 		{ "fma", 3, MathShape::Componentwise, 50, kNoInstruction, kNoInstruction },
 		{ "length", 1, MathShape::VectorToScalar, 66, kNoInstruction, kNoInstruction },
 		{ "distance", 2, MathShape::VectorToScalar, 67, kNoInstruction, kNoInstruction },
-		{ "cross", 2, MathShape::Cross, 68, kNoInstruction, kNoInstruction },
+		{ "cross", 2, MathShape::Cross, 68, kNoInstruction, kNoInstruction, false },
 		{ "normalize", 1, MathShape::Vector, 69, kNoInstruction, kNoInstruction },
-		{ "reflect", 2, MathShape::Vector, 71, kNoInstruction, kNoInstruction },
-		{ "refract", 3, MathShape::Refract, 72, kNoInstruction, kNoInstruction },
-		{ "dot", 2, MathShape::Dot, kNoInstruction, kNoInstruction, kNoInstruction },
-		{ "fwidth", 1, MathShape::Fwidth, kNoInstruction, kNoInstruction, kNoInstruction },
+		{ "reflect", 2, MathShape::Vector, 71, kNoInstruction, kNoInstruction, false },
+		{ "refract", 3, MathShape::Refract, 72, kNoInstruction, kNoInstruction, false },
+		{ "dot", 2, MathShape::Dot, kNoInstruction, kNoInstruction, kNoInstruction, false },
+		{ "fwidth", 1, MathShape::Fwidth, kNoInstruction, kNoInstruction, kNoInstruction, false },
 	};
 
 	// A construct whose type is void: the cast (void)e.
@@ -395,6 +399,28 @@ namespace {
 		return nullptr;
 	}
 
+	std::optional<MathBuiltin> findScopedMathBuiltin(const std::string& callee) {
+		std::string_view rest = callee;
+		if (rest.compare(0, 7, "metal::") == 0) {
+			rest.remove_prefix(7);
+			if (rest.compare(0, 9, "precise::") == 0 || rest.compare(0, 6, "fast::") == 0) {
+				rest.remove_prefix(rest[0] == 'p' ? 9 : 6);
+				const MathBuiltin* builtin = findMathBuiltin(std::string(rest));
+				if (!builtin || !builtin->inFastPrecise) {
+					return std::nullopt;
+				}
+				MathBuiltin scoped = *builtin;
+				scoped.signedInstruction = kNoInstruction;
+				scoped.unsignedInstruction = kNoInstruction;
+				return scoped;
+			}
+		}
+		if (const MathBuiltin* builtin = findMathBuiltin(std::string(rest))) {
+			return *builtin;
+		}
+		return std::nullopt;
+	}
+
 	// A parameter or argument as the standard library's overloads see it: a scalar
 	// (width 1) or a vector of one scalar kind.
 	struct StdlibOperand {
@@ -419,7 +445,16 @@ namespace {
 		if (name == "discard_fragment") {
 			return operands.empty();
 		}
-		const MathBuiltin* builtin = findMathBuiltin(name);
+		if (name == "select" || name == "precise::select" || name == "fast::select") {
+			if (operands.size() != 3 || !operands[0] || !operands[1] || !operands[2]) { return false; }
+			const StdlibOperand a = *operands[0], b = *operands[1], c = *operands[2];
+			const bool valueOk = name == "select"
+				? (isFloatKind(a.scalar) || isIntegerKind(a.scalar) || a.scalar == ScalarKind::Bool)
+				: (a.scalar == ScalarKind::Float || a.scalar == ScalarKind::Half);
+			return valueOk && a == b && a.width <= 4 && c.scalar == ScalarKind::Bool
+				&& (c.width == 1 || c.width == a.width);
+		}
+		const std::optional<MathBuiltin> builtin = findScopedMathBuiltin("metal::" + name);
 		if (!builtin || operands.size() != builtin->arity
 			|| std::any_of(operands.begin(), operands.end(), [](const auto& o) { return !o; })) {
 			return false;
@@ -5956,11 +5991,12 @@ namespace {
 			return emitAtomicCall(expression);
 		}
 
-		if (name == "select") {
+		if (name == "select" || expression.left->name == "metal::precise::select"
+			|| expression.left->name == "metal::fast::select") {
 			return emitSelectCall(expression);
 		}
 
-		const MathBuiltin* builtin = findMathBuiltin(name);
+		const std::optional<MathBuiltin> builtin = findScopedMathBuiltin(expression.left->name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
 				"recognises, and it is not a function declared in this file");
@@ -6020,6 +6056,10 @@ namespace {
 		}
 
 		const uint32_t width = _types.vectorWidth(aType);
+		if ((expression.left->name == "metal::precise::select" || expression.left->name == "metal::fast::select")
+			&& !_types.isFloat(aType)) {
+			throw CompileError("select takes float or half operands in precise or fast");
+		}
 		Id condition;
 		if (conditionWidth > 1) {
 			if (_types.componentOf(conditionType) != _boolType || conditionWidth != width) {
@@ -7692,17 +7732,21 @@ namespace {
 		// visible beside it. Where its parameters are one of theirs, Apple never calls it
 		// alone (ambiguous, or another library overload wins); where the arguments are exactly
 		// one of theirs, that one wins or ties.
-		if (call.left->besideStdlib) {
-			const size_t tail = definition.name.rfind("::");
-			const std::string stdlibName = tail == std::string::npos ? definition.name : definition.name.substr(tail + 2);
+		std::set<std::string> stdlibBeside = call.left->stdlibBeside;
+		if (!receiver && definition.name.compare(0, stdlibPrefix.size(), stdlibPrefix) == 0 && !isMemberName(definition.name)) {
+			stdlibBeside.insert(definition.name.substr(stdlibPrefix.size()));
+		}
+		if (!stdlibBeside.empty()) {
 			std::vector<std::optional<StdlibOperand>> parameterOperands;
 			for (const Parameter& parameter: definition.parameters) {
 				parameterOperands.push_back(stdlibOperand(parameter));
 			}
-			if (isStdlibSignature(stdlibName, parameterOperands) || isStdlibSignature(stdlibName, argumentOperands)) {
-				throw CompileError("the call to \"" + definition.name + "\" also matches the standard library's \""
-					+ stdlibName + "\", which is visible beside it; Apple resolves the two by overload, which mslc "
-					"does not model");
+			for (const std::string& stdlibName: stdlibBeside) {
+				if (isStdlibSignature(stdlibName, parameterOperands) || isStdlibSignature(stdlibName, argumentOperands)) {
+					throw CompileError("the call to \"" + definition.name + "\" also matches the standard library's \""
+						+ stdlibName + "\", which is visible beside it; Apple resolves the two by overload, which mslc "
+						"does not model");
+				}
 			}
 		}
 
@@ -8355,8 +8399,7 @@ namespace {
 				// The return type of the one function the name can find: any overload, template, library
 				// function beside it or argument-dependent lookup would need the arguments' types.
 				if (expression.left->kind != ExpressionKind::Identifier || expression.left->hasTemplateArguments
-					|| _bindings.count(expression.left->name) > 0
-					|| (expression.left->besideStdlib && findMathBuiltin(expression.left->name))) {
+					|| _bindings.count(expression.left->name) > 0) {
 					return std::nullopt;
 				}
 				std::set<std::string> adl;
@@ -8365,7 +8408,80 @@ namespace {
 					return std::nullopt;
 				}
 				const std::vector<HelperFunction*> set = helpersNamed(names.front());
-				if (set.size() != 1 || set.front()->definition->parameters.size() != expression.arguments.size()) {
+				if (set.empty()) {
+					const std::string& callee = names.front();
+					const bool fpSelect = callee == "metal::precise::select" || callee == "metal::fast::select";
+					const bool isSelect = callee == "select" || callee == "metal::select" || fpSelect;
+					const std::optional<MathBuiltin> builtin = isSelect ? std::nullopt : findScopedMathBuiltin(callee);
+					if ((isSelect ? expression.arguments.size() != 3 : (!builtin || expression.arguments.size() != builtin->arity))
+						|| (builtin && builtin->shape == MathShape::Fwidth && (!_entryPoint || _entryPoint->stage != Stage::Fragment))) {
+						return std::nullopt;
+					}
+					std::vector<Type> args;
+					for (const ExpressionPtr& entry: expression.arguments) {
+						const std::optional<Type> arg = sizeofExpressionType(*entry);
+						if (!arg || !plain(*arg) || arg->isPacked || (!isSelect && arg->scalar == ScalarKind::Bool)) {
+							return std::nullopt;
+						}
+						args.push_back(*arg);
+					}
+					if (isSelect) {
+						Type out = args[0].isVector() ? args[0] : args[1];
+						if ((fpSelect && !isFloatKind(out.scalar))
+							|| (args[0].isVector() == args[1].isVector()
+								? (args[0].scalar != args[1].scalar || args[0].vectorWidth != args[1].vectorWidth)
+								: !converts(scalarOf(out.scalar), args[0].isVector() ? args[1] : args[0]))
+							|| (args[2].isVector() && (!out.isVector() || args[2].scalar != ScalarKind::Bool
+								|| args[2].vectorWidth != out.vectorWidth))) {
+							return std::nullopt;
+						}
+						out.isConst = false;
+						out.addressSpace = AddressSpace::None;
+						return out;
+					}
+					const size_t sharing = builtin->shape == MathShape::Refract ? 2 : args.size();
+					const bool takesIntegers = builtin->signedInstruction != kNoInstruction;
+					Type type = args[0];
+					for (size_t i = 0; i < sharing; ++i) {
+						if (args[i].isVector()) { type = args[i]; break; }
+						if (!isFloatKind(type.scalar) && isFloatKind(args[i].scalar)) { type = args[i]; }
+					}
+					const bool takesScalars = builtin->shape != MathShape::VectorToScalar
+						&& builtin->shape != MathShape::Vector && builtin->shape != MathShape::Dot
+						&& builtin->shape != MathShape::Refract && builtin->shape != MathShape::Cross;
+					if ((builtin->shape == MathShape::Fwidth ? !isFloatKind(type.scalar)
+							: (!isFloatKind(type.scalar) && (!takesIntegers
+								|| (!isSignedInteger(type.scalar) && builtin->unsignedInstruction == kNoInstruction))))
+						|| (!takesScalars && !type.isVector())
+						|| (builtin->shape == MathShape::Cross && type.vectorWidth != 3)
+						|| (builtin->shape == MathShape::Refract && args[2].isVector())) {
+						return std::nullopt;
+					}
+					for (size_t i = 0; i < sharing; ++i) {
+						if (args[i].scalar == type.scalar && args[i].vectorWidth == type.vectorWidth) { continue; }
+						const bool converts = !type.isVector() && !takesIntegers && !isFloatKind(args[i].scalar);
+						if (args[i].isVector() || (!type.isVector() && !converts)
+							|| (!isFloatKind(type.scalar) && isFloatKind(args[i].scalar))) {
+							return std::nullopt;
+						}
+					}
+					if (builtin->shape == MathShape::VectorToScalar || builtin->shape == MathShape::Dot) {
+						return scalarOf(type.scalar);
+					}
+					type.isConst = false;
+					type.addressSpace = AddressSpace::None;
+					return type;
+				}
+				std::set<std::string> beside = expression.left->stdlibBeside;
+				if (names.front().compare(0, stdlibPrefix.size(), stdlibPrefix) == 0 && !isMemberName(names.front())) {
+					beside.insert(names.front().substr(stdlibPrefix.size()));
+				}
+				const bool competesWithStdlib = std::any_of(beside.begin(), beside.end(), [](const std::string& sub) {
+					return sub == "select" || sub == "precise::select" || sub == "fast::select"
+						|| findScopedMathBuiltin("metal::" + sub).has_value();
+				});
+				if (set.size() != 1 || competesWithStdlib
+					|| set.front()->definition->parameters.size() != expression.arguments.size()) {
 					return std::nullopt;
 				}
 				// Each argument has to be one the parameter takes: a mismatch is an error in Apple, and

@@ -319,9 +319,9 @@ struct Expression {
 	// Member: written "p->m" rather than "v.m".
 	bool isArrow = false;
 
-	// Identifier: a name found where the standard library's names are also visible, so a
-	// call is resolved against both.
-	bool besideStdlib = false;
+	// Identifier: standard library names (without "metal::") visible beside a user declaration,
+	// so a call is resolved against both.
+	std::set<std::string> stdlibBeside;
 
 	// Identifier: the functions an unqualified lookup found in more than one scope (using
 	// directives and declarations), which together are the overload set of a call. Empty when

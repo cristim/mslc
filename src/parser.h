@@ -106,7 +106,7 @@ class Parser {
 		// overload, so a call is resolved (or found ambiguous) where it is made.
 		std::map<std::string, std::set<std::string>> declarations;
 		// Standard library names a using declaration brought in, as "using metal::clamp;".
-		std::set<std::string> stdlibDeclarations;
+		std::map<std::string, std::set<std::string>> stdlibDeclarations;
 	};
 	std::vector<std::string> _namespacePath;
 	std::set<std::string> _namespaces;
@@ -464,14 +464,17 @@ private:
 	// any, without reporting several as ambiguous (a declaration site is not a use). With
 	// "besideStdlib", also whether the standard library's names are visible there or nearer:
 	// the level is namespace metal, or a using directive or declaration brings them to it.
-	std::set<std::string> unqualifiedFound(const std::string& last, bool* besideStdlib = nullptr) const;
+	std::set<std::string> unqualifiedFound(const std::string& last, std::set<std::string>* stdlibBeside = nullptr,
+		std::set<std::string>* stdlibTargets = nullptr) const;
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens, std::vector<std::string>* alternatives = nullptr) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
-	// With "besideStdlib", also whether the walk visited namespace metal or a scope with a
-	// "using metal::name;" of this name, directly or through a directive it follows.
+	bool collectStdlibOwn(const std::string& scope, const std::string& name, std::set<std::string>* targets,
+		std::set<std::string>* beside) const;
+	// With "stdlibBeside", also collects standard library names visible on the walk.
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-		std::set<std::string>& found, bool qualified, bool* besideStdlib = nullptr) const;
+		std::set<std::string>& found, bool qualified, std::set<std::string>* stdlibBeside = nullptr,
+		std::set<std::string>* stdlibTargets = nullptr, bool* reachedMetal = nullptr) const;
 	bool isLocal(const std::string& name) const;
 	// What the innermost block that declares the name binds it to: "" for a local,
 	// the declaration a using declaration names, or nullptr when no block does.

@@ -862,7 +862,7 @@ void Parser::parseUsing() {
 		}
 	}
 	if (_blocks.empty() && !_declared.count(resolved) && resolved != "metal::discard_fragment") {
-		_scopes[scope].stdlibDeclarations.insert(name.parts.back());
+		_scopes[scope].stdlibDeclarations[name.parts.back()].insert(resolved);
 		return; // a name of the standard library, which is visible already
 	}
 	if (_blocks.empty()) {
@@ -1902,8 +1902,8 @@ size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<s
 		for (const std::string& inner: entry->second.inlines) {
 			work.push_back(inner);
 		}
-		for (const std::string& name: entry->second.stdlibDeclarations) {
-			count += mentioned.count(name) ? 1 : 0;
+		for (const auto& declaration: entry->second.stdlibDeclarations) {
+			count += mentioned.count(declaration.first) ? declaration.second.size() : 0;
 		}
 		for (const auto& declaration: entry->second.declarations) {
 			count += mentioned.count(declaration.first) ? declaration.second.size() : 0;
@@ -1918,7 +1918,9 @@ size_t Parser::usingDeclarationsOf(const std::string& name) const {
 		if (const auto found = scope.second.declarations.find(name); found != scope.second.declarations.end()) {
 			count += found->second.size();
 		}
-		count += scope.second.stdlibDeclarations.count(name);
+		if (const auto found = scope.second.stdlibDeclarations.find(name); found != scope.second.stdlibDeclarations.end()) {
+			count += found->second.size();
+		}
 	}
 	return count;
 }
@@ -3971,8 +3973,26 @@ std::vector<std::string> Parser::inlineClosure(const std::string& scope) const {
 	return set;
 }
 
+bool Parser::collectStdlibOwn(const std::string& scope, const std::string& name,
+	std::set<std::string>* targets, std::set<std::string>* beside) const {
+	bool found = false;
+	for (const std::string& inner : inlineClosure(scope)) {
+		if (const auto entry = _scopes.find(inner); entry != _scopes.end()) {
+			if (const auto stdlib = entry->second.stdlibDeclarations.find(name); stdlib != entry->second.stdlibDeclarations.end()) {
+				found = true;
+				if (targets) { targets->insert(stdlib->second.begin(), stdlib->second.end()); }
+				for (const std::string& target : stdlib->second) {
+					if (beside && target.compare(0, 7, "metal::") == 0) { beside->insert(target.substr(7)); }
+				}
+			}
+		}
+	}
+	return found;
+}
+
 void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-	std::set<std::string>& found, bool qualified, bool* besideStdlib) const {
+	std::set<std::string>& found, bool qualified, std::set<std::string>* stdlibBeside,
+	std::set<std::string>* stdlibTargets, bool* reachedMetal) const {
 	if (!seen.insert(scope).second) {
 		return;
 	}
@@ -3984,9 +4004,13 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	found.insert(own.begin(), own.end());
 	const auto entry = _scopes.find(scope);
 	// "using metal::name;" makes the library's name this namespace's own member too.
-	const bool declaresStdlib = entry != _scopes.end() && entry->second.stdlibDeclarations.count(name);
-	if (besideStdlib && (scope == kStdlibNamespace || declaresStdlib)) {
-		*besideStdlib = true;
+	const bool declaresStdlib = collectStdlibOwn(scope, name, stdlibTargets, stdlibBeside);
+	if (reachedMetal && scope == kStdlibNamespace) {
+		*reachedMetal = true;
+	}
+	if (stdlibBeside && !name.empty()
+		&& (scope == kStdlibNamespace || scope == "metal::precise" || scope == "metal::fast")) {
+		stdlibBeside->insert(scope == kStdlibNamespace ? name : scope.substr(7) + "::" + name);
 	}
 	if (qualified && (!own.empty() || declaresStdlib)) {
 		return;
@@ -3998,7 +4022,7 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	for (const std::string& writer : inlineClosure(scope)) {
 		if (const auto written = _scopes.find(writer); written != _scopes.end()) {
 			for (const std::string& directive : written->second.directives) {
-				collectMembers(directive, name, seen, found, qualified, besideStdlib);
+				collectMembers(directive, name, seen, found, qualified, stdlibBeside, stdlibTargets, reachedMetal);
 			}
 		}
 	}
@@ -4059,7 +4083,7 @@ bool Parser::libraryNominatedFromHere() const {
 			std::set<std::string> seen;
 			std::set<std::string> none;
 			bool nominated = false;
-			collectMembers(target, "", seen, none, false, &nominated);
+			collectMembers(target, "", seen, none, false, nullptr, nullptr, &nominated);
 			if (nominated) {
 				return true;
 			}
@@ -4394,8 +4418,12 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		if (const std::string* bound = blockName(last)) {
 			return bound->empty() ? last : *bound;
 		}
-		if (const std::set<std::string> found = unqualifiedFound(last); !found.empty()) {
+		std::set<std::string> stdlibTargets;
+		if (const std::set<std::string> found = unqualifiedFound(last, nullptr, &stdlibTargets); !found.empty()) {
 			return pick(found, last);
+		}
+		if (!stdlibTargets.empty()) {
+			return pick(stdlibTargets, last);
 		}
 		return last;
 	}
@@ -4408,10 +4436,18 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 	if (found) {
 		std::set<std::string> seen;
 		std::set<std::string> members;
+		std::set<std::string> beside;
+		std::set<std::string> stdlibTargets;
 		bool libraryVisible = false;
-		collectMembers(scope, last, seen, members, true, &libraryVisible);
+		collectMembers(scope, last, seen, members, true, &beside, &stdlibTargets, &libraryVisible);
 		if (!members.empty()) {
 			return pick(members, spelled);
+		}
+		if (!stdlibTargets.empty()) {
+			if (beside.count(last) && stdlibLookup(kStdlibNamespace, last).hasName) {
+				stdlibTargets.insert(std::string(kStdlibNamespace) + "::" + last);
+			}
+			return pick(stdlibTargets, spelled);
 		}
 		// Nothing the file declares, but the walk reached the library's names ("using
 		// metal::name;" or a directive to metal in the namespace or in the namespaces its
@@ -4430,6 +4466,10 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		// scope adds a name there too, and beside a declaration of its own it is ambiguous.
 		if (std::set<std::string> own; collectOwn("", last, own), !own.empty()) {
 			return pick(own, spelled);
+		}
+		std::set<std::string> stdlibTargets;
+		if (collectStdlibOwn("", last, &stdlibTargets, nullptr)) {
+			return pick(stdlibTargets, spelled);
 		}
 		return last;
 	}
@@ -4478,7 +4518,7 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 				std::set<std::string> seen;
 				std::set<std::string> members;
 				bool nominated = false;
-				collectMembers(from, parts[count], seen, members, true, &nominated);
+				collectMembers(from, parts[count], seen, members, true, nullptr, nullptr, &nominated);
 				// A qualified walk stops at an own member of that name, so "nominated" is set only
 				// when the scope declares none.
 				visible = nominated;
@@ -4570,19 +4610,21 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 	throw CompileError("no member named \"" + last + "\" in the namespace \"" + scope + "\" (in \"" + spelled + "\")");
 }
 
-std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* besideStdlib) const {
+std::set<std::string> Parser::unqualifiedFound(const std::string& last, std::set<std::string>* stdlibBeside,
+	std::set<std::string>* stdlibTargets) const {
 	// [namespace.udir]: a using directive in U nominating T makes T's names
 	// appear in the nearest namespace L containing both, for lookups from inside U.
 	// So each enclosing namespace L, innermost out, offers its own names plus
 	// those of directives that land in it; the first level that has any decides.
-	bool stdlibNearer = false;
+	std::set<std::string> nearerBeside;
 	for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
 		const std::string level = joinParts(_namespacePath, 0, depth);
-		std::set<std::string> found;
+		std::set<std::string> found, levelStdlib, hereBeside;
 		collectOwn(level, last, found);
-		const auto own = _scopes.find(level);
-		const bool declaredHere = own != _scopes.end() && own->second.stdlibDeclarations.count(last);
-		bool stdlibHere = level == kStdlibNamespace || declaredHere;
+		collectStdlibOwn(level, last, &levelStdlib, &hereBeside);
+		if (level == kStdlibNamespace || level == "metal::precise" || level == "metal::fast") {
+			hereBeside.insert(level == kStdlibNamespace ? last : level.substr(7) + "::" + last);
+		}
 		for (size_t user = 0; user <= _namespacePath.size(); ++user) {
 			for (const std::string& from : inlineClosure(joinParts(_namespacePath, 0, user))) {
 				const auto entry = _scopes.find(from);
@@ -4592,7 +4634,7 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 				for (const std::string& target : entry->second.directives) {
 					if (nearestCommon(from, target) == level) {
 						std::set<std::string> seen;
-						collectMembers(target, last, seen, found, false, &stdlibHere);
+						collectMembers(target, last, seen, found, false, &hereBeside, &levelStdlib);
 					}
 				}
 			}
@@ -4602,23 +4644,30 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 			for (const std::string& target : block.directives) {
 				if (nearestCommon(function, target) == level) {
 					std::set<std::string> seen;
-					collectMembers(target, last, seen, found, false, &stdlibHere);
+					collectMembers(target, last, seen, found, false, &hereBeside, &levelStdlib);
 				}
 			}
 		}
 		// "using metal::name;" makes the library's name this level's own, which hides every
 		// outer declaration of it: the name is the library's.
-		if (found.empty() && declaredHere) {
+		if (found.empty() && !levelStdlib.empty()) {
+			if (hereBeside.count(last) && stdlibLookup(kStdlibNamespace, last).hasName) {
+				levelStdlib.insert(std::string(kStdlibNamespace) + "::" + last);
+			}
+			if (stdlibTargets) {
+				*stdlibTargets = std::move(levelStdlib);
+			}
 			return {};
 		}
 		if (!found.empty()) {
-			if (besideStdlib) {
-				*besideStdlib = stdlibHere || stdlibNearer;
+			if (stdlibBeside) {
+				stdlibBeside->insert(nearerBeside.begin(), nearerBeside.end());
+				stdlibBeside->insert(hereBeside.begin(), hereBeside.end());
 			}
 			return found;
 		}
 		// Namespace metal's own names may hide the user's function found further out.
-		stdlibNearer = stdlibNearer || stdlibHere;
+		nearerBeside.insert(hereBeside.begin(), hereBeside.end());
 	}
 	return {};
 }
@@ -8442,20 +8491,18 @@ ExpressionPtr Parser::parsePrimary() {
 		// declaration or directive in B, but it is still B's lookup that also reaches the
 		// library when B brings metal in too (directly, as namespace metal itself, or
 		// transitively), so collectMembers walks from the written scope.
-		expression->besideStdlib = false;
 		if (spelled.parts.size() > 1) {
 			const std::string scope = namespaceOf(spelled, spelled.parts.size() - 1);
 			if (!scope.empty()) {
-				std::set<std::string> seen;
-				std::set<std::string> found;
-				collectMembers(scope, spelled.parts.back(), seen, found, true, &expression->besideStdlib);
+				std::set<std::string> seen, found;
+				collectMembers(scope, spelled.parts.back(), seen, found, true, &expression->stdlibBeside);
 			}
+		} else if (spelled.global) {
+			collectStdlibOwn("", spelled.parts.back(), nullptr, &expression->stdlibBeside);
 		}
-		bool foundBesideStdlib = false;
 		if (spelledTokens == 1 && kind() == TokenKind::Identifier && !blockName(std::string(current().text))) {
-			unqualifiedFound(std::string(current().text), &foundBesideStdlib);
+			unqualifiedFound(std::string(current().text), &expression->stdlibBeside);
 		}
-		expression->besideStdlib = expression->besideStdlib || foundBesideStdlib;
 		consumeName();
 		if (templateId) {
 			advance();
