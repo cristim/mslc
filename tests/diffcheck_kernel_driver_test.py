@@ -43,13 +43,65 @@ def mutated(path, edits):
     return run(path, mslc_cmd=MUTATE, env=env)
 
 
-BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "sampler_modes", "layout_unread_member", "ulp_per_buffer", "threadgroup_argument",
-             "texel_buffer_read", "texel_buffer_write", "texel_buffer_read_write", "texel_buffer_unused",
-             "texel_buffer_r_read", "texel_buffer_rg_read", "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
+BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write",
+             "texture_nonfloat_read", "texture_nonfloat_write", "texture_non2d_read", "texture_non2d_write",
+             "texture_cube_read_write", "texture_mip_lod", "sampler_modes", "atomic_device_ops", "atomic_buffer_only",
+             "layout_unread_member", "ulp_per_buffer", "ulp_per_field", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
+             "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
+             "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
 # (probe, edits, expected status): each is a change a real compiler bug could make.
 MUTANTS = [
     # texture: the x and y of a texel fetch swapped
     ("texture_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: the x and y of a write coordinate swapped
+    ("texture_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: two components of a written float4 swapped
+    ("texture_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # texture, write: the two write-only textures change bindings
+    ("texture_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # texture, read_write: the two read_write textures change bindings
+    ("texture_read_write", [["Binding 0$", "Binding 9"], ["Binding 1$", "Binding 0"], ["Binding 9$", "Binding 1"]], "mismatched"),
+    # texture, read_write: the x and y of the read_write coordinate swapped
+    ("texture_read_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-float 2D texture, read: the x and y of a fetch swapped
+    ("texture_nonfloat_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-float 2D texture, read: the int and uint 2D textures change bindings
+    ("texture_nonfloat_read", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # non-float 2D texture, write: two components of a written int4 swapped
+    ("texture_nonfloat_write", [[r"(OpCompositeConstruct %v4int) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-float 2D texture, write: the int and half write-only 2D textures change bindings
+    ("texture_nonfloat_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # non-2D textures, read: 1D array coordinate and layer swapped
+    ("texture_non2d_read", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, read: 3D y and z coordinates swapped
+    ("texture_non2d_read", [[r"(OpCompositeConstruct %v3uint %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, read: 1D array get_array_size reads width (lane 0) instead of layer count (lane 1)
+    ("texture_non2d_read", [[r"(OpImageQuerySize(?:Lod)? %v2uint %\d+(?: %\S+)?\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]], "mismatched"),
+    # non-2D textures, read: 2D array get_array_size and 3D get_depth read height (lane 1) instead of lane 2
+    ("texture_non2d_read", [[r"(OpImageQuerySize(?:Lod)? %v3uint %\d+(?: %\S+)?\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]], "mismatched"),
+    # non-2D textures, write: 1D float write components x and y swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 1D array / 2D array write coordinates swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v2uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 2D array uint write components x and y swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v4uint) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # non-2D textures, write: 3D read_write x and z coordinates swapped
+    ("texture_non2d_write", [[r"(OpCompositeConstruct %v3uint) (%\d+) (%\d+) (%\d+)", r"\1 \4 \3 \2"]], "mismatched"),
+    # cube/cube_array: cube array layer-face stride 5 instead of 6
+    ("texture_cube_read_write", [[r"(OpIMul %uint %\d+) %uint_6\b", r"\1 %uint_5"]], "mismatched"),
+    # cube/cube_array: half cube write components x and y swapped
+    ("texture_cube_read_write", [[r"(OpCompositeConstruct %v4half) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
+    # cube/cube_array: cube sample face 0 direction altered
+    ("texture_cube_read_write", [[r"(OpCompositeConstruct %v3float) %float_1 (%\d+)", r"\1 \2 \2"]], "mismatched"),
+    # multi-mip textures: get_num_mip_levels collapsed to 1, min_lod_clamp dropped, fractional lod rounded to 1,
+    # explicit lod/bias collapsed to 0, 2d/3d/cube mip read collapsed to 0, and get_depth(lod) collapsed to level 0
+    ("texture_mip_lod", [[r"OpImageQueryLevels %uint %\d+$", "OpCopyObject %uint %uint_1"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Grad\|MinLod %\d+ %\d+) %float_2$", r"\1 %float_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %float_1_5$", r"\1 %float_1"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageSampleExplicitLod %v4float %\d+ %\d+ Lod) %\d+$", r"\1 %float_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageFetch %v4float %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageFetch %v4uint %\d+ %\d+ Lod) %\d+$", r"\1 %uint_0"]], "mismatched"),
+    ("texture_mip_lod", [[r"(OpImageQuerySizeLod %v3uint %\d+) %\d+(\n\s+%\d+ = OpCompositeExtract %uint %\d+ 2)", r"\1 %uint_0\2"]], "mismatched"),
     # texture: the two textures change bindings
     ("texture_sample_two", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
     # texture: the swapped coordinates of the second sample are no longer swapped
@@ -67,6 +119,8 @@ MUTANTS = [
     ("texture_read", [[r"OpDecorate (%\w+) ArrayStride 16", r"OpDecorate \1 ArrayStride 32"]], "reflection-mismatch"),
     # per-buffer ULP: an exactly rounded result off by one ULP in a file with an inexact builtin
     ("ulp_per_buffer", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
+    # per-field struct ULP: an exactly rounded struct field off by one ULP next to sqrt and exp fields
+    ("ulp_per_field", [[r"OpConstant %float 3$", "OpConstant %float 3.0000002"]], "mismatched"),
     # threadgroup argument: the spec constant that sizes the first argument's array is no longer the id the reflection names
     ("threadgroup_argument", [[r"SpecId 3$", "SpecId 9"]], "mismatched"),
     # threadgroup argument: a thread reads the wrong neighbour's slot
@@ -103,6 +157,21 @@ MUTANTS = [
     ("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+) (%\d+) (%\d+) (%\d+)", r"\1 \3 \2 \4"]], "mismatched"),
     # R and RG texel buffers, read_write: the R float and the RG float buffer change bindings
     ("texel_buffer_narrow_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # atomics: unsigned atomic fetch_sub replaced by fetch_add
+    ("atomic_device_ops", [[r"OpAtomicISub %uint", "OpAtomicIAdd %uint"]], "mismatched"),
+    # atomics: unsigned min/max confused with signed min/max
+    ("atomic_device_ops", [[r"OpAtomicUMin %uint", "OpAtomicSMin %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicUMax %uint", "OpAtomicSMax %uint"]], "mismatched"),
+    # atomics: signed min/max confused with unsigned min/max
+    ("atomic_device_ops", [[r"OpAtomicSMin %int", "OpAtomicUMin %int"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicSMax %int", "OpAtomicUMax %int"]], "mismatched"),
+    # atomics: exchange replaced by fetch_add, xor by or, CAS equality flipped
+    ("atomic_device_ops", [[r"OpAtomicExchange %uint", "OpAtomicIAdd %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicXor %uint", "OpAtomicOr %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"(OpAtomicCompareExchange %uint [^\n]+\n\s+OpStore %\d+ %\d+\n\s+%\d+ =) OpIEqual (%bool)", r"\1 OpINotEqual \2"]], "mismatched"),
+    # atomic-only buffers: layout stride mismatch and wrong atomic op
+    ("atomic_buffer_only", [[r"OpDecorate (%_runtimearr_uint\S*) ArrayStride 4", r"OpDecorate \1 ArrayStride 8"]], "reflection-mismatch"),
+    ("atomic_buffer_only", [[r"OpAtomicIAdd %uint", "OpAtomicISub %uint"]], "mismatched"),
 ]
 
 # Equivalent mutant: components past the texel format are not stored, so swapping z and w of a write to an RG buffer
@@ -138,21 +207,29 @@ with tempfile.TemporaryDirectory() as d:
     rc, out, data = run(typo)
     assert rc == 2 and "ff" in out, (rc, out)
 
-# Without the directive the file-wide 4 ULP bound hides the one ULP error: the directive is what catches it.
+# Without the directive the per-buffer bound still holds the exactly rounded buffer to 0 ULP
+# (ulp_bounds_by_root), so the one ULP error in it is caught; the loose buffer keeps its 4 ULP bound.
 with tempfile.TemporaryDirectory() as d:
     loose = os.path.join(d, "ulp_loose.metal")
     with open(probe("ulp_per_buffer")) as src, open(loose, "w") as dst:
         dst.write("".join(l for l in src if "DIFFCHECK-ULP" not in l))
     rc, out, data = mutated(loose, next(edits for name, edits, _ in MUTANTS if name == "ulp_per_buffer"))
-    assert rc == 0 and data["status"] == "matched", ("the bound is no longer file-wide", rc, out)
+    assert rc != 0 and data is not None and data["status"] == "mismatched" and "exact" in json.dumps(data), (
+        "the per-buffer bound no longer holds the exact buffer", rc, out)
 
-# A texture the output does not depend on fails unless declared; a written texture and an unknown name are refused.
+# A texture the output does not depend on fails unless declared; a multisampled texture and an unknown name are refused.
 rc, out, data = run(fixture("texture_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
+rc, out, data = run(fixture("texture_unused_read_write"))
+assert rc == 1 and data["status"] == "unused-texture" and "w" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_stale_unused"))
 assert rc == 2 and data["status"] == "error" and "used" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texture_write_kernel"))
-assert rc == 3 and "access Write" in data["reason"], (rc, out)
+assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(fixture("texture_3d_kernel"))
+assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(fixture("texture_multisample_kernel"))
+assert rc == 3 and "unsupported type other" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_undeclared"))
 assert rc == 1 and data["status"] == "unused-texture" and "ignored" in data["reason"], (rc, out)
 rc, out, data = run(fixture("texel_buffer_unused_read_write"))
@@ -163,12 +240,62 @@ rc, out, data = mutated(probe("texel_buffer_read_write"), [["Binding 1$", "Bindi
 assert rc == 2 and data["status"] == "error", (rc, out)
 rc, out, data = run(fixture("texture_kernel"))
 assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(probe("atomic_buffer_only"), "--sentinel")
+assert rc == 0 and data["status"] == "matched" and data["cases"][-1]["profile"] == "sentinel", (rc, out)
 with tempfile.TemporaryDirectory() as d:
     typo = os.path.join(d, "typo.metal")
     with open(probe("texture_unused")) as src, open(typo, "w") as dst:
         dst.write(src.read().replace("UNUSED: ignored", "UNUSED: ignord"))
     rc, out, data = run(typo)
     assert rc == 2 and "ignord" in out, (rc, out)
+    mips_typo = os.path.join(d, "mips_typo.metal")
+    with open(probe("texture_mip_lod")) as src, open(mips_typo, "w") as dst:
+        dst.write(src.read().replace("DIFFCHECK-MIPS: s2 3", "DIFFCHECK-MIPS: ss2 3"))
+    rc, out, data = run(mips_typo)
+    assert rc == 2 and "ss2" in out, (rc, out)
+    for fname, needle, body in (
+        ("mips_1d.metal", "has no mip levels",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture1d<float> t [[texture(0)]], sampler s [[sampler(0)]], device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = t.sample(s, 0.5f); }\n"),
+        ("mips_writable.metal", "writable",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture2d<float, access::write> t [[texture(0)]], uint i [[thread_position_in_grid]]) { t.write(float4(1.0f), uint2(i & 3u, 0u)); }\n"),
+        ("mips_tb.metal", "has no mip levels",
+         "// DIFFCHECK-MIPS: t 3\n#include <metal_stdlib>\nusing namespace metal;\n"
+         "kernel void k(texture_buffer<float, access::read> t [[texture(0)]], device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = t.read(i & 3u); }\n"),
+    ):
+        p = os.path.join(d, fname)
+        with open(p, "w") as f:
+            f.write(body)
+        rc, out, data = run(p)
+        assert rc == 3 and data["status"] == "skipped" and needle in data["reason"], (fname, rc, out)
+
+# A depth texture reflects as depth (not 2d/2d_array/cube) and is skipped; >8 textures or samplers on vkhost skips cleanly.
+with tempfile.TemporaryDirectory() as d:
+    depth_k = os.path.join(d, "depth.metal")
+    with open(depth_k, "w") as f:
+        f.write("#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void k(depth2d<float> d [[texture(0)]], sampler s [[sampler(0)]],"
+                " device float *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = d.sample(s, float2(0.5f)); }\n")
+    rc, out, data = run(depth_k)
+    assert rc == 3 and "unsupported type depth" in data["reason"], (rc, out, data)
+    many_k = os.path.join(d, "many_tex.metal")
+    params = ", ".join(f"texture2d<float, access::read> t{n} [[texture({n})]]" for n in range(9))
+    reads = " + ".join(f"t{n}.read(uint2(0))" for n in range(9))
+    with open(many_k, "w") as f:
+        f.write(f"#include <metal_stdlib>\nusing namespace metal;\n"
+                f"kernel void k({params}, device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ o[i] = {reads}; }}\n")
+    rc, out, data = run(many_k)
+    assert rc == 3 and "too many textures" in data["reason"], (rc, out, data)
+    many_s = os.path.join(d, "many_smp.metal")
+    sparams = ", ".join(f"sampler s{n} [[sampler({n})]]" for n in range(9))
+    sreads = " + ".join(f"t.sample(s{n}, float2(0.5f))" for n in range(9))
+    with open(many_s, "w") as f:
+        f.write(f"#include <metal_stdlib>\nusing namespace metal;\n"
+                f"kernel void k(texture2d<float, access::sample> t [[texture(0)]], {sparams},"
+                f" device float4 *o [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ o[i] = {sreads}; }}\n")
+    rc, out, data = run(many_s)
+    assert rc == 3 and "too many samplers" in data["reason"], (rc, out, data)
 
 # A host that says it cannot make the texel buffer (a format or feature the device lacks) is a skip with that reason,
 # never a pass.

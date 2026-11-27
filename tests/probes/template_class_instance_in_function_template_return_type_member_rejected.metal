@@ -1,4 +1,4 @@
-// EXPECT: error ".v" is not a swizzle
+// EXPECT: error ".v" is read from the result of a function template call whose type is known only once it is deduced; assign the call to a variable first
 // Refs #341: a return type Box<T> is read while T is still being deduced; the instance the call chooses has
 // the real one, but a member taken from the call is read as a swizzle and refused, as for a template returning
 // T (template_struct_result_member_rejected); assign the result to a variable first.

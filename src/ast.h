@@ -339,9 +339,9 @@ struct Expression {
 	// Member: written "p->m" rather than "v.m".
 	bool isArrow = false;
 
-	// Identifier: a name found where the standard library's names are also visible, so a
-	// call is resolved against both.
-	bool besideStdlib = false;
+	// Identifier: standard library names (without "metal::") visible beside a user declaration,
+	// so a call is resolved against both.
+	std::set<std::string> stdlibBeside;
 
 	// Identifier: the functions an unqualified lookup found in more than one scope (using
 	// directives and declarations), which together are the overload set of a call. Empty when
@@ -363,6 +363,9 @@ struct Expression {
 	// Identifier: in a function template's instance, names a parameter (not a local of the same name) whose
 	// declared type names a template parameter, so what it is stands or falls with the arguments.
 	bool templateDependent = false;
+
+	// Member: spelled "x.template f(...)" or "x.template f<...>(...)"; the member must then be a template.
+	bool templateKeyword = false;
 
 	// InitList, Call: a braced temporary or constructor call of a struct the source names (not through a
 	// template parameter), whose type is that struct whatever its arguments are.
@@ -538,6 +541,7 @@ struct FieldAttributes {
 	// [[position]]: the field is the stage's own position. On a vertex output
 	// that is the BuiltIn Position; on a fragment input it is the FragCoord.
 	bool position = false;
+	bool invariant = false;
 
 	// [[attribute(n)]]: the field is a vertex buffer input or a user output at
 	// location n.
@@ -575,6 +579,10 @@ struct StructDecl {
 	bool hasConstructors = false;
 	std::string name;
 	std::vector<StructField> fields;
+	// The class template this is an instance of and the arguments it was made with; empty for a plain
+	// struct. A function template's parameter "Box<T>" deduces T from these.
+	std::string classTemplate;
+	std::vector<TemplateArgument> classArguments;
 };
 
 // A template parameter: a type, or an integer constant of the given type.
@@ -603,6 +611,7 @@ struct ClassInstanceSeed {
 // A function template, kept as tokens and the parser's name state where it was declared, so
 // that each instantiation re-parses it with its arguments bound (see instantiateTemplate).
 struct FunctionTemplate {
+	Stage stage = Stage::None;
 	// Qualified, as a call names it.
 	std::string name;
 	std::vector<TemplateParameter> parameters;
@@ -632,6 +641,10 @@ struct FunctionTemplate {
 	// class template's instance, that template and the arguments its parameters stand for. The name
 	// state it is read in is the struct's end, kept in names.
 	std::string memberOf;
+	// A static member template has no object: it is called as S::f<...>(...) and its body reads no this.
+	bool staticMember = false;
+	bool constructorMember = false;
+	std::vector<std::string> memberFieldOrder;
 	std::set<std::string> memberFields;
 	std::map<std::string, bool> memberFunctions;
 	std::shared_ptr<const ClassTemplate> ownerTemplate;
@@ -676,6 +689,15 @@ struct ClassTemplate {
 	std::map<std::string, size_t> usingDeclarationsBefore;
 };
 
+// An instance of a class template over the type parameters of a function template ("Box<T>"), as the
+// function's signature names it while those parameters are still to be deduced: the type is spelled
+// "<Box<<T>>>" (a marker, as a bare "<T>" is), and this says what it stands for. A type argument is
+// a marker itself, a concrete type, or another such instance.
+struct DependentInstance {
+	std::string classTemplate;
+	std::vector<TemplateArgument> arguments;
+};
+
 struct FunctionDecl {
 	Stage stage = Stage::None;
 	Type returnType;
@@ -693,6 +715,10 @@ struct FunctionDecl {
 	// points and helpers alike, since a function can only be called from below its
 	// first declaration.
 	size_t order = 0;
+
+	// The class template instances over a template parameter that the signature names, by the marker
+	// spelling of their type; only a signature read to deduce has any.
+	std::map<std::string, DependentInstance> dependentInstances;
 
 	// Declared static, inline or constexpr (implicitly inline), or a member defined in its struct: internal to the
 	// translation unit, so a Linkage object keeps it local instead of exporting it.
@@ -732,6 +758,10 @@ struct TranslationUnit {
 	// The function templates themselves, in declaration order. A template is lowered only where
 	// a call instantiates it: instantiateTemplate re-parses its tokens with the arguments bound.
 	std::vector<FunctionTemplate> templates;
+	// Entry-point templates (kernel, vertex, fragment), instantiated by explicit instantiation
+	// with [[host_name("...")]] rather than by call lookup.
+	std::vector<FunctionTemplate> entryTemplates;
+
 	// The explicit specializations of function templates, in declaration order.
 	std::vector<ExplicitSpecialization> specializations;
 

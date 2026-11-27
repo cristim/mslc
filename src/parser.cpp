@@ -81,6 +81,7 @@ namespace {
 			{ "uint32_t", ScalarKind::UInt },
 			{ "int64_t", ScalarKind::Long },
 			{ "uint64_t", ScalarKind::ULong },
+			{ "size_t", ScalarKind::ULong },
 		};
 
 		return table;
@@ -506,9 +507,13 @@ TranslationUnit Parser::parse() {
 			refuse("using declaration of");
 		}
 	}
-	if (!_unit.templates.empty()) {
+	if (!_unit.templates.empty() || !_unit.entryTemplates.empty() || !_unit.specializations.empty()) {
 		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
 		for (FunctionTemplate& declaration: _unit.templates) {
+			declaration.file = file;
+			declaration.seeds = _seedList;
+		}
+		for (FunctionTemplate& declaration: _unit.entryTemplates) {
 			declaration.file = file;
 			declaration.seeds = _seedList;
 		}
@@ -517,6 +522,7 @@ TranslationUnit Parser::parse() {
 			specialization.declaration.seeds = _seedList;
 		}
 	}
+	resolveEntryInstantiations();
 	return std::move(_unit);
 }
 
@@ -805,6 +811,49 @@ void Parser::parseUsing() {
 		return;
 	}
 
+	// "using T = type;" is "typedef type T;".
+	if (at(TokenKind::Identifier) && (lookahead().kind == TokenKind::Assign || lookahead().kind == TokenKind::LBracket)) {
+		if (lookahead().kind == TokenKind::LBracket) {
+			throw CompileError("an attribute on a type alias is not supported");
+		}
+		const std::string spelled(current().text);
+		const std::string alias = qualify(std::string(advance().text));
+		advance();
+		if (atKeyword("struct") || atKeyword("enum")) {
+			throw CompileError("a \"" + std::string(current().text) + "\" keyword in a type alias is not supported");
+		}
+		const Type target = parseType();
+		if (target.isPointer && target.arrayLength) {
+			throw CompileError("a type alias of an array of pointers is not supported");
+		}
+		if (target.addressSpace != AddressSpace::None && !target.isPointer) {
+			throw CompileError("a type alias of a type with an address space is not supported");
+		}
+		if (!target.namedType.empty() && !_unit.findStruct(target.namedType)) {
+			throw CompileError("unknown type name \"" + target.namedType + "\" in a type alias");
+		}
+		expect(TokenKind::Semicolon, "after a type alias");
+		if (!_blocks.empty()) {
+			// Only a name nothing else has: one that hid or redefined another would need the
+			// scope rules the file-scope table does not have. The block's end removes it.
+			Type existing;
+			if (blockName(spelled) || _blocks.back().aliases.count(spelled) || _declared.count(alias)
+				|| _unit.findStruct(alias) || resolveTypeName(alias, existing)) {
+				throw CompileError("the alias \"" + spelled + "\" in a function names something already "
+					"declared, which mslc does not support");
+			}
+			// Bound as a template parameter is: a key no spelling reaches, and the block's name for it,
+			// so that a namespace's own or an outer T cannot be found instead.
+			const std::string key = "<alias " + spelled + ">";
+			_typedefs[key] = target;
+			_blocks.back().names[spelled] = key;
+			_blocks.back().typedefs.push_back(key);
+			return;
+		}
+		registerTypedef(alias, target);
+		return;
+	}
+
 	QualifiedName name;
 	if (!peekQualifiedName(name) || name.parts.size() < 2) {
 		throw CompileError("a using declaration has to name a member of a namespace, as \"using N::x;\"");
@@ -840,7 +889,7 @@ void Parser::parseUsing() {
 		}
 	}
 	if (_blocks.empty() && !_declared.count(resolved) && resolved != "metal::discard_fragment") {
-		_scopes[scope].stdlibDeclarations.insert(name.parts.back());
+		_scopes[scope].stdlibDeclarations[name.parts.back()].insert(resolved);
 		return; // a name of the standard library, which is visible already
 	}
 	if (_blocks.empty()) {
@@ -981,6 +1030,8 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->scopes = _scopes;
 	names->structs = _unit.structs;
 	names->functionTemplates = _unit.functionTemplates;
+	names->entryTemplateNames = _entryTemplateNames;
+	names->helperNames = _helperNames;
 	names->constructors = _constructors;
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
@@ -1003,6 +1054,8 @@ void Parser::restoreNames(const Names& names) {
 	_scopes = names.scopes;
 	_unit.structs = names.structs;
 	_unit.functionTemplates = names.functionTemplates;
+	_entryTemplateNames = names.entryTemplateNames;
+	_helperNames = names.helperNames;
 	_constructors = names.constructors;
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
@@ -1104,6 +1157,15 @@ void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
 	}
 }
 
+namespace {
+
+Stage stageForKeyword(std::string_view word) {
+	return word == "kernel" ? Stage::Kernel : word == "vertex" ? Stage::Vertex
+		: word == "fragment" ? Stage::Fragment : Stage::None;
+}
+
+}
+
 // The declarator of a function template, after its header, to the end of its body or ';': fills the
 // tokens, the signature and whether it has a body, and returns the name. A member also takes "const" after
 // its parameters.
@@ -1152,6 +1214,11 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		if (atKeyword("operator")) {
 			throw CompileError("an operator template is not lowered");
 		}
+		if (angles == 0 && !member && kind() == TokenKind::Identifier && declaration.stage == Stage::None
+			&& stageForKeyword(current().text) != Stage::None) {
+			throw CompileError("an attribute or specifier before \"" + std::string(current().text)
+				+ "\" in an entry-point template is not lowered");
+		}
 		if (at(TokenKind::Less)) {
 			if (angles == 0) {
 				groupName = name;
@@ -1180,14 +1247,35 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		|| name == "alignof" || name == "noexcept") {
 		throw notNameable();
 	}
+	if (declaration.constructorMember && (lookahead().kind == TokenKind::RParen
+			|| (lookahead().kind == TokenKind::Identifier && lookahead().text == "void"
+				&& lookahead(2).kind == TokenKind::RParen))) {
+		throw CompileError("constructor template \"" + name + "\" takes no arguments, which is not lowered yet");
+	}
 
 	skipBalanced(TokenKind::LParen, TokenKind::RParen);
 	if (!(at(TokenKind::EndOfFile) || at(TokenKind::LBrace) || at(TokenKind::Semicolon) || at(TokenKind::Assign)
-		|| at(TokenKind::Arrow) || atKeyword("__attribute__") || (member && atKeyword("const")))) {
+		|| at(TokenKind::Arrow) || atKeyword("__attribute__") || (member && atKeyword("const"))
+		|| (declaration.constructorMember && at(TokenKind::Colon)))) {
 		throw notNameable();
 	}
 	// To the body or ';'. A real parameter list is never followed by a second group
 	// before a trailing return type, so one means the first was a decltype or a name.
+	if (declaration.constructorMember && at(TokenKind::Colon)) {
+		advance();
+		while (kind() == TokenKind::Identifier
+			&& (lookahead().kind == TokenKind::LParen || lookahead().kind == TokenKind::LBrace)) {
+			advance();
+			if (at(TokenKind::LParen)) {
+				skipBalanced(TokenKind::LParen, TokenKind::RParen);
+			} else {
+				skipBalanced(TokenKind::LBrace, TokenKind::RBrace);
+			}
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+	}
 	while (!at(TokenKind::LBrace) && !at(TokenKind::Semicolon)) {
 		if (at(TokenKind::EndOfFile)) {
 			throw CompileError("expected a body or ';' after the template function \"" + name + "\"");
@@ -1223,6 +1311,123 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 	return name;
 }
 
+// "template RET name<arguments>(parameters);" of a helper function template, or
+// "template [[host_name("...")]] stage RET name<arguments>(parameters);" of an entry point.
+// Entry-point instantiations are queued and lowered into _unit.functions at the end of parse().
+void Parser::parseExplicitInstantiation() {
+	const size_t startLine = line();
+	std::optional<std::string> hostName;
+	while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+		advance(); advance();
+		if (!at(TokenKind::RBracket)) {
+			do {
+				if (kind() != TokenKind::Identifier) { throw CompileError("expected an attribute name in an explicit template instantiation"); }
+				const std::string attr(advance().text);
+				if (attr != "host_name") { throw CompileError("attribute \"" + attr + "\" on an explicit template instantiation is not lowered"); }
+				if (hostName) { throw CompileError("attribute \"host_name\" cannot appear more than once"); }
+				expect(TokenKind::LParen, "after [[host_name");
+				if (!at(TokenKind::StringLiteral)) { throw CompileError("[[host_name]] needs a string literal argument"); }
+				std::string value;
+				while (at(TokenKind::StringLiteral)) {
+					const std::string_view raw = advance().text, inner = raw.substr(1, raw.size() - 2);
+					if (inner.find('\\') != std::string_view::npos) { throw CompileError("escape sequences in [[host_name]] are not lowered"); }
+					value.append(inner);
+				}
+				expect(TokenKind::RParen, "to close [[host_name]]");
+				if (value.empty()) { throw CompileError("[[host_name]] cannot be empty"); }
+				hostName = std::move(value);
+			} while (match(TokenKind::Comma));
+		}
+		expect(TokenKind::RBracket, "to close an attribute list"); expect(TokenKind::RBracket, "to close an attribute list");
+	}
+	const Stage stage = kind() == TokenKind::Identifier ? stageForKeyword(current().text) : Stage::None;
+	if (stage != Stage::None) {
+		advance();
+		if (!hostName) {
+			throw CompileError(at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
+				? "an attribute list cannot appear after the stage keyword; write [[host_name(\"...\")]] before it"
+				: "an explicit template instantiation of an entry point needs [[host_name(\"...\")]]");
+		}
+		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr") || at(TokenKind::LBracket) || atKeyword("auto")) {
+			throw CompileError("invalid specifier or attribute in an explicit template instantiation");
+		}
+		const Type returnType = parseType();
+		QualifiedName spelled;
+		if (!peekQualifiedName(spelled)) { throw CompileError("expected a function template name in an explicit template instantiation"); }
+		for (size_t i = 0; i < spelled.tokens; ++i) { advance(); }
+		const std::string spelledText = (spelled.global ? "::" : "") + joinParts(spelled.parts, 0, spelled.parts.size());
+		std::vector<std::string> alternatives;
+		std::set<std::string> candidateNames { resolveName(spelled, &alternatives) };
+		candidateNames.insert(alternatives.begin(), alternatives.end());
+		if (std::none_of(candidateNames.begin(), candidateNames.end(),
+			[&](const std::string& each) { return _entryTemplateNames.count(each) != 0; })) {
+			throw CompileError("an explicit instantiation of \"" + spelledText + "\" does not name an entry-point template");
+		}
+		std::vector<TemplateArgument> explicitArgs;
+		if (match(TokenKind::Less)) {
+			if (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight)) {
+				do { explicitArgs.push_back(parseTemplateArgument()); } while (match(TokenKind::Comma));
+			}
+			closeAngle(("to close explicit template arguments of \"" + spelledText + "\"").c_str());
+		}
+		expect(TokenKind::LParen, "to open the parameters of an explicit template instantiation");
+		std::vector<Parameter> instParams;
+		{
+			const LocalScope parameters(*this);
+			parseEntryParameterList(instParams, "explicit instantiation \"" + spelledText + "\"", true);
+		}
+		if (at(TokenKind::LBrace) || at(TokenKind::LBracket) || at(TokenKind::Arrow)) {
+			throw CompileError(at(TokenKind::LBrace) ? "an explicit template instantiation cannot have a definition"
+				: "an attribute or trailing return type after an explicit template instantiation is not lowered");
+		}
+		expect(TokenKind::Semicolon, "after an explicit template instantiation");
+		_pendingEntryInstantiations.push_back({ _unit.functions.size(), startLine, stage, *hostName,
+			spelledText, std::move(candidateNames), returnType, std::move(explicitArgs), std::move(instParams) });
+		_unit.functions.push_back({ stage, {}, std::move(*hostName), {}, {}, startLine });
+		return;
+	}
+	if (hostName) { throw CompileError("[[host_name]] is only supported on an explicit instantiation of an entry point"); }
+
+	size_t open = 0;
+	for (; lookahead(open).kind != TokenKind::LParen; ++open) {
+		const Token& token = lookahead(open);
+		if (token.kind == TokenKind::EndOfFile || token.kind == TokenKind::Semicolon) {
+			throw CompileError("an explicit template instantiation is not lowered");
+		}
+		if (token.kind == TokenKind::LBracket || (token.kind == TokenKind::Identifier
+			&& (token.text == "kernel" || token.text == "vertex" || token.text == "fragment"))) {
+			throw CompileError("an explicit template instantiation of an entry point is not lowered");
+		}
+	}
+	size_t name = open;
+	if (name > 0 && lookahead(name - 1).kind == TokenKind::Greater) {
+		int depth = 0;
+		do {
+			--name;
+			depth += lookahead(name).kind == TokenKind::Greater ? 1 : lookahead(name).kind == TokenKind::Less ? -1 : 0;
+		} while (depth > 0 && name > 0);
+	}
+	if (name == 0 || lookahead(name - 1).kind != TokenKind::Identifier
+		|| (name > 1 && lookahead(name - 2).kind == TokenKind::ColonColon)) {
+		throw CompileError("an explicit template instantiation is not lowered");
+	}
+	const std::string spelled(lookahead(name - 1).text);
+	if (!_unit.functionTemplates.count(qualify(spelled)) && !_unit.functionTemplates.count(spelled)) {
+		if (_entryTemplateNames.count(qualify(spelled)) || _entryTemplateNames.count(spelled)) {
+			throw CompileError("an explicit template instantiation of entry-point template \"" + spelled
+				+ "\" needs its stage keyword and [[host_name(\"...\")]]");
+		}
+		throw CompileError("an explicit instantiation of \"" + spelled + "\" does not name a function template");
+	}
+	while (!at(TokenKind::Semicolon)) {
+		if (at(TokenKind::EndOfFile)) {
+			throw CompileError("an explicit template instantiation is not terminated");
+		}
+		advance();
+	}
+	advance();
+}
+
 // "template" at file scope: a function template. It is parsed far enough to know its parameters,
 // its name and where it ends; the tokens and the name state are kept, and a call that selects it
 // has it re-parsed with its arguments bound (instantiateTemplate). A body is only meaningful with
@@ -1231,7 +1436,8 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 void Parser::parseTemplateDeclaration() {
 	advance();
 	if (!at(TokenKind::Less)) {
-		throw CompileError("an explicit template instantiation is not lowered");
+		parseExplicitInstantiation();
+		return;
 	}
 	if (lookahead().kind == TokenKind::Greater) {
 		parseExplicitSpecialization(_position);
@@ -1254,6 +1460,12 @@ void Parser::parseTemplateDeclaration() {
 		throw CompileError("an alias template is not lowered");
 	}
 
+	declaration.stage = kind() == TokenKind::Identifier ? stageForKeyword(current().text) : Stage::None;
+	if (declaration.stage != Stage::None
+		&& std::find(_namespacePath.begin(), _namespacePath.end(), kAnonymousNamespace) != _namespacePath.end()) {
+		throw CompileError(std::string(current().text) + " function cannot be declared in anonymous namespace");
+	}
+
 	const std::string name = readTemplateFunction(declaration, headerStart, false);
 
 	const std::string qualified = qualify(name);
@@ -1266,11 +1478,14 @@ void Parser::parseTemplateDeclaration() {
 			"variable, which is not lowered: a call spelled like a construction would not reach it");
 	}
 	declareName(qualified, "function");
-	_unit.functionTemplates.insert(qualified);
+	if (declaration.stage != Stage::None) { rejectUsingConflict(qualified, "function", nullptr); }
+	(declaration.stage == Stage::None ? _unit.functionTemplates : _entryTemplateNames).insert(qualified);
+	std::vector<FunctionTemplate>& targetList = declaration.stage == Stage::None
+		? _unit.templates : _unit.entryTemplates;
 	declaration.endAt = _position;
 
 	// A prototype and its definition are one template, found at the prototype's place in the file.
-	for (FunctionTemplate& earlier: _unit.templates) {
+	for (FunctionTemplate& earlier: targetList) {
 		if (earlier.name != qualified || earlier.signature != declaration.signature) {
 			continue;
 		}
@@ -1283,7 +1498,7 @@ void Parser::parseTemplateDeclaration() {
 		}
 		return;
 	}
-	_unit.templates.push_back(std::move(declaration));
+	targetList.push_back(std::move(declaration));
 }
 
 // "template <>" and a function: an explicit specialization of a function template declared above. It is
@@ -1408,6 +1623,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		_memberFunctions = declaration.memberFunctions;
 		_memberStruct = declaration.memberOf;
 		if (const ClassTemplate* owner = declaration.ownerTemplate.get()) {
+			_classMemberInstance = true;
 			_definedNames = &owner->declaredBefore;
 			bindParameters(owner->name, owner->parameters, declaration.ownerArguments);
 			for (const TemplateParameter& parameter: declaration.parameters) {
@@ -1428,19 +1644,30 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		}
 	};
 	FunctionDecl decl;
+	decl.stage = declaration.stage;
 	decl.line = declaration.line;
 	decl.name = declaration.name;
 	decl.order = declaration.bodyOrder;
 	decl.globalsBefore = declaration.globalsBefore;
 	const std::string quoted = "function template \"" + declaration.name + "\"";
 
-	for (;;) {
-		skipAttributes();
-		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
-			advance();
-			continue;
+	if (declaration.stage != Stage::None) {
+		advance();
+	} else {
+		for (;;) {
+			skipAttributes();
+			if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+				if (skipStandardFunctionAttribute(true)) {
+					continue;
+				}
+				break;
+			}
+			if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+				advance();
+				continue;
+			}
+			break;
 		}
-		break;
 	}
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("an attribute in the declaration of " + quoted + " is not lowered yet");
@@ -1456,43 +1683,49 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	});
 	const size_t returnTypeStart = _position;
 	bool dependentReturn = false;
-	try {
-		if (deducedReturn) {
-			decl.returnType = deducedReturnType();
-		} else {
-			decl.returnType = parseType();
-		}
-	} catch (const DependentClassInstance&) {
-		if (!deducing) {
-			throw;
-		}
-		_position = returnTypeStart;
-		// A "<" or ">" inside parentheses, "(1 < 2)", is an operator, not a bracket.
-		size_t angles = 0;
-		size_t parentheses = 0;
-		while (!at(TokenKind::EndOfFile) && !(angles == 0 && parentheses == 0 && kind() == TokenKind::Identifier
-			&& current().text == written && lookahead().kind == TokenKind::LParen)) {
-			parentheses += at(TokenKind::LParen) ? 1 : 0;
-			parentheses -= at(TokenKind::RParen) && parentheses > 0 ? 1 : 0;
-			if (parentheses == 0) {
-				angles += at(TokenKind::Less) ? 1 : 0;
-				angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
-				angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+	if (declaration.constructorMember) {
+		decl.returnType.namedType = declaration.memberOf;
+	} else {
+		try {
+			if (deducedReturn) {
+				decl.returnType = deducedReturnType();
+			} else {
+				decl.returnType = parseType();
 			}
-			advance();
+		} catch (const DependentClassInstance&) {
+			if (!deducing) {
+				throw;
+			}
+			_position = returnTypeStart;
+			// A "<" or ">" inside parentheses, "(1 < 2)", is an operator, not a bracket.
+			size_t angles = 0;
+			size_t parentheses = 0;
+			while (!at(TokenKind::EndOfFile) && !(angles == 0 && parentheses == 0 && kind() == TokenKind::Identifier
+				&& current().text == written && lookahead().kind == TokenKind::LParen)) {
+				parentheses += at(TokenKind::LParen) ? 1 : 0;
+				parentheses -= at(TokenKind::RParen) && parentheses > 0 ? 1 : 0;
+				if (parentheses == 0) {
+					angles += at(TokenKind::Less) ? 1 : 0;
+					angles -= at(TokenKind::Greater) && angles > 0 ? 1 : 0;
+					angles -= at(TokenKind::ShiftRight) && angles > 1 ? 2 : 0;
+				}
+				advance();
+			}
+			if (at(TokenKind::EndOfFile)) {
+				throw;
+			}
+			decl.returnType = Type();
+			decl.returnType.namedType = "<dependent return type>";
+			dependentReturn = true;
 		}
-		if (at(TokenKind::EndOfFile)) {
-			throw;
-		}
-		decl.returnType = Type();
-		decl.returnType.namedType = "<dependent return type>";
-		dependentReturn = true;
 	}
 	if (!dependentReturn && at(TokenKind::Ampersand)) {
 		advance();
 		takeReferenceReturn(decl, quoted);
 	}
-	rejectUnloweredReturn(decl.returnType, quoted);
+	if (declaration.stage == Stage::None) {
+		rejectUnloweredReturn(decl.returnType, quoted);
+	}
 	if (kind() != TokenKind::Identifier || current().text != written) {
 		throw CompileError("the declaration of " + quoted + " is not a return type and a name that mslc reads "
 			"when it is instantiated (found \"" + std::string(current().text) + "\" where its name is)");
@@ -1506,16 +1739,26 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	const LocalScope parameters(*this);
 	_parameterBlock = _blocks.size() - 1;
 	// The object is a first parameter, as in a member function.
-	const size_t objectParameters = member ? 1 : 0;
-	if (member) {
+	const bool object = member && !declaration.staticMember && !declaration.constructorMember;
+	const size_t objectParameters = object ? 1 : 0;
+	if (object || declaration.constructorMember) {
 		declareLocal("this");
-		Parameter object;
-		object.type.namedType = declaration.memberOf;
-		object.name = "this";
-		decl.parameters.push_back(std::move(object));
+	}
+	if (object) {
+		Parameter self;
+		self.type.namedType = declaration.memberOf;
+		self.name = "this";
+		decl.parameters.push_back(std::move(self));
 	}
 	const size_t parametersFrom = _position;
-	parseHelperParameters(decl, quoted);
+	if (declaration.stage != Stage::None) {
+		parseEntryParameterList(decl.parameters, quoted, !withBody && !declaration.hasBody);
+		if (withBody) {
+			checkUniqueResourceSlots(decl);
+		}
+	} else {
+		parseHelperParameters(decl, quoted);
+	}
 	// A parameter is dependent when the tokens that declare it name a template parameter.
 	{
 		size_t index = 0;
@@ -1544,9 +1787,12 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 			_dependentParameters.insert(decl.parameters[index + objectParameters].name);
 		}
 	}
-	if (member && !matchIdentifier("const")) {
+	if (object && !matchIdentifier("const")) {
 		throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function that "
 			"could write it is not lowered (mark it const)");
+	}
+	if (declaration.constructorMember && matchIdentifier("const")) {
+		throw CompileError(quoted + " is a constructor and cannot be declared const");
 	}
 	// A struct the template's own tokens name has to be declared above it; one an argument brings is not
 	// looked up here (sema sees every struct, so it cannot tell the two apart).
@@ -1555,7 +1801,8 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		bound.insert(argument.type.namedType);
 	}
 	const auto declared = [&](const Type& type) {
-		if (!type.namedType.empty() && !_unit.findStruct(type.namedType) && !bound.count(type.namedType)) {
+		if (!type.namedType.empty() && !_unit.findStruct(type.namedType) && !bound.count(type.namedType)
+			&& !_dependentInstances.count(type.namedType)) {
 			throw CompileError("unknown type name \"" + type.namedType + "\" in the declaration of " + quoted);
 		}
 	};
@@ -1565,6 +1812,7 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	for (const Parameter& parameter: decl.parameters) {
 		declared(parameter.type);
 	}
+	decl.dependentInstances = _dependentInstances;
 	skipAttributes();
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("attributes on " + quoted + " are not lowered yet");
@@ -1572,12 +1820,107 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	if (at(TokenKind::Arrow)) {
 		throw CompileError("a trailing return type on " + quoted + " is not lowered yet");
 	}
-	if (!withBody || match(TokenKind::Semicolon)) {
+	if (declaration.constructorMember && decl.parameters.empty()) {
+		throw CompileError("constructor template \"" + declaration.name + "\" takes no arguments, which is not lowered yet");
+	}
+	if (!withBody || (!declaration.constructorMember && match(TokenKind::Semicolon))) {
 		return decl;
+	}
+	std::vector<std::pair<std::string, ExpressionPtr>> initialisers;
+	if (declaration.constructorMember && match(TokenKind::Colon)) {
+		do {
+			if (kind() != TokenKind::Identifier) {
+				throw CompileError("expected a member name in the initialiser list of " + quoted);
+			}
+			const std::string field(advance().text);
+			if (!_memberFields->count(field)) {
+				throw CompileError("\"" + field + "\" in the initialiser list of " + quoted + " is not a member");
+			}
+			for (const auto& done: initialisers) {
+				if (done.first == field) {
+					throw CompileError("the member \"" + field + "\" is initialised twice in " + quoted);
+				}
+			}
+			if (!match(TokenKind::LParen)) {
+				throw CompileError("only \"member(value)\" is lowered in the initialiser list of " + quoted);
+			}
+			ExpressionPtr value = parseAssignment();
+			expect(TokenKind::RParen, "to close a member initialiser");
+			initialisers.emplace_back(field, std::move(value));
+		} while (match(TokenKind::Comma));
 	}
 	decl.body = parseCompoundStatement(true);
 	if (!at(TokenKind::EndOfFile)) {
 		throw CompileError("unexpected \"" + std::string(current().text) + "\" after the body of " + quoted);
+	}
+	if (declaration.constructorMember) {
+		const auto rewriteReturn = [&](const auto& self, Statement& s) -> void {
+			if (s.kind == StatementKind::Return) {
+				if (s.expression) {
+					throw CompileError(quoted + " is a constructor and cannot return a value");
+				}
+				s.expression = std::make_unique<Expression>();
+				s.expression->kind = ExpressionKind::Identifier;
+				s.expression->line = s.line;
+				s.expression->name = "this";
+			}
+			for (StatementPtr& child: s.children) { self(self, *child); }
+			if (s.thenBranch) { self(self, *s.thenBranch); }
+			if (s.elseBranch) { self(self, *s.elseBranch); }
+			if (s.forBody) { self(self, *s.forBody); }
+			if (s.whileBody) { self(self, *s.whileBody); }
+			for (SwitchCase& sc: s.switchCases) {
+				for (StatementPtr& child: sc.body) { self(self, *child); }
+			}
+			for (StatementPtr& child: s.switchPreamble) { self(self, *child); }
+		};
+		rewriteReturn(rewriteReturn, *decl.body);
+		auto wrapper = std::make_unique<Statement>();
+		wrapper->kind = StatementKind::Compound;
+		wrapper->line = decl.line;
+		auto selfLocal = std::make_unique<Statement>();
+		selfLocal->kind = StatementKind::DeclarationStatement;
+		selfLocal->line = decl.line;
+		selfLocal->declaration = VariableDeclaration();
+		selfLocal->declaration->type = decl.returnType;
+		selfLocal->declaration->name = "this";
+		wrapper->children.push_back(std::move(selfLocal));
+		for (const std::string& fieldName: declaration.memberFieldOrder) {
+			for (auto& [name, value]: initialisers) {
+				if (name != fieldName) {
+					continue;
+				}
+				auto assign = std::make_unique<Expression>();
+				assign->kind = ExpressionKind::Assign;
+				assign->line = decl.line;
+				assign->left = std::make_unique<Expression>();
+				assign->left->kind = ExpressionKind::Member;
+				assign->left->line = decl.line;
+				assign->left->left = std::make_unique<Expression>();
+				assign->left->left->kind = ExpressionKind::Identifier;
+				assign->left->left->line = decl.line;
+				assign->left->left->name = "this";
+				assign->left->memberName = name;
+				assign->left->height = 2;
+				assign->right = std::move(value);
+				measure(*assign);
+				auto statement = std::make_unique<Statement>();
+				statement->kind = StatementKind::ExpressionStatement;
+				statement->line = decl.line;
+				statement->expression = std::move(assign);
+				wrapper->children.push_back(std::move(statement));
+			}
+		}
+		wrapper->children.push_back(std::move(decl.body));
+		auto result = std::make_unique<Statement>();
+		result->kind = StatementKind::Return;
+		result->line = decl.line;
+		result->expression = std::make_unique<Expression>();
+		result->expression->kind = ExpressionKind::Identifier;
+		result->expression->line = decl.line;
+		result->expression->name = "this";
+		wrapper->children.push_back(std::move(result));
+		decl.body = std::move(wrapper);
 	}
 	return decl;
 }
@@ -1854,8 +2197,8 @@ size_t Parser::usingCount(const std::vector<std::string>& path, const std::set<s
 		for (const std::string& inner: entry->second.inlines) {
 			work.push_back(inner);
 		}
-		for (const std::string& name: entry->second.stdlibDeclarations) {
-			count += mentioned.count(name) ? 1 : 0;
+		for (const auto& declaration: entry->second.stdlibDeclarations) {
+			count += mentioned.count(declaration.first) ? declaration.second.size() : 0;
 		}
 		for (const auto& declaration: entry->second.declarations) {
 			count += mentioned.count(declaration.first) ? declaration.second.size() : 0;
@@ -1870,7 +2213,9 @@ size_t Parser::usingDeclarationsOf(const std::string& name) const {
 		if (const auto found = scope.second.declarations.find(name); found != scope.second.declarations.end()) {
 			count += found->second.size();
 		}
-		count += scope.second.stdlibDeclarations.count(name);
+		if (const auto found = scope.second.stdlibDeclarations.find(name); found != scope.second.stdlibDeclarations.end()) {
+			count += found->second.size();
+		}
 	}
 	return count;
 }
@@ -2051,11 +2396,17 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 		throw ClassTemplateError(quoted + " takes " + std::to_string(parameters.size()) + " arguments, and "
 			+ std::to_string(arguments.size()) + " are given");
 	}
+	bool dependent = false;
 	for (const TemplateArgument& argument: arguments) {
-		if (argument.unbound || (argument.isType && isDeductionMarker(argument.type))) {
-			throw DependentClassInstance("an instance of " + quoted + " that depends on the parameters of a function "
-				"template is not lowered yet");
+		if (argument.unbound) {
+			throw DependentClassInstance("an instance of " + quoted + " that depends on a constant template parameter of a "
+				"function template is not lowered yet");
 		}
+		dependent = dependent || (argument.isType && isDeductionMarker(argument.type));
+	}
+	if (dependent && arguments.size() < parameters.size()) {
+		throw ClassTemplateError("an instance of " + quoted + " that depends on the parameters of a function "
+			"template and leaves an argument to its default is not lowered yet");
 	}
 
 	// Saves what the binding of a parameter replaces, and puts it back.
@@ -2166,6 +2517,17 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	}
 	const std::string spelled = declaration.spelled + "<" + key + ">";
 	const std::string instance = declaration.name.substr(0, declaration.name.size() - declaration.spelled.size()) + spelled;
+	if (dependent) {
+		// While a function template's signature is read to deduce its parameters, an instance over one of them
+		// is a marker type, like the parameter itself; deduction matches an argument's struct against what it
+		// records. No struct is made.
+		Type marker;
+		marker.namedType = "<" + instance + ">";
+		_typedefs[instance] = marker;
+		_declared[instance] = "typedef";
+		_dependentInstances[marker.namedType] = DependentInstance { declaration.name, arguments };
+		return instance;
+	}
 	if (_unit.findStruct(instance) || _classInProgress.count(instance)) {
 		return instance;
 	}
@@ -2256,6 +2618,12 @@ std::string Parser::instantiateClass(const ClassTemplate& declaration, std::vect
 	_functionOrder = orderBefore;
 	if (!_unit.findStruct(instance)) {
 		throw ClassTemplateError("the instance \"" + instance + "\" of " + quoted + " did not declare a struct");
+	}
+	for (StructDecl& made: _unit.structs) {
+		if (made.name == instance) {
+			made.classTemplate = declaration.name;
+			made.classArguments = arguments;
+		}
 	}
 	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
 		// A nested instance's helpers were stamped with their own template's order when it was made.
@@ -2648,6 +3016,9 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 			type = operand;
 			if (!alias) {
 				expect(TokenKind::ColonColon, ("after \"" + name + "<...>\"").c_str());
+				if (!atKeyword("type")) {
+					throw CompileError("expected \"type\" after \"" + name + "<...>::\"");
+				}
 				advance();
 			}
 			return;
@@ -2731,20 +3102,84 @@ Type Parser::deducedReturnType() {
 	return type;
 }
 
+bool Parser::skipStandardFunctionAttribute(bool forTemplateInstance) {
+	const size_t start = _position;
+	expect(TokenKind::LBracket, "to open an attribute list");
+	expect(TokenKind::LBracket, "to open an attribute");
+
+	// On a template instance, an unknown [[...]] restores _position so parseInstance reports its own diagnostic.
+	if (!at(TokenKind::RBracket)) {
+		if (atKeyword("using")) {
+			if (forTemplateInstance) {
+				_position = start;
+				return false;
+			}
+			advance();
+			const std::string scope = kind() == TokenKind::Identifier ? std::string(advance().text) : std::string();
+			throw CompileError("an attribute namespace ("
+				+ (scope.empty() ? std::string("using") : "using " + scope + ":")
+				+ ") in [[...]] is not lowered; only [[maybe_unused]] is accepted and dropped");
+		}
+		for (;;) {
+			if (kind() != TokenKind::Identifier || atKeyword("using")) {
+				throw CompileError("expected an attribute name in [[...]]");
+			}
+			std::string name(advance().text);
+			if (at(TokenKind::ColonColon)) {
+				if (forTemplateInstance) {
+					_position = start;
+					return false;
+				}
+				while (match(TokenKind::ColonColon)) {
+					if (kind() != TokenKind::Identifier) {
+						throw CompileError("expected an attribute name in [[...]]");
+					}
+					name += "::" + std::string(advance().text);
+				}
+				throw CompileError("the function attribute \"" + name + "\" is not lowered; only always_inline, "
+					"noinline, unused, used and [[maybe_unused]] are accepted and dropped");
+			}
+			if (name != "maybe_unused") {
+				if (forTemplateInstance) {
+					_position = start;
+					return false;
+				}
+				throw CompileError("the function attribute \"" + name + "\" is not lowered; only always_inline, "
+					"noinline, unused, used and [[maybe_unused]] are accepted and dropped");
+			}
+			if (at(TokenKind::LParen)) {
+				throw CompileError("[[maybe_unused]] takes no argument");
+			}
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+	}
+
+	expect(TokenKind::RBracket, "to close an attribute");
+	expect(TokenKind::RBracket, "to close an attribute list");
+	return true;
+}
+
 bool Parser::tryParseHelperFunction() {
-	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)
+		&& !(at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket)) {
 		return false;
 	}
 
 	const size_t start = _position;
 	FunctionDecl decl;
 	decl.line = line();
+	bool sawStandardAttribute = false;
 
 	// inline, static, constexpr and attributes in any order, ahead of the return type. A refused
 	// attribute throws here, outside the try below, so that it is not read as "not a function".
 	for (;;) {
 		if (atKeyword("__attribute__") && lookahead().kind == TokenKind::LParen) {
 			skipFunctionAttribute();
+		} else if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+			skipStandardFunctionAttribute(false);
+			sawStandardAttribute = true;
 		} else if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
 			decl.isLocal = true;
 			advance();
@@ -2753,28 +3188,30 @@ bool Parser::tryParseHelperFunction() {
 		}
 	}
 
+	bool isHelper = false;
 	bool referenceReturn = false;
 	const bool deducedReturn = deducedReturnAhead("a helper function");
 	try {
-		if (deducedReturn) {
-			decl.returnType = deducedReturnType();
-		} else {
-			decl.returnType = parseType();
-		}
-		referenceReturn = match(TokenKind::Ampersand);
-		if (kind() != TokenKind::Identifier) {
-			_position = start;
-			return false;
-		}
-
-		decl.name = std::string(advance().text);
-		if (!at(TokenKind::LParen)) {
-			_position = start;
-			return false;
+		if (!(sawStandardAttribute && (atKeyword("kernel") || atKeyword("vertex") || atKeyword("fragment")))) {
+			if (deducedReturn) {
+				decl.returnType = deducedReturnType();
+			} else {
+				decl.returnType = parseType();
+			}
+			referenceReturn = match(TokenKind::Ampersand);
+			if (kind() == TokenKind::Identifier) {
+				decl.name = std::string(advance().text);
+				isHelper = at(TokenKind::LParen);
+			}
 		}
 	} catch (const ClassTemplateError&) {
 		throw;
 	} catch (const CompileError&) {
+	}
+	if (!isHelper) {
+		if (sawStandardAttribute) {
+			throw CompileError("[[maybe_unused]] at file or namespace scope is only lowered ahead of a helper function");
+		}
 		_position = start;
 		return false;
 	}
@@ -2795,6 +3232,7 @@ bool Parser::tryParseHelperFunction() {
 	}
 	decl.name = qualify(decl.name);
 	declareName(decl.name, "function");
+	_helperNames.insert(decl.name);
 	const LocalScope parameters(*this);
 	parseHelperParameters(decl, quoted);
 	rejectUsingConflict(decl.name, "function", &decl);
@@ -2907,7 +3345,7 @@ void Parser::parseGlobalDeclaration() {
 // The array suffix and the required initialiser of one file-scope constant.
 VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaration) {
 	bool deduceLength = false;
-	if (at(TokenKind::LBracket)) {
+	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		if (declaration.type.isPointer || declaration.type.arrayLength) {
 			throw CompileError("an array of pointers is not lowered yet");
 		}
@@ -2916,7 +3354,8 @@ VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaratio
 
 	if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
 		const std::string what = "the function constant \"" + declaration.name + "\"";
-		parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+		std::set<std::string> seen;
+		parseAttributeList(seen, [&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
 			if (name != "function_constant") {
 				throw CompileError("attribute \"" + name + "\" does not apply to a file-scope constant");
 			}
@@ -2935,13 +3374,15 @@ VariableDeclaration Parser::parseGlobalDeclarator(VariableDeclaration declaratio
 			throw CompileError(what + " has the type " + typeName(type) + ", and mslc lowers scalar function "
 				"constants only");
 		}
-		if (at(TokenKind::Assign)) {
+		if (at(TokenKind::Assign) || at(TokenKind::LBrace)) {
 			throw CompileError(what + " has an initialiser, but its value is given when a function is made");
 		}
 		return declaration;
 	}
 
-	if (!match(TokenKind::Assign)) {
+	// Apple takes the brace list in place of "=", so "constant int k{5}" and
+	// "constant int k = {5}" are the same declaration.
+	if (!match(TokenKind::Assign) && !at(TokenKind::LBrace)) {
 		throw CompileError("a constant declared at file scope needs an initialiser, found "
 			+ std::string(tokenKindName(kind())));
 	}
@@ -3109,7 +3550,7 @@ void Parser::parseStructBody(StructDecl& decl) {
 // "template <...> R f(...) const {...}" in a struct body. Like a member function it is read once the struct
 // is complete, but as a function template: its tokens are kept, and a call that selects it has it read with
 // its arguments bound, the object being a first parameter called this (see parseInstance).
-void Parser::parseMemberTemplate(const StructDecl& decl) {
+void Parser::parseMemberTemplate(StructDecl& decl) {
 	const std::string quoted = "\"" + decl.name + "\"";
 	if (unqualifiedName(decl.name).empty()) {
 		throw CompileError("a member function template of an unnamed struct is not lowered");
@@ -3130,28 +3571,85 @@ void Parser::parseMemberTemplate(const StructDecl& decl) {
 		throw CompileError("a member template that is not a function is not lowered (in " + quoted + ")");
 	}
 	size_t ahead = 0;
-	for (; lookahead(ahead).kind == TokenKind::Identifier; ++ahead) {
+	for (;;) {
+		if (lookahead(ahead).kind == TokenKind::LBracket && lookahead(ahead + 1).kind == TokenKind::LBracket) {
+			int depth = 0;
+			while (lookahead(ahead).kind != TokenKind::EndOfFile) {
+				if (lookahead(ahead).kind == TokenKind::LBracket) {
+					++depth;
+				} else if (lookahead(ahead).kind == TokenKind::RBracket && --depth == 0) {
+					++ahead;
+					break;
+				}
+				++ahead;
+			}
+			continue;
+		}
+		if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == "__attribute__"
+			&& lookahead(ahead + 1).kind == TokenKind::LParen) {
+			++ahead;
+			int depth = 0;
+			while (lookahead(ahead).kind != TokenKind::EndOfFile) {
+				if (lookahead(ahead).kind == TokenKind::LParen) {
+					++depth;
+				} else if (lookahead(ahead).kind == TokenKind::RParen && --depth == 0) {
+					++ahead;
+					break;
+				}
+				++ahead;
+			}
+			continue;
+		}
+		if (lookahead(ahead).kind != TokenKind::Identifier) {
+			break;
+		}
 		const std::string_view word = lookahead(ahead).text;
 		if (word == "static") {
-			throw CompileError("a static member function template is not lowered (in " + quoted + ")");
+			declaration.staticMember = true;
+			++ahead;
+			continue;
 		}
 		if (word == "explicit" || word == "virtual" || word == "friend") {
 			throw CompileError("a member template declared " + std::string(word) + " is not lowered (in " + quoted + ")");
 		}
-		if (word != "inline" && word != "constexpr") {
-			break;
+		if (word == "inline" || word == "constexpr") {
+			++ahead;
+			continue;
 		}
+		break;
 	}
 	if (lookahead(ahead).kind == TokenKind::Identifier && lookahead(ahead).text == unqualifiedName(decl.name)
 		&& lookahead(ahead + 1).kind == TokenKind::LParen) {
-		throw CompileError("a constructor template is not lowered (in " + quoted + ")");
+		if (declaration.staticMember) {
+			throw CompileError("a constructor template cannot be static (in " + quoted + ")");
+		}
+		declaration.constructorMember = true;
+		decl.hasConstructors = true;
 	}
 	const std::string name = readTemplateFunction(declaration, headerStart, true);
+	if (declaration.constructorMember && !declaration.hasBody) {
+		throw CompileError("constructor template \"" + decl.name + "::" + name + "\" is declared and never defined");
+	}
 	declaration.name = decl.name + "::" + name;
 	declaration.memberOf = decl.name;
 	declaration.order = declaration.bodyOrder = _functionOrder++;
 	declaration.globalsBefore = _unit.globals.size();
-	_memberFunctions[name] = false;
+	if (declaration.constructorMember) {
+		ConstructorInfo& constructors = _constructors[decl.name];
+		constructors.helper = declaration.name;
+		constructors.hasTemplate = true;
+		_unit.functionTemplates.insert(declaration.name);
+		_pendingMemberTemplates.push_back(std::move(declaration));
+		return;
+	}
+	if (const auto earlier = _memberFunctions.find(name);
+		earlier != _memberFunctions.end() && earlier->second != declaration.staticMember) {
+		throw CompileError("\"" + declaration.name + "\" is declared both static and not static, which Apple takes and mslc does not lower");
+	}
+	_memberFunctions[name] = declaration.staticMember;
+	if (declaration.staticMember) {
+		_unit.functionTemplates.insert(declaration.name);
+	}
 	_memberTemplateNames.insert(name);
 	_pendingMemberTemplates.push_back(std::move(declaration));
 }
@@ -3191,10 +3689,16 @@ bool Parser::parseStructFunction(StructDecl& decl) {
 		try {
 			_position = start + ahead;
 			parseType();
-			if (kind() == TokenKind::Identifier) {
-				if (current().text == "operator") {
+			if (at(TokenKind::Ampersand) && lookahead().kind == TokenKind::Identifier && lookahead().text == "operator") {
+				throw CompileError("an operator overload returning a reference is not lowered (in " + quoted + ")");
+			}
+			if (atKeyword("operator")) {
+				if (isStatic || lookahead(1).kind != TokenKind::LBracket
+					|| lookahead(2).kind != TokenKind::RBracket || lookahead(3).kind != TokenKind::LParen) {
 					throw CompileError("an operator overload is not lowered (in " + quoted + ")");
 				}
+				_position += 3; functionName = "operator[]"; isFunction = true;
+			} else if (kind() == TokenKind::Identifier) {
 				functionName = std::string(advance().text);
 				isFunction = at(TokenKind::LParen);
 			}
@@ -3260,21 +3764,32 @@ void Parser::finishStructFunctions(const StructDecl& decl) {
 
 	_memberStruct = decl.name;
 	std::set<std::string> fields;
+	std::vector<std::string> fieldOrder;
 	for (const StructField& field: decl.fields) {
 		fields.insert(field.name);
+		fieldOrder.push_back(field.name);
 	}
 
 	const size_t resume = _position;
+	const size_t helpersBefore = _unit.helpers.size();
 	_memberFields = &fields;
 	for (const size_t start: starts) {
 		parseStructMember(decl, start);
 	}
 	_memberFields = nullptr;
+	const size_t structOrder = _functionOrder++;
+	for (size_t i = helpersBefore; i < _unit.helpers.size(); ++i) {
+		if (!_instanceHelpers.count(i)) {
+			_unit.helpers[i].order = structOrder;
+		}
+	}
 	// A member template is read where the struct ends, with every member it can name in hand.
 	if (!templates.empty()) {
 		const std::shared_ptr<const void> names = captureNames();
 		for (FunctionTemplate& member: templates) {
+			member.order = member.bodyOrder = structOrder;
 			member.names = names;
+			member.memberFieldOrder = fieldOrder;
 			member.memberFields = fields;
 			member.memberFunctions = _memberFunctions;
 			member.spellings = _spellings;
@@ -3334,7 +3849,14 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		advance();
 	} else {
 		fn.returnType = parseType();
-		memberName = std::string(advance().text);
+		if (atKeyword("operator")) {
+			advance();
+			expect(TokenKind::LBracket, "after 'operator'");
+			expect(TokenKind::RBracket, "after '['");
+			memberName = "operator[]";
+		} else {
+			memberName = std::string(advance().text);
+		}
 	}
 	advance();
 
@@ -3356,6 +3878,9 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		fn.parameters.push_back(std::move(object));
 	}
 	parseHelperParameters(fn, quoted);
+	if (memberName == "operator[]" && fn.parameters.size() != 2) {
+		throw CompileError(quoted + " must take exactly one parameter");
+	}
 
 	std::vector<std::pair<std::string, ExpressionPtr>> initialisers;
 	if (isConstructor && match(TokenKind::Colon)) {
@@ -3382,10 +3907,30 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 	}
 
 	if (!isConstructor && !isStatic) {
-		if (!matchIdentifier("const")) {
+		bool sawConst = false;
+		AddressSpace space = AddressSpace::None;
+		for (; kind() == TokenKind::Identifier; advance()) {
+			const std::string_view word = current().text;
+			if (word == "const") {
+				if (sawConst) { throw CompileError("duplicate 'const' qualifier on " + quoted); }
+				sawConst = true;
+			} else if (word == "volatile") {
+				throw CompileError("a volatile member function is not lowered (" + quoted + ")");
+			} else if (const auto found = addressSpaceFor(word)) {
+				if (space != AddressSpace::None) { throw CompileError("duplicate address-space qualifier on " + quoted); }
+				if (*found != AddressSpace::Thread && *found != AddressSpace::Constant) {
+					throw CompileError(quoted + " is qualified " + std::string(word) + "; only thread and constant member functions are lowered");
+				}
+				space = *found;
+			} else { break; }
+		}
+		if (!sawConst) {
 			throw CompileError(quoted + " is not const; mslc takes the object by value, so a member function "
 				"that could write it is not lowered (mark it const)");
 		}
+		fn.parameters[0].type.isConst = true;
+		fn.parameters[0].type.addressSpace = space == AddressSpace::Constant ? AddressSpace::Constant : AddressSpace::Thread;
+		fn.parameters[0].isReference = space == AddressSpace::Constant;
 	}
 
 	ConstructorInfo* constructors = isConstructor ? &_constructors[decl.name] : nullptr;
@@ -3422,12 +3967,31 @@ void Parser::parseStructMember(const StructDecl& decl, size_t start) {
 		constructors->hasDefault = true;
 		return;
 	}
-	if (!constructors->helper.empty()) {
+	if (constructors->hasNonTemplate) {
 		throw CompileError("overloading the constructors of \"" + decl.name + "\" is not lowered yet");
 	}
+	constructors->hasNonTemplate = true;
 	constructors->helper = fn.name;
 	constructors->parameters = fn.parameters.size();
-	constructors->hasDefault = constructors->hasDefault || fn.parameters.empty();
+
+	const auto rewriteReturn = [&](const auto& self, Statement& s) -> void {
+		if (s.kind == StatementKind::Return) {
+			if (s.expression) {
+				throw CompileError(quoted + " is a constructor and cannot return a value");
+			}
+			s.expression = makeIdentifier("this", s.line);
+		}
+		for (StatementPtr& child: s.children) { self(self, *child); }
+		if (s.thenBranch) { self(self, *s.thenBranch); }
+		if (s.elseBranch) { self(self, *s.elseBranch); }
+		if (s.forBody) { self(self, *s.forBody); }
+		if (s.whileBody) { self(self, *s.whileBody); }
+		for (SwitchCase& sc: s.switchCases) {
+			for (StatementPtr& child: sc.body) { self(self, *child); }
+		}
+		for (StatementPtr& child: s.switchPreamble) { self(self, *child); }
+	};
+	rewriteReturn(rewriteReturn, *fn.body);
 
 	auto wrapper = std::make_unique<Statement>();
 	wrapper->kind = StatementKind::Compound;
@@ -3482,7 +4046,9 @@ ExpressionPtr Parser::constructWithConstructor(const Type& type, std::vector<Exp
 	}
 
 	const ConstructorInfo& info = found->second;
-	const bool constructs = arguments.empty() ? info.parameters == 0 && !info.helper.empty() : !info.helper.empty();
+	const bool constructs = arguments.empty()
+		? (info.parameters == 0 || info.hasTemplate) && !info.helper.empty() && !info.hasDefault
+		: !info.helper.empty();
 	if (!constructs) {
 		if (arguments.empty() && info.hasDefault) {
 			return nullptr;
@@ -3551,7 +4117,8 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	// arithmetic, so it is that type here. sema rejects an int or another enum
 	// where an enum is expected in an initializer or an assignment
 	// (requireEnumValue); other conversion sites are tracked in #235.
-	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()) {
+	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()
+		&& !(enumType->second == "metal::component" && _declared.count("metal::component"))) {
 		out.scalar = _enumUnderlying.at(enumType->second);
 		out.vectorWidth = 0;
 		out.matrixColumns = 0;
@@ -3583,6 +4150,10 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	out.namedType = alias->second.namedType;
 	out.enumName = alias->second.enumName;
 	out.isAtomic = alias->second.isAtomic;
+	if (alias->second.isPointer) {
+		out.isPointer = true;
+		out.addressSpace = alias->second.addressSpace;
+	}
 	out.arrayLength = alias->second.arrayLength;
 	out.innerArrayLengths = alias->second.innerArrayLengths;
 	out.isStdArray = alias->second.isStdArray;
@@ -3597,7 +4168,8 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 }
 
 void Parser::declareName(const std::string& name, const char* what) {
-	if (_unit.functionTemplates.count(name) && std::string_view(what) != "function") {
+	if ((_unit.functionTemplates.count(name) || _entryTemplateNames.count(name))
+		&& std::string_view(what) != "function") {
 		throw CompileError("\"" + name + "\" is declared as " + what + " beside a function template of the "
 			"same name, which is not lowered: a call spelled like a construction would not reach the template");
 	}
@@ -3778,6 +4350,164 @@ bool Parser::namesDependentParameter(const std::string& name) const {
 	return false;
 }
 
+bool Parser::typeTokensIndependent(size_t from, size_t to) const {
+	if (to == SIZE_MAX) {
+		to = _position;
+	}
+	for (size_t i = from; i < to; ++i) {
+		if (_tokens[i].kind != TokenKind::Identifier) {
+			continue;
+		}
+		const std::string text(_tokens[i].text);
+		if (text == "auto" || text == "decltype" || text == "typeof" || text == "__typeof__") {
+			return false;
+		}
+		// A using-declaration of a block names a namespace member, which is not dependent; a template parameter
+		// ("<template T>") and a local are.
+		if (const std::string* bound = blockName(text); bound && (bound->empty() || bound->front() == '<')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// "auto a = B{...};" with B a plain struct has the type B whatever the arguments are.
+void Parser::noteAutoConstruction(const std::string& name, size_t from) {
+	if (_localIndependent || _blocks.empty() || _position < from + 3) {
+		return;
+	}
+	const Token& head = _tokens[from];
+	const Token& open = _tokens[from + 1];
+	if (head.kind != TokenKind::Identifier || (open.kind != TokenKind::LBrace && open.kind != TokenKind::LParen)
+		|| !typeTokensIndependent(from, from + 1)) {
+		return;
+	}
+	const std::string text(head.text);
+	if (!_unit.findStruct(text) && !_unit.findStruct(qualify(text))) {
+		return;
+	}
+	const TokenKind closer = open.kind == TokenKind::LBrace ? TokenKind::RBrace : TokenKind::RParen;
+	int depth = 0;
+	for (size_t i = from + 1; i < _position; ++i) {
+		const TokenKind k = _tokens[i].kind;
+		depth += (k == TokenKind::LBrace || k == TokenKind::LParen || k == TokenKind::LBracket) ? 1
+			: (k == TokenKind::RBrace || k == TokenKind::RParen || k == TokenKind::RBracket) ? -1 : 0;
+		if (depth == 0) {
+			if (i + 1 == _position && _tokens[i].kind == closer) {
+				_blocks.back().independent.insert(name);
+			}
+			return;
+		}
+	}
+}
+
+void Parser::noteLocal(const std::string& name) {
+	if (_localIndependent && !_blocks.empty()) {
+		_blocks.back().independent.insert(name);
+		if (_localInjected) {
+			_blocks.back().injected.insert(name);
+		}
+	}
+}
+
+bool Parser::classContext() const {
+	return _classMemberInstance || _classDepth > 0;
+}
+
+// True when the type names the current class template without arguments (the injected class name).
+bool Parser::namesInjectedClass(size_t from, size_t to) const {
+	if (to == SIZE_MAX) {
+		to = _position;
+	}
+	if (!classContext()) {
+		return false;
+	}
+	for (size_t i = from; i < to; ++i) {
+		if (_tokens[i].kind != TokenKind::Identifier || (i + 1 < _tokens.size() && _tokens[i + 1].kind == TokenKind::Less)) {
+			continue;
+		}
+		const std::string text(_tokens[i].text);
+		if (text == unqualifiedName(_memberStruct)) {
+			return true;
+		}
+		for (const std::string& building: _classInProgress) {
+			if (text == unqualifiedName(building)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool Parser::injectedLocal(const std::string& name) const {
+	for (size_t i = _blocks.size(); i-- > 0;) {
+		if (_blocks[i].names.count(name)) {
+			return _blocks[i].injected.count(name) != 0;
+		}
+	}
+	return false;
+}
+
+// A member reached through an injected-name local, directly or through elements, has a type built from the class's
+// own parameters.
+bool Parser::injectedBase(const Expression& chain) const {
+	const Expression* base = &chain;
+	while (base->kind == ExpressionKind::Member || base->kind == ExpressionKind::Index) {
+		base = base->left.get();
+	}
+	return classContext() && base->kind == ExpressionKind::Identifier && injectedLocal(base->name);
+}
+
+bool Parser::receiverIndependent(const Expression& receiver) const {
+	switch (receiver.kind) {
+	case ExpressionKind::Identifier:
+		if (receiver.name == "this") {
+			return true;
+		}
+		for (size_t i = _blocks.size(); i-- > 0;) {
+			if (_blocks[i].names.count(receiver.name)) {
+				return i == _parameterBlock ? !classContext() && !_dependentParameters.count(receiver.name)
+					: _blocks[i].independent.count(receiver.name) != 0;
+			}
+		}
+		return false;
+	// A field of "this" has the declared type of a plain struct's field; in a class template it may be a parameter.
+	// A field of an object, or an element of an array or a pointer, of a type naming no parameter is as well.
+	case ExpressionKind::Member:
+		return receiver.left->kind == ExpressionKind::Identifier && receiver.left->name == "this" ? !classContext()
+			: injectedBase(*receiver.left) ? false
+			: receiverIndependent(*receiver.left);
+	case ExpressionKind::Index: {
+		// A dependent index makes the element dependent, as a dependent call argument does.
+		const ExpressionKind k = receiver.arguments.front()->kind;
+		return receiverIndependent(*receiver.left) && (k == ExpressionKind::IntLiteral
+			|| receiverIndependent(*receiver.arguments.front()));
+	}
+	// A call has a type that depends on nothing only when the function is a plain one, and its arguments are
+	// literals or independent themselves (a dependent argument makes the call dependent through lookup).
+	case ExpressionKind::Call: {
+		if (classContext() || receiver.left->kind != ExpressionKind::Identifier || blockName(receiver.left->name)
+			|| !receiver.left->overloadNames.empty() || _unit.functionTemplates.count(receiver.left->name)) {
+			return false;
+		}
+		const auto declared = _declared.find(receiver.left->name);
+		if (declared == _declared.end() || declared->second != "function") {
+			return false;
+		}
+		for (const ExpressionPtr& argument: receiver.arguments) {
+			const ExpressionKind k = argument->kind;
+			if (k != ExpressionKind::IntLiteral && k != ExpressionKind::FloatLiteral && k != ExpressionKind::BoolLiteral
+				&& !receiverIndependent(*argument)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
 bool Parser::isLocal(const std::string& name) const {
 	const std::string* bound = blockName(name);
 	return bound && bound->empty();
@@ -3822,9 +4552,11 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 				self._position = saved;
 			}
 		}
-		// A qualifier or address space is a keyword, not a namespace: in "constexpr ::metal::sampler"
-		// the "::" begins the next name.
-		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0]))) {
+		// A qualifier, address space or builtin scalar keyword is never a namespace: in
+		// "constexpr ::metal::sampler" or "void ::N::k", "::" begins the next name.
+		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0])
+			|| isIntegerSpecifier(out.parts[0]) || out.parts[0] == "void" || out.parts[0] == "float"
+			|| out.parts[0] == "double" || out.parts[0] == "half" || out.parts[0] == "bool")) {
 			break;
 		}
 		if (lookahead(at).kind != TokenKind::ColonColon || lookahead(at + 1).kind != TokenKind::Identifier) {
@@ -3909,8 +4641,26 @@ std::vector<std::string> Parser::inlineClosure(const std::string& scope) const {
 	return set;
 }
 
+bool Parser::collectStdlibOwn(const std::string& scope, const std::string& name,
+	std::set<std::string>* targets, std::set<std::string>* beside) const {
+	bool found = false;
+	for (const std::string& inner : inlineClosure(scope)) {
+		if (const auto entry = _scopes.find(inner); entry != _scopes.end()) {
+			if (const auto stdlib = entry->second.stdlibDeclarations.find(name); stdlib != entry->second.stdlibDeclarations.end()) {
+				found = true;
+				if (targets) { targets->insert(stdlib->second.begin(), stdlib->second.end()); }
+				for (const std::string& target : stdlib->second) {
+					if (beside && target.compare(0, 7, "metal::") == 0) { beside->insert(target.substr(7)); }
+				}
+			}
+		}
+	}
+	return found;
+}
+
 void Parser::collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-	std::set<std::string>& found, bool qualified, bool* besideStdlib) const {
+	std::set<std::string>& found, bool qualified, std::set<std::string>* stdlibBeside,
+	std::set<std::string>* stdlibTargets, bool* reachedMetal) const {
 	if (!seen.insert(scope).second) {
 		return;
 	}
@@ -3922,9 +4672,13 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	found.insert(own.begin(), own.end());
 	const auto entry = _scopes.find(scope);
 	// "using metal::name;" makes the library's name this namespace's own member too.
-	const bool declaresStdlib = entry != _scopes.end() && entry->second.stdlibDeclarations.count(name);
-	if (besideStdlib && (scope == kStdlibNamespace || declaresStdlib)) {
-		*besideStdlib = true;
+	const bool declaresStdlib = collectStdlibOwn(scope, name, stdlibTargets, stdlibBeside);
+	if (reachedMetal && scope == kStdlibNamespace) {
+		*reachedMetal = true;
+	}
+	if (stdlibBeside && !name.empty()
+		&& (scope == kStdlibNamespace || scope == "metal::precise" || scope == "metal::fast")) {
+		stdlibBeside->insert(scope == kStdlibNamespace ? name : scope.substr(7) + "::" + name);
 	}
 	if (qualified && (!own.empty() || declaresStdlib)) {
 		return;
@@ -3936,7 +4690,7 @@ void Parser::collectMembers(const std::string& scope, const std::string& name, s
 	for (const std::string& writer : inlineClosure(scope)) {
 		if (const auto written = _scopes.find(writer); written != _scopes.end()) {
 			for (const std::string& directive : written->second.directives) {
-				collectMembers(directive, name, seen, found, qualified, besideStdlib);
+				collectMembers(directive, name, seen, found, qualified, stdlibBeside, stdlibTargets, reachedMetal);
 			}
 		}
 	}
@@ -3997,7 +4751,7 @@ bool Parser::libraryNominatedFromHere() const {
 			std::set<std::string> seen;
 			std::set<std::string> none;
 			bool nominated = false;
-			collectMembers(target, "", seen, none, false, &nominated);
+			collectMembers(target, "", seen, none, false, nullptr, nullptr, &nominated);
 			if (nominated) {
 				return true;
 			}
@@ -4332,8 +5086,15 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		if (const std::string* bound = blockName(last)) {
 			return bound->empty() ? last : *bound;
 		}
-		if (const std::set<std::string> found = unqualifiedFound(last); !found.empty()) {
+		std::set<std::string> stdlibTargets;
+		if (const std::set<std::string> found = unqualifiedFound(last, nullptr, &stdlibTargets); !found.empty()) {
 			return pick(found, last);
+		}
+		if (!stdlibTargets.empty()) {
+			return pick(stdlibTargets, last);
+		}
+		if (last == "component" && libraryNominatedFromHere()) {
+			return "metal::component";
 		}
 		return last;
 	}
@@ -4346,10 +5107,18 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 	if (found) {
 		std::set<std::string> seen;
 		std::set<std::string> members;
+		std::set<std::string> beside;
+		std::set<std::string> stdlibTargets;
 		bool libraryVisible = false;
-		collectMembers(scope, last, seen, members, true, &libraryVisible);
+		collectMembers(scope, last, seen, members, true, &beside, &stdlibTargets, &libraryVisible);
 		if (!members.empty()) {
 			return pick(members, spelled);
+		}
+		if (!stdlibTargets.empty()) {
+			if (beside.count(last) && stdlibLookup(kStdlibNamespace, last).hasName) {
+				stdlibTargets.insert(std::string(kStdlibNamespace) + "::" + last);
+			}
+			return pick(stdlibTargets, spelled);
 		}
 		// Nothing the file declares, but the walk reached the library's names ("using
 		// metal::name;" or a directive to metal in the namespace or in the namespaces its
@@ -4368,6 +5137,10 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		// scope adds a name there too, and beside a declaration of its own it is ambiguous.
 		if (std::set<std::string> own; collectOwn("", last, own), !own.empty()) {
 			return pick(own, spelled);
+		}
+		std::set<std::string> stdlibTargets;
+		if (collectStdlibOwn("", last, &stdlibTargets, nullptr)) {
+			return pick(stdlibTargets, spelled);
 		}
 		return last;
 	}
@@ -4416,7 +5189,7 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 				std::set<std::string> seen;
 				std::set<std::string> members;
 				bool nominated = false;
-				collectMembers(from, parts[count], seen, members, true, &nominated);
+				collectMembers(from, parts[count], seen, members, true, nullptr, nullptr, &nominated);
 				// A qualified walk stops at an own member of that name, so "nominated" is set only
 				// when the scope declares none.
 				visible = nominated;
@@ -4466,7 +5239,8 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		if (resolveTypeName(ownerName, ownerType) && !ownerType.enumName.empty()) {
 			const std::string& tag = ownerType.enumName;
 			const size_t enclosing = tag.rfind("::");
-			const std::string key = enclosing == std::string::npos ? last : tag.substr(0, enclosing + 2) + last;
+			const std::string key = tag == "metal::component" ? tag + "::" + last
+				: enclosing == std::string::npos ? last : tag.substr(0, enclosing + 2) + last;
 			const auto constant = _enumConstants.find(key);
 			if (constant != _enumConstants.end() && constant->second.owner == tag) {
 				return key;
@@ -4508,19 +5282,21 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 	throw CompileError("no member named \"" + last + "\" in the namespace \"" + scope + "\" (in \"" + spelled + "\")");
 }
 
-std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* besideStdlib) const {
+std::set<std::string> Parser::unqualifiedFound(const std::string& last, std::set<std::string>* stdlibBeside,
+	std::set<std::string>* stdlibTargets) const {
 	// [namespace.udir]: a using directive in U nominating T makes T's names
 	// appear in the nearest namespace L containing both, for lookups from inside U.
 	// So each enclosing namespace L, innermost out, offers its own names plus
 	// those of directives that land in it; the first level that has any decides.
-	bool stdlibNearer = false;
+	std::set<std::string> nearerBeside;
 	for (size_t depth = _namespacePath.size() + 1; depth-- > 0;) {
 		const std::string level = joinParts(_namespacePath, 0, depth);
-		std::set<std::string> found;
+		std::set<std::string> found, levelStdlib, hereBeside;
 		collectOwn(level, last, found);
-		const auto own = _scopes.find(level);
-		const bool declaredHere = own != _scopes.end() && own->second.stdlibDeclarations.count(last);
-		bool stdlibHere = level == kStdlibNamespace || declaredHere;
+		collectStdlibOwn(level, last, &levelStdlib, &hereBeside);
+		if (level == kStdlibNamespace || level == "metal::precise" || level == "metal::fast") {
+			hereBeside.insert(level == kStdlibNamespace ? last : level.substr(7) + "::" + last);
+		}
 		for (size_t user = 0; user <= _namespacePath.size(); ++user) {
 			for (const std::string& from : inlineClosure(joinParts(_namespacePath, 0, user))) {
 				const auto entry = _scopes.find(from);
@@ -4530,7 +5306,7 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 				for (const std::string& target : entry->second.directives) {
 					if (nearestCommon(from, target) == level) {
 						std::set<std::string> seen;
-						collectMembers(target, last, seen, found, false, &stdlibHere);
+						collectMembers(target, last, seen, found, false, &hereBeside, &levelStdlib);
 					}
 				}
 			}
@@ -4540,23 +5316,30 @@ std::set<std::string> Parser::unqualifiedFound(const std::string& last, bool* be
 			for (const std::string& target : block.directives) {
 				if (nearestCommon(function, target) == level) {
 					std::set<std::string> seen;
-					collectMembers(target, last, seen, found, false, &stdlibHere);
+					collectMembers(target, last, seen, found, false, &hereBeside, &levelStdlib);
 				}
 			}
 		}
 		// "using metal::name;" makes the library's name this level's own, which hides every
 		// outer declaration of it: the name is the library's.
-		if (found.empty() && declaredHere) {
+		if (found.empty() && !levelStdlib.empty()) {
+			if (hereBeside.count(last) && stdlibLookup(kStdlibNamespace, last).hasName) {
+				levelStdlib.insert(std::string(kStdlibNamespace) + "::" + last);
+			}
+			if (stdlibTargets) {
+				*stdlibTargets = std::move(levelStdlib);
+			}
 			return {};
 		}
 		if (!found.empty()) {
-			if (besideStdlib) {
-				*besideStdlib = stdlibHere || stdlibNearer;
+			if (stdlibBeside) {
+				stdlibBeside->insert(nearerBeside.begin(), nearerBeside.end());
+				stdlibBeside->insert(hereBeside.begin(), hereBeside.end());
 			}
 			return found;
 		}
 		// Namespace metal's own names may hide the user's function found further out.
-		stdlibNearer = stdlibNearer || stdlibHere;
+		nearerBeside.insert(hereBeside.begin(), hereBeside.end());
 	}
 	return {};
 }
@@ -4695,8 +5478,12 @@ void Parser::parseTypedef() {
 		}
 	}
 
-	// A typedef under the name of the struct it names is the same type, but the
-	// name is then a typedef as well, which is what another declaration collides with.
+	registerTypedef(name, target);
+}
+
+// The name is a typedef of target. A typedef under the name of the struct it names is the same
+// type, but the name is then a typedef as well, which is what another declaration collides with.
+void Parser::registerTypedef(const std::string& name, const Type& target) {
 	if (name == target.namedType) {
 		_declared[name] = "typedef";
 		return;
@@ -4719,6 +5506,15 @@ void Parser::parseTypedef() {
 
 	declareName(name, "typedef");
 	_typedefs[name] = target;
+}
+
+void Parser::seedStdlibEnums() {
+	_enumTypes["metal::component"] = "metal::component";
+	_enumUnderlying["metal::component"] = ScalarKind::Int;
+	_enumConstants["metal::component::x"] = { 0, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::y"] = { 1, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::z"] = { 2, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::w"] = { 3, ScalarKind::Int, "metal::component" };
 }
 
 std::string Parser::parseEnumDeclaration(bool& hadBody) {
@@ -4907,6 +5703,9 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
+			if (expression.enumName == "metal::component") {
+				throw CompileError("a value of scoped enum metal::component is not an integer constant expression");
+			}
 			// A sizeof is a ulong, which unsigned arithmetic would wrap but this does not, so
 			// the operators below refuse the one case where a signed result differs.
 			if (expression.isSizeof) {
@@ -5201,17 +6000,17 @@ void Parser::recordConstantArray(const VariableDeclaration& declaration, bool lo
 	}
 }
 
-// An integer declared const or constexpr (a file-scope one is a constant by its address space) and
-// initialised by a constant expression is one a later array length may name. A value its own type
-// cannot hold is not recorded, because Apple would convert it and evaluateConstant would not.
+// An integer declared const or constexpr (or at file scope) with a constant initialiser may be
+// named by a later array length; a value its own type cannot hold is left out.
 void Parser::recordConstant(const VariableDeclaration& declaration, bool local) {
 	const Type& type = declaration.type;
 	if (type.arrayLength) {
 		recordConstantArray(declaration, local);
 		return;
 	}
-	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer
-		|| type.vectorWidth != 0 || !declaration.initializer) {
+	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || (!local && type.isAtomic)
+		|| !type.isScalar() || !type.namedType.empty() || type.enumName == "metal::component"
+		|| !declaration.initializer) {
 		return;
 	}
 	int64_t low = 0;
@@ -5229,10 +6028,9 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 		default: return;
 	}
 
-	// "= 3", "{3}" and "(3)" initialise the same way.
 	const Expression* initializer = declaration.initializer.get();
-	if (initializer->kind == ExpressionKind::InitList && initializer->elements.size() == 1
-		&& initializer->elements.front().fieldName.empty()) {
+	while (initializer->kind == ExpressionKind::InitList && !initializer->constructType
+		&& initializer->elements.size() == 1 && initializer->elements.front().fieldName.empty()) {
 		initializer = initializer->elements.front().value.get();
 	}
 	if (initializer->kind == ExpressionKind::Construct && initializer->arguments.size() == 1
@@ -5241,10 +6039,13 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 		initializer = initializer->arguments.front().get();
 	}
 	int64_t value = 0;
-	try {
-		value = evaluateConstant(*initializer, false);
-	} catch (const CompileError&) {
-		return;
+	if (!(initializer->kind == ExpressionKind::InitList && !initializer->constructType
+		&& initializer->elements.empty())) {
+		try {
+			value = evaluateConstant(*initializer, false);
+		} catch (const CompileError&) {
+			return;
+		}
 	}
 	if (type.scalar == ScalarKind::Bool && value != 0) {
 		value = 1;
@@ -5326,6 +6127,9 @@ std::optional<Type> Parser::declaredObjectType(const Expression& operand) const 
 static bool isSixtyFourBit(const Expression& expression) {
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
+			if (expression.enumName == "metal::component") {
+				throw CompileError("a value of scoped enum metal::component is not an integer constant expression");
+			}
 			return expression.intKind == ScalarKind::Long || expression.intKind == ScalarKind::ULong;
 		case ExpressionKind::Unary:
 			return isSixtyFourBit(*expression.left);
@@ -5416,6 +6220,9 @@ void Parser::deduceArrayLength(VariableDeclaration& declaration) {
 bool Parser::parseArrayDimensions(Type& type) {
 	bool deduced = false;
 	bool outermost = true;
+	if (type.arrayLength && !type.isStdArray && at(TokenKind::LBracket)) {
+		throw CompileError("an array of an array alias is not supported");
+	}
 	while (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		advance();
 		if (at(TokenKind::RBracket)) {
@@ -5441,7 +6248,7 @@ bool Parser::parseArrayDimensions(Type& type) {
 }
 
 std::optional<uint32_t> Parser::tryParseArrayLength() {
-	if (!at(TokenKind::LBracket)) {
+	if (!at(TokenKind::LBracket) || lookahead().kind == TokenKind::LBracket) {
 		return std::nullopt;
 	}
 
@@ -5804,6 +6611,7 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	// name, so the parameter became "Vertex" and the list ended at the "*".
 	while (parseQualifier(type, false)) {
 	}
+	const bool prefixQualified = type.isConst || type.addressSpace != AddressSpace::None;
 
 	// metal::sampler and metal::texture2d, which Apple takes as the unqualified names.
 	if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon
@@ -5861,6 +6669,10 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	} else if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
 		parseLibraryVec(type, vecTokens);
 	} else if (!name.empty() && resolveTypeName(name, type)) {
+		if (type.isPointer && prefixQualified) {
+			throw CompileError("a const or an address space written before a pointer alias is not supported; "
+				"put it in the alias");
+		}
 		if (type.resource != ResourceKind::None && !allowResource) {
 			throw CompileError("\"" + std::string(current().text) + "\" is the type " + typeName(type) + ", a texture or sampler type, which "
 				"mslc takes as a parameter only, and a sampler also as a local");
@@ -5885,13 +6697,22 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 			+ " \"" + std::string(current().text) + "\"");
 	}
 
+	const bool aliasPointer = type.isPointer;
+	const bool aliasArray = type.arrayLength && !type.isStdArray;
+	const bool constBefore = type.isConst;
 	while (parseQualifier(type, false)) {
+	}
+	if (aliasPointer && type.isConst != constBefore) {
+		throw CompileError("a const written after a pointer alias is not supported; put it in the alias");
 	}
 
 	if (base) {
 		*base = type;
 	}
 	parseDeclaratorStars(type);
+	if (aliasArray && (type.isPointer || at(TokenKind::LBracket))) {
+		throw CompileError("a pointer to an array alias, and an array of one, are not supported");
+	}
 
 	if (type.isStdArray && at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
 		throw CompileError("an array of array<T, N> is not lowered");
@@ -5988,9 +6809,9 @@ void Parser::parseResourceType(Type& type) {
 			"sampled types float, half, int, uint, short and ushort");
 	}
 
-	// Apple's texture_buffer is access::read unless it says otherwise, and has no sampled form.
+	// Apple's texture_buffer and multisampled textures are access::read unless spelled otherwise.
 	const bool isBuffer = color != textures.end() && color->second == ResourceKind::TextureBuffer;
-	std::string access = isBuffer ? "read" : "sample";
+	std::string access = (isBuffer || isMultisampled) ? "read" : "sample";
 	bool accessSpelled = false;
 	if (match(TokenKind::Comma)) {
 		if (kind() == TokenKind::Identifier && current().text == "metal" && lookahead().kind == TokenKind::ColonColon) {
@@ -6035,23 +6856,25 @@ void Parser::parseResourceType(Type& type) {
 	type.resource = isMultisampled ? ms->second.kind : depth != depthTextures.end() ? depth->second : color->second;
 	type.isDepth = isDepth;
 	type.isMultisampled = isMultisampled;
-	if (isMultisampled && (access != "sample" || accessSpelled) && access != "read") {
+	if (type.isDepth && element->second != ScalarKind::Float) {
+		throw CompileError(name + "<" + component + (accessSpelled ? ", access::" + access : "")
+			+ "> is not lowered yet; mslc lowers depth textures of float (Apple has no depth half)");
+	}
+	if (isMultisampled && access != "read" && !(isDepth && access == "sample")) {
 		throw CompileError(name + " access::" + access + " is not lowered yet; a multisampled texture is read-only");
 	}
-	if (type.isDepth && (element->second != ScalarKind::Float || access != "sample")) {
-		throw CompileError(name + "<" + component + (access == "sample" ? "" : ", access::" + access)
-			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample"
-			+ (access == "sample" ? " (Apple has no depth half)" : ""));
+	if (type.isDepth && access != "sample" && access != "read") {
+		throw CompileError(name + "<" + component + ", access::" + access
+			+ "> is not lowered yet; mslc lowers depth textures of float with access::sample or access::read");
 	}
-	// A multisampled texture is a sampled image whichever way read is spelled.
-	type.textureAccess = isMultisampled ? TextureAccess::Sample : access == "write" ? TextureAccess::Write
+	type.textureAccess = access == "write" ? TextureAccess::Write
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
 	type.scalar = element->second;
 	type.namedType = deducedFrom;
 }
 
-Parameter Parser::parseParameter(const std::string& helperName) {
+Parameter Parser::parseParameter(const std::string& helperName, bool allowUnnamed) {
 	Parameter param;
 	const bool helper = !helperName.empty();
 
@@ -6071,7 +6894,8 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 	param.isReference = match(TokenKind::Ampersand);
 
 	// A prototype and an unused parameter may leave the name out.
-	const bool unnamed = helper && (at(TokenKind::Comma) || at(TokenKind::RParen));
+	const bool unnamed = (helper || allowUnnamed)
+		&& (at(TokenKind::Comma) || at(TokenKind::RParen) || (allowUnnamed && at(TokenKind::LBracket)));
 	if (!unnamed && kind() != TokenKind::Identifier) {
 		throw CompileError("expected a parameter name, found " + std::string(tokenKindName(kind())));
 	}
@@ -6198,7 +7022,8 @@ void Parser::checkHelperParameterAttributes(const Parameter& param, const std::s
 		&& (type.scalar == ScalarKind::UInt || type.scalar == ScalarKind::UShort) && type.vectorWidth <= 3;
 	const bool integerScalarType = integerBuiltinType && type.vectorWidth == 0 && !place && !type.isAtomic;
 	std::string wrong;
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t>, const std::string&) {
+	std::set<std::string> seen;
+	parseAttributeList(seen, [&](const std::string& name, std::optional<uint32_t>, const std::string&) {
 		if (interpolationFromName(name)) {
 			throw CompileError(what + "has the attribute [[" + name + "]], which applies to a struct member only");
 		}
@@ -6233,8 +7058,9 @@ void Parser::checkHelperParameterAttributes(const Parameter& param, const std::s
 
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
+	std::set<std::string> seen;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string& identifier) {
+	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument, const std::string& identifier) {
 		if (name == "function_constant") {
 			if (identifier.empty()) {
 				throw CompileError("[[function_constant]] on a parameter needs the name of a program-scope constant");
@@ -6272,6 +7098,8 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			throw CompileError("[[stencil]] is not valid on an input parameter");
 		} else if (name == "sample_mask") {
 			throw CompileError("[[sample_mask]] on an input parameter is not lowered yet");
+		} else if (name == "invariant") {
+			throw CompileError("[[invariant]] is only valid on a vertex output's [[position]] field");
 		} else if (name == "stage_in") {
 			attributes.stageIn = true;
 		} else if (name == "color") {
@@ -6287,7 +7115,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\"");
 		}
-	});
+	};
+	do {
+		parseAttributeList(seen, visit);
+	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
 
 	if (!attributes.functionConstant.empty() && attributes.stageIn) {
 		throw CompileError("[[function_constant]] on a [[stage_in]] parameter is not lowered yet");
@@ -6298,8 +7129,9 @@ ParameterAttributes Parser::parseParameterAttributes() {
 
 FieldAttributes Parser::parseFieldAttributes() {
 	FieldAttributes attributes;
+	std::set<std::string> seen;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument,
+	const auto visit = [&](const std::string& name, std::optional<uint32_t> argument,
 		const std::string& identifier) {
 		if (name == "depth") {
 			if (attributes.depthMode) {
@@ -6339,6 +7171,8 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.userName = identifier;
 		} else if (name == "position") {
 			attributes.position = true;
+		} else if (name == "invariant") {
+			attributes.invariant = true;
 		} else if (name == "attribute") {
 			if (!argument) {
 				throw CompileError("[[attribute]] needs an index");
@@ -6363,12 +7197,15 @@ FieldAttributes Parser::parseFieldAttributes() {
 			attributes.interpolation = *interpolation;
 		} else if (builtinFromName(name)) {
 			throw CompileError("builtin attribute \"" + name + "\" is not valid on a struct "
-				"field; only [[position]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
+				"field; only [[position]], [[invariant]], [[attribute(n)]], [[color(n)]], [[depth(mode)]], [[sample_mask]], [[point_size]], [[user(name)]] and the "
 				"interpolation attributes are");
 		} else {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
 		}
-	});
+	};
+	do {
+		parseAttributeList(seen, visit);
+	} while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket);
 
 	// A gated stage input or output other than a colour or the sample mask would change the interface between
 	// stages, which is fixed when a pipeline is made here.
@@ -6380,12 +7217,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 	return attributes;
 }
 
-void Parser::parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>,
-	const std::string&)>& visit) {
+void Parser::parseAttributeList(std::set<std::string>& seen, const std::function<void(const std::string&,
+	std::optional<uint32_t>, const std::string&)>& visit) {
 	expect(TokenKind::LBracket, "to open an attribute list");
 	expect(TokenKind::LBracket, "to open an attribute");
 
-	std::set<std::string> seen;
 	while (!at(TokenKind::EndOfFile)) {
 		if (match(TokenKind::RBracket)) {
 			break;
@@ -6413,6 +7249,9 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 			}
 			if (name == "point_size") {
 				throw CompileError("[[point_size]] takes no argument");
+			}
+			if (name == "invariant") {
+				throw CompileError("[[invariant]] takes no argument");
 			}
 			if (name == "stencil") {
 				throw CompileError("[[stencil]] takes no argument");
@@ -6505,7 +7344,28 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 
 	expect(TokenKind::RParen, "to close a parameter list");
 	rejectUsingConflict(decl.name, "function", &decl);
+	checkUniqueResourceSlots(decl);
 
+	// parseCompoundStatement consumes the opening brace itself, so consuming it
+	// here as well would make it look for a second one.
+	decl.body = parseCompoundStatement(true);
+
+	return decl;
+}
+
+void Parser::parseEntryParameterList(std::vector<Parameter>& out, const std::string& quoted, bool allowUnnamed) {
+	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) { advance(); }
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		out.push_back(parseParameter(std::string(), allowUnnamed));
+		if (at(TokenKind::Assign)) {
+			throw CompileError("a default argument is not lowered yet (parameter \"" + out.back().name + "\" of " + quoted + ")");
+		}
+		if (!match(TokenKind::Comma)) { break; }
+	}
+	expect(TokenKind::RParen, "to close a parameter list");
+}
+
+void Parser::checkUniqueResourceSlots(const FunctionDecl& decl) const {
 	// Two parameters of one kind cannot take the same slot, unless every one of them but one is gated by
 	// [[function_constant]]. Apple's compiler accepts such a slot, as when a function takes its source as a
 	// texture2d or a texture2d_array at texture(0) and a function constant picks one (metal 32023.883, macOS 26);
@@ -6527,12 +7387,142 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 			}
 		}
 	}
+}
 
-	// parseCompoundStatement consumes the opening brace itself, so consuming it
-	// here as well would make it look for a second one.
-	decl.body = parseCompoundStatement(true);
+namespace {
 
-	return decl;
+bool fitsNonTypeTemplateConstant(ScalarKind kind, int64_t value) {
+	if (kind == ScalarKind::Bool) { return value == 0 || value == 1; }
+	int64_t low = 0, high = 0;
+	return integerRange(kind, low, high) && value >= low && value <= high;
+}
+
+bool sameFullType(Type lhs, Type rhs, bool checkTopConst) {
+	if (!checkTopConst && !lhs.isPointer) { lhs.isConst = false; }
+	if (!checkTopConst && !rhs.isPointer) { rhs.isConst = false; }
+	return sameType(lhs, rhs) && lhs.isPointer == rhs.isPointer && lhs.addressSpace == rhs.addressSpace
+		&& lhs.resource == rhs.resource && lhs.textureAccess == rhs.textureAccess
+		&& lhs.isDepth == rhs.isDepth && lhs.isMultisampled == rhs.isMultisampled;
+}
+
+auto parameterAttributeKey(const ParameterAttributes& a) {
+	return std::tie(a.bufferIndex, a.threadgroupIndex, a.textureIndex, a.samplerIndex, a.builtin, a.stageIn, a.colorIndex, a.functionConstant);
+}
+
+}
+
+bool Parser::deduceEntryArguments(const FunctionTemplate& tmpl, const FunctionDecl& pattern,
+	size_t given, const std::vector<Parameter>& gotParams, std::vector<TemplateArgument>& arguments) const {
+	if (pattern.parameters.size() != gotParams.size()) { return false; }
+	std::vector<bool> known(arguments.size(), false);
+	std::fill_n(known.begin(), given, true);
+	const auto matchType = [&](const auto& self, const Type& patType, const Type& gotType, bool ptrOrRef, bool inInst) -> bool {
+		if (pattern.dependentInstances.count(patType.namedType)) {
+			if ((ptrOrRef && patType.isConst != gotType.isConst) || (inInst && (gotType.isPointer || gotType.arrayLength))) { return false; }
+			const DependentInstance& expected = pattern.dependentInstances.at(patType.namedType);
+			const StructDecl* made = gotType.namedType.empty() ? nullptr : _unit.findStruct(gotType.namedType);
+			if (!made || made->classTemplate != expected.classTemplate || made->classArguments.size() != expected.arguments.size()) { return false; }
+			for (size_t k = 0; k < expected.arguments.size(); ++k) {
+				const TemplateArgument& want = expected.arguments[k], &got = made->classArguments[k];
+				if (want.isType != got.isType || (!want.isType && want.value != got.value)
+					|| (want.isType && !self(self, want.type, got.type, true, true))) { return false; }
+			}
+			return true;
+		}
+		size_t idx = tmpl.parameters.size();
+		for (size_t j = given; j < tmpl.parameters.size(); ++j) {
+			if (tmpl.parameters[j].isType && !tmpl.parameters[j].name.empty() && patType.namedType == "<" + tmpl.parameters[j].name + ">") { idx = j; break; }
+		}
+		if (idx == tmpl.parameters.size()) { return !inInst || sameFullType(patType, gotType, true); }
+		if (patType.isConst && !gotType.isConst && ptrOrRef) { return false; }
+		if (gotType.resource != ResourceKind::None || !gotType.enumName.empty() || gotType.isVolatile || gotType.isAtomic) { return false; }
+		Type bound = gotType;
+		bound.isPointer = bound.isStdArray = false;
+		bound.addressSpace = AddressSpace::None;
+		bound.arrayLength.reset();
+		bound.innerArrayLengths.clear();
+		if (patType.isConst || !ptrOrRef) { bound.isConst = false; }
+		if (known[idx]) { return sameFullType(arguments[idx].type, bound, true); }
+		known[idx] = true;
+		arguments[idx] = TemplateArgument { true, bound, 0, false };
+		return true;
+	};
+	for (size_t i = 0; i < pattern.parameters.size(); ++i) {
+		const Parameter& pat = pattern.parameters[i], &got = gotParams[i];
+		const bool patPtr = pat.type.isPointer || pat.type.arrayLength.has_value(), gotPtr = got.type.isPointer || got.type.arrayLength.has_value();
+		if (pat.isReference != got.isReference || patPtr != gotPtr
+			|| ((patPtr || pat.isReference) && pat.type.addressSpace != got.type.addressSpace)
+			|| !matchType(matchType, pat.type, got.type, patPtr || pat.isReference, false)) { return false; }
+	}
+	for (size_t j = given; j < tmpl.parameters.size(); ++j) {
+		if (tmpl.parameters[j].isType && !known[j]) {
+			if (!tmpl.parameters[j].hasDefault) { return false; }
+			try { arguments[j] = templateDefault(tmpl, j, arguments); } catch (const SubstitutionFailure&) { return false; }
+		} else if (!tmpl.parameters[j].isType && arguments[j].unbound) { return false; }
+	}
+	return true;
+}
+
+void Parser::resolveEntryInstantiations() {
+	for (const PendingEntryInstantiation& pending: _pendingEntryInstantiations) {
+		for (size_t i = 0; i < _unit.functions.size(); ++i) {
+			if (i != pending.slotIndex && _unit.functions[i].name == pending.hostName) {
+				throw CompileError("two entry points are named \"" + pending.hostName + "\"; entry points are identified by name, so the names must differ");
+			}
+		}
+		FunctionDecl pendingSig { pending.stage, pending.returnType, {}, pending.parameters, nullptr, pending.line };
+		const FunctionTemplate* chosen = nullptr;
+		std::vector<TemplateArgument> chosenArgs;
+		bool sawProtoMatch = false, sawStageMismatch = false;
+		for (const FunctionTemplate& tmpl: _unit.entryTemplates) {
+			if (!pending.candidateNames.count(tmpl.name)) { continue; }
+			if (tmpl.stage != pending.stage) { sawStageMismatch = true; continue; }
+			if (pending.explicitArgs.size() > tmpl.parameters.size()) { continue; }
+			std::vector<TemplateArgument> arguments(tmpl.parameters.size());
+			bool argsFit = true;
+			for (size_t i = 0; i < tmpl.parameters.size() && argsFit; ++i) {
+				const TemplateParameter& p = tmpl.parameters[i];
+				if (i < pending.explicitArgs.size()) {
+					arguments[i] = pending.explicitArgs[i];
+					argsFit = arguments[i].isType == p.isType && (p.isType || fitsNonTypeTemplateConstant(p.kind, arguments[i].value));
+				} else if (p.isType) { arguments[i].type.namedType = "<" + p.name + ">"; }
+				else if (p.hasDefault) {
+					try { arguments[i] = templateDefault(tmpl, i, arguments); argsFit = fitsNonTypeTemplateConstant(p.kind, arguments[i].value); }
+					catch (const SubstitutionFailure&) { argsFit = false; }
+				} else { arguments[i] = { false, {}, 0, true }; }
+			}
+			if (!argsFit) { continue; }
+			try {
+				FunctionDecl pattern = instantiateTemplate(tmpl, arguments, false);
+				if (!deduceEntryArguments(tmpl, pattern, pending.explicitArgs.size(), pending.parameters, arguments)) { continue; }
+				const FunctionDecl finalSig = pending.explicitArgs.size() == tmpl.parameters.size()
+					? std::move(pattern) : instantiateTemplate(tmpl, arguments, false);
+				if (!sameFullType(finalSig.returnType, pendingSig.returnType, false) || !sameParameterTypes(finalSig, pendingSig)) { continue; }
+			} catch (const SubstitutionFailure&) { continue; }
+			if (!tmpl.hasBody) { sawProtoMatch = true; continue; }
+			if (chosen) { throw CompileError("explicit instantiation of \"" + pending.spelled + "\" at line " + std::to_string(pending.line) + " is ambiguous"); }
+			chosen = &tmpl;
+			chosenArgs = std::move(arguments);
+		}
+		if (!chosen) {
+			const std::string at = " at line " + std::to_string(pending.line);
+			throw CompileError(sawProtoMatch
+				? "the entry-point template \"" + pending.spelled + "\" (instantiated" + at + ") is declared and never defined"
+				: "explicit instantiation of \"" + pending.spelled + "\"" + at
+					+ (sawStageMismatch ? " does not match the entry-point template's stage" : " does not match any entry-point template"));
+		}
+		FunctionDecl instantiated = instantiateTemplate(*chosen, chosenArgs, true);
+		for (size_t i = 0; i < pending.parameters.size(); ++i) {
+			const auto givenKey = parameterAttributeKey(pending.parameters[i].attributes);
+			if (givenKey != parameterAttributeKey(ParameterAttributes{})
+				&& givenKey != parameterAttributeKey(instantiated.parameters[i].attributes)) {
+				throw CompileError("parameter attributes in explicit instantiation of \"" + pending.spelled
+					+ "\" at line " + std::to_string(pending.line) + " do not match the entry-point template");
+			}
+		}
+		instantiated.name = pending.hostName;
+		_unit.functions[pending.slotIndex] = std::move(instantiated);
+	}
 }
 
 Parser::NestingScope::NestingScope(Parser& parser): _parser(parser) {
@@ -6571,7 +7561,9 @@ void Parser::measure(Expression& expression) const {
 void Parser::parseAutoInitializer(VariableDeclaration& declaration) {
 	const std::string quoted = "\"" + declaration.name + "\"";
 	if (match(TokenKind::Assign)) {
+		const size_t from = _position;
 		declaration.initializer = parseInitializer();
+		noteAutoConstruction(declaration.name, from);
 	} else if (match(TokenKind::LParen)) {
 		std::vector<ExpressionPtr> arguments = parseArgumentList("to close the initialiser of an auto variable");
 		if (arguments.size() != 1) {
@@ -6950,8 +7942,12 @@ StatementPtr Parser::parseStatement() {
 			statement->kind = StatementKind::DeclarationStatement;
 			VariableDeclaration declaration;
 			Type base;
+			const size_t typeFrom = _position;
 			declaration.type = parseType(true, true, &base);
-			if (declaration.type.arrayLength && !declaration.type.isStdArray) {
+			_localIndependent = typeTokensIndependent(typeFrom);
+			_localInjected = namesInjectedClass(typeFrom);
+			// An array alias ends in its name; written brackets end in "]".
+			if (declaration.type.arrayLength && !declaration.type.isStdArray && _tokens[_position - 1].kind == TokenKind::RBracket) {
 				throw CompileError("brackets are not allowed here; write the array length after the name, as float v[N]");
 			}
 			if (declaration.type.isAuto && declaration.type.isPointer) {
@@ -6972,6 +7968,7 @@ StatementPtr Parser::parseStatement() {
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+			noteLocal(declaration.name);
 
 			// "float a[4]" and "float a[] = {...}": the length follows the name.
 			bool deduceLength = false;
@@ -7055,6 +8052,7 @@ VariableDeclaration Parser::parseNextLocalDeclarator(const Type& base) {
 	}
 	another.name = std::string(advance().text);
 	declareLocal(another.name);
+	noteLocal(another.name);
 
 	bool deduceLength = false;
 	if (at(TokenKind::LBracket) && lookahead().kind != TokenKind::LBracket) {
@@ -7164,7 +8162,9 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 			"mag_filter", "min_filter", "mip_filter", "compare_func", "max_anisotropy", "lod_clamp", "border_color",
 		};
 		if (unlowered.count(family)) {
-			throw CompileError("the sampler option \"" + family + "\" is not lowered yet; mslc lowers "
+			throw CompileError("the sampler option \"" + family + "\" is accepted by Apple but not lowered: Vulkan "
+				"selects it with VkSamplerReductionMode (VK_EXT_sampler_filter_minmax) and the reflection's sampler "
+				"has no field for it, so it would be dropped silently; mslc lowers "
 				"coord, address, s_address, t_address, r_address, filter, mag_filter, min_filter, "
 				"mip_filter, compare_func, max_anisotropy, lod_clamp and border_color");
 		}
@@ -7235,6 +8235,11 @@ SamplerState Parser::parseSamplerOptions(TokenKind closing) {
 		const auto filter = [&]() -> SamplerFilter {
 			if (value == "nearest") return SamplerFilter::Nearest;
 			if (value == "linear") return SamplerFilter::Linear;
+			if (value == "bicubic") {
+				throw CompileError("\"" + spelled + "\" is accepted by Apple but not lowered: Vulkan has bicubic "
+					"filtering only as VK_EXT_filter_cubic / VK_IMG_filter_cubic, outside core, and the reflection's "
+					"sampler has no field for it, so it would be dropped silently");
+			}
 			throw CompileError("\"" + spelled + "\" is not a sampler filter");
 		};
 
@@ -7391,7 +8396,10 @@ StatementPtr Parser::parseForStatement() {
 		if (looksLikeType) {
 			VariableDeclaration declaration;
 			Type base;
+			const size_t typeFrom = _position;
 			declaration.type = parseType(false, true, &base);
+			_localIndependent = typeTokensIndependent(typeFrom);
+			_localInjected = namesInjectedClass(typeFrom);
 			rejectLocalQualifiers(declaration.type, at(TokenKind::Ampersand));
 			if (declaration.type.isAuto && (declaration.type.isPointer || declaration.type.arrayLength)) {
 				throw CompileError("a pointer or an array declared with auto is not lowered yet");
@@ -7401,6 +8409,7 @@ StatementPtr Parser::parseForStatement() {
 			}
 			declaration.name = std::string(advance().text);
 			declareLocal(declaration.name);
+			noteLocal(declaration.name);
 			if (declaration.type.isAuto) {
 				rejectParameterListInitializer(declaration);
 				parseAutoInitializer(declaration);
@@ -8363,6 +9372,9 @@ ExpressionPtr Parser::parsePostfix() {
 			if (keyword) {
 				advance();
 			}
+			if (atKeyword("operator")) {
+				throw CompileError("calling an operator with member syntax is not lowered; write s[i]");
+			}
 			if (kind() != TokenKind::Identifier) {
 				throw CompileError("expected a member name after '" + op + "'");
 			}
@@ -8383,6 +9395,15 @@ ExpressionPtr Parser::parsePostfix() {
 				expression = std::move(folded);
 				continue;
 			}
+			const auto hasName = [&](const std::set<std::string>& set) {
+				return set.count(expression->name) || std::any_of(expression->overloadNames.begin(),
+					expression->overloadNames.end(), [&](const std::string& n) { return set.count(n) != 0; });
+			};
+			if (expression->kind == ExpressionKind::Identifier && !expression->hasTemplateArguments
+				&& (expression->fileScope || !isLocal(expression->name))
+				&& hasName(_entryTemplateNames) && !hasName(_unit.functionTemplates) && !hasName(_helperNames)) {
+				throw CompileError("cannot call the entry point \"" + expression->name + "\"");
+			}
 			advance();
 			auto call = std::make_unique<Expression>();
 			call->kind = ExpressionKind::Call;
@@ -8402,10 +9423,12 @@ ExpressionPtr Parser::parsePostfix() {
 // name some struct declares as a member template is tried, and only a list closed by ">(" is taken, so a
 // comparison of a field of that name is left alone.
 void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
-	if (keyword && (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName))) {
+	member.templateKeyword = keyword;
+	if (keyword && !_memberTemplateNames.count(member.memberName)) {
 		throw CompileError("\"" + member.memberName + "\" follows the 'template' keyword, and no struct declares a "
-			"member function template of that name, called with explicit arguments");
+			"member function template of that name");
 	}
+	// "x.template f(a)" leaves the arguments to deduction: with no "<" the call below is read as any other.
 	if (!at(TokenKind::Less) || !_memberTemplateNames.count(member.memberName)) {
 		return;
 	}
@@ -8429,20 +9452,23 @@ void Parser::parseMemberTemplateArguments(Expression& member, bool keyword) {
 		throw;
 	} catch (const CompileError&) {
 	}
-	// Inside a template body Apple rejects "x.f<int>(a)" unless x is known not to depend on a parameter, and mslc
-	// does not track that, so the keyword is required (never for "this", which is the instance itself).
-	if (taken && !keyword && (_classDepth > 0 || _inInstance)
-		&& !(member.left->kind == ExpressionKind::Identifier && member.left->name == "this")) {
+	// Inside a template body Apple rejects "x.f<int>(a)" when x depends on a template parameter, and takes it when
+	// x does not. mslc takes it for "this" and for a local or parameter whose declared type names no template
+	// parameter; any other receiver is taken as dependent, which over-refuses a few valid sources loudly.
+	if (taken && !keyword && (_classDepth > 0 || _inInstance) && !receiverIndependent(*member.left)) {
 		throw CompileError("explicit template arguments on \"" + member.memberName + "\" inside a template need the "
-			"keyword: write \".template " + member.memberName + "<...>(...)\" (Apple requires it when the receiver "
-			"depends on a template parameter, and mslc does not tell which receivers do)");
+			"keyword unless the receiver is known not to depend on a template parameter: write \".template "
+			+ member.memberName + "<...>(...)\" (Apple requires it when the receiver depends on one; mslc takes the "
+			"bare form only where the receiver's type provably names no template parameter, so a dependent "
+			"receiver, an auto local or a receiver inside a class template that is not a concrete local needs the "
+			"keyword)");
 	}
 	if (taken) {
 		return;
 	}
 	if (keyword) {
-		throw CompileError("\"template " + member.memberName + "\" is not followed by a list of explicit template "
-			"arguments closed by \">(\"");
+		throw CompileError("\"template " + member.memberName + "\" is followed by \"<\", which is not a list of "
+			"explicit template arguments closed by \">(\"");
 	}
 	_position = saved;
 }
@@ -8686,7 +9712,19 @@ ExpressionPtr Parser::parsePrimary() {
 				const size_t atLine = line();
 				const std::string name(advance().text);
 				if (function->second) {
-					return makeIdentifier(_memberStruct + "::" + name, atLine);
+					ExpressionPtr staticCall = makeIdentifier(_memberStruct + "::" + name, atLine);
+					if (at(TokenKind::Less)) {
+						advance();
+						staticCall->hasTemplateArguments = true;
+						while (!at(TokenKind::Greater)) {
+							staticCall->templateArguments.push_back(parseTemplateArgument());
+							if (!match(TokenKind::Comma)) {
+								break;
+							}
+						}
+						expect(TokenKind::Greater, "to close the template arguments");
+					}
+					return staticCall;
 				}
 				ExpressionPtr member = makeThisMember(name, atLine);
 				parseMemberTemplateArguments(*member);
@@ -8754,19 +9792,19 @@ ExpressionPtr Parser::parsePrimary() {
 		}
 
 		// A struct's name and an argument list call its constructor.
-		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _constructors.count(resolved) && lookahead(spelledTokens).kind == TokenKind::LParen) {
+		if (!tagHidden && (fileScoped || !isLocal(resolved)) && _constructors.count(braced) && lookahead(spelledTokens).kind == TokenKind::LParen) {
 			const size_t atLine = line();
 			consumeName();
 			advance();
 			Type type;
-			type.namedType = resolved;
+			type.namedType = braced;
 			std::vector<ExpressionPtr> arguments = parseArgumentList("to close a constructor's argument list");
 			ExpressionPtr call = constructWithConstructor(type, arguments, atLine);
 			if (call) {
 				call->namesConcreteStruct = resolved.rfind("<template ", 0) != 0;
 			}
 			if (!call) {
-				throw CompileError("\"" + resolved + "\" has a constructor with nothing to do, and a value of it is not lowered");
+				throw CompileError("\"" + braced + "\" has a constructor with nothing to do, and a value of it is not lowered");
 			}
 			return call;
 		}
@@ -8828,10 +9866,15 @@ ExpressionPtr Parser::parsePrimary() {
 
 		// "f<float, 3>(x)": the "<" after a function template's name opens its arguments. A name that
 		// a block declares (a local, a using declaration) is not looked up as the template.
-		const bool templateId = lookahead(spelledTokens).kind == TokenKind::Less
-			&& !(spelledTokens == 1 && blockName(std::string(current().text)))
-			&& (_unit.functionTemplates.count(resolved) || std::any_of(alternatives.begin(), alternatives.end(),
-				[&](const std::string& each) { return _unit.functionTemplates.count(each) != 0; }));
+		const bool blocked = spelledTokens == 1 && blockName(std::string(current().text));
+		const auto matchesSet = [&](const std::set<std::string>& set) {
+			return set.count(resolved) || std::any_of(alternatives.begin(), alternatives.end(),
+				[&](const std::string& each) { return set.count(each) != 0; });
+		};
+		const bool templateId = lookahead(spelledTokens).kind == TokenKind::Less && !blocked && matchesSet(_unit.functionTemplates);
+		if (!templateId && lookahead(spelledTokens).kind == TokenKind::Less && !blocked && matchesSet(_entryTemplateNames)) {
+			throw CompileError("cannot call the entry point \"" + resolved + "\"");
+		}
 
 		// A name that is also an MSL builtin is a plain identifier here. Whether
 		// it is the builtin or a parameter that shadows one is a question about
@@ -8851,20 +9894,18 @@ ExpressionPtr Parser::parsePrimary() {
 		// declaration or directive in B, but it is still B's lookup that also reaches the
 		// library when B brings metal in too (directly, as namespace metal itself, or
 		// transitively), so collectMembers walks from the written scope.
-		expression->besideStdlib = false;
 		if (spelled.parts.size() > 1) {
 			const std::string scope = namespaceOf(spelled, spelled.parts.size() - 1);
 			if (!scope.empty()) {
-				std::set<std::string> seen;
-				std::set<std::string> found;
-				collectMembers(scope, spelled.parts.back(), seen, found, true, &expression->besideStdlib);
+				std::set<std::string> seen, found;
+				collectMembers(scope, spelled.parts.back(), seen, found, true, &expression->stdlibBeside);
 			}
+		} else if (spelled.global) {
+			collectStdlibOwn("", spelled.parts.back(), nullptr, &expression->stdlibBeside);
 		}
-		bool foundBesideStdlib = false;
 		if (spelledTokens == 1 && kind() == TokenKind::Identifier && !blockName(std::string(current().text))) {
-			unqualifiedFound(std::string(current().text), &foundBesideStdlib);
+			unqualifiedFound(std::string(current().text), &expression->stdlibBeside);
 		}
-		expression->besideStdlib = expression->besideStdlib || foundBesideStdlib;
 		consumeName();
 		if (templateId) {
 			advance();

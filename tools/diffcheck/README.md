@@ -19,9 +19,16 @@ loader and Mesa's lavapipe (`brew install mesa vulkan-loader`; the ICD is found 
 lavapipe manifest is accepted), `cc` and `clang++`. The two hosts are built on demand into
 `$TMPDIR/diffcheck-hosts`. Nothing else outside this repository is needed.
 
-A corpus list has one path per line, `#` comments, and an optional `std=3.1`. Paths are
+A corpus list has one path per line, `#` comments, an optional `std=3.1` and the fields of a
+`// RUN:` line (`vertex=vs fragment=fs width=32 ...`), which override the file's own, so a file you do
+not edit can be drawn as a graphics pair. An unknown or malformed field, an empty `std=`, a repeated `std=`, or a field in the path position is reported
+as an error, naming it, so the run exits with an error (even if `--min-compared` is also unmet), and the other lines still run. A path containing `=` is not supported: the line is split on whitespace with no escaping, so it reads as a field. Paths are
 relative to `--root` (default: the list's directory), so third-party shaders stay out of
-the repository: the harness takes any path.
+the repository: the harness takes any path. In `--corpus` mode, a file with one `vertex` and
+one `fragment` entry point and no explicit `vertex=`/`fragment=` is also drawn automatically (if it has
+`[[stage_in]]` attributes and no `// DIFFCHECK-POSITION:`, an unambiguous `float2`..`float4`
+or `pos`/`position` attribute carries the geometry; ambiguous attributes, multiple graphics
+entry points per stage or an unpaired stage are skipped with the reason).
 
 Exit status: `0` every compared case matched; `1` a mismatch, a failed negative control, a
 zero-output run or a reflection disagreement; `2` a harness error; `3` nothing could be
@@ -38,8 +45,7 @@ In `--corpus` mode skips do not fail the run.
    cross-checked (buffer index and name); a disagreement is itself a finding.
 3. Per case, every buffer is filled from one seeded generator and both backends get the same
    bytes. Cases cycle three profiles: `moderate` (small values), `wide` (random bits, finite
-   floats) and `edge` (0, 1, -1, INT_MIN/MAX, UINT_MAX, +-0, +-inf, NaN, denormals, +-1e-38,
-   +-1e38). bool leaves are only ever 0 or 1. `--sentinel` adds a case whose buffers are all
+   floats) and `edge` (0, 1, -1, INT_MIN/MAX, UINT_MAX, +-0, +-inf, NaN, +-1.2e-38, +-1e38; float32 denormals are never generated, because Apple flushes them in a compare and mslc does not, #377: `denormal_compare_flush.metal` pins that difference). bool leaves are only ever 0 or 1. `--sentinel` adds a case whose buffers are all
    0x7f bytes (a finite float), so a store outside the expected bytes shows. `--poison-padding`
    fills struct padding with 0xA5.
 4. All buffers are read back and compared leaf by leaf, writable and read-only alike.
@@ -58,9 +64,10 @@ A file whose `// RUN:` line names a vertex and a fragment function (or `--vertex
 is drawn instead of dispatched:
 
 ```
-// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 cases=2
+// RUN: vertex=vs fragment=fs width=32 height=32 instances=2 base_vertex=0 base_instance=0 cases=2
 // DIFFCHECK-POSITION: pos          the stage_in field that carries the position, or `none`
-// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list, pixels, `x,y` or `x,y,z` (optional)
+// DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...   triangle list (or vertex list with DIFFCHECK-INDEXES), pixels, `x,y` or `x,y,z`
+// DIFFCHECK-INDEXES: 0 1 2 0 2 3 ...       optional uint32 triangle index list into the geometry vertices
 // DIFFCHECK: depth                 read a depth target back (implied by [[depth(any)]])
 ```
 
@@ -69,9 +76,13 @@ one triangle list (default: a 20x10 and an 18x13 rectangle and a thin triangle i
 no edge passes through a pixel centre) times `instances`, into colour targets chosen from the
 fragment's outputs (float: 32F, int: 32I, uint: 32U, half: 16F; R, RG or RGBA to match the
 component count), cleared to values no plausible output equals, and an optional D32 depth target (always-pass depth test).
-The set of colour targets, their types and the depth output are read from the Metal source
-(`[[color(n)]]`, `[[depth]]`, or the plain return type), never from mslc's module: an output mslc
-drops, retypes or moves is reported as a `reflection-mismatch`, not left out of the comparison.
+The set of colour targets (`[[color(n)]]` for any subset of `0..7`), their types and the depth
+output are read from the Metal source (`[[color(n)]]`, `[[depth]]`, or the plain return type),
+never from mslc's module: an output mslc drops, retypes or moves is reported as a
+`reflection-mismatch`, not left out of the comparison. Both `noperspective` and `centroid`
+stage-interface varyings (`[[center_no_perspective]]`, `[[centroid_perspective]]`,
+`[[centroid_no_perspective]]`) are drawn inside the unclipped target; Vulkan keeps unused colour
+attachment slots as `VK_FORMAT_UNDEFINED` / `VK_NULL_HANDLE`.
 A return type the harness cannot read from the file (a typedef, a struct from an `#include`, a
 3-component output, which no pixel format holds) is skipped with the reason.
 Everything must stay inside the target: lavapipe returns NaN for `noperspective` varyings on a
@@ -84,10 +95,18 @@ interpolated values drift apart by about 1e-3. `DIFFCHECK-GEOMETRY` is checked; 
 that moves positions (instance offsets) must keep them on the grid when the output is smooth.
 
 Inputs: the `DIFFCHECK-POSITION` field is filled from the geometry (w = 1); every other stage_in
-field is seeded per vertex, one tightly packed vertex buffer per attribute (Metal slot
-`30 - location`, so a `[[buffer(n)]]` argument must not use those); `[[buffer]]` arguments are
-seeded like kernel buffers, in both stages; a 2D float texture is 4x4 RGBA32F and a runtime
-sampler is nearest, normalised, no mips, clamp-to-edge for `sampler(0)` (the only index graphics probes use). Probes should sample at a texel centre.
+field (including scalar and vector `half`, for which `mslc` widens the SPIR-V Input to `float` and
+narrows with `OpFConvert`, while both hosts feed the 16-bit vertex format) is seeded per vertex,
+one tightly packed vertex buffer per attribute (Metal slot `30 - location`, so a `[[buffer(n)]]`
+argument must not use those); `[[buffer]]` arguments are seeded like kernel buffers in both stages
+(and when `instances` is 1, writable `device` buffers are read back and compared leaf by leaf under
+`DIFFCHECK-ULP` / source ULP bounds); a texture (`1d`, `1d_array`, `2d`, `2d_array`, `3d`,
+`cube` or `cube_array`) is RGBA of `float`, `half`, `int`, `uint`, `short` or `ushort` (`sample`
+or `access::read`), a runtime sampler is nearest,
+normalised, mip-nearest with address mode picked by its Metal index (`0` clamp-to-edge, `1` repeat,
+`2` mirrored repeat), and an embedded (`constexpr`) sampler is built on Vulkan from mslc's
+reflection (`mip_filter::none`, `nearest`, or `linear`). Probes should sample at a texel centre (or 1/1024-grid coordinates for linear filtering).
+`// DIFFCHECK-MIPS: <texture> <2|3>` seeds 2 or 3 mip levels on non-1D read-only textures across both stages.
 Graphics defaults to the `moderate` profile and two cases: `wide` values interpolate to magnitudes
 where any tolerance is meaningless.
 
@@ -110,17 +129,14 @@ the audited transfer-write to host-read barrier of PR #148. Vertex-stage values 
 back (there is no transfer-feedback path), so a vertex miscompile shows only through what it
 puts in the attachments.
 
-Skipped with the reason (follow-up work): a writable `[[buffer]]` in either stage, vertex-stage
-textures, non-2D or non-float textures, embedded samplers, framebuffer fetch, a scalar half vertex
-attribute, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws, blending,
-stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
+Skipped with the reason (follow-up work): a writable `[[buffer]]` with `instances > 1`, writable
+textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures,
+framebuffer fetch. Not covered: blending, stencil, multisampling, sample-rate varyings, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants eleven
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 47
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
-
-Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tracked in #372).
 
 ## Comparison rules (`compare.py`)
 
@@ -155,11 +171,15 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   multiply and add either. Apple's in-expression fusion stays out of scope (known-issues.md).
 - `// DIFFCHECK-ULP: <buffer> <n>` replaces the file-wide ULP bound for one buffer (0 = bit-exact),
   so a buffer that must be exact is not loosened by a neighbour fed by `exp` (a graphics attachment
-  is named `color0`, ...). It cannot loosen the interpolation tolerance of a graphics attachment.
+  is named `color0`, ...). In a simple single-entry kernel without control flow or aliasing,
+  `ulp_bounds_by_root` derives each buffer's (and each scalar struct field's) ULP bound from the
+  expressions stored into it automatically. It cannot loosen the interpolation tolerance of a
+  graphics attachment.
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
+- `// DIFFCHECK-MIPS: <texture> <2|3>` seeds 2 or 3 mip levels for a non-1D read-only texture (default 1; kernel and graphics).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
-- Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374), writable
-  textures, non-2D or non-float textures, embedded (`constexpr`) samplers (all #374). Graphics pairs have their
+- Not supported yet in kernel mode, skipped with the reason: argument buffers,
+  multisample and depth textures. Graphics pairs have their
   own mode, below.
 
 ## Kernel threadgroup memory arguments
@@ -171,26 +191,56 @@ reflection entry, `spec <id> <value>` in vkhost's manifest). The indices, names 
 mslc's reflection are cross-checked against Apple's threadgroup bindings. A kernel must therefore index
 its threadgroup arguments below the local size.
 
+## Kernel atomic buffers
+
+`device atomic_int *`, `device atomic_uint *` and `device const atomic_int|atomic_uint *` (and typedef
+aliases of them) work in kernel mode with `#include <metal_stdlib>` and `using namespace metal;` (or
+`metal::atomic_*`). Apple reflects `_atomic<T>` as a 4-byte struct with scalar field `__s` (`int` or
+`uint`), which `metalhost` decomposes to `{off: 0, scalar: "int"|"uint", field: "__s"}`, `layout.py`
+cross-checks against mslc's `OpTypeRuntimeArray` layout, and `compare.py` compares bit-exact (readable
+`const` pointers reflect `access: "read"`, mutable pointers `readwrite` so writable atomic-only kernels
+are compared and perturbed by the negative control). Non-commutative ops in probes must use isolated slots
+per invocation, and shared slots across threads must use associative, commutative operations (`fetch_add`,
+`fetch_min`, `fetch_max`, `fetch_and`, `fetch_or`, `fetch_xor`). Files omitting `using namespace metal;`
+fail Apple compile as usual, and atomic struct members or non-32-bit atomics are rejected by mslc.
+Probes (`tests/diffcheck/kernel/atomic_device_ops.metal`, `tests/diffcheck/kernel/atomic_buffer_only.metal`)
+and planted SPIR-V mutants in `diffcheck/kernel-driver` cover load, store, exchange, compare_exchange_weak,
+signed/unsigned fetch_* ops, threadgroup atomic locals and layout checks.
+
 ## Kernel textures and samplers
 
-A kernel with `texture2d<float>` arguments (access `sample` or `read`) and runtime `sampler`
-arguments is run like any other: each case seeds one 4x4 RGBA32Float texture per binding from the
-case's generator (profile and seed as for buffers, so NaN and infinity texels appear in the `edge`
-case) and gives both sides the same bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
-Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index
-and name. A sampler is nearest, normalised, no mips, and its address mode follows its Metal index: 0 clamp to
+A kernel with `texture1d`, `texture1d_array`, `texture2d`, `texture2d_array`, `texture3d`, `texturecube` or
+`texturecube_array` arguments of `T` (float, half, int, uint, short or ushort; access `sample`, `read`, `write`
+or `read_write`) and runtime `sampler` arguments is run like any other: each case seeds one RGBA texture of T
+(4 texels for `1d`, 4x3 for `1d_array`, 4x4 for `2d`, 4x4x3 for `2d_array`, 4x4x2 for `3d`, 4x4x6 for `cube`,
+4x4x6x2 for `cube_array`; RGBA32Float, RGBA16Float, RGBA32Sint, RGBA32Uint, RGBA16Sint or RGBA16Uint) per binding from the case's generator
+(profile and seed as for buffers, so NaN and infinity texels appear in the `edge` case) and gives both sides the same
+bytes. Apple binds them by `[[texture(n)]]`/`[[sampler(n)]]`,
+Vulkan by the set and binding of mslc's reflection; the two reflections are cross-checked by index,
+name and access, and the element type and texture kind come from Apple's reflection. After the dispatch, every `write` or
+`read_write` texture's texels are read back and compared leaf by leaf (4 leaves of T per texel, so texels no
+thread writes must keep their seed), and the negative control perturbs one writable texture as its own group. Adding `// DIFFCHECK-MIPS: <name> <2|3>` seeds 2 or 3 mip levels for a non-1D read-only (`sample` or `access::read`) texture in level-major order (`4x4` -> `2x2` -> `1x1`, or `4x4x2` -> `2x2x1` -> `1x1x1` for 3D). A sampler is nearest, normalised, mip-nearest, and its address mode follows its Metal index: 0 clamp to
 edge, 1 repeat, 2 mirrored repeat (repeating, so index 3 is clamp again). Sample at texel centres.
 Samplers with different indices therefore read different texels outside [0, 1], and a swapped sampler
 binding is visible, but only between indices that differ modulo 3 and only for coordinates outside the
 unit square; the filter is always nearest, so a wrong filter state is not detected (#374).
 
-Vacuity guard: in case 0 the texels of each texture are replaced by others and Apple's output must
+An embedded (`constexpr`) sampler in a kernel is in Apple's shader, so Apple gets no binding for it; the Vulkan
+host builds it from mslc's `embedded_samplers` state (address modes, nearest or linear, `mip_filter::none`, `nearest`, or `linear`). A state it cannot build (compare, unnormalised coordinates, anisotropy, a min filter that differs from the mag filter, non-transparent border colour, a lod range) is skipped
+with the reason. Known gap: a linear filter on a format without the linear-filter feature bit is not checked.
+
+Vacuity guard: in case 0 the texels of each `sample`, `read` or `read_write` texture are replaced by others and Apple's output must
 change; a texture the output does not depend on is the status `unused-texture` (exit 1) unless the
-file declares `// DIFFCHECK-UNUSED: <name> <reason>`. A declaration for a texture that is in fact used
+file declares `// DIFFCHECK-UNUSED: <name> <reason>`. For a `read_write` texture its own texels count only at
+coordinates the kernel wrote, so a texture the kernel merely overwrites without reading is unused; a write-only
+texture is an output and is not tested this way. A declaration for a texture that is in fact used
 is an `error`, so a stale directive cannot hide a texture. Probes are in `tests/diffcheck/kernel`
-(`diffcheck/kernel/<name>`, run at grid 64, local 16) and `diffcheck/kernel-driver` plants planted
-miscompiles in the SPIR-V of the real output: swapped texel coordinates, two textures swapped
-between bindings, an unswapped sample coordinate, two samplers swapped between bindings. Each is reported as a mismatch while the baselines match.
+(`diffcheck/kernel/<name>`, run at grid 64, 48, 96 or 16, local 16) and `diffcheck/kernel-driver` plants
+miscompiles in the SPIR-V of the real output: swapped texel or write coordinates (2D, 1D/2D array and 3D),
+swapped written float4, half4, int4 or uint4 components, two textures (sampled, read-only, write-only or read-write)
+swapped between bindings, an unswapped sample coordinate, two samplers swapped between bindings, wrong `get_array_size`
+or `get_depth` query lane, a cube array layer-face stride of 5 instead of 6, and a wrong cube sample direction.
+Each is reported as a mismatch while the baselines match.
 
 ## Kernel texel buffers
 
@@ -274,11 +324,10 @@ test (55 of them); the other 7 are corpus-only.
   output zero, so they say `writes-zero`; they are termination checks only (a mutant that just stores
   zero survives).
 - `bool_from_float_is_unordered_compare`, `bool_vector_from_float_vector_is_unordered_compare`,
-  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are not in the list:
+  `condition_from_float_is_unordered_compare` and `logical_and_of_numeric_operands` are back in the list:
   Apple flushes a denormal in a float compare (`x != 0.0f`) and in `bool(x)`, while mslc keeps it (#377).
-  The edge profile contains denormals, and no grid size or seed keeps them out reliably (a grid that stops
-  before the first denormal passes at one seed and fails at the next). Bring them back with a way to keep
-  denormals out of the inputs.
+  The inputs no longer contain float32 denormals (`no_denormal_float`), so all four match across moderate,
+  wide and edge profiles.
 
 Not in the list, and why:
 
@@ -306,8 +355,9 @@ Not in the list, and why:
   `newLibraryWithSource` pre-includes `<metal_stdlib>`; that is the unverified reading of the
   other `pp_metal_*` probe.
 - Lavapipe rejects some valid modules (an empty struct passed by value: `vkCreateComputePipelines` -13, #376).
-- Apple flushes denormal floats in a float compare and in a float to bool conversion (#377); the
-  edge profile contains denormals, so a probe that compares or converts float inputs can mismatch there.
+- Apple flushes denormal floats in a float compare and in a float to bool conversion; mslc declares no
+  DenormFlushToZero (#377). The inputs contain no float32 denormal; `tests/diffcheck/denormal_compare_flush.metal`
+  pins the difference (Apple 0, mslc 1), checked by `tests/diffcheck_denormal_test.py`.
 - **Fixed, #368:** lavapipe used to fold `float(half(x))` to `x`, `float(int(x))` to `trunc(x)`,
   `x * 0` to `0` and `(x + 1) - 1` to `x`, because mslc's SPIR-V carried no `NoContraction` and no
   `SignedZeroInfNanPreserve`. The `safe_math_*` probes pin each case; a mismatch of that shape now is a new bug.
@@ -326,7 +376,7 @@ when it does not. Unproven on a real runner: read that step's log on the first r
 under `devices:` and `default: present` means the job runs; `devices: 0` means a self-hosted runner is
 the only way). A failing job-level `continue-on-error` job may still show a red check on the commit;
 that is unverified until the first run. `tests/probe-run.txt` lists the kernel probes that match (at the default grid or the one their `RUN` line names); the job
-requires 1,105 compared (the list compares 1,185 kernels).
+requires at least 1,105 compared.
 
 A probe in `tests/probes/` opts in with a `// RUN:` line; with the option on it becomes the
 ctest test `diffcheck/probe/<name>` and kills a mutant the disassembly regexes cannot.

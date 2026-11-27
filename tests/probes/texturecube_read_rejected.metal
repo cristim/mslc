@@ -1,4 +1,4 @@
-// EXPECT: error the texturecube method "read" is not lowered yet
+// EXPECT: error read is refused because Vulkan's OpImageFetch does not take a Cube image
 // Apple has read(uint2, uint face, uint lod); OpImageFetch does not take a Cube image.
 #include <metal_stdlib>
 using namespace metal;

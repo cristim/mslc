@@ -88,18 +88,18 @@ assert rc == 2 and data is None, (rc, out)
 # Corpus mode: a table with a summary; skips do not fail the run, a mismatch does.
 with tempfile.TemporaryDirectory() as d:
     listing = os.path.join(d, "list.txt")
-    open(listing, "w").write("# comment\n%s\n%s std=3.1\n%s\n%s\n%s\n" % (
+    open(listing, "w").write("# comment\n%s\n%s std=3.1\n%s\n%s\n%s\n%s\n" % (
         kernel("fma_kernel.metal"), kernel("struct_kernel.metal"), kernel("texture_write_kernel.metal"),
-        os.path.join(d, "missing.metal"), kernel("zero_declared_kernel.metal")))
+        kernel("texture_multisample_kernel.metal"), os.path.join(d, "missing.metal"), kernel("zero_declared_kernel.metal")))
     open(os.path.join(d, "missing.metal"), "w").write("kernel void k() { nope(); }\n")
     report = os.path.join(d, "r.json")
     base = [sys.executable, DRIVER, "--corpus", listing, "--mslc", mslc, "--metalhost", metalhost,
             "--vkhost", vkhost, "--report", report, "--jobs", "3"]
     r = subprocess.run(base, capture_output=True, text=True)
     assert r.returncode == 0, r
-    assert "5 kernels: 3 compared, 3 matched, 2 skipped" in r.stdout, r.stdout
+    assert "6 kernels: 4 compared, 4 matched, 2 skipped" in r.stdout, r.stdout
     reasons = {os.path.basename(x["file"]): x["reason"] for x in json.load(open(report))["results"] if x["status"] == "skipped"}
-    assert "access Write" in reasons["texture_write_kernel.metal"], reasons
+    assert "unsupported type other" in reasons["texture_multisample_kernel.metal"], reasons
     assert "nope" in reasons["missing.metal"] or "mslc" in reasons["missing.metal"], reasons
     open(listing, "a").write("%s\n" % kernel("zero_kernel.metal"))
     r = subprocess.run(base, capture_output=True, text=True)
@@ -134,4 +134,32 @@ with tempfile.TemporaryDirectory() as d:
     assert subprocess.run(base, capture_output=True, text=True).returncode == 0
     r = subprocess.run(base + ["--min-compared", "2"], capture_output=True, text=True)
     assert r.returncode == 1 and "--min-compared" in r.stderr, r
+
+    # Corpus graphics pairs without // RUN: vid pairs match, unambiguous stage_in infers position,
+    # ambiguous stage_in and multi-pair files skip cleanly.
+    g_vid = os.path.join(d, "g_vid.metal")
+    g_pos = os.path.join(d, "g_pos.metal")
+    g_amb = os.path.join(d, "g_amb.metal")
+    g_multi = os.path.join(d, "g_multi.metal")
+    open(g_vid, "w").write("#include <metal_stdlib>\nusing namespace metal;\n"
+                            "constant float2 P[3]={{-0.5,-0.5},{0.5,-0.5},{0.0,0.5}};\n"
+                            "vertex float4 vs(uint vid [[vertex_id]]) { return float4(P[vid % 3], 0.5, 1.0); }\n"
+                            "fragment float4 fs() { return float4(0.25, 0.5, 0.75, 1.0); }\n")
+    open(g_pos, "w").write("#include <metal_stdlib>\nusing namespace metal;\nstruct V { float2 p [[attribute(0)]]; };\n"
+                            "vertex float4 vs(V in [[stage_in]]) { return float4(in.p, 0.5, 1.0); }\n"
+                            "fragment float4 fs() { return float4(0.5, 0.25, 0.75, 1.0); }\n")
+    open(g_amb, "w").write("#include <metal_stdlib>\nusing namespace metal;\nstruct V { float2 a [[attribute(0)]]; float2 b [[attribute(1)]]; };\n"
+                            "vertex float4 vs(V in [[stage_in]]) { return float4(in.a + in.b, 0.5, 1.0); }\n"
+                            "fragment float4 fs() { return float4(1.0); }\n")
+    open(g_multi, "w").write("#include <metal_stdlib>\nusing namespace metal;\n"
+                              "vertex float4 v1() { return float4(0); }\nvertex float4 v2() { return float4(0); }\n"
+                              "fragment float4 fs() { return float4(1); }\n")
+    g_rep = os.path.join(d, "g.json")
+    open(listing, "w").write("%s\n%s\n%s\n%s\n" % (g_vid, g_pos, g_amb, g_multi))
+    r = subprocess.run(base + ["--report", g_rep, "--cases", "1"], capture_output=True, text=True)
+    assert r.returncode == 0 and "4 kernels: 2 compared, 2 matched, 2 skipped" in r.stdout, (r.returncode, r.stdout, r.stderr)
+    by_base = {os.path.basename(x["file"]): x for x in json.load(open(g_rep))["results"]}
+    assert by_base["g_vid.metal"]["status"] == "matched" and by_base["g_pos.metal"]["status"] == "matched", by_base
+    assert "DIFFCHECK-POSITION" in by_base["g_amb.metal"]["reason"]
+    assert "multiple vertex or fragment" in by_base["g_multi.metal"]["reason"]
 print("PASS")

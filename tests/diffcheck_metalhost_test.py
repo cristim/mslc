@@ -39,6 +39,7 @@ with tempfile.TemporaryDirectory() as d:
     want = [(0, "float"), (4, "float"), (8, "float"), (16, "uint"), (20, "bool"), (22, "half"),
             (24, "float"), (28, "float"), (32, "float"), (36, "float")]
     assert got == want, got
+    assert [l["field"] for l in by_name["in"]["leaves"]] == ["a", "a", "a", "n", "flag", "h", "p", "p", "p", "p"]
     assert by_name["in"]["stride"] == 48 and by_name["in"]["access"] == "read"
     assert by_name["out"]["access"] == "readwrite"
 
@@ -56,6 +57,22 @@ with tempfile.TemporaryDirectory() as d:
     want = tuple(x * 3.0 + 1.0 for x in a)
     assert out == want, (out[:8], want[:8])
     assert out != tuple(w + 1 for w in want)  # negative control
+
+    # Atomic buffer pointers reflect _atomic<int|uint> via struct field __s with stride 4.
+    open(path("atomics.metal"), "w").write(
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void k(device atomic_int *ai [[buffer(0)]], device atomic_uint *au [[buffer(1)]],"
+        " device const atomic_uint *cau [[buffer(2)]]) {"
+        " atomic_store_explicit(ai, int(atomic_load_explicit(cau, memory_order_relaxed)), memory_order_relaxed);"
+        " atomic_fetch_add_explicit(au, 1u, memory_order_relaxed); }\n")
+    assert run("mode reflect\nsource %s\nentry k\nreflection %s\n" % (path("atomics.metal"), path("a.json"))).returncode == 0
+    arefl = json.load(open(path("a.json")))
+    assert arefl["unsupported"] == [], arefl
+    aby = {b["name"]: b for b in arefl["buffers"]}
+    assert aby["ai"]["stride"] == 4 and aby["ai"]["access"] == "readwrite"
+    assert aby["ai"]["leaves"] == [{"off": 0, "scalar": "int", "field": "__s"}], aby["ai"]
+    assert aby["au"]["leaves"] == [{"off": 0, "scalar": "uint", "field": "__s"}], aby["au"]
+    assert aby["cau"]["access"] == "read" and aby["cau"]["leaves"] == [{"off": 0, "scalar": "uint", "field": "__s"}]
 
     # A source Apple rejects is an error with Apple's message, not a silent success.
     open(path("bad.metal"), "w").write("kernel void k(device float* o [[buffer(0)]]) { o[0] = nope; }\n")

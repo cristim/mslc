@@ -88,5 +88,17 @@ class Verdict(unittest.TestCase):
         self.assertEqual(checks.verdict([self.OK], True, False)[0], "matched")
 
 
+class ControlHolds(unittest.TestCase):
+    def test_requires_every_nonempty_group_to_compare_unequal(self):
+        good = {0: LAYOUT}
+        good2 = {1: dict(LAYOUT, name="o2")}
+        truncated = {1: {"name": "short", "access": "readwrite", "stride": 8, "leaves": LEAF}}
+        buf = {0: bytearray(b"\x00\x00\x80\x3f"), 1: bytearray(b"\x00\x00\x80\x3f")}
+        self.assertTrue(checks.control_holds([good, good2], buf, buf))
+        self.assertFalse(checks.control_holds([good, truncated], buf, buf))
+        self.assertFalse(checks.control_holds([], buf, buf))
+        self.assertFalse(checks.control_holds([{0: dict(LAYOUT, access="read")}], buf, buf))
+
+
 if __name__ == "__main__":
     unittest.main()

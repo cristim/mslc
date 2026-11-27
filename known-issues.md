@@ -117,22 +117,18 @@ attachment. What it does not cover:
 - A mismatched input and output type at one index is refused with Apple's wording, but only
   against the return type of the same function.
 
-## half `fwidth` lowers via widen-to-float32, Apple parity unmeasured (#173)
+## half `fwidth` narrows each derivative to half before the sum (#173)
 
-`fwidth` on a `half`/`half2`/`half3`/`half4` argument lowers by converting the
-operand to `float32`, emitting `OpFwidth` (core SPIR-V requires 32-bit float
-components), and converting the result back to `half`. This is proven
-internally correct by a lavapipe readback (exact affine-input derivative,
-tolerance 0, two compiler mutants both caught), but **Apple's own half-fwidth
-rounding policy is unmeasured on this machine** (no Apple toolchain is
-reachable here). Apple is known to emit a native `air.fwidth.v2f16` for half,
-which may compute the difference/sum in half precision directly rather than
-widening to float32 first; the two approaches are not guaranteed to produce
-bit-identical results. The project owner was asked directly and chose to land
-this lowering with the gap stated rather than wait for hardware access to
-measure it. If Apple hardware/toolchain access becomes available, measure
-`air.fwidth.v2f16`'s actual output against mslc's widen-compute-narrow output
-and update or remove this entry.
+`fwidth` on a `half`/`half2`/`half3`/`half4` argument widens the operand to
+`float32` (core SPIR-V derivatives are 32-bit), takes `OpDPdx` and `OpDPdy`, narrows
+each to half, applies `FAbs` and adds in half. Apple's GPU does the same: on
+`tests/half_fwidth_wide.metal` (1024 next to 2^-10, |dy| = 1.5) both give 1026,
+where a float32 sum narrowed once gives 1025. Measured with tools/diffcheck, Apple
+GPU against lavapipe: `half_fwidth`, `half_fwidth_special` (rounding, subnormal, Inf,
+NaN, inf - inf, overflow) and `half_fwidth_wide` all match bit for bit, and
+`tests/half_fwidth_expected_test.py` checks the values against numpy float16.
+Not covered: half varyings interpolated from vertex data, and whether Apple uses a
+coarse or fine derivative on other hardware (lavapipe is fine).
 
 ## mslc emits Vulkan-valid modules that this lavapipe rejects
 
@@ -447,18 +443,26 @@ of the #354 fix.
 
 ## Constant-expression narrowing: over-accepts and gaps (#160)
 
-Apple rejects these and mslc accepts them. Both predate the #160 change (the reviewer found
+Apple rejects these and mslc accepts them. They predate the #160 change (the reviewer found
 them on master as well), so neither is a regression.
 
 - `const int k = 3; const thread int& r = k; float x{r};` is accepted; Apple does not treat a
   reference to a const as a constant, so it rejects the narrowing.
-- Narrowing in dead code after `return;` is not checked: `return; constexpr int n = 300; char x{n};`
-  is accepted, Apple rejects it.
+- Code after a `return;` (declarations, nested blocks, if bodies, switch cases) is now type-checked as
+  Apple does, by lowering it once more in a scratch module that is dropped, so it adds no capability,
+  type or constant to the real one (an uninitialized declaration after a `return` in a non-last switch case
+  gets storage in the real module only when a later case names it). A function with dead code is therefore compiled twice, and a form
+  mslc does not lower yet is now refused in dead code too.
+- A live module that uses both `uchar` and `char` (`uchar x{200}; char y{100};`) carries `OpCapability Int8`
+  twice (spirv-val accepts it). Predates #160; found in review.
+
+
+Arithmetic on a scalar bool promotes it to int, in code and in a constant (`float x{true + 1}`, `-flag`,
+`i += flag`). Still refused as "not lowered yet": arithmetic or a unary `+ - ~` on a bool vector (Apple
+accepts it), and a compound assignment whose target is a bool (`b &= c`, `b += 1`; Apple accepts it).
 
 Forms Apple accepts that the validity proof still leaves as the unsupported-proof diagnostic:
-char literals such as `'a'` in a constant (parser limit), arithmetic on a bool
-(`float x{true + 1}`; every arithmetic or bitwise operator on a bool is refused as "not lowered yet", so
-this is a lowering gap and not a proof gap), a float-to-integer cast inside a vector constructor of a constexpr list
+char literals such as `'a'` in a constant (parser limit), a float-to-integer cast inside a vector constructor of a constexpr list
 (`constexpr int3 v{int3(1.5f)}`), and a file-scope `constant` initialised with a float division by
 zero that is then narrowed to half. A file-scope `constant int g = true ? 1 : 5 / 0;` (an unchosen arm that
 does not fold, outside a function) is refused with "not known outside a function"; Apple accepts it.
@@ -476,17 +480,27 @@ supported. Dropped or type-probed initialisers no longer leave dead function loc
 
 Apple accepts the first five, which are refused loudly. It also rejects the last two, so for those only the wording differs.
 
-- `using T = S; T{1,2}`: every alias declaration is rejected ("a using declaration has to name a
-  member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
-  at statement start too.
+- `using T = S; T{1,2}`: an alias of a struct, scalar, vector, pointer (`using P = device float*;`) or array
+  (`using A = float[4];`) works at file scope and in a function (it ends with its block). Still refused where Apple
+  accepts: a `struct` keyword (`using T = struct S;`, `using F = enum E;`; the enum message reads 'a "enum" keyword'
+  and should read 'an "enum" keyword', not yet fixed), an attribute (`using T [[maybe_unused]] = S;`), a function
+  alias that hides another declaration of its name, a `const` or address space written beside a pointer alias
+  (`const P p`), a pointer or array of an array alias (`A x[2]`, `A*`), and an array alias as a struct member or a
+  helper parameter (as `float a[4]` there). A local of a pointer alias is the existing "a local pointer" refusal.
+  `typedef S T; T{1,2}` works, at statement start too.
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
   included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`),
   indexing a temporary (`S{{1,2},3}.a[1]`), a braced return from an entry point (a helper's `return {1,2};` works, #362), and the
   parenthesised copy `A z(A{{1},2})` ("constructing a A is not lowered yet", as for any struct).
 - File-scope `constant` structs with a positional or array-member initialiser (a plain `constant P g = {1, 4};` gets the same "initialised by field name" error; designators on a plain struct work), which Apple accepts: `constant Q g =
-  {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` ("needs an
-  initialiser, found {") and `constant Q g = {.a = {1,2,3}, .s = 4};` ("a constant of \"\" is not a struct this
-  source declares").
+  {{1,2,3},4};` ("initialised by field name, so a has to be named"), `constant Q g{{1,2,3},4};` (the same
+  field-name error, now that a brace list is accepted in place of "=") and `constant Q g = {.a = {1,2,3}, .s = 4};`
+  ("a constant of \"\" is not a struct this source declares").
+- A file-scope `constant` of a scalar, vector or array takes its brace list with or without "=" (#390); a vector's
+  brace list still requires all of its components (an empty or partial list such as `constant int4 z{};` or
+  `constant int4 v{1, 2};` is refused, where a scalar or array zero-fills). A bool
+  still does not convert to or from a number in a constant, where Apple accepts both: `constant bool b = 1;`,
+  `constant bool b{1};`, `constant int k = true;` and `constant float f{true};` are refused.
 - Assigning to a conditional or comma that yields a place, including `(c ? s : t) = S{3,4}`,
   `(c ? S{1,2} : S{3,4}) = S{3,4}`, `(c ? s : t).a = 9` and a reference bound to a member of one;
   a store, `++`, reference binding or by-reference argument on such a member is refused with a
@@ -631,12 +645,22 @@ below the template that rebinds a name, and a later overload found by argument-d
   reads a function template's instance cannot declare a struct, so it asks for the instance and the file is
   parsed again with it made where its class template and argument types are first declared (one more parse per
   distinct instance, at most 64: more is refused). Refused: an argument type declared after the function template;
-  a deduced `Box<T>` in a parameter (`T unbox(Box<T>)`) or a return type (`Box<T> make(T)`), where T is still being
-  deduced (the explicit form `unbox<float>(b)` works); a file-scope name the class template spells that is declared
+  a file-scope name the class template spells that is declared
   anywhere after it (a loud false refusal when it is unrelated); and a using declaration or directive after the
   class template in a scope it reads from, checked at the end of the file. Explicit instantiation of an entry point
-  (`template [[host_name("kf")]] kernel void k<float>(...)`, accepted by Apple) is not class-instance work and is
-  still refused.
+  (`template [[host_name("kf")]] kernel void k<float>(...)`, vertex and fragment included) is lowered (#341);
+  omitting `[[host_name("...")]]` on an explicit entry-point instantiation, `[[host_name("...")]]` on a helper
+  or non-template entry point, conflicting parameter attributes on the instantiation, and a `host_name` that
+  collides with a helper function name remain refused (Apple accepts omitting `host_name` when unique, accepts
+  `host_name` sharing a name with a helper, and ignores conflicting attributes on named instantiation parameters).
+- A deduced instance in a function template's signature (`T unbox(Box<T>)`, `Box<Box<T>>`, `Pair<A, int>`, `Box<T>
+  make(T)`) works (slice 5e): the instance is a marker type while T is being deduced, and an argument that is an
+  instance of the same class template gives T its argument (one T named twice must agree, also with a plain `T x`).
+  Refused: `Box<T>*` or an array of instances as a parameter; a constant parameter deduced through an instance
+  (`Vn<T, N>`, which Apple accepts); an instance that leaves an argument to its default while a parameter is still
+  to be deduced (`D<T>` for `D<T, U = int>`); an instance over a deduced parameter in a return type used as
+  `make(x).field` (`f(x).field` is refused for every template). `f(Box<T>)` beside `f(T)` is an ambiguity here and
+  Apple picks the first by partial ordering (not modelled).
 - Every member function of an instance is read when the instance is made, so an unused member whose body does
   not compile for that argument is an error here and not in Apple. Apple reads a member only when it is used.
 - Member functions count as declared where the template is. Clang instantiates at the end of the file, where an
@@ -685,10 +709,16 @@ members and templates, helpers, function template instances, namespaces, a call 
 receiver, and `Box<T>` members: no value differed.
 
 - Refused, loudly: a member template beside a member function of the same name (Apple takes one overload set), a
-  static one, a constructor template, `explicit`, `virtual` and `friend`, a non-const one (as every non-const
+  static member template called through an object (`s.f(x)`; Apple takes it, call it as `S::f(x)`), a static and a
+  non-static member template of one name, `explicit`, `virtual` and `friend`, a non-const one (as every non-const
   member), an explicit specialisation or instantiation, an out-of-line definition (refused where it is written), a
   template parameter named like one of the class template's, a member template of an unnamed struct, and a call on
   an object in device, constant or threadgroup memory (Apple rejects that too).
+- The static and non-static member template check depends on declaration order (#341): a non-static member
+  function declared after a static template of its name is accepted, and the reverse order is refused. Apple
+  accepts both orders.
+- `template <typename U> U static f(U x)` (`static` after the return type) is refused with a misleading "is not const"
+  message, because only a leading `static` is read; Apple accepts it (#341).
 - The result type of `v.f(x)` is known only once the arguments are deduced, so `v.f(x).field` is refused when the
   template returns its own parameter (it reads as a swizzle), as for a function template. A result that does not
   name a template parameter (`P f(U) const`) is a struct value as usual.
@@ -699,6 +729,27 @@ receiver, and `Box<T>` members: no value differed.
   above), so a function or constant declared below the class template that its body names is refused.
 - `v.f<float>(x)` is read as template arguments only when some struct declares a member template `f` and a `>(` closes
   the list; a comparison written that way is left alone.
+- Inside a template, `x.f<float>(a)` without the `template` keyword is taken only when `x` is `this`, a local or parameter
+  whose declared type names no template parameter (and no `auto`, no local), a field of `this` of a non-template struct, a
+  field or element of such a receiver, the result of a plain (non-template) function called with literals or such
+  receivers, or `auto a = B{...}` with `B` a plain struct. A block-scope using-declared type counts as concrete. Inside
+  a class template the receiver may be a concrete local (a `W<float>` local and a `W w = *this;` local of the injected name are concrete, as the member belongs to the current instantiation; a field of the injected-name local, or of one of its elements, is dependent), never a parameter, a field
+  or a call: those are refused loudly and ask for `.template`, as class-scope typedefs are not tracked. Other
+  concrete receivers Apple accepts (a call result of a function with other arguments, `B{...}.f<float>()`, an
+  element indexed by an expression such as `loc[int(x)]`) are also refused loudly. An element needs a literal or independent index,
+  as Apple treats `loc[x]` with a dependent `x` as dependent.
+  A `W<T> w = *this;` local inside the class template `W` is the current instantiation too and Apple takes `w.f<float>(x)`
+  bare; mslc refuses it loudly and asks for `.template`.
+  `x.template f(a)` (deduced arguments) is accepted when some struct declares a member template `f`; Apple rejects it when `x`'s own `f`
+  is a plain member, which mslc diagnoses at the call. No wrong value comes of any of these.
+- A program-scope receiver (a `constant` object) is not reached: mslc refuses its `constant`-qualified member
+  template at the declaration ("the declarator of the template "f" is not a shape mslc can name the function in");
+  Apple accepts it. Reproduced with att/e01 in review of #386.
+- `x.f < 3 > (y)` on an int field, where some struct declares a member template `f`, is refused with the misleading
+  "not a texture parameter" message; Apple accepts it as a comparison. This also fails outside templates, so it predates
+  #386.
+- The class-instance flag set in `parseInstance` (`_classMemberInstance`) has no probe pinning it, and its purpose is
+  not reachable today.
 - A member template that is never called is read at no point, so an error in its body is not reported (Apple reports
   only the non-dependent ones).
 - Older gap, unchanged: a non-template member function called on a device object is accepted.
@@ -855,8 +906,8 @@ Apple's value is undefined.
 ## `metal::fast::` and `metal::precise::` lower as the plain functions
 
 A call of one of the functions both scopes declare (of those mslc lowers: abs, acos, asin, atan, atan2, ceil,
-clamp, cos, distance, exp, exp2, floor, fma, fmod, fract, length, log, log2, max, min, normalize, pow, powr,
-rint, round, rsqrt, saturate, select, sin, sqrt, tan and trunc) is that function on float: a scalar of another
+clamp, cos, distance, exp, exp2, fabs, floor, fma, fmax, fmin, fmod, fract, length, log, log2, max, min,
+normalize, pow, powr, rint, round, rsqrt, saturate, select, sin, sqrt, tan and trunc) is that function on float: a scalar of another
 type converts to float and a vector of another type is refused, as Apple's float-only overloads do. The
 instructions are the plain function's, with the precision Vulkan gives them. Neither variant's bound in the
 MSL specification is promised; the fast variants are what Apple's default fast math compiles the plain names
@@ -891,3 +942,35 @@ Apple accepts, and mslc refuses (each a loud error):
 - `return g();` where `g` returns void (C++ deduces void): "a call to \"g\" returns void and has no value".
 - An auto function declared with no body ("declared auto with no body here").
 - `auto` member functions of a struct.
+
+## Explicit instantiation of a helper function template (#341)
+
+- `template float f<float>(int);` (a signature that matches no instance of `f`) is accepted and ignored; Apple
+  rejects it. Only the name is checked, and nothing is emitted, so the result is harmless.
+
+## Linear sampling of inf and NaN texels differs from Apple (#374, diffcheck)
+
+- With the edge input profile (inf and NaN texels), a `filter::linear` sample gives a number on Apple where
+  lavapipe gives NaN, so `embedded_sampler_linear.metal` and the linear output of
+  `embedded_sampler_clamp_to_zero.metal` cannot be compared on that profile. Measured example, `embedded_sampler_linear`,
+  `outA` element 5 offset 92, seed 1: Apple `-6.7059e-07` (0xb5340298), mslc on lavapipe NaN (0x7fc00000); element 0
+  gives Apple `inf` against NaN. The likely cause (not isolated) is a zero filter weight times an infinite texel,
+  which lavapipe evaluates to NaN and Apple apparently skips. Both probes therefore declare `cases=1` (the moderate,
+  finite profile) with a per-buffer `DIFFCHECK-ULP`. Whether real shaders can see it is open: it needs a texture
+  holding inf or NaN.
+
+## Sample `bias` and `min_lod_clamp` in vertex and kernel functions (#360)
+
+- Measured on Apple M1 Pro GPU across multi-mip textures (4-level 8x8 RGBA32F, RGBA16F, RGBA32S/Uint,
+  RGBA16S/Uint, 2D array, 3D, cube, cube array, depth2d/array/cube/cube_array `sample` and `sample_compare`,
+  nearest and linear mip filters, anisotropy, runtime `lodMinClamp`/`lodMaxClamp`, `int2` offsets, and helpers):
+  in both vertex and kernel functions, plain `sample` reads level 0, `bias(b)` reads level `b` (clamped to `[0, max]`
+  and the sampler's `[lodMinClamp, lodMaxClamp]`), `gradient*` with `min_lod_clamp(m)` clamps the gradient LOD to `m`,
+  and `min_lod_clamp(m)` without gradients is ignored (both alone and alongside `bias(b)`).
+- mslc matches that hardware behaviour (`Lod = b` for `bias(b)`, `Grad | MinLod` with gradients, and dropping
+  non-gradient `min_lod_clamp` in vertex and kernel). Two assumptions remain: negative `bias(b)` clamps to 0 only
+  when the host sampler's `minLod >= 0`, and dropping non-gradient `min_lod_clamp` assumes other Metal GPUs ignore it
+  in vertex and kernel stages the same way Apple M1 Pro does.
+- A library helper (`--compile-library`) naming `bias` or non-gradient `min_lod_clamp` still fails with `StageError`
+  because fragment callers emit `Bias`/`MinLod` on `OpImageSampleImplicitLod` while vertex/kernel callers lower them
+  to explicit `Lod`.

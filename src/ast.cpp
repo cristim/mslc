@@ -74,8 +74,9 @@ std::string typeName(const Type& type) {
 		// A function template's parameter still to be deduced, "<T>", is spelled as its name.
 		const std::string sampled = type.namedType.size() > 2 && type.namedType.front() == '<'
 			? type.namedType.substr(1, type.namedType.size() - 2) : std::string(scalarKindName(type.scalar));
+		const TextureAccess defaultAccess = type.isMultisampled ? TextureAccess::Read : TextureAccess::Sample;
 		return kindName + "<" + sampled
-			+ (type.textureAccess == TextureAccess::Sample ? std::string(">")
+			+ (type.textureAccess == defaultAccess ? std::string(">")
 				: std::string(", access::") + textureAccessName(type.textureAccess) + ">");
 	}
 
