@@ -265,7 +265,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         ep, a = compiled[stage][1], apple[stage]
         if a["unsupported"]:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
-        reasons = resources.unsupported(ep, a)
+        reasons = resources.unsupported(ep, a) + ["texture %s is not a 2D texture" % t["name"] for t in a["textures"] if t["type"] != "2d"]
         if reasons:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(reasons)))
         layouts[stage] = {l["index"]: l for l in a["buffers"]}

@@ -36,7 +36,7 @@ OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
 
 def run_backend(backend, run, case, textures, tag="", texels=()):
     """{key: output bytes} of one backend for one case: a device buffer under its Metal index, a texel
-    buffer under resources.texel_key, a writable 2D texture under resources.texture_key. The inputs are
+    buffer under resources.texel_key, a writable texture under resources.texture_key. The inputs are
     the files in-<case>-<index>.bin; `textures` is resources.seed's list and `texels` resources.seed_texels';
     `tag` keeps repeat runs' files apart."""
     work, mbuf = run["work"], run["mbuf"]
@@ -80,9 +80,10 @@ def unused_textures(run, params, textures, texels, bindings, compared, apple_out
         if access == "Write":
             continue
         scalar = rest[0] if rest else "float"
+        kind = rest[1] if len(rest) > 1 else "2d"
         key, data = resources.texture_key(index), hostenv.read_bytes(path)
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
-        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar)
+        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar, kind)
         hostenv.write_bytes(alt, alt_data)
         swapped = [(i, s, b, alt if i == index else f, a, *r) for i, s, b, f, a, *r in textures]
         again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)

@@ -11,15 +11,17 @@
 //   local X Y Z             groups X Y Z
 //   buffer <member> <bytes> <input file> <output file>
 //   texture|storagetexture <metal index> <set> <binding> <w> <h> <rgba file> [<type> [write|readwrite <output file>]]
-//                                                                       (at most 4)
+//                                                                       (at most 8)
+//   image <kind> <access> <metal index> <set> <binding> <w> <h> <d> <layers> <type> <in> [<out>]
+//                                                                       (1d, 1d_array, 2d_array, 3d, cube, cube_array)
 //   esampler <set> <binding> <S> <T> <R> <linear 0|1>   (kernel mode: an embedded sampler, state in VkSamplerAddressMode values)
-//   sampler <metal index> <set> <binding>                               (at most 4)
+//   sampler <metal index> <set> <binding>                               (at most 8)
 //   spec <constant id> <value>   a specialization constant besides the local size (mslc's threadgroup
 //                                memory arguments: the element count of their Workgroup array; at most 8)
 //   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                                                       (at most 8)
-// A texture is a 2D RGBA sampled image of <type> (default float; a storagetexture: a storage image, read-only or with `write|readwrite`
-// written back to the output file after the dispatch) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
+// A texture is an RGBA sampled or storage image of <type> (default float; with `write|readwrite`, written back to
+// the output file after the dispatch) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
 // 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> texels of <components> (1, 2 or 4) components of <type>
 // (float half int uint short ushort: R32_SFLOAT, R32G32_SFLOAT, R32G32B32A32_SFLOAT, R16..., ..._SINT, ..._UINT) over a
 // buffer filled from the input file, a UNIFORM_TEXEL_BUFFER descriptor (sampled) or a STORAGE_TEXEL_BUFFER one,
@@ -139,13 +141,20 @@ static uint32_t initDevice(VkQueueFlags queueFlag) {
 
 // ---- textures and samplers, shared by the compute and the draw path ----
 
-#define MAXTEX 4
+#define MAXTEX 8
 #define MAXTB 8
+typedef enum { TEX_1D, TEX_1D_ARRAY, TEX_2D, TEX_2D_ARRAY, TEX_3D, TEX_CUBE, TEX_CUBE_ARRAY } TexKind;
 static VkFormat texelFormat(const char *type, unsigned components, unsigned *bytes);
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Img;
-static Img makeImage(VkFormat f, unsigned w, unsigned h, VkImageUsageFlags usage, VkImageAspectFlags aspect);
-static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
-                                       VkAccessFlags src, VkAccessFlags dst);
+static TexKind parseTexKind(const char *s);
+static unsigned texSlices(TexKind kind, unsigned layers);
+static VkImageType texImageType(TexKind kind);
+static VkImageCreateFlags texCreateFlags(TexKind kind);
+static VkImageUsageFlags texUsage(int storage);
+static Img makeImage(TexKind kind, VkFormat f, unsigned w, unsigned h, unsigned d, unsigned layers,
+                     VkImageUsageFlags usage, VkImageAspectFlags aspect);
+static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, unsigned layers,
+                                       VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst);
 static void fillBuf(Buf b, const void *data, size_t n);
 
 // Nearest, normalised; the address mode is picked by the Metal sampler index, as in metalhost, so a
@@ -169,25 +178,30 @@ static VkSampler makeNearestSampler(unsigned index) {
 }
 
 // The image and the staging buffer holding the file's RGBA texels (`storage` 0 sampled, 1 read, 2 write, 3 readwrite).
-static Img loadTexture(const char *file, const char *type, unsigned w, unsigned h, int storage, Buf *stage, unsigned *bpp) {
+static Img loadTexture(TexKind kind, const char *file, const char *type, unsigned w, unsigned h, unsigned d, unsigned layers,
+                       int storage, Buf *stage, unsigned *bpp) {
     VkFormat fmt = texelFormat(type, 4, bpp);
-    VkImageUsageFlags usage = (storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        | (storage >= 2 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
-    Img t = makeImage(fmt, w, h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
-    size_t n; void *data = slurp(file, &n);
-    if (n != (size_t)w * h * *bpp) die("%s has the wrong size", file);
+    Img t = makeImage(kind, fmt, w, h, d, layers, texUsage(storage), VK_IMAGE_ASPECT_COLOR_BIT);
+    size_t n, expect = (size_t)w * h * d * texSlices(kind, layers) * *bpp;
+    void *data = slurp(file, &n);
+    if (n != expect) die("%s has the wrong size", file);
     *stage = makeBuf(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0); fillBuf(*stage, data, n); free(data);
     return t;
 }
 
 // Copies the staging buffer into the image and makes it accessible to `consumer`.
-static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, unsigned w, unsigned h, int storage, VkPipelineStageFlags consumer) {
-    VkImageMemoryBarrier to = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, TexKind kind, unsigned w, unsigned h, unsigned d,
+                                unsigned layers, int storage, VkPipelineStageFlags consumer) {
+    unsigned totalLayers = texSlices(kind, layers);
+    VkImageMemoryBarrier to = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, totalLayers, VK_IMAGE_LAYOUT_UNDEFINED,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to);
-    VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, totalLayers}, {0, 0, 0}, {w, h, d}};
     vkCmdCopyBufferToImage(cmd, stage.buf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     VkAccessFlags dst = (storage != 2 ? VK_ACCESS_SHADER_READ_BIT : 0) | (storage >= 2 ? VK_ACCESS_SHADER_WRITE_BIT : 0);
-    VkImageMemoryBarrier rd = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, dst);
+    VkImageMemoryBarrier rd = imgBarrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, totalLayers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT, dst);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, consumer, 0, 0, NULL, 0, NULL, 1, &rd);
 }
 
@@ -221,7 +235,9 @@ int main(int argc, char **argv) {
     char spv[1024] = "", entry[256] = "main", in[MAXBUF][1024], out[MAXBUF][1024];
     unsigned local[3] = {1, 1, 1}, groups[3] = {1, 1, 1}, set = 0, member[MAXBUF], nbuf = 0;
     unsigned long long bytes[MAXBUF];
-    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], tbpp[MAXTEX], nt = 0, sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0, eaddr[MAXTEX][4];
+    unsigned tset[MAXTEX], tbind[MAXTEX], tw[MAXTEX], th[MAXTEX], td[MAXTEX], tlayers[MAXTEX], tbpp[MAXTEX], nt = 0;
+    TexKind tkind[MAXTEX];
+    unsigned sset[MAXTEX], sbind[MAXTEX], sidx[MAXTEX], ns = 0, eaddr[MAXTEX][4];
     char tfile[MAXTEX][1024], ttype[MAXTEX][16], tout[MAXTEX][1024]; int tstore[MAXTEX];
     unsigned specid[MAXSPEC], specval[MAXSPEC], nspec = 0;
     unsigned bset[MAXTB], bbind[MAXTB], bcomp[MAXTB], btexels[MAXTB], bbytes[MAXTB], nb = 0; int bstore[MAXTB];
@@ -236,19 +252,41 @@ int main(int argc, char **argv) {
         if (sscanf(line, "local %u %u %u", local, local + 1, local + 2) == 3) continue;
         if (sscanf(line, "groups %u %u %u", groups, groups + 1, groups + 2) == 3) continue;
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
-        if (nt < MAXTEX) {
-            strcpy(ttype[nt], "float"); tout[nt][0] = 0;
-            int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt]);
-            if (n == 5 || n == 6) { tstore[nt++] = 0; continue; }
-        }
-        if (nt < MAXTEX) {
-            char mode[16] = ""; strcpy(ttype[nt], "float"); tout[nt][0] = 0;
-            int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], mode, tout[nt]);
-            if (n == 5 || n == 6 || n == 8) {
-                if (n == 8 && strcmp(mode, "write") && strcmp(mode, "readwrite")) die("storage texture mode %s is not write or readwrite", mode);
-                tstore[nt++] = n < 8 ? 1 : mode[0] == 'w' ? 2 : 3;
-                continue;
+        if (!strncmp(line, "texture ", 8) || !strncmp(line, "storagetexture ", 15) || !strncmp(line, "image ", 6)) {
+            if (nt >= MAXTEX) refuse("too many textures (max %d)", MAXTEX);
+            strcpy(ttype[nt], "float"); tout[nt][0] = 0; td[nt] = 1; tlayers[nt] = 1; tkind[nt] = TEX_2D;
+            int ok = 0;
+            if (!strncmp(line, "texture ", 8)) {
+                int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt]);
+                if (n == 5 || n == 6) { tstore[nt] = 0; ok = 1; }
+            } else if (!strncmp(line, "storagetexture ", 15)) {
+                char mode[16] = "";
+                int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s %1023s",
+                               &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], mode, tout[nt]);
+                if (n == 5 || n == 6 || n == 8) {
+                    if (n == 8 && strcmp(mode, "write") && strcmp(mode, "readwrite")) die("storage texture mode %s is not write or readwrite", mode);
+                    tstore[nt] = n < 8 ? 1 : mode[0] == 'w' ? 2 : 3;
+                    ok = 1;
+                }
+            } else {
+                char kindStr[16] = "", mode[16] = "";
+                int n = sscanf(line, "image %15s %15s %*u %u %u %u %u %u %u %15s %1023s %1023s",
+                               kindStr, mode, &tset[nt], &tbind[nt], &tw[nt], &th[nt], &td[nt], &tlayers[nt],
+                               ttype[nt], tfile[nt], tout[nt]);
+                if (n == 10 || n == 11) {
+                    tkind[nt] = parseTexKind(kindStr);
+                    if (n == 10 && !strcmp(mode, "sample")) tstore[nt] = 0;
+                    else if (n == 10 && !strcmp(mode, "read")) tstore[nt] = 1;
+                    else if (n == 11 && !strcmp(mode, "write")) tstore[nt] = 2;
+                    else if (n == 11 && !strcmp(mode, "readwrite")) tstore[nt] = 3;
+                    else die("bad image mode %s in: %s", mode, line);
+                    ok = 1;
+                }
             }
+            if (!ok) die("bad manifest line: %s", line);
+            if (!tw[nt] || !th[nt] || !td[nt] || !tlayers[nt]) die("zero texture dimension");
+            nt++;
+            continue;
         }
         if (nb < MAXTB) {
             char kind[16];
@@ -258,8 +296,12 @@ int main(int argc, char **argv) {
                 continue;
             }
         }
-        if (ns < MAXTEX && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { eaddr[ns++][3] = 0; continue; }
-        if (ns < MAXTEX && sscanf(line, "esampler %u %u %u %u %u %u", &sset[ns], &sbind[ns], &eaddr[ns][0], &eaddr[ns][1], &eaddr[ns][2], &sidx[ns]) == 6) { eaddr[ns++][3] = 1; continue; }
+        if (!strncmp(line, "sampler ", 8) || !strncmp(line, "esampler ", 9)) {
+            if (ns >= MAXTEX) refuse("too many samplers (max %d)", MAXTEX);
+            if (sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { eaddr[ns++][3] = 0; continue; }
+            if (sscanf(line, "esampler %u %u %u %u %u %u", &sset[ns], &sbind[ns], &eaddr[ns][0], &eaddr[ns][1], &eaddr[ns][2], &sidx[ns]) == 6) { eaddr[ns++][3] = 1; continue; }
+            die("bad manifest line: %s", line);
+        }
         if (line[0] != '\n') die("bad manifest line: %s", line);
     }
     fclose(mf);
@@ -297,7 +339,16 @@ int main(int argc, char **argv) {
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     Img tex[MAXTEX]; Buf stage[MAXTEX], trb[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
-    for (unsigned i = 0; i < nt; i++) checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
+    for (unsigned i = 0; i < nt; i++) {
+        checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
+        VkFormat fmt = texelFormat(ttype[i], 4, &tbpp[i]);
+        if (tkind[i] == TEX_CUBE_ARRAY && !gfeatures.imageCubeArray)
+            refuse("the device has no imageCubeArray");
+        VkImageFormatProperties ifp;
+        if (vkGetPhysicalDeviceImageFormatProperties(gpd, fmt, texImageType(tkind[i]), VK_IMAGE_TILING_OPTIMAL,
+                                                     texUsage(tstore[i]), texCreateFlags(tkind[i]), &ifp) != VK_SUCCESS)
+            refuse("device lacks image support for %s texture of format %d", ttype[i], (int)fmt);
+    }
     for (unsigned i = 0; i < nb; i++) {
         unsigned bytes1;
         VkFormat fmt = texelFormat(btype[i], bcomp[i], &bytes1);
@@ -343,8 +394,9 @@ int main(int argc, char **argv) {
             wr[nw++].pBufferInfo = &dbi;
         }
         for (unsigned i = 0; i < nt; i++) {
-            tex[i] = loadTexture(tfile[i], ttype[i], tw[i], th[i], tstore[i], &stage[i], &tbpp[i]);
-            if (tstore[i] >= 2) trb[i] = makeBuf((size_t)tw[i] * th[i] * tbpp[i], VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
+            tex[i] = loadTexture(tkind[i], tfile[i], ttype[i], tw[i], th[i], td[i], tlayers[i], tstore[i], &stage[i], &tbpp[i]);
+            if (tstore[i] >= 2) trb[i] = makeBuf((size_t)tw[i] * th[i] * td[i] * texSlices(tkind[i], tlayers[i]) * tbpp[i],
+                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
             ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view, tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[nw].dstSet = dset[tset[i]]; wr[nw].dstBinding = tbind[i]; wr[nw].descriptorCount = 1;
@@ -391,13 +443,15 @@ int main(int argc, char **argv) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHK(vkBeginCommandBuffer(cmd, &bi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    for (unsigned i = 0; i < nt; i++) recordTextureUpload(cmd, tex[i], stage[i], tw[i], th[i], tstore[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    for (unsigned i = 0; i < nt; i++) recordTextureUpload(cmd, tex[i], stage[i], tkind[i], tw[i], th[i], td[i], tlayers[i], tstore[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (nsets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, nsets, dset, 0, NULL);
     vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
     for (unsigned i = 0; i < nt; i++) if (tstore[i] >= 2) {
-        VkImageMemoryBarrier post = imgBarrier(tex[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        unsigned totalLayers = texSlices(tkind[i], tlayers[i]);
+        VkImageMemoryBarrier post = imgBarrier(tex[i].img, VK_IMAGE_ASPECT_COLOR_BIT, totalLayers, VK_IMAGE_LAYOUT_GENERAL,
+                                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &post);
-        VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {tw[i], th[i], 1}};
+        VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, totalLayers}, {0, 0, 0}, {tw[i], th[i], td[i]}};
         vkCmdCopyImageToBuffer(cmd, tex[i].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, trb[i].buf, 1, &bc);
     }
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -418,7 +472,8 @@ int main(int argc, char **argv) {
     }
     for (unsigned i = 0; i < nt; i++) if (tstore[i] >= 2) {
         void *m; CHK(vkMapMemory(dev, trb[i].mem, 0, VK_WHOLE_SIZE, 0, &m));
-        writeFile(tout[i], m, (size_t)tw[i] * th[i] * tbpp[i]); vkUnmapMemory(dev, trb[i].mem);
+        writeFile(tout[i], m, (size_t)tw[i] * th[i] * td[i] * texSlices(tkind[i], tlayers[i]) * tbpp[i]);
+        vkUnmapMemory(dev, trb[i].mem);
     }
     for (unsigned i = 0; i < nb; i++) {
         void *m; CHK(vkMapMemory(dev, tbuf[i].mem, 0, VK_WHOLE_SIZE, 0, &m));
@@ -482,10 +537,43 @@ static uint32_t memTypeAny(uint32_t bits) {
     die("no memory type");
 }
 
-static Img makeImage(VkFormat f, unsigned w, unsigned h, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+static TexKind parseTexKind(const char *s) {
+    if (!strcmp(s, "1d")) return TEX_1D;
+    if (!strcmp(s, "1d_array")) return TEX_1D_ARRAY;
+    if (!strcmp(s, "2d")) return TEX_2D;
+    if (!strcmp(s, "2d_array")) return TEX_2D_ARRAY;
+    if (!strcmp(s, "3d")) return TEX_3D;
+    if (!strcmp(s, "cube")) return TEX_CUBE;
+    if (!strcmp(s, "cube_array")) return TEX_CUBE_ARRAY;
+    die("unknown texture kind %s", s);
+}
+
+static unsigned texSlices(TexKind kind, unsigned layers) {
+    return (kind == TEX_CUBE || kind == TEX_CUBE_ARRAY) ? 6 * layers : layers;
+}
+
+static VkImageType texImageType(TexKind kind) {
+    return (kind == TEX_1D || kind == TEX_1D_ARRAY) ? VK_IMAGE_TYPE_1D
+        : (kind == TEX_3D) ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+}
+
+static VkImageCreateFlags texCreateFlags(TexKind kind) {
+    return (kind == TEX_CUBE || kind == TEX_CUBE_ARRAY) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+}
+
+static VkImageUsageFlags texUsage(int storage) {
+    return (storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | (storage >= 2 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+}
+
+static Img makeImage(TexKind kind, VkFormat f, unsigned w, unsigned h, unsigned d, unsigned layers,
+                     VkImageUsageFlags usage, VkImageAspectFlags aspect) {
     Img r = {0};
+    unsigned totalLayers = texSlices(kind, layers);
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = f; ci.extent = (VkExtent3D){w, h, 1}; ci.mipLevels = 1; ci.arrayLayers = 1;
+    ci.flags = texCreateFlags(kind);
+    ci.imageType = texImageType(kind);
+    ci.format = f; ci.extent = (VkExtent3D){w, h, d}; ci.mipLevels = 1; ci.arrayLayers = totalLayers;
     ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = usage;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     CHK(vkCreateImage(dev, &ci, NULL, &r.img));
@@ -495,8 +583,11 @@ static Img makeImage(VkFormat f, unsigned w, unsigned h, VkImageUsageFlags usage
     CHK(vkAllocateMemory(dev, &ai, NULL, &r.mem));
     CHK(vkBindImageMemory(dev, r.img, r.mem, 0));
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = r.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = f;
-    vi.subresourceRange = (VkImageSubresourceRange){aspect, 0, 1, 0, 1};
+    vi.image = r.img; vi.format = f;
+    vi.viewType = kind == TEX_1D ? VK_IMAGE_VIEW_TYPE_1D : kind == TEX_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
+        : kind == TEX_2D ? VK_IMAGE_VIEW_TYPE_2D : kind == TEX_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+        : kind == TEX_3D ? VK_IMAGE_VIEW_TYPE_3D : kind == TEX_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    vi.subresourceRange = (VkImageSubresourceRange){aspect, 0, 1, 0, totalLayers};
     CHK(vkCreateImageView(dev, &vi, NULL, &r.view));
     return r;
 }
@@ -506,12 +597,12 @@ static void fillBuf(Buf b, const void *data, size_t n) {
     memcpy(m, data, n); vkUnmapMemory(dev, b.mem);
 }
 
-static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
-                                       VkAccessFlags src, VkAccessFlags dst) {
+static VkImageMemoryBarrier imgBarrier(VkImage img, VkImageAspectFlags aspect, unsigned layers,
+                                       VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.srcAccessMask = src; b.dstAccessMask = dst; b.oldLayout = from; b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = img;
-    b.subresourceRange = (VkImageSubresourceRange){aspect, 0, 1, 0, 1};
+    b.subresourceRange = (VkImageSubresourceRange){aspect, 0, 1, 0, layers};
     return b;
 }
 
@@ -654,7 +745,7 @@ static int drawMain(const char *manifest) {
     Img tex[MAXDTEX]; Buf stage[MAXDTEX];
     for (unsigned i = 0; i < nt; i++) {
         unsigned bpp;
-        tex[i] = loadTexture(tfile[i], ttype[i], tw[i], th[i], tstore[i], &stage[i], &bpp);
+        tex[i] = loadTexture(TEX_2D, tfile[i], ttype[i], tw[i], th[i], 1, 1, tstore[i], &stage[i], &bpp);
         ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view,
             tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -687,12 +778,12 @@ static int drawMain(const char *manifest) {
     for (unsigned i = 0; i < nc; i++) {
         const Fmt *f = findFmt(CFMT, sizeof CFMT / sizeof *CFMT, cfmt[i]);
         cf[i] = f->format; cbytes[i] = f->size;
-        color[i] = makeImage(f->format, width, height, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        color[i] = makeImage(TEX_2D, f->format, width, height, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         rb[i] = makeBuf((size_t)width * height * f->size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
     }
     Img depth = {0}; Buf drb = {0};
     if (hasDepth) {
-        depth = makeImage(VK_FORMAT_D32_SFLOAT, width, height, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        depth = makeImage(TEX_2D, VK_FORMAT_D32_SFLOAT, width, height, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
         drb = makeBuf((size_t)width * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
     }
 
@@ -740,11 +831,11 @@ static int drawMain(const char *manifest) {
     VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHK(vkBeginCommandBuffer(cmd, &cbi));
 
     VkImageMemoryBarrier pre[MAXCOLOR + 1]; unsigned npre = 0;
-    for (unsigned i = 0; i < nc; i++) pre[npre++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    if (hasDepth) pre[npre++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+    for (unsigned i = 0; i < nc; i++) pre[npre++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    if (hasDepth) pre[npre++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
     if (npre) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, npre, pre);
     for (unsigned i = 0; i < nt; i++)
-        recordTextureUpload(cmd, tex[i], stage[i], tw[i], th[i], tstore[i],
+        recordTextureUpload(cmd, tex[i], stage[i], TEX_2D, tw[i], th[i], 1, 1, tstore[i],
                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     VkRenderingAttachmentInfo ca[MAXCOLOR], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -771,8 +862,8 @@ static int drawMain(const char *manifest) {
     vkCmdEndRendering(cmd);
 
     VkImageMemoryBarrier post[MAXCOLOR + 1]; unsigned npost = 0;
-    for (unsigned i = 0; i < nc; i++) post[npost++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    if (hasDepth) post[npost++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (unsigned i = 0; i < nc; i++) post[npost++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    if (hasDepth) post[npost++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, 1, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     if (npost) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, npost, post);
     for (unsigned i = 0; i < nc; i++) {
         VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}};
