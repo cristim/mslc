@@ -4291,6 +4291,9 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	// every enumerator of it is an unsigned int, the small ones too (Apple:
 	// "kSmall - 4 > 0" is true beside a 0xffffffff).
 	int64_t next = 0;
+	// Until the closing brace an enumerator has the type of its initializer, or the previous enumerator's
+	// when it has none ([dcl.enum]/5), so one given an unsigned value is unsigned in the initializers after it.
+	ScalarKind nextKind = ScalarKind::Int;
 	int64_t lowest = 0;
 	int64_t highest = 0;
 	std::vector<std::string> names;
@@ -4301,19 +4304,23 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 
 		const std::string name = qualify(std::string(advance().text));
 		int64_t value = next;
+		ScalarKind kind = nextKind;
 		if (match(TokenKind::Assign)) {
-			value = evaluateConstant(*parseAssignment(), false);
+			const ExpressionPtr initializer = parseAssignment();
+			value = evaluateConstant(*initializer, false);
+			kind = containsUnsigned(*initializer) ? ScalarKind::UInt : ScalarKind::Int;
 		}
 		if (value > UINT_MAX || value < -INT_MAX) {
 			throw CompileError("the enumerator \"" + name + "\" does not fit in an int or an unsigned int");
 		}
 
 		declareName(name, "enum constant");
-		_enumConstants[name] = {value, ScalarKind::Int, tag.empty() ? std::string("<anonymous>") : tag};
+		_enumConstants[name] = {value, kind, tag.empty() ? std::string("<anonymous>") : tag};
 		names.push_back(name);
 		lowest = std::min(lowest, value);
 		highest = std::max(highest, value);
 		next = value + 1;
+		nextKind = kind;
 
 		if (!match(TokenKind::Comma)) {
 			break;
@@ -4329,9 +4336,10 @@ std::string Parser::parseEnumDeclaration(bool& hadBody) {
 				"which mslc has no enum for");
 		}
 		underlying = ScalarKind::UInt;
-		for (const std::string& name : names) {
-			_enumConstants[name].kind = underlying;
-		}
+	}
+	// After it, every enumerator has the enum's type, which promotes to its underlying one.
+	for (const std::string& name : names) {
+		_enumConstants[name].kind = underlying;
 	}
 	_lastEnumUnderlying = underlying;
 	if (!tag.empty()) {
