@@ -73,6 +73,10 @@ MUTANTS = [
     ("vertex_attr_half", "vertex", [["Location 1$", "Location 9"], ["Location 2$", "Location 1"], ["Location 9$", "Location 2"]], "reflection-mismatch"),
     ("vertex_attr_half", "vertex", [[r"(OpVectorShuffle %v2half %\d+ %\d+) 2 3", r"\1 3 2"]]),
     ("vertex_attr_half", "vertex", [["OpFAdd %half", "OpFSub %half"]]),
+    ("sparse_color_interp", "fragment", [[r"(OpDecorate %\d+ )Location 3(?=\n\s+OpDecorate %\d+ Location 6)", r"\1Location 2"]], "reflection-mismatch"),
+    ("sparse_color_interp", "fragment", [["OpIMul %uint", "OpIAdd %uint"]]),
+    ("sparse_color_interp", "vertex", [["OpFAdd %v2float", "OpFSub %v2float"]]),
+    ("sparse_color_interp", "fragment", [[r"^\s*OpDecorate %\d+ NoPerspective\n", ""]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -83,7 +87,7 @@ if rc == 77:
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
              "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d",
-             "writable_buffer", "vertex_attr_half"):
+             "writable_buffer", "vertex_attr_half", "sparse_color_interp"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)

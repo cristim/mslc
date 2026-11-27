@@ -126,6 +126,8 @@ class Outputs(unittest.TestCase):
 
     def test_struct_members_give_colours_and_depth(self):
         self.assertEqual(outputs.fragment_outputs(self.SRC, "fs"), ({0: ("float", 4), 1: ("uint", 2)}, True))
+        sparse = "struct F { float4 a [[color(1)]]; half2 b [[color(3)]]; uint2 c [[color(6)]]; };\nfragment F fs() {}\n"
+        self.assertEqual(outputs.fragment_outputs(sparse, "fs"), ({1: ("float", 4), 3: ("half", 2), 6: ("uint", 2)}, False))
 
     def test_plain_return_types(self):
         self.assertEqual(outputs.fragment_outputs("fragment half4 fs() {}", "fs"), ({0: ("half", 4)}, False))
@@ -133,7 +135,10 @@ class Outputs(unittest.TestCase):
 
     def test_unreadable_outputs_are_unsupported_not_guessed(self):
         for src in ("fragment Mystery fs() {}", "fragment uchar4 fs() {}", "typedef int T;\nfragment T fs() {}",
-                    "struct F { float4 a [[color(1)]]; };\nfragment F fs() {}"):
+                    "struct F { float4 a [[color(8)]]; };\nfragment F fs() {}",
+                    "struct F { float4 a [[color(1)]]; float4 b [[color(1)]]; };\nfragment F fs() {}",
+                    "struct F { float4 a [[color(0)]]; float4 b [[color(Second)]]; };\nfragment F fs() {}",
+                    "struct F { float4 a [[color(0)]]; uint m [[sample_mask]]; };\nfragment F fs() {}"):
             with self.assertRaises(outputs.Unsupported, msg=src):
                 outputs.fragment_outputs(src, "fs")
 

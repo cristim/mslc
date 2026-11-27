@@ -649,8 +649,11 @@ static int drawMain(const char *manifest) {
         } else if (sscanf(line, "target %u %u", &width, &height) == 2) {
         } else if (sscanf(line, "draw %u %u", &nverts, &ninst) == 2) {
         } else if (na < MAXATTR && sscanf(line, "attr %u %31s %1023s", &aloc[na], afmt[na], afile[na]) == 3) { na++;
-        } else if (nc < MAXCOLOR && sscanf(line, "color %u %31s %lf %lf %lf %lf %1023s", &cidx[nc], cfmt[nc], &cclear[nc][0],
-                       &cclear[nc][1], &cclear[nc][2], &cclear[nc][3], cout[nc]) == 7) { nc++;
+        } else if (!strncmp(line, "color ", 6)) {
+            if (nc >= MAXCOLOR) refuse("too many colour targets");
+            if (sscanf(line, "color %u %31s %lf %lf %lf %lf %1023s", &cidx[nc], cfmt[nc], &cclear[nc][0],
+                       &cclear[nc][1], &cclear[nc][2], &cclear[nc][3], cout[nc]) != 7) die("bad manifest line: %s", line);
+            nc++;
         } else if (sscanf(line, "depth %lf %1023s", &dclear, dout) == 2) { hasDepth = 1;
         } else if (!strncmp(line, "gbuffer ", 8)) {
             if (ng >= MAXG) refuse("too many buffers");
@@ -676,7 +679,12 @@ static int drawMain(const char *manifest) {
     }
     fclose(mf);
     if (!spv[0][0] || !spv[1][0] || !vname[0] || !fname[0] || !width || !height || !nverts) die("incomplete draw manifest");
-    for (unsigned i = 0; i < nc; i++) if (cidx[i] != i) die("colour targets must be listed 0..n-1 in order");
+    unsigned nslots = 0;
+    for (unsigned i = 0; i < nc; i++) {
+        if (cidx[i] >= MAXCOLOR) die("colour target %u >= %u", cidx[i], MAXCOLOR);
+        for (unsigned j = 0; j < i; j++) if (cidx[j] == cidx[i]) die("duplicate colour target %u", cidx[i]);
+        if (cidx[i] + 1 > nslots) nslots = cidx[i] + 1;
+    }
 
     uint32_t qf = initDevice(VK_QUEUE_GRAPHICS_BIT);
     for (unsigned i = 0; i < nt; i++) checkTextureSupport(tkind[i], ttype[i], tstore[i], &tbpp[i]);
@@ -785,9 +793,10 @@ static int drawMain(const char *manifest) {
     }
 
     Img color[MAXCOLOR]; Buf rb[MAXCOLOR]; VkFormat cf[MAXCOLOR]; unsigned cbytes[MAXCOLOR];
+    for (unsigned s = 0; s < MAXCOLOR; s++) cf[s] = VK_FORMAT_UNDEFINED;
     for (unsigned i = 0; i < nc; i++) {
         const Fmt *f = findFmt(CFMT, sizeof CFMT / sizeof *CFMT, cfmt[i]);
-        cf[i] = f->format; cbytes[i] = f->size;
+        cf[cidx[i]] = f->format; cbytes[i] = f->size;
         color[i] = makeImage(TEX_2D, f->format, width, height, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         rb[i] = makeBuf((size_t)width * height * f->size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0);
     }
@@ -821,12 +830,12 @@ static int drawMain(const char *manifest) {
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     dss.depthTestEnable = hasDepth; dss.depthWriteEnable = hasDepth; dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-    VkPipelineColorBlendAttachmentState cba[MAXCOLOR];
-    for (unsigned i = 0; i < nc; i++) cba[i] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xF};
+    VkPipelineColorBlendAttachmentState cba[MAXCOLOR] = {0};
+    for (unsigned i = 0; i < nc; i++) cba[cidx[i]] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xF};
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cbs.attachmentCount = nc; cbs.pAttachments = cba;
+    cbs.attachmentCount = nslots; cbs.pAttachments = cba;
     VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    ri.colorAttachmentCount = nc; ri.pColorAttachmentFormats = cf; ri.depthAttachmentFormat = hasDepth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+    ri.colorAttachmentCount = nslots; ri.pColorAttachmentFormats = cf; ri.depthAttachmentFormat = hasDepth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.pNext = &ri; gpi.stageCount = 2; gpi.pStages = stages; gpi.pVertexInputState = &vis; gpi.pInputAssemblyState = &ias;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pDepthStencilState = &dss;
@@ -849,20 +858,21 @@ static int drawMain(const char *manifest) {
                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     VkRenderingAttachmentInfo ca[MAXCOLOR], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    for (unsigned s = 0; s < MAXCOLOR; s++) ca[s] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     for (unsigned i = 0; i < nc; i++) {
-        ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        ca[i].imageView = color[i].view; ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (strstr(cfmt[i], "sint")) for (int k = 0; k < 4; k++) ca[i].clearValue.color.int32[k] = (int32_t)cclear[i][k];
-        else if (strstr(cfmt[i], "uint")) for (int k = 0; k < 4; k++) ca[i].clearValue.color.uint32[k] = (uint32_t)cclear[i][k];
-        else for (int k = 0; k < 4; k++) ca[i].clearValue.color.float32[k] = (float)cclear[i][k];
+        unsigned slot = cidx[i];
+        ca[slot].imageView = color[i].view; ca[slot].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ca[slot].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (strstr(cfmt[i], "sint")) for (int k = 0; k < 4; k++) ca[slot].clearValue.color.int32[k] = (int32_t)cclear[i][k];
+        else if (strstr(cfmt[i], "uint")) for (int k = 0; k < 4; k++) ca[slot].clearValue.color.uint32[k] = (uint32_t)cclear[i][k];
+        else for (int k = 0; k < 4; k++) ca[slot].clearValue.color.float32[k] = (float)cclear[i][k];
     }
     if (hasDepth) {
         da.imageView = depth.view; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
         da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; da.clearValue.depthStencil.depth = (float)dclear;
     }
     VkRenderingInfo rinfo = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-    rinfo.renderArea = sc; rinfo.layerCount = 1; rinfo.colorAttachmentCount = nc; rinfo.pColorAttachments = ca;
+    rinfo.renderArea = sc; rinfo.layerCount = 1; rinfo.colorAttachmentCount = nslots; rinfo.pColorAttachments = ca;
     rinfo.pDepthAttachment = hasDepth ? &da : NULL;
     vkCmdBeginRendering(cmd, &rinfo);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
