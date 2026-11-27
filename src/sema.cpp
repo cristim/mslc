@@ -2807,6 +2807,7 @@ namespace {
 		bool isInstance(const FunctionDecl* function) const { return function && _instanceOf.count(function) != 0; }
 		bool callsDependentTemplate(const Expression& call);
 		bool deducedResultIsFundamental(const Expression& call);
+		bool bringsNoNamespace(const Expression& argument);
 		bool dependsOnTemplate(const Expression& call);
 		std::string describeTemplate(const FunctionTemplate& declaration, const FunctionDecl& pattern) const;
 		HelperFunction* definedHelper(HelperFunction* entry);
@@ -6964,35 +6965,76 @@ namespace {
 		return false;
 	}
 
-	// Whether every template a call may be to returns a type parameter deduced, from a parameter of exactly that
-	// type, a reference to it included, from an argument of no struct or enum type: the result is then a scalar or
-	// vector, which brings no namespace to argument-dependent lookup ([basic.lookup.argdep]), whatever is deduced.
-	// Deduction allows no conversion there ([temp.deduct.call]), so the argument's type is the parameter's.
+	// Whether an argument brings no namespace to argument-dependent lookup ([basic.lookup.argdep]): it has no
+	// struct or enum type, nor has anything inside it. An operator's operands are looked into, so pointer
+	// arithmetic on a pointer to a struct is not taken for a scalar.
+	bool Emitter::bringsNoNamespace(const Expression& argument) {
+		switch (argument.kind) {
+			case ExpressionKind::Conditional:
+			case ExpressionKind::Comma:
+			case ExpressionKind::Assign:
+				return false;
+			case ExpressionKind::Binary:
+				return argument.left && argument.right && bringsNoNamespace(*argument.left)
+					&& bringsNoNamespace(*argument.right);
+			case ExpressionKind::Unary:
+				return argument.unaryOperator != UnaryOperator::AddressOf && argument.left
+					&& bringsNoNamespace(*argument.left);
+			case ExpressionKind::Call:
+				if (callsDependentTemplate(argument)) {
+					return deducedResultIsFundamental(argument);
+				}
+				break;
+			default:
+				break;
+		}
+		const std::optional<std::string> tag = enumOf(argument);
+		return !adlStructOf(argument) && tag && tag->empty();
+	}
+
+	// Whether a call to a function template, whose result is known only once deduced, has a result that brings
+	// no namespace to argument-dependent lookup, whichever function it chooses. That holds when none of its own
+	// arguments brings one, so its candidates are only those ordinary lookup finds, and each of them returns a
+	// scalar or vector: a function or a template returning a type of no struct or enum, or a template returning
+	// a type parameter deduced from a parameter of exactly that type, a reference to it included. Deduction
+	// allows no conversion there ([temp.deduct.call]), so the argument's type is the parameter's.
 	bool Emitter::deducedResultIsFundamental(const Expression& call) {
 		if (call.left->kind != ExpressionKind::Identifier) {
 			return false;
+		}
+		for (const ExpressionPtr& argument: call.arguments) {
+			if (!bringsNoNamespace(*argument)) {
+				return false;
+			}
+		}
+		const auto scalarOrVector = [](const Type& type) {
+			return type.namedType.empty() && type.enumName.empty() && type.resource == ResourceKind::None;
+		};
+		for (const HelperFunction* helper: helpersCalled(call)) {
+			if (!scalarOrVector(helper->definition->returnType)) {
+				return false;
+			}
 		}
 		for (const FunctionTemplate* declaration: templatesCalled(call)) {
 			std::vector<TemplateArgument> arguments;
 			const FunctionDecl* pattern = declaration->order > callerOrder() ? nullptr
 				: templatePattern(*declaration, call.left->templateArguments, arguments);
-			if (!pattern || !isTemplateMarker(pattern->returnType)) {
+			if (!pattern) {
+				continue;
+			}
+			if (!isTemplateMarker(pattern->returnType)) {
+				if (!scalarOrVector(pattern->returnType)) {
+					return false;
+				}
 				continue;
 			}
 			const std::string& marker = pattern->returnType.namedType;
-			bool fundamental = false;
-			for (size_t i = 0; i < pattern->parameters.size() && i < call.arguments.size() && !fundamental; ++i) {
+			bool deduced = false;
+			for (size_t i = 0; i < pattern->parameters.size() && i < call.arguments.size() && !deduced; ++i) {
 				const Type& type = pattern->parameters[i].type;
-				if (type.namedType != marker || type.isPointer || type.arrayLength) {
-					continue;
-				}
-				const Expression& argument = *call.arguments[i];
-				const bool nested = argument.kind == ExpressionKind::Call && callsDependentTemplate(argument);
-				const std::optional<std::string> tag = nested ? std::optional<std::string>(std::string()) : enumOf(argument);
-				fundamental = argument.kind != ExpressionKind::Conditional && !adlStructOf(argument)
-					&& tag && tag->empty() && (!nested || deducedResultIsFundamental(argument));
+				deduced = type.namedType == marker && !type.isPointer && !type.arrayLength;
 			}
-			if (!fundamental) {
+			if (!deduced) {
 				return false;
 			}
 		}
