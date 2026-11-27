@@ -9908,6 +9908,20 @@ namespace {
 		}
 	}
 
+	// Whether an assignment's left operand names an element: then its index may change with the store, and the
+	// value is loaded from the address stored to rather than read again.
+	static bool hasIndex(const Expression& left) {
+		for (const Expression* part = &left; part; part = part->left.get()) {
+			if (part->kind == ExpressionKind::Index) {
+				return true;
+			}
+			if (part->kind != ExpressionKind::Member) {
+				return false;
+			}
+		}
+		return false;
+	}
+
 	Id Emitter::emitExpression(const Expression& expression) {
 		const auto fileScopeView = viewFileScope(expression);
 		switch (expression.kind) {
@@ -9974,6 +9988,20 @@ namespace {
 				if (!readsWithoutEffect(*expression.left)) {
 					throw CompileError("an assignment whose left operand has a call, an increment or an assignment "
 						"in it cannot be used as a value yet; assign first, then use the variable");
+				}
+				// An element, as a[a[0]] or a[k] with k changed on the right: its address, taken where the store
+				// takes it, is the place stored to.
+				if (hasIndex(*expression.left)) {
+					if (expression.left->kind == ExpressionKind::Member && !structOf(*expression.left->left)) {
+						throw CompileError("an assignment to a swizzle of an element cannot be used as a value yet; "
+							"assign first, then use the element");
+					}
+					const Id address = emitPlaceAddress(*expression.left);
+					emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+					const Id pointee = valueTypeAt(address);
+					const auto storage = _types.storageClassOf(_builder.typeOf(address));
+					return storage == spirv::StorageClass::PhysicalStorageBuffer
+						? loadFromBuffer(address, pointee) : loadFrom(address, pointee);
 				}
 				emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
 				return emitExpression(*expression.left);
