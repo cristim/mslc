@@ -2473,6 +2473,16 @@ namespace {
 		std::map<std::string, FunctionConstant> _functionConstants;
 		// "constant bool b = is_function_constant_defined(c);": b, and the c it stands for.
 		std::map<std::string, std::string> _functionConstantDefinedAliases;
+		// A file-scope constant whose initialiser reads a function constant, as "constant bool b = n > 0;" with n
+		// one: a specialization constant computed from those (OpSpecConstantOp), declared where it is first read.
+		// reads is every function constant under it, through other such constants too, for the reflection.
+		struct DerivedFunctionConstant {
+			const VariableDeclaration* declaration = nullptr;
+			Id value = InvalidId;
+			bool emitting = false;
+			std::set<std::string> reads;
+		};
+		std::map<std::string, DerivedFunctionConstant> _derivedFunctionConstants;
 		// The function constants each function reads in the code emitted for it, and the functions each calls:
 		// an entry point's reflection lists the constants of every function it reaches. A helper is emitted once
 		// for the entry points that share it, so what it reads is kept with it rather than with an entry point.
@@ -2737,9 +2747,14 @@ namespace {
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
 		void declareFunctionConstant(const VariableDeclaration& declaration);
-		void declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read);
+		void declareFunctionConstantAlias(const VariableDeclaration& declaration);
+		bool isFunctionConstantDefinedAlias(const VariableDeclaration& declaration) const;
 		const std::string* functionConstantNamed(const std::string& name) const;
 		Id functionConstantValue(const std::string& name, bool defined);
+		void declareDerivedFunctionConstant(const VariableDeclaration& declaration);
+		Id derivedFunctionConstantValue(const std::string& name);
+		Id emitSpecConstantExpression(const Expression& expression, const std::string& constant);
+		Id specConstantConvert(Id value, Id type);
 		Id emitIsFunctionConstantDefined(const Expression& call);
 		Id emitAsType(const Expression& call);
 		std::string functionConstantsJson();
@@ -3544,6 +3559,9 @@ namespace {
 			const auto alias = _functionConstantDefinedAliases.find(expression.name);
 			if (alias != _functionConstantDefinedAliases.end()) {
 				return functionConstantValue(alias->second, true);
+			}
+			if (_derivedFunctionConstants.count(expression.name)) {
+				return derivedFunctionConstantValue(expression.name);
 			}
 			const auto constant = _constants.find(expression.name);
 			if (constant != _constants.end()) {
@@ -10580,24 +10598,23 @@ namespace {
 	}
 
 	// "constant bool b = is_function_constant_defined(c);" makes b another name for whether c is defined. Any
-	// other initialiser that reads a function constant is refused.
-	void Emitter::declareFunctionConstantAlias(const VariableDeclaration& declaration, const std::string& read) {
+	// other initialiser that reads a function constant is a derived one (declareDerivedFunctionConstant).
+	bool Emitter::isFunctionConstantDefinedAlias(const VariableDeclaration& declaration) const {
 		const Expression& initializer = *declaration.initializer;
-		const bool alias = initializer.kind == ExpressionKind::Call && initializer.left
+		return initializer.kind == ExpressionKind::Call && initializer.left
 			&& initializer.left->kind == ExpressionKind::Identifier
 			&& builtinCalleeName(initializer.left->name) == "__metal_is_function_constant_defined"
 			&& initializer.arguments.size() == 1 && initializer.arguments[0]->kind == ExpressionKind::Identifier
 			&& _functionConstants.count(initializer.arguments[0]->name);
-		if (!alias) {
-			throw CompileError("the constant \"" + declaration.name + "\" is initialised from the function constant \""
-				+ read + "\", and the only such initialiser mslc lowers is is_function_constant_defined(" + read + ")");
-		}
+	}
+
+	void Emitter::declareFunctionConstantAlias(const VariableDeclaration& declaration) {
 		const Type& type = declaration.type;
 		if (type.scalar != ScalarKind::Bool || type.vectorWidth > 1 || type.isPointer || type.arrayLength) {
 			throw CompileError("the constant \"" + declaration.name + "\" holds is_function_constant_defined(...) "
 				"and has to be a bool");
 		}
-		_functionConstantDefinedAliases[declaration.name] = initializer.arguments[0]->name;
+		_functionConstantDefinedAliases[declaration.name] = declaration.initializer->arguments[0]->name;
 	}
 
 	// The function constant a name stands for, through "constant bool b = is_function_constant_defined(c);" too.
@@ -10717,6 +10734,194 @@ namespace {
 		return functionConstantValue(call.arguments[0]->name, true);
 	}
 
+	// A constant computed from function constants, "constant bool b = n > 0;" with n one: its value is known only
+	// when the function is made, so it is a specialization constant of its own, an OpSpecConstantOp over theirs,
+	// which the driver works out from the values it is given. Only a bool or an integer of 32 bits can be one, and
+	// only the integer and logical operators: the operations an OpSpecConstantOp may take in a shader.
+	void Emitter::declareDerivedFunctionConstant(const VariableDeclaration& declaration) {
+		const Type& type = declaration.type;
+		if ((type.scalar != ScalarKind::Bool && type.scalar != ScalarKind::Int && type.scalar != ScalarKind::UInt)
+			|| type.vectorWidth > 1 || type.isMatrix() || type.isPointer || type.arrayLength || !type.namedType.empty()
+			|| !type.enumName.empty() || !declaration.initializer) {
+			throw CompileError("the constant \"" + declaration.name + "\" is initialised from a function constant, and "
+				"mslc lowers such a constant only as a bool, an int or a uint");
+		}
+		DerivedFunctionConstant& derived = _derivedFunctionConstants[declaration.name];
+		derived.declaration = &declaration;
+		std::set<std::string> read;
+		collectIdentifiers(*declaration.initializer, read);
+		for (const std::string& name: read) {
+			if (const std::string* constant = functionConstantNamed(name)) {
+				derived.reads.insert(*constant);
+			} else if (const auto other = _derivedFunctionConstants.find(name); other != _derivedFunctionConstants.end()
+				&& name != declaration.name) {
+				derived.reads.insert(other->second.reads.begin(), other->second.reads.end());
+			}
+		}
+	}
+
+	Id Emitter::derivedFunctionConstantValue(const std::string& name) {
+		DerivedFunctionConstant& derived = _derivedFunctionConstants.at(name);
+		std::set<std::string>& reads = _functionConstantReads[_helper ? _helper : _entryPoint];
+		reads.insert(derived.reads.begin(), derived.reads.end());
+		if (derived.value == InvalidId) {
+			if (derived.emitting) {
+				throw CompileError("the constant \"" + name + "\" is initialised from itself");
+			}
+			derived.emitting = true;
+			const Type& type = derived.declaration->type;
+			const Id value = emitSpecConstantExpression(*derived.declaration->initializer, name);
+			derived.value = specConstantConvert(value, _types.scalar(type.scalar));
+			derived.emitting = false;
+		}
+		return derived.value;
+	}
+
+	// A bool or a 32-bit integer specialization constant as another of those types, as an implicit conversion
+	// does: a bool from the comparison with zero, an integer from a bool as 1 or 0, an int to a uint and back
+	// keeping the bits (an OpIAdd with zero, as OpBitcast is not one of the operations a shader may use).
+	Id Emitter::specConstantConvert(Id value, Id type) {
+		const Id from = _builder.typeOf(value);
+		if (from == type) {
+			return value;
+		}
+		const auto operation = [&](Id resultType, uint16_t op, std::vector<uint32_t> operands) {
+			operands.insert(operands.begin(), static_cast<uint32_t>(op));
+			return _builder.emitDeclTyped(spirv::OpSpecConstantOp, resultType, operands);
+		};
+		if (type == _boolType) {
+			return operation(_boolType, spirv::OpINotEqual, { value, _types.zero(from) });
+		}
+		if (from == _boolType) {
+			return operation(type, spirv::OpSelect, { value, _types.one(type), _types.zero(type) });
+		}
+		return operation(type, spirv::OpIAdd, { value, _types.zero(type) });
+	}
+
+	// The initialiser of a derived function constant as specialization constant operations. A name in it is a
+	// function constant, another derived one, or a constant of the source (an enumerator is a literal by now).
+	Id Emitter::emitSpecConstantExpression(const Expression& expression, const std::string& constant) {
+		const auto refuse = [&]() -> Id {
+			throw CompileError("the initialiser of \"" + constant + "\" reads a function constant, and mslc lowers "
+				"such an initialiser only with literals, constants and the integer and logical operators");
+		};
+		const auto operation = [&](Id resultType, uint16_t op, std::vector<uint32_t> operands) {
+			operands.insert(operands.begin(), static_cast<uint32_t>(op));
+			return _builder.emitDeclTyped(spirv::OpSpecConstantOp, resultType, operands);
+		};
+		const auto checked = [&](Id value) {
+			const Id type = _builder.typeOf(value);
+			if (type != _boolType && type != _intType && type != _uintType) {
+				refuse();
+			}
+			return value;
+		};
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::BoolLiteral:
+				return checked(emitExpression(expression));
+			case ExpressionKind::Identifier: {
+				// The initialiser is file-scope code: a local or parameter of the function that first reads the
+				// constant, however it is named, is not in its scope.
+				if (_functionConstants.count(expression.name)) {
+					return checked(functionConstantValue(expression.name, false));
+				}
+				const auto alias = _functionConstantDefinedAliases.find(expression.name);
+				if (alias != _functionConstantDefinedAliases.end()) {
+					return checked(functionConstantValue(alias->second, true));
+				}
+				if (_derivedFunctionConstants.count(expression.name)) {
+					return checked(derivedFunctionConstantValue(expression.name));
+				}
+				const auto found = _constants.find(expression.name);
+				if (found != _constants.end()) {
+					return checked(found->second.id);
+				}
+				return refuse();
+			}
+			case ExpressionKind::Call:
+				if (expression.left && expression.left->kind == ExpressionKind::Identifier
+					&& builtinCalleeName(expression.left->name) == "__metal_is_function_constant_defined") {
+					return checked(emitIsFunctionConstantDefined(expression));
+				}
+				return refuse();
+			case ExpressionKind::Construct: {
+				const ScalarKind target = expression.constructType ? expression.constructType->scalar : ScalarKind::Void;
+				if (expression.arguments.size() != 1 || expression.constructType->vectorWidth > 1
+					|| (target != ScalarKind::Bool && target != ScalarKind::Int && target != ScalarKind::UInt)) {
+					return refuse();
+				}
+				return specConstantConvert(emitSpecConstantExpression(*expression.arguments[0], constant),
+					_types.scalar(target));
+			}
+			case ExpressionKind::Unary: {
+				const Id operand = emitSpecConstantExpression(*expression.left, constant);
+				switch (expression.unaryOperator) {
+					case UnaryOperator::Plus:
+						return specConstantConvert(operand, _builder.typeOf(operand) == _boolType ? _intType
+							: _builder.typeOf(operand));
+					case UnaryOperator::Not:
+						return operation(_boolType, spirv::OpLogicalNot, { specConstantConvert(operand, _boolType) });
+					case UnaryOperator::Negate:
+					case UnaryOperator::BitNot: {
+						const Id type = _builder.typeOf(operand) == _boolType ? _intType : _builder.typeOf(operand);
+						return operation(type, expression.unaryOperator == UnaryOperator::Negate ? spirv::OpSNegate
+							: spirv::OpNot, { specConstantConvert(operand, type) });
+					}
+					default:
+						return refuse();
+				}
+			}
+			case ExpressionKind::Conditional: {
+				if (expression.arguments.size() != 2) {
+					return refuse();
+				}
+				const Id condition = specConstantConvert(emitSpecConstantExpression(*expression.left, constant), _boolType);
+				Id yes = emitSpecConstantExpression(*expression.arguments[0], constant);
+				Id no = emitSpecConstantExpression(*expression.arguments[1], constant);
+				if (_builder.typeOf(yes) != _builder.typeOf(no)) {
+					// The usual arithmetic conversions: a bool is promoted, and an int beside a uint becomes one.
+					const Id type = _builder.typeOf(yes) == _uintType || _builder.typeOf(no) == _uintType
+						? _uintType : _intType;
+					yes = specConstantConvert(yes, type);
+					no = specConstantConvert(no, type);
+				}
+				return operation(_builder.typeOf(yes), spirv::OpSelect, { condition, yes, no });
+			}
+			case ExpressionKind::Binary: {
+				const Id left = emitSpecConstantExpression(*expression.left, constant);
+				const Id right = emitSpecConstantExpression(*expression.right, constant);
+				const BinaryOperator op = expression.binaryOperator;
+				if (op == BinaryOperator::LogicalAnd || op == BinaryOperator::LogicalOr) {
+					return operation(_boolType, op == BinaryOperator::LogicalAnd ? spirv::OpLogicalAnd
+						: spirv::OpLogicalOr, { specConstantConvert(left, _boolType), specConstantConvert(right, _boolType) });
+				}
+				const bool comparison = op == BinaryOperator::Equal || op == BinaryOperator::NotEqual
+					|| op == BinaryOperator::Less || op == BinaryOperator::LessEqual || op == BinaryOperator::Greater
+					|| op == BinaryOperator::GreaterEqual;
+				if (comparison && _builder.typeOf(left) == _boolType && _builder.typeOf(right) == _boolType
+					&& (op == BinaryOperator::Equal || op == BinaryOperator::NotEqual)) {
+					return operation(_boolType, op == BinaryOperator::Equal ? spirv::OpLogicalEqual
+						: spirv::OpLogicalNotEqual, { left, right });
+				}
+				// The usual arithmetic conversions: bools are promoted to int, and an int beside a uint becomes one.
+				// A shift is the exception: it has the type of its promoted left operand alone.
+				const bool shift = op == BinaryOperator::ShiftLeft || op == BinaryOperator::ShiftRight;
+				const Id type = shift ? (_builder.typeOf(left) == _uintType ? _uintType : _intType)
+					: _builder.typeOf(left) == _uintType || _builder.typeOf(right) == _uintType ? _uintType : _intType;
+				const Id a = specConstantConvert(left, type);
+				const Id b = specConstantConvert(right, type);
+				const bool isSigned = type == _intType;
+				if (comparison) {
+					return operation(_boolType, comparisonOpcode(op, false, isSigned), { a, b });
+				}
+				return operation(type, arithmeticOpcode(op, false, isSigned), { a, b });
+			}
+			default:
+				return refuse();
+		}
+	}
+
 	// The reflection of the function constants the entry point reads, itself or in a function it reaches, by index.
 	std::string Emitter::functionConstantsJson() {
 		std::map<uint32_t, std::string> byIndex;
@@ -10763,10 +10968,15 @@ namespace {
 			if (global.initializer && !_functionConstants.empty()) {
 				std::set<std::string> read;
 				collectIdentifiers(*global.initializer, read);
-				const auto constant = std::find_if(read.begin(), read.end(),
-					[&](const std::string& name) { return functionConstantNamed(name) != nullptr; });
+				const auto constant = std::find_if(read.begin(), read.end(), [&](const std::string& name) {
+						return functionConstantNamed(name) != nullptr || _derivedFunctionConstants.count(name);
+					});
 				if (constant != read.end()) {
-					declareFunctionConstantAlias(global, *constant);
+					if (isFunctionConstantDefinedAlias(global)) {
+						declareFunctionConstantAlias(global);
+					} else {
+						declareDerivedFunctionConstant(global);
+					}
 					continue;
 				}
 			}
