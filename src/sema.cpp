@@ -2753,6 +2753,7 @@ namespace {
 		Id functionConstantValue(const std::string& name, bool defined);
 		void declareDerivedFunctionConstant(const VariableDeclaration& declaration);
 		Id derivedFunctionConstantValue(const std::string& name);
+		Id gateValue(const std::string& name);
 		Id emitSpecConstantExpression(const Expression& expression, const std::string& constant);
 		Id specConstantConvert(Id value, Id type);
 		Id emitIsFunctionConstantDefined(const Expression& call);
@@ -10761,6 +10762,29 @@ namespace {
 		}
 	}
 
+	// The bool a [[function_constant(name)]] gate reads: name is a program-scope constant, which the parser
+	// checked, and a numeric one gates as "not zero".
+	Id Emitter::gateValue(const std::string& name) {
+		Id value = InvalidId;
+		if (_functionConstants.count(name)) {
+			value = functionConstantValue(name, false);
+		} else if (const auto alias = _functionConstantDefinedAliases.find(name);
+			alias != _functionConstantDefinedAliases.end()) {
+			value = functionConstantValue(alias->second, true);
+		} else if (_derivedFunctionConstants.count(name)) {
+			value = derivedFunctionConstantValue(name);
+		} else if (const auto constant = _constants.find(name); constant != _constants.end()) {
+			value = constant->second.id;
+		} else {
+			throw CompileError("the [[function_constant]] gate \"" + name + "\" is not a program-scope constant");
+		}
+		const Id type = _builder.typeOf(value);
+		if (_types.vectorWidth(type) > 1) {
+			throw CompileError("the [[function_constant]] gate \"" + name + "\" is a vector; a gate is a scalar");
+		}
+		return _types.isBool(type) ? value : convert(value, type, _boolType);
+	}
+
 	Id Emitter::derivedFunctionConstantValue(const std::string& name) {
 		DerivedFunctionConstant& derived = _derivedFunctionConstants.at(name);
 		std::set<std::string>& reads = _functionConstantReads[_helper ? _helper : _entryPoint];
@@ -13949,9 +13973,17 @@ namespace {
 				const StageVariable& output = _outputs[i];
 				const Id field = _builder.emitTyped(spirv::OpCompositeExtract, output.valueType,
 					{ copy, static_cast<uint32_t>(i) });
-				const Id stored = structValue(_entryPoint->returnType)->fields[i].attributes.sampleMask
-					? _builder.emitTyped(spirv::OpCompositeConstruct, output.interfaceType, { field })
-					: convert(field, output.valueType, output.interfaceType);
+				const FieldAttributes& attributes = structValue(_entryPoint->returnType)->fields[i].attributes;
+				Id written = field;
+				// A gated sample mask that is off is not an output: SampleMask is declared all the same, and
+				// all ones leaves the coverage as it is, where an unwritten one would be undefined.
+				if (attributes.sampleMask && !attributes.functionConstant.empty()) {
+					written = _builder.emitTyped(spirv::OpSelect, output.valueType,
+						{ gateValue(attributes.functionConstant), field, constantU32(0xFFFFFFFFu) });
+				}
+				const Id stored = attributes.sampleMask
+					? _builder.emitTyped(spirv::OpCompositeConstruct, output.interfaceType, { written })
+					: convert(written, output.valueType, output.interfaceType);
 				_builder.emit(spirv::OpStore, { output.variable, stored });
 			}
 		} else {
