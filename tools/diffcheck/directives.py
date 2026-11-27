@@ -18,8 +18,9 @@
                                                      is required and is printed in the report
 
 Graphics (a vertex and a fragment function drawn into offscreen targets):
-  // RUN: vertex=vs fragment=fs width=32 height=32 instances=2   makes the file a graphics pair
-  // DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...          triangle list in pixel coordinates, "x,y" or "x,y,z"
+  // RUN: vertex=vs fragment=fs width=32 height=32 instances=2 base_vertex=1 base_instance=2
+  // DIFFCHECK-GEOMETRY: 2,3 22,3 22,13 ...          triangle list (or vertex list when DIFFCHECK-INDEXES is set) in pixel coordinates, "x,y" or "x,y,z"
+  // DIFFCHECK-INDEXES: 0 1 2 0 2 3 ...              uint32 triangle index list into the geometry vertices
   // DIFFCHECK-POSITION: <attribute>|none            the stage_in field that carries the position
   // DIFFCHECK: depth                                also read back a depth attachment
 The excludable names are color0, color1, ... and depth.
@@ -27,7 +28,8 @@ The excludable names are color0, color1, ... and depth.
 
 import re
 
-RUN_KEYS = {"grid", "local", "seed", "cases", "elems", "width", "height", "instances"}
+RUN_KEYS = {"grid", "local", "seed", "cases", "elems", "width", "height", "instances", "base_vertex", "base_instance"}
+RUN_NONNEG = {"base_vertex", "base_instance"}
 RUN_NAMES = {"vertex", "fragment"}
 
 
@@ -50,15 +52,17 @@ def parse_run_pairs(pairs):
         if key in RUN_NAMES and re.fullmatch(r"[A-Za-z_]\w*", value):
             run[key] = value
             continue
-        if key not in RUN_KEYS or not value.isdigit() or int(value) < 1:
-            raise ValueError("bad RUN parameter %r (a positive number; keys: %s; a name for %s)" % (
-                pair, ", ".join(sorted(RUN_KEYS)), ", ".join(sorted(RUN_NAMES))))
+        minimum = 0 if key in RUN_NONNEG else 1
+        if key not in RUN_KEYS or not re.fullmatch(r"[0-9]+", value) or int(value) < minimum:
+            kind = "a non-negative integer" if key in RUN_NONNEG else "a positive number"
+            raise ValueError("bad RUN parameter %r (%s; keys: %s; a name for %s)" % (
+                pair, kind, ", ".join(sorted(RUN_KEYS)), ", ".join(sorted(RUN_NAMES))))
         run[key] = int(value)
     return run
 
 
 def parse(source):
-    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "position": None,
+    result = {"run": {}, "writes_zero": False, "exclude": {}, "range": {}, "float_range": {}, "ulp": {}, "texel": {}, "unused": {}, "geometry": None, "indexes": None, "position": None,
               "depth": False}
     for line in source.splitlines():
         m = re.match(r"\s*//\s*RUN:\s*(.*)$", line)
@@ -80,6 +84,21 @@ def parse(source):
         m = re.match(r"\s*//\s*DIFFCHECK-GEOMETRY:\s*(.*)$", line)
         if m:
             result["geometry"] = [_point(t) for t in m.group(1).split()]
+            continue
+        m = re.match(r"\s*//\s*DIFFCHECK-INDEXES:\s*(.*)$", line)
+        if m:
+            tokens = m.group(1).split()
+            if not tokens:
+                raise ValueError("DIFFCHECK-INDEXES needs at least one index")
+            indexes = []
+            for t in tokens:
+                if not re.fullmatch(r"[0-9]+", t):
+                    raise ValueError("DIFFCHECK-INDEXES index %r is not a non-negative integer" % t)
+                v = int(t)
+                if v > 0xFFFFFFFF:
+                    raise ValueError("DIFFCHECK-INDEXES index %s exceeds uint32 range" % t)
+                indexes.append(v)
+            result["indexes"] = indexes
             continue
         m = re.match(r"\s*//\s*DIFFCHECK-RANGE:\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$", line)
         if m:

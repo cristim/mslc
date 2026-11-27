@@ -36,10 +36,23 @@
 // "unsupported". Exit 0 on success, 2 on any error (never a mismatch).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
 static void die(NSString *msg) { fprintf(stderr, "metalhost: %s\n", msg.UTF8String); exit(2); }
+
+static uint32_t parseU32(NSString *s, NSString *what) {
+    const char *p = s.UTF8String;
+    if (!p || !*p) die([@"bad " stringByAppendingFormat:@"%@ in manifest", what]);
+    uint64_t v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') die([@"bad " stringByAppendingFormat:@"%@ in manifest: %@", what, s]);
+        v = v * 10 + (uint64_t)(*p - '0');
+        if (v > UINT32_MAX) die([@"bad " stringByAppendingFormat:@"%@ in manifest: %@", what, s]);
+    }
+    return (uint32_t)v;
+}
 
 struct Leaf { NSUInteger off; const char *scalar; };
 
@@ -377,7 +390,7 @@ static id<MTLSamplerState> nearestSampler(id<MTLDevice> device, NSUInteger index
 }
 
 // Reflects the render pipeline (draw == NO) or draws and writes every attachment to its file.
-// Manifest lines: vertex, fragment, target W H, draw V I, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
+// Manifest lines: vertex, fragment, target W H, draw V I [BV BI], index N FILE, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
 // depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE [OUTFILE], texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
 // image KIND ACCESS INDEX SET BINDING W H D LAYERS TYPE FILE, sampler INDEX SET BINDING (set 0 is vertex, 1 is fragment).
 // Vertex buffer slot for attribute n is 30 - n.
@@ -426,7 +439,12 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         return 0;
     }
 
-    NSUInteger vertices = [m[@"draw"][0] integerValue], instances = [m[@"draw"][1] integerValue];
+    NSArray *drawArgs = m[@"draw"];
+    if (drawArgs.count != 2 && drawArgs.count != 4) die(@"bad draw line in manifest");
+    NSUInteger vertices = parseU32(drawArgs[0], @"draw"), instances = parseU32(drawArgs[1], @"draw");
+    NSUInteger baseVert = drawArgs.count == 4 ? parseU32(drawArgs[2], @"draw") : 0;
+    NSUInteger baseInst = drawArgs.count == 4 ? parseU32(drawArgs[3], @"draw") : 0;
+    if (!vertices || !instances || baseVert > INT32_MAX) die(@"bad draw line in manifest");
     id<MTLCommandQueue> q = [device newCommandQueue];
     id<MTLCommandBuffer> cb = [q commandBuffer];
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -460,7 +478,7 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
     }
     NSMutableArray *keep = [NSMutableArray array];
     for (NSArray *w in lists[@"attr"]) {
-        NSData *d = slurp(w[3], NSUIntegerMax);
+        NSData *d = slurp(w[3], (baseVert + vertices) * vertexFormat(w[2]).size);
         id<MTLBuffer> b = [device newBufferWithBytes:d.bytes length:d.length ?: 4 options:MTLResourceStorageModeShared];
         [enc setVertexBuffer:b offset:0 atIndex:30 - [w[1] integerValue]];
         [keep addObject:b];
@@ -499,7 +517,18 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         else [enc setFragmentSamplerState:s atIndex:idx];
         [keep addObject:s];
     }
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices instanceCount:instances];
+    NSArray *idxArgs = m[@"index"];
+    if (idxArgs) {
+        if (idxArgs.count != 2) die(@"bad index line in manifest");
+        NSUInteger indexCount = parseU32(idxArgs[0], @"index");
+        if (!indexCount) die(@"bad index line in manifest");
+        NSData *idxData = slurp(idxArgs[1], indexCount * 4);
+        id<MTLBuffer> ib = [device newBufferWithBytes:idxData.bytes length:idxData.length options:MTLResourceStorageModeShared];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt32
+            indexBuffer:ib indexBufferOffset:0 instanceCount:instances baseVertex:(NSInteger)baseVert baseInstance:baseInst];
+    } else {
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:baseVert vertexCount:vertices instanceCount:instances baseInstance:baseInst];
+    }
     [enc endEncoding];
 
     // Private targets are copied to shared buffers; the buffers are what the host reads.

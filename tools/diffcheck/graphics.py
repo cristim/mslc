@@ -49,6 +49,7 @@ DEPTH_EPS = 1e-6
 SUBPIXEL = 256  # vertex positions must sit on this grid, in pixels
 SLOT_TOP = 30  # attribute at location n is vertex buffer slot 30 - n, away from [[buffer(n)]] arguments
 MAX_COLOR = 8
+MAX_BASE_VERTEX = 65536
 DEFAULT_SIZE, DEFAULT_ELEMS = 32, 64
 # Pixel coordinates of 32x32. Three shapes; no edge passes through a pixel centre (checked by
 # hand: the slopes 1/2, 13/18 and 3/26 never meet k + 0.5), so top-left fill rules cannot
@@ -67,12 +68,21 @@ def ndc(point, width, height):
     return 2 * x / width - 1, 1 - 2 * y / height, z
 
 
-def check_geometry(points, width, height):
+def check_geometry(points, width, height, indexes=None):
     if any(n < 2 or n & (n - 1) for n in (width, height)):
         raise GraphicsError("width and height must be powers of two, so every pixel coordinate converts to clip "
                             "space exactly (got %dx%d)" % (width, height))
-    if not points or len(points) % 3:
-        raise GraphicsError("DIFFCHECK-GEOMETRY needs a multiple of 3 points, got %d" % len(points))
+    if indexes is None:
+        if not points or len(points) % 3:
+            raise GraphicsError("DIFFCHECK-GEOMETRY needs a multiple of 3 points, got %d" % len(points))
+    else:
+        if not points:
+            raise GraphicsError("DIFFCHECK-GEOMETRY needs at least one vertex")
+        if not indexes or len(indexes) % 3:
+            raise GraphicsError("DIFFCHECK-INDEXES needs a multiple of 3 indices, got %d" % len(indexes))
+        for idx in indexes:
+            if not (0 <= idx < len(points)):
+                raise GraphicsError("DIFFCHECK-INDEXES index %d is out of range for %d vertices" % (idx, len(points)))
     for x, y, z in points:
         if not (0 < x < width and 0 < y < height and 0 <= z <= 1):
             raise GraphicsError("geometry point %g,%g,%g is not strictly inside the %dx%d target "
@@ -105,13 +115,18 @@ def clear_image(scalar, comps, pixels):
     return bytearray(b"".join(struct.pack(fmt, v) for v in CLEAR[scalar][:comps]) * pixels)
 
 
-def vertex_data(attributes, points, position, width, height, rng, profile):
-    """{location: bytes}: one tightly packed array per attribute, `len(points)` vertices."""
+def vertex_data(attributes, points, position, width, height, rng, profile, base_vertex=0):
+    """{location: bytes}: one tightly packed array per attribute, `base_vertex + len(points)` vertices."""
+    if base_vertex < 0:
+        raise ValueError("base_vertex must be non-negative, got %d" % base_vertex)
+    if base_vertex and not points:
+        raise ValueError("base_vertex requires at least one vertex point")
     data = {}
+    verts = ([points[0]] * base_vertex if base_vertex else []) + list(points)
     for location, a in sorted(attributes.items()):
         size = compare.SCALARS[a["scalar"]][0]
         out = bytearray()
-        for p in points:
+        for p in verts:
             if a["name"] == position:
                 x, y, z = ndc(p, width, height)
                 out += b"".join(struct.pack("<f", v) for v in (x, y, z, 1.0)[:a["comps"]])
@@ -120,6 +135,11 @@ def vertex_data(attributes, points, position, width, height, rng, profile):
                     out += inputs.leaf_bits(rng, a["scalar"], profile).to_bytes(size, "little")
         data[location] = out
     return data
+
+
+def index_data(indexes):
+    """Little-endian uint32 bytes for an index buffer."""
+    return struct.pack("<%dI" % len(indexes), *indexes)
 
 
 def split_leaves(layout, apple, primitives):
@@ -155,12 +175,18 @@ def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
     return lines + (["depth"] if depth else [])
 
 
-def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers, backend="vulkan"):
+def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers, backend="vulkan",
+               base_vertex=0, base_instance=0, index_file=None, index_count=0):
     """`shape` plus the data both hosts read: `attr_files` {location: file}, `color_outs` {index: file},
     `buffers` [(stage, metal index, set, member, bytes, file[, out_file])], `textures` and `samplers` in
     resources.seed's shape."""
     lines = [l for l in shape if not l.startswith(("attr ", "color ", "depth"))]
-    lines.append("draw %d %d" % (len(points), instances))
+    draw = "draw %d %d" % (len(points), instances)
+    if base_vertex or base_instance:
+        draw += " %d %d" % (base_vertex, base_instance)
+    lines.append(draw)
+    if index_file:
+        lines.append("index %d %s" % (index_count, index_file))
     for l in shape:
         if l.startswith("attr "):
             lines.append("%s %s" % (l, attr_files[int(l.split()[1])]))
@@ -212,9 +238,13 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     (None, result) when the file is skipped or erroneous."""
     res = {"entry": "%s+%s" % (vs, fs), "status": None, "cases": [], "reason": None}
     width, height = params["width"], params["height"]
-    points = params["geometry"] or DEFAULT_GEOMETRY
+    points = DEFAULT_GEOMETRY if params["geometry"] is None else params["geometry"]
+    indexes = params.get("indexes")
+    base_vertex, base_instance = params.get("base_vertex", 0), params.get("base_instance", 0)
     try:
-        check_geometry(points, width, height)
+        check_geometry(points, width, height, indexes)
+        if base_vertex < 0 or base_vertex > MAX_BASE_VERTEX or base_instance < 0 or base_instance > 0xffffffff:
+            raise GraphicsError("base_vertex %d (max %d) or base_instance %d out of range" % (base_vertex, MAX_BASE_VERTEX, base_instance))
     except GraphicsError as e:
         res.update(status="error", reason=str(e))
         return None, res
@@ -321,19 +351,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
             attributes[a["index"]]["scalar"] = "half"
     shape = pipeline_lines(width, height, vs, fs, attributes, colors, depth)
     return dict(res=res, compiled=compiled, attributes=attributes, position=position, colors=colors, depth=depth,
-                points=points, shape=shape, lines=lines, layouts=layouts, apple=apple), None
-
-
-def _control_holds(groups, mine, apple):
-    """True when every non-empty output group compares unequal after a single-leaf perturbation."""
-    held = []
-    for g in groups:
-        fired = checks.perturb(g, mine, apple)
-        if fired:
-            copy, name, _ = fired
-            index = next(i for i, l in g.items() if l["name"] == name)
-            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
-    return bool(held) and all(held)
+                points=points, indexes=indexes, shape=shape, lines=lines, layouts=layouts, apple=apple), None
 
 
 def check_pair(opts, source, vs, fs, params, work, includes):
@@ -343,7 +361,13 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         return early
     res, width, height = plan["res"], params["width"], params["height"]
     pixels = width * height
-    primitives = len(plan["points"]) // 3 * params["instances"]
+    indexes = plan["indexes"]
+    base_vertex, base_instance = params.get("base_vertex", 0), params.get("base_instance", 0)
+    primitives = (len(indexes) if indexes else len(plan["points"])) // 3 * params["instances"]
+    index_file = None
+    if indexes:
+        index_file = os.path.join(work, "indices.bin")
+        hostenv.write_bytes(index_file, index_data(indexes))
     attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in plan["colors"].items()}
     if plan["depth"]:
         attach[DEPTH_INDEX] = depth_layout()
@@ -368,7 +392,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         base = os.path.join(work, "case%d-" % case)
         case_before = {i: bytearray(v) for i, v in before.items()}
         attr_files, buffers, textures, samplers = {}, [], [], []
-        for loc, data in vertex_data(plan["attributes"], plan["points"], plan["position"], width, height, rng, profile).items():
+        for loc, data in vertex_data(plan["attributes"], plan["points"], plan["position"], width, height, rng, profile, base_vertex).items():
             attr_files[loc] = base + "attr%d.bin" % loc
             hostenv.write_bytes(attr_files[loc], data)
         for stage in ("vertex", "fragment"):
@@ -397,7 +421,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
             backend_buffers = [b + ((buf_outs[_wbuf_key(b[0], b[1])],) if _wbuf_key(b[0], b[1]) in buf_outs else ())
                                for b in buffers]
             body = draw_lines(plan["shape"], plan["points"], params["instances"], attr_files, color_outs, plan["colors"],
-                              depth_out, backend_buffers, textures, samplers, backend)
+                              depth_out, backend_buffers, textures, samplers, backend, base_vertex, base_instance,
+                              index_file, len(indexes or ()))
             if backend == "apple":
                 text, binary = ["mode draw"] + plan["lines"] + body, opts.metal
             else:
@@ -432,7 +457,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
             diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][k], outs["mslc"][k], bound)]
         all_compared = {**compared, **wcompared}
         nonzero = nonzero or any(checks.written_nonzero(all_compared, case_before, outs[b]) for b in ("apple", "mslc"))
-        control_ok = _control_holds([g for g in (compared, wcompared) if g], outs["mslc"], outs["apple"])
+        control_ok = checks.control_holds([g for g in (compared, wcompared) if g], outs["mslc"], outs["apple"])
         res["cases"].append({"case": case, "profile": profile, "diffs": diffs[:16], "diff_count": len(diffs), "negative_control": control_ok})
     res["status"], res["reason"] = checks.verdict(res["cases"], nonzero, params["writes_zero"])
     if excluded:

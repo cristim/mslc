@@ -69,17 +69,27 @@ class VertexAttributes(unittest.TestCase):
 
 class Directives(unittest.TestCase):
     def test_graphics_directives(self):
-        d = directives.parse("// RUN: vertex=vs fragment=fs width=8 instances=2\n// DIFFCHECK-GEOMETRY: 1,2 3,4 5,6,0.25\n"
+        d = directives.parse("// RUN: vertex=vs fragment=fs width=8 instances=2 base_vertex=3 base_instance=5\n"
+                             "// DIFFCHECK-GEOMETRY: 1,2 3,4 5,6 1,6\n// DIFFCHECK-INDEXES: 0 1 2 0 2 3\n"
                              "// DIFFCHECK-POSITION: pos\n// DIFFCHECK: depth\n")
-        self.assertEqual(d["run"], {"vertex": "vs", "fragment": "fs", "width": 8, "instances": 2})
-        self.assertEqual(d["geometry"], [(1.0, 2.0, 0.5), (3.0, 4.0, 0.5), (5.0, 6.0, 0.25)])
+        self.assertEqual(d["run"], {"vertex": "vs", "fragment": "fs", "width": 8, "instances": 2,
+                                    "base_vertex": 3, "base_instance": 5})
+        self.assertEqual(d["geometry"], [(1.0, 2.0, 0.5), (3.0, 4.0, 0.5), (5.0, 6.0, 0.5), (1.0, 6.0, 0.5)])
+        self.assertEqual(d["indexes"], [0, 1, 2, 0, 2, 3])
         self.assertEqual((d["position"], d["depth"]), ("pos", True))
+        zero_base = directives.parse("// RUN: vertex=vs fragment=fs base_vertex=0 base_instance=0\n")
+        self.assertEqual(zero_base["run"]["base_vertex"], 0)
+        self.assertEqual(zero_base["run"]["base_instance"], 0)
 
     def test_bad_values_are_refused(self):
-        for text in ("// RUN: vertex=1x\n", "// RUN: instances=0\n", "// RUN: vertex=\n", "// DIFFCHECK-GEOMETRY: 1\n",
-                     "// DIFFCHECK-GEOMETRY: a,b\n"):
+        for text in ("// RUN: vertex=1x\n", "// RUN: instances=0\n", "// RUN: vertex=\n", "// RUN: base_vertex=-1\n",
+                     "// RUN: base_instance=-1\n", "// RUN: grid=²\n", "// DIFFCHECK-GEOMETRY: 1\n",
+                     "// DIFFCHECK-GEOMETRY: a,b\n", "// DIFFCHECK-INDEXES:\n", "// DIFFCHECK-INDEXES: -1\n",
+                     "// DIFFCHECK-INDEXES: 0 x 2\n", "// DIFFCHECK-INDEXES: ²\n"):
             with self.assertRaises(ValueError, msg=text):
                 directives.parse(text)
+        with self.assertRaisesRegex(ValueError, "exceeds uint32"):
+            directives.parse("// DIFFCHECK-INDEXES: 4294967296\n")
 
 
 class Interface(unittest.TestCase):
@@ -118,6 +128,13 @@ class Geometry(unittest.TestCase):
     def test_pixel_to_ndc_keeps_row_zero_on_top(self):
         self.assertEqual(graphics.ndc((8, 8, .5), 32, 16), (-.5, 0.0, .5))
         self.assertEqual(graphics.ndc((16, 4, .5), 32, 16)[1], .5)
+
+    def test_indexed_quad_geometry_and_bad_indexes(self):
+        quad = [(4, 4, .5), (28, 4, .5), (28, 28, .5), (4, 28, .5)]
+        graphics.check_geometry(quad, 32, 32, [0, 1, 2, 0, 2, 3])
+        for pts, idxs in ((quad, []), (quad, [0, 1]), (quad, [0, 1, 4]), ([], [0, 1, 2])):
+            with self.assertRaises(graphics.GraphicsError, msg=(pts, idxs)):
+                graphics.check_geometry(pts, 32, 32, idxs)
 
 
 class Outputs(unittest.TestCase):
@@ -163,6 +180,13 @@ class Data(unittest.TestCase):
         self.assertEqual(len(a[1]), 3 * 2 * 4)
         b = graphics.vertex_data(attrs, [(8, 8, .25), (24, 8, .25), (8, 24, .25)], "pos", 32, 32, random.Random(1), "moderate")
         self.assertEqual(a, b)
+        shifted = graphics.vertex_data(attrs, [(8, 8, .25), (24, 8, .25), (8, 24, .25)], "pos", 32, 32, random.Random(1), "moderate", base_vertex=2)
+        self.assertEqual((len(shifted[0]), len(shifted[1])), (5 * 4 * 4, 5 * 2 * 4))
+        self.assertEqual(shifted[0][2 * 16:], a[0])
+        self.assertEqual(graphics.index_data([0, 1, 2, 0, 2, 3]), struct.pack("<6I", 0, 1, 2, 0, 2, 3))
+        for bad_pts, bad_base in (([], 2), ([(8, 8, .25)], -1)):
+            with self.assertRaises(ValueError):
+                graphics.vertex_data(attrs, bad_pts, "pos", 32, 32, random.Random(1), "moderate", base_vertex=bad_base)
 
     def test_attachment_layout_compares_only_the_written_components(self):
         layout = graphics.attachment_layout("color0", "float", 2)
@@ -266,6 +290,10 @@ class Resources(unittest.TestCase):
         self.assertIn("sampler 1 0 1", vk)
         self.assertIn("esampler 1 1 0 3 1 1", vk)
         self.assertFalse(any(l.startswith("esampler ") for l in ap))
+        indexed = graphics.draw_lines(shape, graphics.DEFAULT_GEOMETRY[:4], 2, {}, {0: "c.bin"}, {0: ("float", 4)}, None,
+                                      [], [], [], "mslc", base_vertex=3, base_instance=5, index_file="idx.bin", index_count=6)
+        self.assertIn("draw 4 2 3 5", indexed)
+        self.assertIn("index 6 idx.bin", indexed)
 
     def test_prepare_accepts_vertex_resources_nonfloat_non2d_and_embedded_samplers(self):
         v_kinds = ("1d", "1d_array", "2d")
@@ -483,6 +511,87 @@ class Resources(unittest.TestCase):
                 bad = graphics.check_pair(corrupt_opts, src, "vs", "fs", self.PARAMS, os.path.join(d, "bad"), [])
                 self.assertEqual(bad["status"], "mismatched")
                 self.assertEqual(bad["cases"][0]["diffs"][0]["buffer"], "fout")
+
+    def test_check_pair_writes_indexed_and_base_offset_manifests(self):
+        refl = self._refl(v_bindings=[{"kind": "VertexInput", "location": 0, "name": "pos"}])
+        v_iface = {"inputs": {0: {"scalar": "float", "comps": 2, "flat": False}}, "outputs": {}, "frag_depth": False, "unsupported": []}
+        apple = dict(self._apple(), vertex_attributes=[{"index": 0, "name": "pos", "scalar": "float", "comps": 2}])
+        quad = [(4.0, 4.0, .5), (26.0, 4.0, .5), (26.0, 27.0, .5), (4.0, 26.0, .5)]
+        params = dict(self.PARAMS, instances=2, base_vertex=3, base_instance=5, geometry=quad, indexes=[1, 2, 0, 3, 0, 2], position="pos")
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write(self.SOURCE)
+            ifaces = {"vertex": v_iface, "fragment": self.IFACE}
+            manifests, seen_attr, seen_idx = [], [], []
+
+            def run_host(binary, manifest):
+                with open(manifest) as mf:
+                    text = mf.read()
+                manifests.append(text)
+                for line in text.splitlines():
+                    w = line.split()
+                    if w[0] == "attr":
+                        with open(w[-1], "rb") as af:
+                            seen_attr.append(len(af.read()))
+                    elif w[0] == "index":
+                        with open(w[2], "rb") as idf:
+                            seen_idx.append((int(w[1]), idf.read()))
+                    elif w[0] == "color":
+                        with open(w[-1], "wb") as out:
+                            out.write(struct.pack("<4f", 1.0, 2.0, 3.0, 4.0) * (32 * 32))
+
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: (a[4] + ".spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", side_effect=lambda spv: spv[:-4]), \
+                 mock.patch.object(spirvio, "interface", side_effect=lambda tag, _: ifaces[tag]), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple), \
+                 mock.patch.object(hosts, "run_metal", side_effect=run_host), \
+                 mock.patch.object(hosts, "run_vulkan", side_effect=run_host):
+                res = graphics.check_pair(self.OPTS, src, "vs", "fs", params, d, [])
+            self.assertEqual(res["status"], "matched")
+            self.assertEqual(seen_attr, [7 * 8, 7 * 8])
+            self.assertEqual(seen_idx, [(6, struct.pack("<6I", 1, 2, 0, 3, 0, 2))] * 2)
+            for mf in manifests:
+                self.assertIn("draw 4 2 3 5", mf)
+                self.assertTrue(any(l.startswith("index 6 ") for l in mf.splitlines()))
+
+    def test_prepare_rejects_empty_geometry_and_out_of_range_base_offsets(self):
+        quad = [(4.0, 4.0, .5), (26.0, 4.0, .5), (26.0, 27.0, .5), (4.0, 26.0, .5)]
+        for extra in ({"geometry": []}, {"geometry": quad, "indexes": [0, 1, 2, 0, 2, 3], "base_vertex": -1},
+                      {"base_vertex": graphics.MAX_BASE_VERTEX + 1}, {"base_instance": -1}, {"base_instance": 0x100000000}):
+            _, err = self._run_prepare(self._refl(), self._apple(), dict(self.PARAMS, **extra))
+            self.assertEqual(err["status"], "error", extra)
+
+    def test_check_pair_uses_index_count_for_split_leaves_primitives(self):
+        # 4 vertices give len(points)//3 == 1, while 6 indices give 2 primitives: 3 distinct float values must stay exact.
+        refl = self._refl()
+        iface_r = {"inputs": {}, "outputs": {0: {"scalar": "float", "comps": 1, "flat": False}}, "frag_depth": False, "unsupported": []}
+        params = dict(self.PARAMS, width=4, height=4, geometry=[(1.0, 1.0, .5), (3.0, 1.0, .5), (3.0, 3.0, .5), (1.0, 3.0, .5)],
+                      indexes=[0, 1, 2, 0, 2, 3])
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write("vertex float4 vs() { return float4(0); }\nfragment float fs() { return 0.0f; }\n")
+            ifaces = {"vertex": iface_r, "fragment": iface_r}
+
+            def run_host(binary, manifest):
+                with open(manifest) as mf:
+                    lines = mf.read().splitlines()
+                out_path = next(l.split()[-1] for l in lines if l.startswith("color "))
+                last = struct.pack("<f", 2.0) if "metalhost" in binary else bytes.fromhex("01000040")
+                with open(out_path, "wb") as out:
+                    out.write(FLOAT(-1.5) * 14 + FLOAT(1.0) + last)
+
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: (a[4] + ".spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", side_effect=lambda spv: spv[:-4]), \
+                 mock.patch.object(spirvio, "interface", side_effect=lambda tag, _: ifaces[tag]), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=self._apple()), \
+                 mock.patch.object(hosts, "run_metal", side_effect=run_host), \
+                 mock.patch.object(hosts, "run_vulkan", side_effect=run_host):
+                res = graphics.check_pair(self.OPTS, src, "vs", "fs", params, d, [])
+            self.assertEqual(res["status"], "mismatched", res)
 
 
 if __name__ == "__main__":
