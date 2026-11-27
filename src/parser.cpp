@@ -522,6 +522,11 @@ void Parser::parseDeclaration() {
 		return;
 	}
 
+	if (matchIdentifier("static_assert")) {
+		parseStaticAssert();
+		return;
+	}
+
 	if (matchIdentifier("namespace")) {
 		if (kind() == TokenKind::Identifier && lookahead().kind == TokenKind::Assign) {
 			parseNamespaceAlias();
@@ -2193,6 +2198,36 @@ ExpressionPtr Parser::tryParseTraitValue() {
 		expression->boolValue = true;
 	}
 	return expression;
+}
+
+// static_assert(condition) or static_assert(condition, "message"), the keyword consumed ([dcl.pre]): the condition is
+// an integral constant expression, checked where it is read. A function template's body is read once per instance,
+// with its arguments bound, so each instance checks its own; a false one is an error naming the message.
+void Parser::parseStaticAssert() {
+	const size_t assertLine = line();
+	expect(TokenKind::LParen, "after \"static_assert\"");
+	const ExpressionPtr condition = parseConditional();
+	std::string message;
+	if (match(TokenKind::Comma)) {
+		if (!at(TokenKind::StringLiteral)) {
+			throw CompileError("the message of a static_assert has to be a string literal");
+		}
+		// Adjacent literals are one string ([lex.string]).
+		while (at(TokenKind::StringLiteral)) {
+			std::string_view text = current().text;
+			if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+				text = text.substr(1, text.size() - 2);
+			}
+			message += text;
+			advance();
+		}
+	}
+	expect(TokenKind::RParen, "to close \"static_assert(\"");
+	expect(TokenKind::Semicolon, "after \"static_assert(...)\"");
+	if (evaluateConstant(*condition, false) == 0) {
+		throw CompileError("static assertion failed" + (message.empty() ? std::string() : ": " + message)
+			+ " (line " + std::to_string(assertLine) + ")");
+	}
 }
 
 // enable_if, enable_if_t, make_scalar and make_scalar_t, the name consumed and "<" next.
@@ -5976,6 +6011,12 @@ StatementPtr Parser::parseStatement() {
 		}
 		throw CompileError("a '" + label + "' label nested inside a compound statement, loop or if within a switch "
 			"body is not supported: put every label directly in the switch body");
+	}
+
+	if (matchIdentifier("static_assert")) {
+		parseStaticAssert();
+		statement->kind = StatementKind::ExpressionStatement;
+		return statement;
 	}
 
 	if (atKeyword("namespace") && lookahead().kind == TokenKind::Identifier && lookahead(2).kind == TokenKind::Assign) {
