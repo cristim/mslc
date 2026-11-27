@@ -6548,41 +6548,8 @@ namespace {
 			}
 		}
 
-		// A template competes through its instance; one that cannot be deduced is no candidate (as in C++).
-		std::map<const HelperFunction*, const TemplateCandidate*> patternOf;
-		for (const TemplateCandidate& candidate: patterns) {
-			std::vector<TemplateArgument> deduced = candidate.arguments;
-			if (!deduceTemplateArguments(*candidate.declaration, *candidate.pattern, candidate.given, arguments, deduced)) {
-				continue;
-			}
-			try {
-				HelperFunction* made = &templateInstance(*candidate.declaration, std::move(deduced)).helper;
-				candidates.push_back(made);
-				patternOf[made] = &candidate;
-			} catch (const SubstitutionFailure&) {
-				// The signature with these arguments is ill-formed (an enable_if): not a candidate.
-			}
-		}
-
-		std::vector<std::pair<HelperFunction*, std::vector<ConversionCost>>> viable;
-		for (HelperFunction* entry: candidates) {
-			std::vector<ConversionCost> costs;
-			for (size_t i = 0; i < arguments.size(); ++i) {
-				// Every candidate takes the one receiver, so it cannot rank them.
-				costs.push_back(i < objects ? ConversionCost { kExact, -1 }
-					: conversionCost(arguments[i], entry->definition->parameters[i]));
-			}
-			if (std::none_of(costs.begin(), costs.end(), [](const ConversionCost& cost) { return cost.rank == kNoConversion; })) {
-				viable.emplace_back(entry, std::move(costs));
-			}
-		}
-		if (viable.empty()) {
-			throw CompileError("no matching function for call to \"" + name + "\"; candidates: "
-				+ describe(candidates) + (templateList.empty() ? "" : "; templates: " + templateList));
-		}
-
-		// Whether the second template's parameters can all be read off the first's, by value types, class
-		// template instances and consistent markers; anything else (pointers, arrays) is left unordered.
+		// Whether the second template's parameters can all be read off the first's, by value types, pointers,
+		// class template instances and consistent markers; anything else (arrays) is left unordered.
 		const auto deducibleFrom = [&](const TemplateCandidate& from, const TemplateCandidate& to) {
 			if (from.pattern->parameters.size() != to.pattern->parameters.size()) {
 				return false;
@@ -6595,11 +6562,13 @@ namespace {
 				return decl.dependentInstances.count(type.namedType) > 0;
 			};
 			// A parameter of the second template takes the first's type for it; asked again, it must agree.
-			std::map<std::string, std::pair<Type, bool>> bound;
-			const auto bind = [&](const std::string& marker, const Type& type, bool whole) {
-				const auto [slot, fresh] = bound.emplace(marker, std::make_pair(type, whole));
-				return fresh || (slot->second.second == whole && slot->second.first.namedType == type.namedType
-					&& sameValueType(slot->second.first, type) && slot->second.first.isConst == type.isConst);
+			std::map<std::string, Type> bound;
+			const auto bind = [&](const std::string& marker, const Type& type) {
+				const auto [slot, fresh] = bound.emplace(marker, type);
+				return fresh || (slot->second.namedType == type.namedType
+					&& sameValueType(slot->second, type) && slot->second.isConst == type.isConst
+					&& slot->second.isPointer == type.isPointer
+					&& slot->second.addressSpace == type.addressSpace);
 			};
 			const auto matchInstance = [&](const auto& self, const Type& a, const Type& b) -> bool {
 				const DependentInstance& have = from.pattern->dependentInstances.at(a.namedType);
@@ -6623,7 +6592,11 @@ namespace {
 							return false;
 						}
 					} else if (isParameter(*to.declaration, y.type)) {
-						if (y.type.isConst != x.type.isConst || !bind(y.type.namedType, x.type, false)) {
+						if ((y.type.isConst && !x.type.isConst) || !bind(y.type.namedType, [&] {
+								Type t = x.type;
+								t.isConst = x.type.isConst && !y.type.isConst;
+								return t;
+							}())) {
 							return false;
 						}
 					} else if (isParameter(*from.declaration, x.type) || isInstance(*from.pattern, x.type)
@@ -6639,6 +6612,36 @@ namespace {
 				const auto plain = [](const Parameter& p) {
 					return !p.type.isPointer && !p.type.arrayLength && p.type.resource == ResourceKind::None;
 				};
+				const auto pointer = [](const Parameter& p) {
+					return p.type.isPointer && !p.isReference && !p.type.arrayLength
+						&& p.type.innerArrayLengths.empty() && p.type.resource == ResourceKind::None;
+				};
+				if (pointer(a) && pointer(b)) {
+					if (a.type.addressSpace != b.type.addressSpace || (b.type.isConst && !a.type.isConst)
+						|| isInstance(*from.pattern, a.type) || isInstance(*to.pattern, b.type)) {
+						return false;
+					}
+					Type pointee = a.type;
+					pointee.isPointer = false;
+					pointee.addressSpace = AddressSpace::None;
+					pointee.isConst = a.type.isConst && !b.type.isConst;
+					if (isParameter(*to.declaration, b.type)) {
+						if (!bind(b.type.namedType, pointee)) {
+							return false;
+						}
+					} else if (isParameter(*from.declaration, a.type) || a.type.isConst != b.type.isConst
+						|| !sameValueType(a.type, b.type)) {
+						return false;
+					}
+					continue;
+				}
+				if (pointer(a) && plain(b) && (!b.isReference || (b.type.isConst && b.type.addressSpace == AddressSpace::Thread))
+					&& isParameter(*to.declaration, b.type) && !isInstance(*from.pattern, a.type)) {
+					if (!bind(b.type.namedType, a.type)) {
+						return false;
+					}
+					continue;
+				}
 				if (!plain(a) || !plain(b) || a.isReference != b.isReference || a.type.isConst != b.type.isConst) {
 					return false;
 				}
@@ -6647,7 +6650,7 @@ namespace {
 						return false;
 					}
 				} else if (isParameter(*to.declaration, b.type)) {
-					if (!bind(b.type.namedType, a.type, true)) {
+					if (!bind(b.type.namedType, a.type)) {
 						return false;
 					}
 				} else if (isInstance(*from.pattern, a.type) || isParameter(*from.declaration, a.type)
@@ -6657,6 +6660,157 @@ namespace {
 			}
 			return true;
 		};
+
+		// A template competes through its instance; one that cannot be deduced is no candidate (as in C++).
+		std::map<const HelperFunction*, const TemplateCandidate*> patternOf;
+		struct DeferredPointerTemplate {
+			const TemplateCandidate* candidate;
+			std::vector<TemplateArgument> deduced;
+			size_t pointerArgIndex;
+		};
+		std::vector<DeferredPointerTemplate> pointerValueCandidates;
+		for (const TemplateCandidate& candidate: patterns) {
+			std::vector<TemplateArgument> deduced = candidate.arguments;
+			if (!deduceTemplateArguments(*candidate.declaration, *candidate.pattern, candidate.given, arguments, deduced)) {
+				continue;
+			}
+			bool pointerInValueParameter = false;
+			size_t pointerArgIndex = 0;
+			for (size_t i = 0; i < candidate.pattern->parameters.size(); ++i) {
+				const Parameter& p = candidate.pattern->parameters[i];
+				if (p.type.isPointer || !isTemplateMarker(p.type)
+					|| candidate.pattern->dependentInstances.count(p.type.namedType)) {
+					continue;
+				}
+				const OverloadArgument& arg = arguments[i];
+				const bool buffer = arg.kind == OverloadArgument::Kind::Variable && !arg.expression->fileScope
+					&& arg.binding && arg.binding->isPointer && arg.binding->isBuffer
+					&& arg.binding->bufferPointeeType != InvalidId;
+				if (arg.kind == OverloadArgument::Kind::Array || buffer) {
+					pointerInValueParameter = true;
+					pointerArgIndex = i;
+					break;
+				}
+			}
+			if (pointerInValueParameter) {
+				pointerValueCandidates.push_back({ &candidate, std::move(deduced), pointerArgIndex });
+				continue;
+			}
+			try {
+				HelperFunction* made = &templateInstance(*candidate.declaration, std::move(deduced)).helper;
+				candidates.push_back(made);
+				patternOf[made] = &candidate;
+			} catch (const SubstitutionFailure&) {
+				// The signature with these arguments is ill-formed (an enable_if): not a candidate.
+			}
+		}
+
+		std::vector<std::pair<HelperFunction*, std::vector<ConversionCost>>> viable;
+		for (HelperFunction* entry: candidates) {
+			std::vector<ConversionCost> costs;
+			for (size_t i = 0; i < arguments.size(); ++i) {
+				// Every candidate takes the one receiver, so it cannot rank them.
+				costs.push_back(i < objects ? ConversionCost { kExact, -1 }
+					: conversionCost(arguments[i], entry->definition->parameters[i]));
+			}
+			if (std::none_of(costs.begin(), costs.end(), [](const ConversionCost& cost) { return cost.rank == kNoConversion; })) {
+				viable.emplace_back(entry, std::move(costs));
+			}
+		}
+		// A plain T parameter that would have deduced a pointer from a buffer or local array cannot be
+		// instantiated here, so it is dropped only when a viable non-template or more specialized viable
+		// template beats it across every argument (including conversion and const qualification).
+		const auto costsBeat = [](const std::vector<ConversionCost>& a, const std::vector<ConversionCost>& b,
+			bool& strictlyBetter) {
+			strictlyBetter = false;
+			for (size_t i = 0; i < a.size(); ++i) {
+				const bool ranked = a[i].rank != b[i].rank;
+				const bool qualified = !ranked && a[i].qualification >= 0 && b[i].qualification >= 0
+					&& a[i].qualification != b[i].qualification;
+				if (ranked ? a[i].rank > b[i].rank : qualified && a[i].qualification > b[i].qualification) {
+					return false;
+				}
+				strictlyBetter = strictlyBetter || (ranked ? a[i].rank < b[i].rank : qualified);
+			}
+			return true;
+		};
+		for (const DeferredPointerTemplate& deferred: pointerValueCandidates) {
+			const TemplateCandidate* candidate = deferred.candidate;
+			std::vector<ConversionCost> deferredCosts;
+			bool deferredViable = true;
+			for (size_t i = 0; i < arguments.size(); ++i) {
+				if (i < objects) {
+					deferredCosts.push_back({ kExact, -1 });
+					continue;
+				}
+				Parameter sub = candidate->pattern->parameters[i];
+				const OverloadArgument& arg = arguments[i];
+				if (candidate->pattern->dependentInstances.count(sub.type.namedType)) {
+					TypeTable::StructForm form;
+					if (_types.structForm(_builder.typeOf(arg.value), form)) {
+						sub.type.namedType = form.name;
+					}
+				} else {
+					for (size_t j = 0; j < candidate->declaration->parameters.size(); ++j) {
+						if (candidate->declaration->parameters[j].isType
+							&& sub.type.namedType == templateMarker(candidate->declaration->parameters[j])) {
+							const bool wasPointer = sub.type.isPointer;
+							const bool wasConst = sub.type.isConst;
+							const AddressSpace wasSpace = sub.type.addressSpace;
+							const std::vector<uint32_t> wasInner = sub.type.innerArrayLengths;
+							sub.type = deferred.deduced[j].type;
+							sub.type.isPointer = sub.type.isPointer || wasPointer;
+							sub.type.isConst = sub.type.isConst || wasConst;
+							if (wasSpace != AddressSpace::None) {
+								sub.type.addressSpace = wasSpace;
+							}
+							if (!wasInner.empty()) {
+								sub.type.innerArrayLengths = wasInner;
+							}
+							break;
+						}
+					}
+				}
+				const bool buffer = arg.kind == OverloadArgument::Kind::Variable && !arg.expression->fileScope
+					&& arg.binding && arg.binding->isPointer && arg.binding->isBuffer
+					&& arg.binding->bufferPointeeType != InvalidId;
+				if ((arg.kind == OverloadArgument::Kind::Array || buffer) && !candidate->pattern->parameters[i].type.isPointer) {
+					deferredCosts.push_back({ kExact, 0 });
+				} else {
+					const ConversionCost cost = conversionCost(arg, sub);
+					if (cost.rank == kNoConversion) {
+						deferredViable = false;
+						break;
+					}
+					deferredCosts.push_back(cost);
+				}
+			}
+			if (!deferredViable) {
+				continue;
+			}
+			const bool beaten = std::any_of(viable.begin(), viable.end(), [&](const auto& entry) {
+				bool better = false;
+				if (!costsBeat(entry.second, deferredCosts, better)) {
+					return false;
+				}
+				if (better || !isInstance(entry.first->definition)) {
+					return true;
+				}
+				const auto other = patternOf.find(entry.first);
+				return other != patternOf.end() && deducibleFrom(*other->second, *candidate)
+					&& !deducibleFrom(*candidate, *other->second);
+			});
+			if (!beaten) {
+				throw CompileError("the type parameter of \"" + candidate->declaration->name
+					+ "\" is deduced from argument " + std::to_string(deferred.pointerArgIndex + 1)
+					+ ", which is an array, a pointer or a texture; that is not lowered yet");
+			}
+		}
+		if (viable.empty()) {
+			throw CompileError("no matching function for call to \"" + name + "\"; candidates: "
+				+ describe(candidates) + (templateList.empty() ? "" : "; templates: " + templateList));
+		}
+
 		const auto moreSpecialized = [&](const HelperFunction* first, const HelperFunction* second) {
 			const auto a = patternOf.find(first);
 			const auto b = patternOf.find(second);
@@ -6888,42 +7042,77 @@ namespace {
 			const OverloadArgument& argument = arguments[i];
 			Type value;
 			if (parameter.type.isPointer) {
-				if (argument.kind != OverloadArgument::Kind::Array) {
+				const bool buffer = argument.kind == OverloadArgument::Kind::Variable && !argument.expression->fileScope
+					&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
+					&& argument.binding->bufferPointeeType != InvalidId;
+				if (argument.kind != OverloadArgument::Kind::Array && !buffer) {
 					if (argument.pointerLike || argument.kind == OverloadArgument::Kind::Resource) {
-						throw refuse(i, "which is a pointer, a buffer or a texture and not a local array");
+						throw refuse(i, "which is a pointer or a texture and neither a local array nor a whole buffer");
 					}
 					return false;
 				}
+				if (buffer ? argument.binding->pointeeMsl.addressSpace != parameter.type.addressSpace
+					: parameter.type.addressSpace != AddressSpace::Thread) {
+					return false;
+				}
 				value = argument.binding->pointeeMsl;
-				value.dropOuterDimension();
+				if (!buffer) {
+					value.dropOuterDimension();
+				}
 				if (value.arrayLength || value.isPointer || value.resource != ResourceKind::None) {
 					throw refuse(i, "which is an array of arrays");
 				}
+				if (value.isAtomic || !value.enumName.empty()) {
+					throw refuse(i, "which points at an atomic or an enum");
+				}
 				value.addressSpace = AddressSpace::None;
-				value.isConst = argument.binding->readOnly && !parameter.type.isConst;
+				value.isConst = (argument.binding->readOnly && parameter.type.addressSpace != AddressSpace::Constant)
+					&& !parameter.type.isConst;
 			} else {
 				if (parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
 					throw refuse(i, "to a parameter that is an array or a texture");
 				}
-				if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
-					|| argument.pointerLike) {
-					throw refuse(i, "which is an array, a pointer or a texture");
+				const bool buffer = argument.kind == OverloadArgument::Kind::Variable && !argument.expression->fileScope
+					&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
+					&& argument.binding->bufferPointeeType != InvalidId;
+				if ((argument.kind == OverloadArgument::Kind::Array || buffer)
+					&& (!parameter.isReference || (parameter.type.isConst && parameter.type.addressSpace == AddressSpace::Thread))) {
+					value = argument.binding->pointeeMsl;
+					if (!buffer) {
+						value.dropOuterDimension();
+					}
+					if (value.arrayLength || value.isPointer || value.resource != ResourceKind::None) {
+						throw refuse(i, "which is an array of arrays");
+					}
+					if (value.isAtomic || !value.enumName.empty()) {
+						throw refuse(i, "which points at an atomic or an enum");
+					}
+					value.isPointer = true;
+					value.addressSpace = buffer ? argument.binding->pointeeMsl.addressSpace : AddressSpace::Thread;
+					value.isConst = argument.binding->readOnly && value.addressSpace != AddressSpace::Constant;
+				} else {
+					if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
+						|| argument.pointerLike) {
+						throw refuse(i, "which is an array, a pointer or a texture");
+					}
+					if (argument.tag && !argument.tag->empty()) {
+						throw refuse(i, "which is an enum");
+					}
+					// Apple deduces T = "device float" for such an lvalue and binds it, as a plain float& cannot.
+					if (parameter.isReference && argument.kind == OverloadArgument::Kind::Variable && !argument.inThread) {
+						throw refuse(i, "which is an lvalue in device, constant or threadgroup memory, where Apple "
+							"deduces an address-space-qualified type");
+					}
+					value = deduceAutoType(Type(), _builder.typeOf(argument.value), "argument " + std::to_string(i + 1));
+					// A mutable reference to a const object has T = "const float".
+					value.isConst = parameter.isMutableReference() && argument.kind == OverloadArgument::Kind::Variable
+						&& argument.inThread && !argument.changeable;
 				}
-				if (argument.tag && !argument.tag->empty()) {
-					throw refuse(i, "which is an enum");
-				}
-				// Apple deduces T = "device float" for such an lvalue and binds it, as a plain float& cannot.
-				if (parameter.isReference && argument.kind == OverloadArgument::Kind::Variable && !argument.inThread) {
-					throw refuse(i, "which is an lvalue in device, constant or threadgroup memory, where Apple "
-						"deduces an address-space-qualified type");
-				}
-				value = deduceAutoType(Type(), _builder.typeOf(argument.value), "argument " + std::to_string(i + 1));
-				// A mutable reference to a const object has T = "const float".
-				value.isConst = parameter.isMutableReference() && argument.kind == OverloadArgument::Kind::Variable
-					&& argument.inThread && !argument.changeable;
 			}
 			if (known[index]) {
-				if (!sameValueType(deduced[index].type, value) || deduced[index].type.isConst != value.isConst) {
+				if (!sameValueType(deduced[index].type, value) || deduced[index].type.isConst != value.isConst
+					|| deduced[index].type.isPointer != value.isPointer
+					|| deduced[index].type.addressSpace != value.addressSpace) {
 					return false;
 				}
 				continue;
@@ -7145,19 +7334,35 @@ namespace {
 			return binding && sameResourceType(binding->pointeeMsl, type) ? exact(-1) : none;
 		}
 		if (type.isPointer || type.arrayLength) {
+			const bool buffer = argument.kind == OverloadArgument::Kind::Variable && !argument.expression->fileScope
+				&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
+				&& argument.binding->bufferPointeeType != InvalidId;
+			if (buffer) {
+				if (!type.isPointer || type.arrayLength || !type.innerArrayLengths.empty()
+					|| argument.binding->pointeeMsl.addressSpace != type.addressSpace) {
+					return none;
+				}
+				const Type& given = argument.binding->pointeeMsl;
+				const bool canWrite = type.addressSpace == AddressSpace::Device && !type.isConst;
+				return given.isAtomic != type.isAtomic || given.enumName != type.enumName
+					|| argument.binding->bufferPointeeType != bufferParamTypes(type).second
+					|| (argument.binding->readOnly && canWrite)
+					? none : exact(type.isConst && !argument.binding->readOnly ? 1 : 0);
+			}
 			if (argument.kind != OverloadArgument::Kind::Array) {
 				if (argument.expression->kind == ExpressionKind::IntLiteral && argument.expression->intValue == 0) {
 					throw CompileError("a literal 0 chooses among overloads one of which takes a pointer; the "
 						"null pointer conversion is not lowered yet");
 				}
 				if (argument.pointerLike) {
-					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
-						"buffer) chooses among overloads, which is not lowered yet");
+					throw CompileError("a pointer argument other than a local array or a whole buffer (&x, a + n "
+						"or a pointer into a buffer) chooses among overloads, which is not lowered yet");
 				}
 				return none;
 			}
-			return !pointerFit(*argument.binding, type).matches || (argument.binding->readOnly && !type.isConst)
-				? none : exact(type.isConst ? 1 : 0);
+			return type.addressSpace != AddressSpace::Thread || !pointerFit(*argument.binding, type).matches
+				|| (argument.binding->readOnly && !type.isConst)
+				? none : exact(type.isConst && !argument.binding->readOnly ? 1 : 0);
 		}
 		if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
 			|| argument.pointerLike) {
