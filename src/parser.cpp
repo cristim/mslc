@@ -4568,6 +4568,12 @@ bool Parser::containsUnsigned(const Expression& expression) const {
 		return (target == ScalarKind::UInt || target == ScalarKind::ULong)
 			&& expression.arguments.size() == 1 && containsUnsigned(*expression.arguments.front());
 	}
+	// A conditional's type is that of its two values after the usual arithmetic conversions ([expr.cond]): either
+	// one being unsigned makes it unsigned, whichever is chosen. Its condition does not take part.
+	if (expression.kind == ExpressionKind::Conditional) {
+		return expression.arguments.size() == 2
+			&& (containsUnsigned(*expression.arguments[0]) || containsUnsigned(*expression.arguments[1]));
+	}
 	return (expression.left && containsUnsigned(*expression.left))
 		|| (expression.right && containsUnsigned(*expression.right));
 }
@@ -4723,6 +4729,23 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 				case BinaryOperator::LogicalOr: return left != 0 || right != 0;
 			}
 			break;
+		}
+		case ExpressionKind::Conditional: {
+			// Only the value the condition chooses is evaluated ([expr.cond]), so the other may be one no constant
+			// expression holds, such as a division by zero.
+			if (expression.arguments.size() != 2) {
+				break;
+			}
+			// The condition is a bool, not the index, so a bool literal is fine there in an attribute index.
+			const int64_t condition = evaluateConstant(*expression.left, true, false);
+			const int64_t value = evaluateConstant(*expression.arguments[condition != 0 ? 0 : 1], nested, attribute);
+			// An unsigned value on either side makes the conditional unsigned, so a negative one chosen converts
+			// to a huge one, which is not modelled.
+			if (value < 0 && containsUnsigned(expression)) {
+				throw CompileError("a constant expression that mixes an unsigned operand with a negative value or "
+					"subtracts below zero would wrap as an unsigned one, which is not supported");
+			}
+			return value;
 		}
 		case ExpressionKind::Sizeof:
 			throw CompileError("the size of an expression is worked out after parsing, so it is not an "
