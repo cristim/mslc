@@ -529,6 +529,11 @@ constexpr uint32_t kImageOperandsOffset = 0x10;
 	// these start beyond that.
 	constexpr uint32_t kGridSizeSpecializationID = 0x40000;
 
+	// The SpecId of the sample count get_num_samples() reads. Vulkan gives a fragment shader no builtin for the
+	// sample count of what it renders to, so it is a spec constant the host sets from the pipeline's sample
+	// count, past the grid size's three.
+	constexpr uint32_t kNumSamplesSpecializationID = 0x40003;
+
 	// The SpecIds of a function constant [[function_constant(n)]]: its value at this plus n, and a bool that the
 	// host sets when it gives the constant a value at the other plus n. Threadgroup argument lengths take the
 	// SpecIds from 3 up to the first of these.
@@ -2590,6 +2595,10 @@ namespace {
 		Id _gridSize[3] = { InvalidId, InvalidId, InvalidId };
 		Id _globalInvocationVariable = InvalidId;
 		bool _masksGridSize = false;
+		// The sample count get_num_samples() reads, one spec constant for the module, and whether the entry point
+		// being emitted reads it.
+		Id _numSamples = InvalidId;
+		bool _readsNumSamples = false;
 		std::vector<StageVariable> _stageInputs;
 		// Framebuffer fetch: a [[color(n)]] parameter and the value it is read into.
 		struct AttachmentParameter {
@@ -2756,6 +2765,7 @@ namespace {
 		Id emitSpecConstantExpression(const Expression& expression, const std::string& constant);
 		Id specConstantConvert(Id value, Id type);
 		Id emitIsFunctionConstantDefined(const Expression& call);
+		Id emitNumSamples(const Expression& call);
 		Id emitAsType(const Expression& call);
 		std::string functionConstantsJson();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
@@ -6259,6 +6269,10 @@ namespace {
 
 		if (name == "__metal_is_function_constant_defined") {
 			return emitIsFunctionConstantDefined(expression);
+		}
+
+		if (name == "get_num_samples") {
+			return emitNumSamples(expression);
 		}
 
 		if (isAtomicFunction(name)) {
@@ -10725,6 +10739,30 @@ namespace {
 			return _builder.emitTyped(spirv::OpVectorShuffle, toType, { bits, bits, 0, 1, 2 });
 		}
 		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
+	}
+
+	// get_num_samples(), the number of samples of what a fragment function renders to. A helper is emitted for each
+	// entry point that calls it, so the stage is the caller's; Apple's compiler refuses it in a vertex or kernel
+	// function, a helper's call included. Its default is 1, a pipeline that does not set it renders one sample.
+	Id Emitter::emitNumSamples(const Expression& call) {
+		if (!call.arguments.empty()) {
+			throw CompileError("get_num_samples() takes no arguments");
+		}
+		if (_entryPoint == &_libraryScope) {
+			throw StageError("get_num_samples() reads the sample count of a fragment function, and this is not in one");
+		}
+		if (_entryPoint->stage != Stage::Fragment) {
+			throw StageError(std::string("get_num_samples() is not allowed within a ")
+				+ (_entryPoint->stage == Stage::Vertex ? "vertex" : "kernel")
+				+ " function: it is the sample count of what a fragment function renders to");
+		}
+		if (_numSamples == InvalidId) {
+			_numSamples = _builder.emitDeclTyped(spirv::OpSpecConstant, _uintType, { 1u });
+			_builder.emit(spirv::OpDecorate, { _numSamples, static_cast<uint32_t>(spirv::Decoration::SpecId),
+				kNumSamplesSpecializationID });
+		}
+		_readsNumSamples = true;
+		return _numSamples;
 	}
 
 	Id Emitter::emitIsFunctionConstantDefined(const Expression& call) {
@@ -16020,6 +16058,7 @@ namespace {
 			_threadsPerThreadgroup = nullptr;
 			_globalInvocationVariable = InvalidId;
 			_masksGridSize = false;
+			_readsNumSamples = false;
 			_stageInputs.clear();
 			_attachmentParameters.clear();
 			_attachmentIndices.clear();
@@ -16041,6 +16080,9 @@ namespace {
 				document += "\t\t\t\"grid_size_spec_ids\": [" + std::to_string(kGridSizeSpecializationID) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 1) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 2) + "],\n";
+			}
+			if (_readsNumSamples) {
+				document += "\t\t\t\"num_samples_spec_id\": " + std::to_string(kNumSamplesSpecializationID) + ",\n";
 			}
 			const std::string functionConstants = functionConstantsJson();
 			if (!functionConstants.empty()) {
