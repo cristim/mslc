@@ -649,8 +649,11 @@ below the template that rebinds a name, and a later overload found by argument-d
   a file-scope name the class template spells that is declared
   anywhere after it (a loud false refusal when it is unrelated); and a using declaration or directive after the
   class template in a scope it reads from, checked at the end of the file. Explicit instantiation of an entry point
-  (`template [[host_name("kf")]] kernel void k<float>(...)`, accepted by Apple) is not class-instance work and is
-  still refused.
+  (`template [[host_name("kf")]] kernel void k<float>(...)`, vertex and fragment included) is lowered (#341);
+  omitting `[[host_name("...")]]` on an explicit entry-point instantiation, `[[host_name("...")]]` on a helper
+  or non-template entry point, conflicting parameter attributes on the instantiation, and a `host_name` that
+  collides with a helper function name remain refused (Apple accepts omitting `host_name` when unique, accepts
+  `host_name` sharing a name with a helper, and ignores conflicting attributes on named instantiation parameters).
 - A deduced instance in a function template's signature (`T unbox(Box<T>)`, `Box<Box<T>>`, `Pair<A, int>`, `Box<T>
   make(T)`) works (slice 5e): the instance is a marker type while T is being deduced, and an argument that is an
   instance of the same class template gives T its argument (one T named twice must agree, also with a plain `T x`).

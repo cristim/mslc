@@ -242,6 +242,8 @@ private:
 		std::map<std::string, NamespaceScope> scopes;
 		std::deque<StructDecl> structs;
 		std::set<std::string> functionTemplates;
+		std::set<std::string> entryTemplateNames;
+		std::set<std::string> helperNames;
 		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
 		std::map<std::string, ConstantInt> constantInts;
 		std::map<std::string, ConstructorInfo> constructors;
@@ -520,12 +522,29 @@ private:
 	ExpressionPtr foldStdArrayCall(ExpressionPtr& receiver);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
+	void checkUniqueResourceSlots(const FunctionDecl& decl) const;
+	void parseEntryParameterList(std::vector<Parameter>& out, const std::string& quoted, bool allowUnnamed);
 	// A file-scope function that is not an entry point. False, with the position
 	// restored, when the tokens ahead are not a function's return type, name and
 	// opening parenthesis, so a file-scope constant still reaches its own parser.
 	bool tryParseHelperFunction();
 	void parseTemplateDeclaration();
 	void parseExplicitInstantiation();
+	// Queued until end of parse() so template bodies have full tokens and class seeds.
+	struct PendingEntryInstantiation {
+		size_t slotIndex = 0, line = 0;
+		Stage stage = Stage::None;
+		std::string hostName, spelled;
+		std::set<std::string> candidateNames;
+		Type returnType;
+		std::vector<TemplateArgument> explicitArgs;
+		std::vector<Parameter> parameters;
+	};
+	std::set<std::string> _entryTemplateNames, _helperNames;
+	std::vector<PendingEntryInstantiation> _pendingEntryInstantiations;
+	void resolveEntryInstantiations();
+	bool deduceEntryArguments(const FunctionTemplate& tmpl, const FunctionDecl& pattern,
+		size_t given, const std::vector<Parameter>& got, std::vector<TemplateArgument>& arguments) const;
 	void skipBalanced(TokenKind open, TokenKind close);
 	void skipFunctionAttribute();
 	bool skipStandardFunctionAttribute(bool forTemplateInstance = false);
@@ -578,7 +597,7 @@ private:
 	// Parameters
 	// helperName is set for a helper function's parameter, which has fewer forms
 	// than an entry point's: no attribute, no resource, no pointer or reference.
-	Parameter parseParameter(const std::string& helperName = std::string());
+	Parameter parseParameter(const std::string& helperName = std::string(), bool allowUnnamed = false);
 	ParameterAttributes parseParameterAttributes();
 
 	// Struct fields

@@ -502,13 +502,18 @@ TranslationUnit Parser::parse() {
 			refuse("using declaration of");
 		}
 	}
-	if (!_unit.templates.empty()) {
+	if (!_unit.templates.empty() || !_unit.entryTemplates.empty()) {
 		const auto file = std::make_shared<const std::vector<Token>>(_tokens);
 		for (FunctionTemplate& declaration: _unit.templates) {
 			declaration.file = file;
 			declaration.seeds = _seedList;
 		}
+		for (FunctionTemplate& declaration: _unit.entryTemplates) {
+			declaration.file = file;
+			declaration.seeds = _seedList;
+		}
 	}
+	resolveEntryInstantiations();
 	return std::move(_unit);
 }
 
@@ -989,6 +994,8 @@ std::shared_ptr<const Parser::Names> Parser::captureNames() const {
 	names->scopes = _scopes;
 	names->structs = _unit.structs;
 	names->functionTemplates = _unit.functionTemplates;
+	names->entryTemplateNames = _entryTemplateNames;
+	names->helperNames = _helperNames;
 	names->constructors = _constructors;
 	names->classTemplates = _classTemplates;
 	names->constantInts = _constantInts;
@@ -1010,6 +1017,8 @@ void Parser::restoreNames(const Names& names) {
 	_scopes = names.scopes;
 	_unit.structs = names.structs;
 	_unit.functionTemplates = names.functionTemplates;
+	_entryTemplateNames = names.entryTemplateNames;
+	_helperNames = names.helperNames;
 	_constructors = names.constructors;
 	_classTemplates = names.classTemplates;
 	_constantInts = names.constantInts;
@@ -1110,6 +1119,15 @@ void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
 	}
 }
 
+namespace {
+
+Stage stageForKeyword(std::string_view word) {
+	return word == "kernel" ? Stage::Kernel : word == "vertex" ? Stage::Vertex
+		: word == "fragment" ? Stage::Fragment : Stage::None;
+}
+
+}
+
 // The declarator of a function template, after its header, to the end of its body or ';': fills the
 // tokens, the signature and whether it has a body, and returns the name. A member also takes "const" after
 // its parameters.
@@ -1147,6 +1165,11 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		}
 		if (atKeyword("operator")) {
 			throw CompileError("an operator template is not lowered");
+		}
+		if (angles == 0 && !member && kind() == TokenKind::Identifier && declaration.stage == Stage::None
+			&& stageForKeyword(current().text) != Stage::None) {
+			throw CompileError("an attribute or specifier before \"" + std::string(current().text)
+				+ "\" in an entry-point template is not lowered");
 		}
 		if (at(TokenKind::Less)) {
 			++angles;
@@ -1234,11 +1257,83 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 	return name;
 }
 
-// "template RET name<arguments>(parameters);" of a helper function template. An instance is made where
-// a call needs it, so one nothing calls has no effect, as in clang; the declaration only has to name a
-// function template. An entry point (an attribute, or a stage keyword) would need host_name entry
-// points and stays refused.
+// "template RET name<arguments>(parameters);" of a helper function template, or
+// "template [[host_name("...")]] stage RET name<arguments>(parameters);" of an entry point.
+// Entry-point instantiations are queued and lowered into _unit.functions at the end of parse().
 void Parser::parseExplicitInstantiation() {
+	const size_t startLine = line();
+	std::optional<std::string> hostName;
+	while (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+		advance(); advance();
+		if (!at(TokenKind::RBracket)) {
+			do {
+				if (kind() != TokenKind::Identifier) { throw CompileError("expected an attribute name in an explicit template instantiation"); }
+				const std::string attr(advance().text);
+				if (attr != "host_name") { throw CompileError("attribute \"" + attr + "\" on an explicit template instantiation is not lowered"); }
+				if (hostName) { throw CompileError("attribute \"host_name\" cannot appear more than once"); }
+				expect(TokenKind::LParen, "after [[host_name");
+				if (!at(TokenKind::StringLiteral)) { throw CompileError("[[host_name]] needs a string literal argument"); }
+				std::string value;
+				while (at(TokenKind::StringLiteral)) {
+					const std::string_view raw = advance().text, inner = raw.substr(1, raw.size() - 2);
+					if (inner.find('\\') != std::string_view::npos) { throw CompileError("escape sequences in [[host_name]] are not lowered"); }
+					value.append(inner);
+				}
+				expect(TokenKind::RParen, "to close [[host_name]]");
+				if (value.empty()) { throw CompileError("[[host_name]] cannot be empty"); }
+				hostName = std::move(value);
+			} while (match(TokenKind::Comma));
+		}
+		expect(TokenKind::RBracket, "to close an attribute list"); expect(TokenKind::RBracket, "to close an attribute list");
+	}
+	const Stage stage = kind() == TokenKind::Identifier ? stageForKeyword(current().text) : Stage::None;
+	if (stage != Stage::None) {
+		advance();
+		if (!hostName) {
+			throw CompileError(at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket
+				? "an attribute list cannot appear after the stage keyword; write [[host_name(\"...\")]] before it"
+				: "an explicit template instantiation of an entry point needs [[host_name(\"...\")]]");
+		}
+		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr") || at(TokenKind::LBracket) || atKeyword("auto")) {
+			throw CompileError("invalid specifier or attribute in an explicit template instantiation");
+		}
+		const Type returnType = parseType();
+		QualifiedName spelled;
+		if (!peekQualifiedName(spelled)) { throw CompileError("expected a function template name in an explicit template instantiation"); }
+		for (size_t i = 0; i < spelled.tokens; ++i) { advance(); }
+		const std::string spelledText = (spelled.global ? "::" : "") + joinParts(spelled.parts, 0, spelled.parts.size());
+		std::vector<std::string> alternatives;
+		std::set<std::string> candidateNames { resolveName(spelled, &alternatives) };
+		candidateNames.insert(alternatives.begin(), alternatives.end());
+		if (std::none_of(candidateNames.begin(), candidateNames.end(),
+			[&](const std::string& each) { return _entryTemplateNames.count(each) != 0; })) {
+			throw CompileError("an explicit instantiation of \"" + spelledText + "\" does not name an entry-point template");
+		}
+		std::vector<TemplateArgument> explicitArgs;
+		if (match(TokenKind::Less)) {
+			if (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight)) {
+				do { explicitArgs.push_back(parseTemplateArgument()); } while (match(TokenKind::Comma));
+			}
+			closeAngle(("to close explicit template arguments of \"" + spelledText + "\"").c_str());
+		}
+		expect(TokenKind::LParen, "to open the parameters of an explicit template instantiation");
+		std::vector<Parameter> instParams;
+		{
+			const LocalScope parameters(*this);
+			parseEntryParameterList(instParams, "explicit instantiation \"" + spelledText + "\"", true);
+		}
+		if (at(TokenKind::LBrace) || at(TokenKind::LBracket) || at(TokenKind::Arrow)) {
+			throw CompileError(at(TokenKind::LBrace) ? "an explicit template instantiation cannot have a definition"
+				: "an attribute or trailing return type after an explicit template instantiation is not lowered");
+		}
+		expect(TokenKind::Semicolon, "after an explicit template instantiation");
+		_pendingEntryInstantiations.push_back({ _unit.functions.size(), startLine, stage, *hostName,
+			spelledText, std::move(candidateNames), returnType, std::move(explicitArgs), std::move(instParams) });
+		_unit.functions.push_back({ stage, {}, std::move(*hostName), {}, {}, startLine });
+		return;
+	}
+	if (hostName) { throw CompileError("[[host_name]] is only supported on an explicit instantiation of an entry point"); }
+
 	size_t open = 0;
 	for (; lookahead(open).kind != TokenKind::LParen; ++open) {
 		const Token& token = lookahead(open);
@@ -1264,6 +1359,10 @@ void Parser::parseExplicitInstantiation() {
 	}
 	const std::string spelled(lookahead(name - 1).text);
 	if (!_unit.functionTemplates.count(qualify(spelled)) && !_unit.functionTemplates.count(spelled)) {
+		if (_entryTemplateNames.count(qualify(spelled)) || _entryTemplateNames.count(spelled)) {
+			throw CompileError("an explicit template instantiation of entry-point template \"" + spelled
+				+ "\" needs its stage keyword and [[host_name(\"...\")]]");
+		}
 		throw CompileError("an explicit instantiation of \"" + spelled + "\" does not name a function template");
 	}
 	while (!at(TokenKind::Semicolon)) {
@@ -1307,6 +1406,12 @@ void Parser::parseTemplateDeclaration() {
 		throw CompileError("an alias template is not lowered");
 	}
 
+	declaration.stage = kind() == TokenKind::Identifier ? stageForKeyword(current().text) : Stage::None;
+	if (declaration.stage != Stage::None
+		&& std::find(_namespacePath.begin(), _namespacePath.end(), kAnonymousNamespace) != _namespacePath.end()) {
+		throw CompileError(std::string(current().text) + " function cannot be declared in anonymous namespace");
+	}
+
 	const std::string name = readTemplateFunction(declaration, headerStart, false);
 
 	const std::string qualified = qualify(name);
@@ -1319,11 +1424,14 @@ void Parser::parseTemplateDeclaration() {
 			"variable, which is not lowered: a call spelled like a construction would not reach it");
 	}
 	declareName(qualified, "function");
-	_unit.functionTemplates.insert(qualified);
+	if (declaration.stage != Stage::None) { rejectUsingConflict(qualified, "function", nullptr); }
+	(declaration.stage == Stage::None ? _unit.functionTemplates : _entryTemplateNames).insert(qualified);
+	std::vector<FunctionTemplate>& targetList = declaration.stage == Stage::None
+		? _unit.templates : _unit.entryTemplates;
 	declaration.endAt = _position;
 
 	// A prototype and its definition are one template, found at the prototype's place in the file.
-	for (FunctionTemplate& earlier: _unit.templates) {
+	for (FunctionTemplate& earlier: targetList) {
 		if (earlier.name != qualified || earlier.signature != declaration.signature) {
 			continue;
 		}
@@ -1336,7 +1444,7 @@ void Parser::parseTemplateDeclaration() {
 		}
 		return;
 	}
-	_unit.templates.push_back(std::move(declaration));
+	targetList.push_back(std::move(declaration));
 }
 
 // Binds the template's parameters in the innermost block: a type is a typedef, a constant an
@@ -1406,25 +1514,30 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		}
 	};
 	FunctionDecl decl;
+	decl.stage = declaration.stage;
 	decl.line = declaration.line;
 	decl.name = declaration.name;
 	decl.order = declaration.bodyOrder;
 	decl.globalsBefore = declaration.globalsBefore;
 	const std::string quoted = "function template \"" + declaration.name + "\"";
 
-	for (;;) {
-		skipAttributes();
-		if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
-			if (skipStandardFunctionAttribute(true)) {
+	if (declaration.stage != Stage::None) {
+		advance();
+	} else {
+		for (;;) {
+			skipAttributes();
+			if (at(TokenKind::LBracket) && lookahead().kind == TokenKind::LBracket) {
+				if (skipStandardFunctionAttribute(true)) {
+					continue;
+				}
+				break;
+			}
+			if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
+				advance();
 				continue;
 			}
 			break;
 		}
-		if (atKeyword("inline") || atKeyword("static") || atKeyword("constexpr")) {
-			advance();
-			continue;
-		}
-		break;
 	}
 	if (at(TokenKind::LBracket)) {
 		throw CompileError("an attribute in the declaration of " + quoted + " is not lowered yet");
@@ -1439,7 +1552,9 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	} else {
 		decl.returnType = parseType();
 	}
-	rejectUnloweredReturn(decl.returnType, quoted);
+	if (declaration.stage == Stage::None) {
+		rejectUnloweredReturn(decl.returnType, quoted);
+	}
 	if (kind() != TokenKind::Identifier || current().text != written) {
 		throw CompileError("the declaration of " + quoted + " is not a return type and a name that mslc reads "
 			"when it is instantiated (found \"" + std::string(current().text) + "\" where its name is)");
@@ -1465,7 +1580,14 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		decl.parameters.push_back(std::move(self));
 	}
 	const size_t parametersFrom = _position;
-	parseHelperParameters(decl, quoted);
+	if (declaration.stage != Stage::None) {
+		parseEntryParameterList(decl.parameters, quoted, !withBody && !declaration.hasBody);
+		if (withBody) {
+			checkUniqueResourceSlots(decl);
+		}
+	} else {
+		parseHelperParameters(decl, quoted);
+	}
 	// A parameter is dependent when the tokens that declare it name a template parameter.
 	{
 		size_t index = 0;
@@ -2648,6 +2770,7 @@ bool Parser::tryParseHelperFunction() {
 	}
 	decl.name = qualify(decl.name);
 	declareName(decl.name, "function");
+	_helperNames.insert(decl.name);
 	const LocalScope parameters(*this);
 	parseHelperParameters(decl, quoted);
 	rejectUsingConflict(decl.name, "function", &decl);
@@ -3540,7 +3663,8 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 }
 
 void Parser::declareName(const std::string& name, const char* what) {
-	if (_unit.functionTemplates.count(name) && std::string_view(what) != "function") {
+	if ((_unit.functionTemplates.count(name) || _entryTemplateNames.count(name))
+		&& std::string_view(what) != "function") {
 		throw CompileError("\"" + name + "\" is declared as " + what + " beside a function template of the "
 			"same name, which is not lowered: a call spelled like a construction would not reach the template");
 	}
@@ -3923,9 +4047,11 @@ bool Parser::peekQualifiedName(QualifiedName& out) const {
 				self._position = saved;
 			}
 		}
-		// A qualifier or address space is a keyword, not a namespace: in "constexpr ::metal::sampler"
-		// the "::" begins the next name.
-		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0]))) {
+		// A qualifier, address space or builtin scalar keyword is never a namespace: in
+		// "constexpr ::metal::sampler" or "void ::N::k", "::" begins the next name.
+		if (out.parts.size() == 1 && !out.global && (isTypeQualifier(out.parts[0]) || addressSpaceFor(out.parts[0])
+			|| isIntegerSpecifier(out.parts[0]) || out.parts[0] == "void" || out.parts[0] == "float"
+			|| out.parts[0] == "double" || out.parts[0] == "half" || out.parts[0] == "bool")) {
 			break;
 		}
 		if (lookahead(at).kind != TokenKind::ColonColon || lookahead(at + 1).kind != TokenKind::Identifier) {
@@ -5437,7 +5563,7 @@ bool Parser::parseArrayDimensions(Type& type) {
 }
 
 std::optional<uint32_t> Parser::tryParseArrayLength() {
-	if (!at(TokenKind::LBracket)) {
+	if (!at(TokenKind::LBracket) || lookahead().kind == TokenKind::LBracket) {
 		return std::nullopt;
 	}
 
@@ -5905,7 +6031,7 @@ void Parser::parseResourceType(Type& type) {
 	type.scalar = element->second;
 }
 
-Parameter Parser::parseParameter(const std::string& helperName) {
+Parameter Parser::parseParameter(const std::string& helperName, bool allowUnnamed) {
 	Parameter param;
 	const bool helper = !helperName.empty();
 
@@ -5925,7 +6051,8 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 	param.isReference = match(TokenKind::Ampersand);
 
 	// A prototype and an unused parameter may leave the name out.
-	const bool unnamed = helper && (at(TokenKind::Comma) || at(TokenKind::RParen));
+	const bool unnamed = (helper || allowUnnamed)
+		&& (at(TokenKind::Comma) || at(TokenKind::RParen) || (allowUnnamed && at(TokenKind::LBracket)));
 	if (!unnamed && kind() != TokenKind::Identifier) {
 		throw CompileError("expected a parameter name, found " + std::string(tokenKindName(kind())));
 	}
@@ -6247,7 +6374,28 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 
 	expect(TokenKind::RParen, "to close a parameter list");
 	rejectUsingConflict(decl.name, "function", &decl);
+	checkUniqueResourceSlots(decl);
 
+	// parseCompoundStatement consumes the opening brace itself, so consuming it
+	// here as well would make it look for a second one.
+	decl.body = parseCompoundStatement(true);
+
+	return decl;
+}
+
+void Parser::parseEntryParameterList(std::vector<Parameter>& out, const std::string& quoted, bool allowUnnamed) {
+	if (atKeyword("void") && lookahead().kind == TokenKind::RParen) { advance(); }
+	while (!at(TokenKind::RParen) && !at(TokenKind::EndOfFile)) {
+		out.push_back(parseParameter(std::string(), allowUnnamed));
+		if (at(TokenKind::Assign)) {
+			throw CompileError("a default argument is not lowered yet (parameter \"" + out.back().name + "\" of " + quoted + ")");
+		}
+		if (!match(TokenKind::Comma)) { break; }
+	}
+	expect(TokenKind::RParen, "to close a parameter list");
+}
+
+void Parser::checkUniqueResourceSlots(const FunctionDecl& decl) const {
 	// Two parameters of one kind cannot take the same slot.
 	std::set<std::pair<std::string, uint32_t>> slots;
 	for (const Parameter& parameter: decl.parameters) {
@@ -6263,12 +6411,142 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 			}
 		}
 	}
+}
 
-	// parseCompoundStatement consumes the opening brace itself, so consuming it
-	// here as well would make it look for a second one.
-	decl.body = parseCompoundStatement(true);
+namespace {
 
-	return decl;
+bool fitsNonTypeTemplateConstant(ScalarKind kind, int64_t value) {
+	if (kind == ScalarKind::Bool) { return value == 0 || value == 1; }
+	int64_t low = 0, high = 0;
+	return integerRange(kind, low, high) && value >= low && value <= high;
+}
+
+bool sameFullType(Type lhs, Type rhs, bool checkTopConst) {
+	if (!checkTopConst && !lhs.isPointer) { lhs.isConst = false; }
+	if (!checkTopConst && !rhs.isPointer) { rhs.isConst = false; }
+	return sameType(lhs, rhs) && lhs.isPointer == rhs.isPointer && lhs.addressSpace == rhs.addressSpace
+		&& lhs.resource == rhs.resource && lhs.textureAccess == rhs.textureAccess
+		&& lhs.isDepth == rhs.isDepth && lhs.isMultisampled == rhs.isMultisampled;
+}
+
+auto parameterAttributeKey(const ParameterAttributes& a) {
+	return std::tie(a.bufferIndex, a.threadgroupIndex, a.textureIndex, a.samplerIndex, a.builtin, a.stageIn, a.colorIndex);
+}
+
+}
+
+bool Parser::deduceEntryArguments(const FunctionTemplate& tmpl, const FunctionDecl& pattern,
+	size_t given, const std::vector<Parameter>& gotParams, std::vector<TemplateArgument>& arguments) const {
+	if (pattern.parameters.size() != gotParams.size()) { return false; }
+	std::vector<bool> known(arguments.size(), false);
+	std::fill_n(known.begin(), given, true);
+	const auto matchType = [&](const auto& self, const Type& patType, const Type& gotType, bool ptrOrRef, bool inInst) -> bool {
+		if (pattern.dependentInstances.count(patType.namedType)) {
+			if ((ptrOrRef && patType.isConst != gotType.isConst) || (inInst && (gotType.isPointer || gotType.arrayLength))) { return false; }
+			const DependentInstance& expected = pattern.dependentInstances.at(patType.namedType);
+			const StructDecl* made = gotType.namedType.empty() ? nullptr : _unit.findStruct(gotType.namedType);
+			if (!made || made->classTemplate != expected.classTemplate || made->classArguments.size() != expected.arguments.size()) { return false; }
+			for (size_t k = 0; k < expected.arguments.size(); ++k) {
+				const TemplateArgument& want = expected.arguments[k], &got = made->classArguments[k];
+				if (want.isType != got.isType || (!want.isType && want.value != got.value)
+					|| (want.isType && !self(self, want.type, got.type, true, true))) { return false; }
+			}
+			return true;
+		}
+		size_t idx = tmpl.parameters.size();
+		for (size_t j = given; j < tmpl.parameters.size(); ++j) {
+			if (tmpl.parameters[j].isType && !tmpl.parameters[j].name.empty() && patType.namedType == "<" + tmpl.parameters[j].name + ">") { idx = j; break; }
+		}
+		if (idx == tmpl.parameters.size()) { return !inInst || sameFullType(patType, gotType, true); }
+		if (patType.isConst && !gotType.isConst && ptrOrRef) { return false; }
+		if (gotType.resource != ResourceKind::None || !gotType.enumName.empty() || gotType.isVolatile || gotType.isAtomic) { return false; }
+		Type bound = gotType;
+		bound.isPointer = bound.isStdArray = false;
+		bound.addressSpace = AddressSpace::None;
+		bound.arrayLength.reset();
+		bound.innerArrayLengths.clear();
+		if (patType.isConst || !ptrOrRef) { bound.isConst = false; }
+		if (known[idx]) { return sameFullType(arguments[idx].type, bound, true); }
+		known[idx] = true;
+		arguments[idx] = TemplateArgument { true, bound, 0, false };
+		return true;
+	};
+	for (size_t i = 0; i < pattern.parameters.size(); ++i) {
+		const Parameter& pat = pattern.parameters[i], &got = gotParams[i];
+		const bool patPtr = pat.type.isPointer || pat.type.arrayLength.has_value(), gotPtr = got.type.isPointer || got.type.arrayLength.has_value();
+		if (pat.isReference != got.isReference || patPtr != gotPtr
+			|| ((patPtr || pat.isReference) && pat.type.addressSpace != got.type.addressSpace)
+			|| !matchType(matchType, pat.type, got.type, patPtr || pat.isReference, false)) { return false; }
+	}
+	for (size_t j = given; j < tmpl.parameters.size(); ++j) {
+		if (tmpl.parameters[j].isType && !known[j]) {
+			if (!tmpl.parameters[j].hasDefault) { return false; }
+			try { arguments[j] = templateDefault(tmpl, j, arguments); } catch (const SubstitutionFailure&) { return false; }
+		} else if (!tmpl.parameters[j].isType && arguments[j].unbound) { return false; }
+	}
+	return true;
+}
+
+void Parser::resolveEntryInstantiations() {
+	for (const PendingEntryInstantiation& pending: _pendingEntryInstantiations) {
+		for (size_t i = 0; i < _unit.functions.size(); ++i) {
+			if (i != pending.slotIndex && _unit.functions[i].name == pending.hostName) {
+				throw CompileError("two entry points are named \"" + pending.hostName + "\"; entry points are identified by name, so the names must differ");
+			}
+		}
+		FunctionDecl pendingSig { pending.stage, pending.returnType, {}, pending.parameters, nullptr, pending.line };
+		const FunctionTemplate* chosen = nullptr;
+		std::vector<TemplateArgument> chosenArgs;
+		bool sawProtoMatch = false, sawStageMismatch = false;
+		for (const FunctionTemplate& tmpl: _unit.entryTemplates) {
+			if (!pending.candidateNames.count(tmpl.name)) { continue; }
+			if (tmpl.stage != pending.stage) { sawStageMismatch = true; continue; }
+			if (pending.explicitArgs.size() > tmpl.parameters.size()) { continue; }
+			std::vector<TemplateArgument> arguments(tmpl.parameters.size());
+			bool argsFit = true;
+			for (size_t i = 0; i < tmpl.parameters.size() && argsFit; ++i) {
+				const TemplateParameter& p = tmpl.parameters[i];
+				if (i < pending.explicitArgs.size()) {
+					arguments[i] = pending.explicitArgs[i];
+					argsFit = arguments[i].isType == p.isType && (p.isType || fitsNonTypeTemplateConstant(p.kind, arguments[i].value));
+				} else if (p.isType) { arguments[i].type.namedType = "<" + p.name + ">"; }
+				else if (p.hasDefault) {
+					try { arguments[i] = templateDefault(tmpl, i, arguments); argsFit = fitsNonTypeTemplateConstant(p.kind, arguments[i].value); }
+					catch (const SubstitutionFailure&) { argsFit = false; }
+				} else { arguments[i] = { false, {}, 0, true }; }
+			}
+			if (!argsFit) { continue; }
+			try {
+				FunctionDecl pattern = instantiateTemplate(tmpl, arguments, false);
+				if (!deduceEntryArguments(tmpl, pattern, pending.explicitArgs.size(), pending.parameters, arguments)) { continue; }
+				const FunctionDecl finalSig = pending.explicitArgs.size() == tmpl.parameters.size()
+					? std::move(pattern) : instantiateTemplate(tmpl, arguments, false);
+				if (!sameFullType(finalSig.returnType, pendingSig.returnType, false) || !sameParameterTypes(finalSig, pendingSig)) { continue; }
+			} catch (const SubstitutionFailure&) { continue; }
+			if (!tmpl.hasBody) { sawProtoMatch = true; continue; }
+			if (chosen) { throw CompileError("explicit instantiation of \"" + pending.spelled + "\" at line " + std::to_string(pending.line) + " is ambiguous"); }
+			chosen = &tmpl;
+			chosenArgs = std::move(arguments);
+		}
+		if (!chosen) {
+			const std::string at = " at line " + std::to_string(pending.line);
+			throw CompileError(sawProtoMatch
+				? "the entry-point template \"" + pending.spelled + "\" (instantiated" + at + ") is declared and never defined"
+				: "explicit instantiation of \"" + pending.spelled + "\"" + at
+					+ (sawStageMismatch ? " does not match the entry-point template's stage" : " does not match any entry-point template"));
+		}
+		FunctionDecl instantiated = instantiateTemplate(*chosen, chosenArgs, true);
+		for (size_t i = 0; i < pending.parameters.size(); ++i) {
+			const auto givenKey = parameterAttributeKey(pending.parameters[i].attributes);
+			if (givenKey != parameterAttributeKey(ParameterAttributes{})
+				&& givenKey != parameterAttributeKey(instantiated.parameters[i].attributes)) {
+				throw CompileError("parameter attributes in explicit instantiation of \"" + pending.spelled
+					+ "\" at line " + std::to_string(pending.line) + " do not match the entry-point template");
+			}
+		}
+		instantiated.name = pending.hostName;
+		_unit.functions[pending.slotIndex] = std::move(instantiated);
+	}
 }
 
 Parser::NestingScope::NestingScope(Parser& parser): _parser(parser) {
@@ -8076,6 +8354,15 @@ ExpressionPtr Parser::parsePostfix() {
 				expression = std::move(folded);
 				continue;
 			}
+			const auto hasName = [&](const std::set<std::string>& set) {
+				return set.count(expression->name) || std::any_of(expression->overloadNames.begin(),
+					expression->overloadNames.end(), [&](const std::string& n) { return set.count(n) != 0; });
+			};
+			if (expression->kind == ExpressionKind::Identifier && !expression->hasTemplateArguments
+				&& (expression->fileScope || !isLocal(expression->name))
+				&& hasName(_entryTemplateNames) && !hasName(_unit.functionTemplates) && !hasName(_helperNames)) {
+				throw CompileError("cannot call the entry point \"" + expression->name + "\"");
+			}
 			advance();
 			auto call = std::make_unique<Expression>();
 			call->kind = ExpressionKind::Call;
@@ -8508,10 +8795,15 @@ ExpressionPtr Parser::parsePrimary() {
 
 		// "f<float, 3>(x)": the "<" after a function template's name opens its arguments. A name that
 		// a block declares (a local, a using declaration) is not looked up as the template.
-		const bool templateId = lookahead(spelledTokens).kind == TokenKind::Less
-			&& !(spelledTokens == 1 && blockName(std::string(current().text)))
-			&& (_unit.functionTemplates.count(resolved) || std::any_of(alternatives.begin(), alternatives.end(),
-				[&](const std::string& each) { return _unit.functionTemplates.count(each) != 0; }));
+		const bool blocked = spelledTokens == 1 && blockName(std::string(current().text));
+		const auto matchesSet = [&](const std::set<std::string>& set) {
+			return set.count(resolved) || std::any_of(alternatives.begin(), alternatives.end(),
+				[&](const std::string& each) { return set.count(each) != 0; });
+		};
+		const bool templateId = lookahead(spelledTokens).kind == TokenKind::Less && !blocked && matchesSet(_unit.functionTemplates);
+		if (!templateId && lookahead(spelledTokens).kind == TokenKind::Less && !blocked && matchesSet(_entryTemplateNames)) {
+			throw CompileError("cannot call the entry point \"" + resolved + "\"");
+		}
 
 		// A name that is also an MSL builtin is a plain identifier here. Whether
 		// it is the builtin or a parameter that shadows one is a question about

@@ -581,6 +581,7 @@ struct ClassInstanceSeed {
 // A function template, kept as tokens and the parser's name state where it was declared, so
 // that each instantiation re-parses it with its arguments bound (see instantiateTemplate).
 struct FunctionTemplate {
+	Stage stage = Stage::None;
 	// Qualified, as a call names it.
 	std::string name;
 	std::vector<TemplateParameter> parameters;
@@ -713,6 +714,9 @@ struct TranslationUnit {
 	// The function templates themselves, in declaration order. A template is lowered only where
 	// a call instantiates it: instantiateTemplate re-parses its tokens with the arguments bound.
 	std::vector<FunctionTemplate> templates;
+	// Entry-point templates (kernel, vertex, fragment), instantiated by explicit instantiation
+	// with [[host_name("...")]] rather than by call lookup.
+	std::vector<FunctionTemplate> entryTemplates;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.
