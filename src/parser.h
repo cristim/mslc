@@ -509,6 +509,7 @@ private:
 	// is one.
 	ExpressionPtr foldStdArrayCall(ExpressionPtr& receiver);
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
+	void parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
 	// A file-scope function that is not an entry point. False, with the position
 	// restored, when the tokens ahead are not a function's return type, name and

@@ -5940,7 +5940,14 @@ void Parser::checkHelperParameterAttributes(const Parameter& param, const std::s
 ParameterAttributes Parser::parseParameterAttributes() {
 	ParameterAttributes attributes;
 
-	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string&) {
+	parseAttributeList([&](const std::string& name, std::optional<uint32_t> argument, const std::string& identifier) {
+		if (name == "function_constant") {
+			if (identifier.empty()) {
+				throw CompileError("[[function_constant]] on a parameter needs the name of a program-scope constant");
+			}
+			attributes.functionConstant = identifier;
+			return;
+		}
 		if (argument && (name == "buffer" || name == "texture" || name == "sampler" || name == "threadgroup")) {
 			checkAttributeIndex(name, *argument);
 		}
@@ -5987,6 +5994,10 @@ ParameterAttributes Parser::parseParameterAttributes() {
 			throw CompileError("unsupported attribute \"" + name + "\"");
 		}
 	});
+
+	if (!attributes.functionConstant.empty() && attributes.stageIn) {
+		throw CompileError("[[function_constant]] on a [[stage_in]] parameter is not lowered yet");
+	}
 
 	return attributes;
 }
@@ -6045,6 +6056,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 				throw CompileError("[[color]] needs an index");
 			}
 			attributes.colorIndex = argument;
+		} else if (name == "function_constant") {
+			if (identifier.empty()) {
+				throw CompileError("[[function_constant]] on a struct field needs the name of a program-scope constant");
+			}
+			attributes.functionConstant = identifier;
 		} else if (const auto interpolation = interpolationFromName(name)) {
 			if (attributes.interpolation != Interpolation::None) {
 				throw CompileError("a struct field has more than one interpolation attribute; "
@@ -6059,6 +6075,12 @@ FieldAttributes Parser::parseFieldAttributes() {
 			throw CompileError("unsupported attribute \"" + name + "\" on a struct field");
 		}
 	});
+
+	// A gated stage input or output other than a colour would change the interface between stages, which is
+	// fixed when a pipeline is made here.
+	if (!attributes.functionConstant.empty() && !attributes.colorIndex) {
+		throw CompileError("[[function_constant]] on a struct field is lowered on a [[color(n)]] field only");
+	}
 
 	return attributes;
 }
@@ -6107,6 +6129,8 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 						+ std::string(tokenKindName(kind())));
 				}
 				identifier = std::string(advance().text);
+			} else if (name == "function_constant") {
+				parseFunctionConstantArgument(argument, identifier);
 			} else {
 				argument = static_cast<uint32_t>(parseConstantIndex("attribute \"" + name + "\"", true));
 			}
@@ -6119,6 +6143,34 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 	}
 
 	expect(TokenKind::RBracket, "to close an attribute list");
+}
+
+// The argument of [[function_constant(...)]]. On a file-scope constant it is the constant's index, a constant
+// integer expression; anywhere else it names the program-scope constant that gates the declaration. Which one
+// is wanted is up to the caller, so both are worked out: index gets the value of an integer constant
+// expression and gate the name of a file-scope constant.
+void Parser::parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate) {
+	const size_t start = _position;
+	const ExpressionPtr expression = parseAssignment();
+	// The file-scope names, which the parser of a template's instance is given as well (restoreNames).
+	if (expression->kind == ExpressionKind::Identifier) {
+		const auto declared = _declared.find(expression->name);
+		if (declared != _declared.end() && declared->second == "variable") {
+			gate = expression->name;
+		}
+	}
+	const size_t end = _position;
+	_position = start;
+	try {
+		index = static_cast<uint32_t>(parseConstantIndex("attribute \"function_constant\"", true));
+	} catch (const CompileError&) {
+		if (gate.empty()) {
+			throw CompileError("attribute \"function_constant\" needs the index of a function constant on a "
+				"file-scope constant and the name of a program-scope constant anywhere else");
+		}
+		index.reset();
+	}
+	_position = end;
 }
 
 FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
@@ -6154,9 +6206,15 @@ FunctionDecl Parser::parseFunctionDeclaration(Stage stage) {
 	expect(TokenKind::RParen, "to close a parameter list");
 	rejectUsingConflict(decl.name, "function", &decl);
 
-	// Two parameters of one kind cannot take the same slot.
+	// Two parameters of one kind cannot take the same slot, unless every one of them but one is gated by
+	// [[function_constant]]. Apple's compiler accepts such a slot, as when a function takes its source as a
+	// texture2d or a texture2d_array at texture(0) and a function constant picks one (metal 32023.883, macOS 26);
+	// each such parameter has a binding of its own here.
 	std::set<std::pair<std::string, uint32_t>> slots;
 	for (const Parameter& parameter: decl.parameters) {
+		if (!parameter.attributes.functionConstant.empty()) {
+			continue;
+		}
 		const std::pair<const char*, std::optional<uint32_t>> taken[] = {
 			{ "buffer", parameter.attributes.bufferIndex },
 			{ "texture", parameter.attributes.textureIndex },
