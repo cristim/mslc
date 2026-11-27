@@ -76,9 +76,9 @@ MUTANTS = [
     # non-2D textures, read: 3D y and z coordinates swapped
     ("texture_non2d_read", [[r"(OpCompositeConstruct %v3uint %\d+) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
     # non-2D textures, read: 1D array get_array_size reads width (lane 0) instead of layer count (lane 1)
-    ("texture_non2d_read", [[r"(OpImageQuerySize %v2uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]], "mismatched"),
+    ("texture_non2d_read", [[r"(OpImageQuerySize(?:Lod)? %v2uint %\d+(?: %\S+)?\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]], "mismatched"),
     # non-2D textures, read: 2D array get_array_size and 3D get_depth read height (lane 1) instead of lane 2
-    ("texture_non2d_read", [[r"(OpImageQuerySize %v3uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]], "mismatched"),
+    ("texture_non2d_read", [[r"(OpImageQuerySize(?:Lod)? %v3uint %\d+(?: %\S+)?\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]], "mismatched"),
     # non-2D textures, write: 1D float write components x and y swapped
     ("texture_non2d_write", [[r"(OpCompositeConstruct %v4float) (%\d+) (%\d+)", r"\1 \3 \2"]], "mismatched"),
     # non-2D textures, write: 1D array / 2D array write coordinates swapped
