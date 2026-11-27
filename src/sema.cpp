@@ -369,6 +369,52 @@ namespace {
 		{ "dfdy", 1, MathShape::Dfdy, kNoInstruction, kNoInstruction, kNoInstruction },
 	};
 
+	// The <metal_pack> functions (MSL specification 6.15) that mslc lowers: four 8-bit or two 16-bit
+	// normalized integers in a uint, from or to a float or half vector. The 10a2 and 565 forms (Metal 4)
+	// are not here.
+	enum class PackEncoding { Unorm, Snorm, Srgb };
+
+	struct PackBuiltin {
+		const char* name;
+		bool pack;
+		PackEncoding encoding;
+		uint32_t count;
+		uint32_t bits;
+		ScalarKind floatKind;
+	};
+
+	constexpr PackBuiltin kPackBuiltins[] = {
+		{ "pack_float_to_unorm4x8", true, PackEncoding::Unorm, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_unorm4x8", true, PackEncoding::Unorm, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_snorm4x8", true, PackEncoding::Snorm, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_snorm4x8", true, PackEncoding::Snorm, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_srgb_unorm4x8", true, PackEncoding::Srgb, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_srgb_unorm4x8", true, PackEncoding::Srgb, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_unorm2x16", true, PackEncoding::Unorm, 2, 16, ScalarKind::Float },
+		{ "pack_half_to_unorm2x16", true, PackEncoding::Unorm, 2, 16, ScalarKind::Half },
+		{ "pack_float_to_snorm2x16", true, PackEncoding::Snorm, 2, 16, ScalarKind::Float },
+		{ "pack_half_to_snorm2x16", true, PackEncoding::Snorm, 2, 16, ScalarKind::Half },
+		{ "unpack_unorm4x8_to_float", false, PackEncoding::Unorm, 4, 8, ScalarKind::Float },
+		{ "unpack_unorm4x8_to_half", false, PackEncoding::Unorm, 4, 8, ScalarKind::Half },
+		{ "unpack_snorm4x8_to_float", false, PackEncoding::Snorm, 4, 8, ScalarKind::Float },
+		{ "unpack_snorm4x8_to_half", false, PackEncoding::Snorm, 4, 8, ScalarKind::Half },
+		{ "unpack_unorm4x8_srgb_to_float", false, PackEncoding::Srgb, 4, 8, ScalarKind::Float },
+		{ "unpack_unorm4x8_srgb_to_half", false, PackEncoding::Srgb, 4, 8, ScalarKind::Half },
+		{ "unpack_unorm2x16_to_float", false, PackEncoding::Unorm, 2, 16, ScalarKind::Float },
+		{ "unpack_unorm2x16_to_half", false, PackEncoding::Unorm, 2, 16, ScalarKind::Half },
+		{ "unpack_snorm2x16_to_float", false, PackEncoding::Snorm, 2, 16, ScalarKind::Float },
+		{ "unpack_snorm2x16_to_half", false, PackEncoding::Snorm, 2, 16, ScalarKind::Half },
+	};
+
+	const PackBuiltin* findPackBuiltin(const std::string& name) {
+		for (const PackBuiltin& builtin: kPackBuiltins) {
+			if (name == builtin.name) {
+				return &builtin;
+			}
+		}
+		return nullptr;
+	}
+
 	// A construct whose type is void: the cast (void)e.
 	static bool isVoidCast(const Expression& expression) {
 		return expression.kind == ExpressionKind::Construct && expression.constructType
@@ -2894,6 +2940,10 @@ namespace {
 		Id emitSelectCall(const Expression& expression);
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
+		Id emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
+		Id packFloatConstant(Id type, float value);
+		Id packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words);
+		Id glslInstruction(uint32_t instruction, Id type, const std::vector<Id>& operands);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
@@ -6026,6 +6076,10 @@ namespace {
 			return emitSelectCall(expression);
 		}
 
+		if (const PackBuiltin* pack = findPackBuiltin(name)) {
+			return emitPackBuiltin(*pack, expression.arguments);
+		}
+
 		const MathBuiltin* builtin = findMathBuiltin(name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
@@ -8582,6 +8636,186 @@ namespace {
 		std::vector<uint32_t> operands { _glslSet, instruction };
 		operands.insert(operands.end(), values.begin(), values.end());
 		return _builder.emitTyped(spirv::OpExtInst, result, operands);
+	}
+
+	// A float constant of a scalar or vector float type: every component is the value.
+	Id Emitter::packFloatConstant(Id type, float value) {
+		uint32_t bits = 0;
+		std::memcpy(&bits, &value, sizeof bits);
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = _types.scalar(ScalarKind::Float);
+		const Id scalar = _builder.emitDeclTyped(spirv::OpConstant, component, { bits });
+		if (width <= 1) {
+			return scalar;
+		}
+		return _builder.emitDeclTyped(spirv::OpConstantComposite, type, std::vector<uint32_t>(width, scalar));
+	}
+
+	// A constant vector of 32-bit integers, one word per component.
+	Id Emitter::packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words) {
+		const Id component = _types.scalar(kind);
+		std::vector<uint32_t> parts;
+		for (const uint32_t word: words) {
+			parts.push_back(_builder.emitDeclTyped(spirv::OpConstant, component, { word }));
+		}
+		return _builder.emitDeclTyped(spirv::OpConstantComposite, _types.vector(kind, uint32_t(words.size())), parts);
+	}
+
+	Id Emitter::glslInstruction(uint32_t instruction, Id type, const std::vector<Id>& operands) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+		std::vector<uint32_t> words { _glslSet, instruction };
+		words.insert(words.end(), operands.begin(), operands.end());
+		return _builder.emitTyped(spirv::OpExtInst, type, words);
+	}
+
+	// The <metal_pack> functions, written out as the conversions the MSL specification gives in 8.7.1
+	// (normalized integers) and 8.7.7 (sRGB), rather than with GLSL.std.450's Pack and Unpack
+	// instructions, whose rounding and precision Vulkan leaves to the implementation. Component i is
+	// held in bits [i * bits, (i + 1) * bits) of the uint, the first component in the lowest bits.
+	// The work is done in float; a half result is converted from it, a half argument converted to it.
+	// c / max is computed as c * (1 / max), which Vulkan rounds correctly where it allows OpFDiv 2.5 ULP:
+	// for every 8- and 16-bit field it is within 1 ULP of the quotient and exact at 0, -1 and 1, inside
+	// the 1.5 ULP and the exact corner cases of the specification's Table 8.6.
+	Id Emitter::emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments) {
+		const std::string name = builtin.name;
+		if (arguments.size() != 1) {
+			throw CompileError(name + " takes 1 argument, and this call passes " + std::to_string(arguments.size()));
+		}
+		constexpr uint32_t kRoundEven = 2;
+		constexpr uint32_t kPow = 26;
+		constexpr uint32_t kNMax = 80;
+		constexpr uint32_t kNClamp = 81;
+		const uint32_t n = builtin.count;
+		const Id uintType = _types.scalar(ScalarKind::UInt);
+		const Id uintVector = _types.vector(ScalarKind::UInt, n);
+		const Id intVector = _types.vector(ScalarKind::Int, n);
+		const Id floatVector = _types.vector(ScalarKind::Float, n);
+		const Id boolVector = _types.vector(ScalarKind::Bool, n);
+		const Id floatTypeOut = _types.vector(builtin.floatKind, n);
+		std::vector<uint32_t> shiftWords;
+		for (uint32_t i = 0; i < n; ++i) {
+			shiftWords.push_back(i * builtin.bits);
+		}
+		const Id shifts = packConstantVector(ScalarKind::UInt, shiftWords);
+		const uint32_t unormMax = (1u << builtin.bits) - 1;
+		const uint32_t snormMax = (1u << (builtin.bits - 1)) - 1;
+		const std::string vectorName = std::string(scalarKindName(builtin.floatKind)) + std::to_string(n);
+
+		// sRGB keeps the alpha channel linear: the colour components come from one vector and the
+		// fourth from the other.
+		const auto colourAndAlpha = [&](Id colour, Id alpha, Id type) {
+			return _builder.emitTyped(spirv::OpVectorShuffle, type, { colour, alpha, 0, 1, 2, 7 });
+		};
+
+		if (!builtin.pack) {
+			const Id value = emitExpression(*arguments[0]);
+			const Id valueType = _builder.typeOf(value);
+			const auto scalar = _types.scalarKindOf(valueType);
+			if (!scalar || (*scalar != ScalarKind::UInt && *scalar != ScalarKind::Int)) {
+				throw CompileError(name + " takes a uint");
+			}
+			const Id word = convert(value, valueType, uintType);
+			const Id words = _builder.emitTyped(spirv::OpCompositeConstruct, uintVector, std::vector<Id>(n, word));
+			Id result;
+			if (builtin.encoding == PackEncoding::Snorm) {
+				// Each field moved to the top of a word and back down with its sign: max(-1, c / max).
+				std::vector<uint32_t> up;
+				for (uint32_t i = 0; i < n; ++i) {
+					up.push_back(32 - builtin.bits - i * builtin.bits);
+				}
+				const Id raised = _builder.emitTyped(spirv::OpShiftLeftLogical, uintVector,
+					{ words, packConstantVector(ScalarKind::UInt, up) });
+				const Id signedFields = _builder.emitTyped(spirv::OpShiftRightArithmetic, intVector,
+					{ _builder.emitTyped(spirv::OpBitcast, intVector, { raised }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, 32 - builtin.bits)) });
+				const Id asFloat = _builder.emitTyped(spirv::OpConvertSToF, floatVector, { signedFields });
+				const Id scaled = _builder.emitTyped(spirv::OpFMul, floatVector,
+					{ asFloat, packFloatConstant(floatVector, 1.0f / float(snormMax)) });
+				result = glslInstruction(kNMax, floatVector, { packFloatConstant(floatVector, -1.0f), scaled });
+			} else {
+				// c / max for each field.
+				const Id fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
+					{ _builder.emitTyped(spirv::OpShiftRightLogical, uintVector, { words, shifts }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
+				const Id asFloat = _builder.emitTyped(spirv::OpConvertUToF, floatVector, { fields });
+				result = _builder.emitTyped(spirv::OpFMul, floatVector,
+					{ asFloat, packFloatConstant(floatVector, 1.0f / float(unormMax)) });
+				if (builtin.encoding == PackEncoding::Srgb) {
+					// c <= 0.04045 ? c / 12.92 : powr((c + 0.055) / 1.055, 2.4)
+					const Id low = _builder.emitTyped(spirv::OpFDiv, floatVector,
+						{ result, packFloatConstant(floatVector, 12.92f) });
+					const Id shifted = _builder.emitTyped(spirv::OpFDiv, floatVector,
+						{ _builder.emitTyped(spirv::OpFAdd, floatVector, { result, packFloatConstant(floatVector, 0.055f) }),
+							packFloatConstant(floatVector, 1.055f) });
+					const Id high = glslInstruction(kPow, floatVector, { shifted, packFloatConstant(floatVector, 2.4f) });
+					const Id isLow = _builder.emitTyped(spirv::OpFOrdLessThanEqual, boolVector,
+						{ result, packFloatConstant(floatVector, 0.04045f) });
+					const Id linear = _builder.emitTyped(spirv::OpSelect, floatVector, { isLow, low, high });
+					result = colourAndAlpha(linear, result, floatVector);
+				}
+			}
+			return builtin.floatKind == ScalarKind::Float ? result : convert(result, floatVector, floatTypeOut);
+		}
+
+		const Id value = emitExpression(*arguments[0]);
+		const Id valueType = _builder.typeOf(value);
+		if (valueType != floatTypeOut) {
+			throw CompileError(name + " takes a " + vectorName);
+		}
+		const Id floats = builtin.floatKind == ScalarKind::Float ? value : convert(value, valueType, floatVector);
+		const Id zero = packFloatConstant(floatVector, 0.0f);
+		Id fields;
+		if (builtin.encoding == PackEncoding::Snorm) {
+			// min(max(f * max, -max), max), rounded to nearest even; a NaN gives 0.
+			const Id limit = packFloatConstant(floatVector, float(snormMax));
+			const Id clamped = glslInstruction(kNClamp, floatVector,
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { floats, limit }),
+					packFloatConstant(floatVector, -float(snormMax)), limit });
+			const Id isNan = _builder.emitTyped(spirv::OpIsNan, boolVector, { floats });
+			const Id rounded = glslInstruction(kRoundEven, floatVector,
+				{ _builder.emitTyped(spirv::OpSelect, floatVector, { isNan, zero, clamped }) });
+			fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
+				{ _builder.emitTyped(spirv::OpBitcast, uintVector,
+						{ _builder.emitTyped(spirv::OpConvertFToS, intVector, { rounded }) }),
+					packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
+		} else {
+			// min(max(f * max, 0), max), rounded to nearest even; NClamp takes a NaN to the lower bound, 0.
+			const Id limit = packFloatConstant(floatVector, float(unormMax));
+			const Id clamped = glslInstruction(kNClamp, floatVector,
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { floats, limit }), zero, limit });
+			fields = _builder.emitTyped(spirv::OpConvertFToU, uintVector,
+				{ glslInstruction(kRoundEven, floatVector, { clamped }) });
+			if (builtin.encoding == PackEncoding::Srgb) {
+				// The colour: c clamped to [0, 1] (a NaN to 0), then c < 0.0031308 ? 12.92 * c :
+				// 1.055 * powr(c, 1 / 2.4) - 0.055, scaled to 255, plus 0.5, its fraction dropped.
+				const Id one = packFloatConstant(floatVector, 1.0f);
+				const Id c = glslInstruction(kNClamp, floatVector, { floats, zero, one });
+				const Id low = _builder.emitTyped(spirv::OpFMul, floatVector, { c, packFloatConstant(floatVector, 12.92f) });
+				const Id curve = glslInstruction(kPow, floatVector, { c, packFloatConstant(floatVector, 1.0f / 2.4f) });
+				const Id high = _builder.emitTyped(spirv::OpFSub, floatVector,
+					{ _builder.emitTyped(spirv::OpFMul, floatVector, { curve, packFloatConstant(floatVector, 1.055f) }),
+						packFloatConstant(floatVector, 0.055f) });
+				const Id isLow = _builder.emitTyped(spirv::OpFOrdLessThan, boolVector,
+					{ c, packFloatConstant(floatVector, 0.0031308f) });
+				const Id encoded = _builder.emitTyped(spirv::OpSelect, floatVector, { isLow, low, high });
+				const Id scaled = _builder.emitTyped(spirv::OpFAdd, floatVector,
+					{ _builder.emitTyped(spirv::OpFMul, floatVector, { encoded, packFloatConstant(floatVector, 255.0f) }),
+						packFloatConstant(floatVector, 0.5f) });
+				const Id colour = _builder.emitTyped(spirv::OpConvertFToU, uintVector, { scaled });
+				fields = colourAndAlpha(colour, fields, uintVector);
+			}
+		}
+		const Id placed = _builder.emitTyped(spirv::OpShiftLeftLogical, uintVector, { fields, shifts });
+		Id word = _builder.emitTyped(spirv::OpCompositeExtract, uintType, { placed, 0 });
+		for (uint32_t i = 1; i < n; ++i) {
+			word = _builder.emitTyped(spirv::OpBitwiseOr, uintType,
+				{ word, _builder.emitTyped(spirv::OpCompositeExtract, uintType, { placed, i }) });
+		}
+		return word;
 	}
 
 	// round(x): the whole number nearest x, a half going away from zero. Trunc
