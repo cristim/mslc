@@ -1634,7 +1634,8 @@ TemplateArgument Parser::parseTemplateArgument() {
 	size_t vecTokens = 0;
 	const bool isTypeArgument = (named && (resolveTypeName(name, probe) || isTypeQualifier(name)
 			|| (_unit.findStruct(name) != nullptr && !localHides)))
-		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) || atLibraryVec(vecTokens);
+		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) || atLibraryVec(vecTokens)
+		|| atTraitType(vecTokens);
 	if (isTypeArgument) {
 		argument.type = parseType();
 		if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
@@ -1657,6 +1658,13 @@ TemplateArgument Parser::parseTemplateArgument() {
 }
 
 namespace {
+
+// The <type_traits> transformations read as a type: make_scalar, make_signed and make_unsigned,
+// with or without the _t.
+bool isTransformationTrait(const std::string& library) {
+	return library == "make_scalar" || library == "make_scalar_t" || library == "make_signed"
+		|| library == "make_signed_t" || library == "make_unsigned" || library == "make_unsigned_t";
+}
 
 // A trait's argument is a deduction marker: its value is not known until the type is.
 class DependentTrait: public CompileError {
@@ -2396,7 +2404,41 @@ std::string Parser::parseStaticAssert(bool inStatement) {
 	return failure;
 }
 
-// enable_if, enable_if_t, make_scalar and make_scalar_t, the name consumed and "<" next.
+// QUIRK: Metal's make_signed and make_unsigned map an integer scalar, vector or packed vector to the same shape of
+// the other signedness (make_signed of uchar is signed char, and of char is char, which mslc does not tell apart
+// from signed char), and drop const and volatile, where C++ keeps them.
+// make_unsigned keeps a bool and refuses a floating-point type; make_signed keeps a floating-point type and refuses a
+// bool. C++ refuses bool and floating-point in both. The MSL specification lists the traits but not these cases.
+// Evidence: black-box observation of Apple's compiler with static_assert(is_same_v<...>) (tier 2; metal 32023.883,
+// macOS 26), which reports "no type named 'type' in 'metal::_make_unsigned_impl<float>'" for the refused ones.
+// Test: probes trait_make_signed_unsigned and trait_make_*_rejected.
+static void changeSignedness(bool toSigned, const Type& operand, Type& result) {
+	const std::string name = toSigned ? "make_signed" : "make_unsigned";
+	if (operand.matrixColumns || !operand.namedType.empty() || !operand.enumName.empty()) {
+		throw CompileError(name + " of " + typeName(operand) + " is not lowered: it takes an integer, bool or "
+			"floating-point scalar or vector");
+	}
+	switch (operand.scalar) {
+		case ScalarKind::Char: case ScalarKind::UChar: result.scalar = toSigned ? ScalarKind::Char : ScalarKind::UChar; break;
+		case ScalarKind::Short: case ScalarKind::UShort: result.scalar = toSigned ? ScalarKind::Short : ScalarKind::UShort; break;
+		case ScalarKind::Int: case ScalarKind::UInt: result.scalar = toSigned ? ScalarKind::Int : ScalarKind::UInt; break;
+		case ScalarKind::Long: case ScalarKind::ULong: result.scalar = toSigned ? ScalarKind::Long : ScalarKind::ULong; break;
+		case ScalarKind::Bool:
+			if (toSigned) {
+				throw CompileError("make_signed of bool has no type");
+			}
+			break;
+		case ScalarKind::Half: case ScalarKind::Float: case ScalarKind::Double:
+			if (!toSigned) {
+				throw CompileError("make_unsigned of the floating-point type " + typeName(operand) + " has no type");
+			}
+			break;
+		case ScalarKind::Void:
+			throw CompileError(name + " of void has no type");
+	}
+}
+
+// enable_if, make_scalar, make_signed and make_unsigned, or the _t alias of one, the name consumed and "<" next.
 void Parser::parseTraitType(const std::string& name, Type& type) {
 	const bool alias = name.size() > 2 && name.compare(name.size() - 2, 2, "_t") == 0;
 	const bool enableIf = name.rfind("enable_if", 0) == 0;
@@ -2426,7 +2468,7 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 		closeAngle(("to close \"" + name + "<\"").c_str());
 		if (isDeductionMarker(operand)) {
 			if (!_inEnableIf) {
-				throw DependentTrait("make_scalar depends on a type that is not deduced yet");
+				throw DependentTrait(name + " depends on a type that is not deduced yet");
 			}
 			type = operand;
 			if (!alias) {
@@ -2435,16 +2477,24 @@ void Parser::parseTraitType(const std::string& name, Type& type) {
 			}
 			return;
 		}
+		const std::string trait = alias ? name.substr(0, name.size() - 2) : name;
 		if (operand.isPointer || operand.arrayLength || operand.resource != ResourceKind::None || operand.isAtomic
 			|| operand.addressSpace != AddressSpace::None) {
-			throw CompileError("make_scalar of a pointer, array, texture, sampler, atomic or address-space-qualified "
+			throw CompileError(trait + " of a pointer, array, texture, sampler, atomic or address-space-qualified "
 				"type is not lowered");
 		}
 		result = operand;
 		result.isConst = false;
-		if (result.matrixColumns == 0 && result.namedType.empty() && result.enumName.empty()) {
-			result.vectorWidth = 0;
-			result.isPacked = false;
+		if (trait != "make_scalar") {
+			result.isVolatile = false;
+		}
+		if (trait == "make_scalar") {
+			if (result.matrixColumns == 0 && result.namedType.empty() && result.enumName.empty()) {
+				result.vectorWidth = 0;
+				result.isPacked = false;
+			}
+		} else {
+			changeSignedness(trait == "make_signed", operand, result);
 		}
 	}
 	if (!alias) {
@@ -5463,6 +5513,29 @@ bool Parser::atLibraryVec(size_t& nameTokens) const {
 	return lookahead(nameTokens).kind == TokenKind::Less;
 }
 
+bool Parser::atTraitType(size_t& nameTokens) const {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return false;
+	}
+	// A local or member of the name hides the library's, unless qualified.
+	if (kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal(std::string(current().text)) || memberHidesName(std::string(current().text)))) {
+		return false;
+	}
+	// Only a spelling whose last name is a trait's and is followed by "<" is resolved: resolving every name here
+	// would throw for an overloaded function that is ambiguous until its arguments choose (tryParseTraitValue).
+	size_t last = at(TokenKind::ColonColon) ? 1 : 0;
+	while (lookahead(last).kind == TokenKind::Identifier && lookahead(last + 1).kind == TokenKind::ColonColon) {
+		last += 2;
+	}
+	if (lookahead(last).kind != TokenKind::Identifier || lookahead(last + 1).kind != TokenKind::Less
+		|| !isTransformationTrait(std::string(lookahead(last).text))) {
+		return false;
+	}
+	const std::string name = peekResolved(nameTokens);
+	return isTransformationTrait(libraryName(name)) && lookahead(nameTokens).kind == TokenKind::Less;
+}
+
 // metal::vec<T, N> is the library's name for the vector of N T: vec<float, 4> is float4, so it is
 // read as that vector. The qualifiers read before it apply to the vector.
 void Parser::parseLibraryVec(Type& type, size_t nameTokens) {
@@ -5545,8 +5618,8 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 		}
 	};
 	std::string library = name.empty() ? std::string() : libraryName(name);
-	traitType = (library == "enable_if" || library == "enable_if_t" || library == "make_scalar"
-		|| library == "make_scalar_t") && lookahead(nameTokens).kind == TokenKind::Less;
+	traitType = (library == "enable_if" || library == "enable_if_t" || isTransformationTrait(library))
+		&& lookahead(nameTokens).kind == TokenKind::Less;
 	if (typenameKeyword && !traitType) {
 		_position = typenameAt;
 		throw CompileError("a dependent type written with \"typename\" is not lowered");
@@ -6648,7 +6721,7 @@ StatementPtr Parser::parseStatement() {
 				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
 		size_t arrayTokens = 0;
 		const bool stdArrayType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-			&& !isLocal(name) && (atStdArray(arrayTokens) || atLibraryVec(arrayTokens));
+			&& !isLocal(name) && (atStdArray(arrayTokens) || atLibraryVec(arrayTokens) || atTraitType(arrayTokens));
 		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
@@ -7098,7 +7171,7 @@ StatementPtr Parser::parseForStatement() {
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
 				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)))
-			|| atLibraryVec(vecTokens);
+			|| atLibraryVec(vecTokens) || atTraitType(vecTokens);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -7613,7 +7686,7 @@ ExpressionPtr Parser::parseSizeof() {
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
 				&& !(kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && memberHidesName(name))
 				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
-					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && (atStdArray(nameTokens) || atLibraryVec(nameTokens)))))
+					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && (atStdArray(nameTokens) || atLibraryVec(nameTokens) || atTraitType(nameTokens)))))
 			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
 		if (startsType) {
 			Type type = parseType(true, false);
@@ -7834,8 +7907,9 @@ ExpressionPtr Parser::parseCast() {
 	// Read the name, which may be namespace-qualified, from just past the '('.
 	const size_t open = _position;
 	++_position;
-	// (vec<T, N>)x; a parenthesis holding more than the type, "(vec<float, 4>(a).x)", is an expression.
-	if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
+	// (vec<T, N>)x and (make_unsigned_t<T>)x; a parenthesis holding more than the type, "(vec<float, 4>(a).x)",
+	// is an expression.
+	if (size_t vecTokens = 0; atLibraryVec(vecTokens) || atTraitType(vecTokens)) {
 		const size_t atLine = line();
 		Type target;
 		try {
@@ -8350,9 +8424,9 @@ ExpressionPtr Parser::parsePrimary() {
 		return parseAsType(asTypeTokens);
 	}
 
-	// vec<T, N>(...) constructs the vector, as float4(...) does.
+	// vec<T, N>(...) constructs the vector, as float4(...) does, and make_unsigned_t<T>(x) converts x.
 	if (size_t vecTokens = 0; (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-		&& !isLocal(std::string(current().text)) && atLibraryVec(vecTokens)) {
+		&& !isLocal(std::string(current().text)) && (atLibraryVec(vecTokens) || atTraitType(vecTokens))) {
 		const size_t atLine = line();
 		const Type type = parseType(false, false);
 		if (!at(TokenKind::LParen)) {

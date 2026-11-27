@@ -433,6 +433,9 @@ private:
 	// Whether the cursor is at metal::vec<, spelled with or without the namespace unless the file
 	// declares its own vec; nameTokens is how many tokens the name takes.
 	bool atLibraryVec(size_t& nameTokens) const;
+	// make_scalar, make_signed or make_unsigned (or the _t alias) and "<", read as a type where a
+	// type can begin an expression or a statement.
+	bool atTraitType(size_t& nameTokens) const;
 	// vec<T, N> after its qualifiers, folded into type as the vector of N T.
 	void parseLibraryVec(Type& type, size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
