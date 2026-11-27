@@ -339,6 +339,8 @@ namespace {
 		{ "atan", 1, MathShape::Componentwise, 18, kNoInstruction, kNoInstruction },
 		{ "atan2", 2, MathShape::Componentwise, 25, kNoInstruction, kNoInstruction },
 		{ "pow", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
+		// powr is pow for x >= 0 (MSL 6.6); GLSL.std.450 Pow is undefined for x < 0 too.
+		{ "powr", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
 		{ "exp", 1, MathShape::Componentwise, 27, kNoInstruction, kNoInstruction },
 		{ "log", 1, MathShape::Componentwise, 28, kNoInstruction, kNoInstruction },
 		{ "exp2", 1, MathShape::Componentwise, 29, kNoInstruction, kNoInstruction },
