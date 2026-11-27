@@ -88,8 +88,11 @@ that moves positions (instance offsets) must keep them on the grid when the outp
 Inputs: the `DIFFCHECK-POSITION` field is filled from the geometry (w = 1); every other stage_in
 field is seeded per vertex, one tightly packed vertex buffer per attribute (Metal slot
 `30 - location`, so a `[[buffer(n)]]` argument must not use those); `[[buffer]]` arguments are
-seeded like kernel buffers, in both stages; a 2D float texture is 4x4 RGBA32F and a runtime
-sampler is nearest, normalised, no mips, clamp-to-edge for `sampler(0)` (the only index graphics probes use). Probes should sample at a texel centre.
+seeded like kernel buffers, in both stages; a 2D texture is 4x4 RGBA of `float`, `half`,
+`int`, `uint`, `short` or `ushort` (`sample` or `access::read`), a runtime sampler is nearest,
+normalised, no mips with address mode picked by its Metal index (`0` clamp-to-edge, `1` repeat,
+`2` mirrored repeat), and an embedded (`constexpr`) sampler is built on Vulkan from mslc's
+reflection. Probes should sample at a texel centre (or 1/1024-grid coordinates for linear filtering).
 Graphics defaults to the `moderate` profile and two cases: `wide` values interpolate to magnitudes
 where any tolerance is meaningless.
 
@@ -112,13 +115,13 @@ the audited transfer-write to host-read barrier of PR #148. Vertex-stage values 
 back (there is no transfer-feedback path), so a vertex miscompile shows only through what it
 puts in the attachments.
 
-Skipped with the reason (follow-up work): a writable `[[buffer]]` in either stage, vertex-stage
-textures, non-2D or non-float textures, embedded samplers in a graphics pair, framebuffer fetch, a scalar half vertex
+Skipped with the reason (follow-up work): a writable `[[buffer]]` or writable texture (`access::write`
+or `access::read_write`) in either stage, non-2D textures, framebuffer fetch, a scalar half vertex
 attribute, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws, blending,
 stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants eleven
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 22
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
 

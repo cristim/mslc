@@ -191,6 +191,17 @@ static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, unsigned 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, consumer, 0, 0, NULL, 0, NULL, 1, &rd);
 }
 
+static void checkTextureSupport(const char *type, int storage, unsigned *bpp) {
+    VkFormat fmt = texelFormat(type, 4, bpp);
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(gpd, fmt, &fp);
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(fp.optimalTilingFeatures & need)) refuse("format %d lacks the %s image feature", (int)fmt, storage ? "storage" : "sampled");
+    if ((storage == 1 || storage == 3) && !gfeatures.shaderStorageImageReadWithoutFormat)
+        refuse("the device has no shaderStorageImageReadWithoutFormat, which a read storage image needs");
+    if (storage >= 2 && !gfeatures.shaderStorageImageWriteWithoutFormat)
+        refuse("the device has no shaderStorageImageWriteWithoutFormat, which a writable storage image needs");
+}
+
 static void writeFile(const char *path, const void *p, size_t n);
 static int drawMain(const char *manifest);
 
@@ -286,16 +297,7 @@ int main(int argc, char **argv) {
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     Img tex[MAXTEX]; Buf stage[MAXTEX], trb[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
-    for (unsigned i = 0; i < nt; i++) {
-        VkFormat fmt = texelFormat(ttype[i], 4, &tbpp[i]);
-        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(gpd, fmt, &fp);
-        VkFormatFeatureFlags need = tstore[i] ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-        if (!(fp.optimalTilingFeatures & need)) refuse("format %d lacks the %s image feature", (int)fmt, tstore[i] ? "storage" : "sampled");
-        if ((tstore[i] == 1 || tstore[i] == 3) && !gfeatures.shaderStorageImageReadWithoutFormat)
-            refuse("the device has no shaderStorageImageReadWithoutFormat, which a read storage image needs");
-        if (tstore[i] >= 2 && !gfeatures.shaderStorageImageWriteWithoutFormat)
-            refuse("the device has no shaderStorageImageWriteWithoutFormat, which a writable storage image needs");
-    }
+    for (unsigned i = 0; i < nt; i++) checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
     for (unsigned i = 0; i < nb; i++) {
         unsigned bytes1;
         VkFormat fmt = texelFormat(btype[i], bcomp[i], &bytes1);
@@ -429,14 +431,15 @@ int main(int argc, char **argv) {
 //
 // Manifest lines: mode draw, spv vertex|fragment FILE, vertex NAME, fragment NAME, target W H,
 // draw V I, attr LOC FMT FILE, color I FMT C0 C1 C2 C3 OUT, depth CLEAR OUT,
-// gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture INDEX SET BINDING W H FILE,
-// sampler INDEX SET BINDING. Same bytes and same names as metalhost's draw mode.
+// gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
+// sampler INDEX SET BINDING, esampler SET BINDING S T R FILTER. Same bytes and same names as metalhost's draw mode.
 // The viewport has a negative height so framebuffer row 0 is the top, as in Metal.
 // Read-back: colour/depth attachment write -> transfer read (image barrier), then transfer
 // write -> host read, the barrier audited in PR #148.
 #define MAXATTR 16
 #define MAXCOLOR 8
 #define MAXG 16
+#define MAXDTEX 8
 
 typedef struct { const char *name; VkFormat format; unsigned size; } Fmt;
 static const Fmt VFMT[] = {
@@ -526,8 +529,9 @@ static int drawMain(const char *manifest) {
     unsigned cidx[MAXCOLOR]; char cfmt[MAXCOLOR][32], cout[MAXCOLOR][1024]; double cclear[MAXCOLOR][4];
     double dclear = 1; char dout[1024] = "";
     char gstage[MAXG][16], gfile[MAXG][1024]; unsigned gidx[MAXG], gset[MAXG], gmember[MAXG]; unsigned long long gbytes[MAXG];
-    unsigned tset[4], tbind[4], tw[4], th[4]; char tfile[4][1024];
-    unsigned sset[4], sbind[4], sidx[4];
+    unsigned tset[MAXDTEX], tbind[MAXDTEX], tw[MAXDTEX], th[MAXDTEX], tbpp[MAXDTEX];
+    char tfile[MAXDTEX][1024], ttype[MAXDTEX][16]; int tstore[MAXDTEX];
+    unsigned sset[MAXDTEX], sbind[MAXDTEX], sidx[MAXDTEX], eaddr[MAXDTEX][4];
     FILE *mf = fopen(manifest, "r");
     if (!mf) die("cannot open %s", manifest);
     char line[4096], word[32];
@@ -545,8 +549,28 @@ static int drawMain(const char *manifest) {
         } else if (sscanf(line, "depth %lf %1023s", &dclear, dout) == 2) { hasDepth = 1;
         } else if (ng < MAXG && sscanf(line, "gbuffer %15s %u %u %u %llu %1023s", gstage[ng], &gidx[ng], &gset[ng], &gmember[ng],
                        &gbytes[ng], gfile[ng]) == 6) { ng++;
-        } else if (nt < 4 && sscanf(line, "texture %*u %u %u %u %u %1023s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt]) == 5) { nt++;
-        } else if (ns < 4 && sscanf(line, "sampler %u %u %u", &sidx[ns], &sset[ns], &sbind[ns]) == 3) { ns++;
+        } else if (!strncmp(line, "texture ", 8)) {
+            if (nt >= MAXDTEX) refuse("too many textures");
+            char extra[16] = ""; strcpy(ttype[nt], "float");
+            int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], extra);
+            if (n != 5 && n != 6) die("bad manifest line: %s", line);
+            tstore[nt++] = 0;
+        } else if (!strncmp(line, "storagetexture ", 15)) {
+            if (nt >= MAXDTEX) refuse("too many textures");
+            char extra[16] = ""; strcpy(ttype[nt], "float");
+            int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], extra);
+            if (n != 5 && n != 6) die("bad manifest line: %s", line);
+            tstore[nt++] = 1;
+        } else if (!strncmp(line, "sampler ", 8)) {
+            if (ns >= MAXDTEX) refuse("too many samplers");
+            char extra[16] = "";
+            if (sscanf(line, "sampler %u %u %u %15s", &sidx[ns], &sset[ns], &sbind[ns], extra) != 3) die("bad manifest line: %s", line);
+            eaddr[ns++][3] = 0;
+        } else if (!strncmp(line, "esampler ", 9)) {
+            if (ns >= MAXDTEX) refuse("too many samplers");
+            char extra[16] = "";
+            if (sscanf(line, "esampler %u %u %u %u %u %u %15s", &sset[ns], &sbind[ns], &eaddr[ns][0], &eaddr[ns][1], &eaddr[ns][2], &sidx[ns], extra) != 6) die("bad manifest line: %s", line);
+            eaddr[ns++][3] = 1;
         } else die("bad manifest line: %s", line);
     }
     fclose(mf);
@@ -554,6 +578,7 @@ static int drawMain(const char *manifest) {
     for (unsigned i = 0; i < nc; i++) if (cidx[i] != i) die("colour targets must be listed 0..n-1 in order");
 
     uint32_t qf = initDevice(VK_QUEUE_GRAPHICS_BIT);
+    for (unsigned i = 0; i < nt; i++) checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
 
     // Address blocks, one uniform buffer per stage that has buffer arguments.
     Buf blk[2] = {{0}, {0}}; unsigned blkSet[2] = {0, 0}, nmember[2] = {0, 0}, haveBlk[2] = {0, 0};
@@ -582,23 +607,34 @@ static int drawMain(const char *manifest) {
     for (unsigned i = 0; i < nt; i++) if (tset[i] > maxset) maxset = tset[i];
     for (unsigned i = 0; i < ns; i++) if (sset[i] > maxset) maxset = sset[i];
     if (maxset >= 8) die("descriptor set %u too large", maxset);
-    VkDescriptorSetLayoutBinding lb[8][8]; unsigned nlb[8] = {0};
+    VkDescriptorSetLayoutBinding lb[8][1 + 2 * MAXDTEX]; unsigned nlb[8] = {0};
     for (int st = 0; st < 2; st++) if (haveBlk[st]) {
         unsigned s = blkSet[st];
         lb[s][nlb[s]++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
             st ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT, NULL};
     }
-    for (unsigned i = 0; i < nt; i++) lb[tset[i]][nlb[tset[i]]++] = (VkDescriptorSetLayoutBinding){tbind[i], VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-    for (unsigned i = 0; i < ns; i++) lb[sset[i]][nlb[sset[i]]++] = (VkDescriptorSetLayoutBinding){sbind[i], VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    for (unsigned i = 0; i < nt; i++) {
+        if (nlb[tset[i]] >= 1 + 2 * MAXDTEX) die("too many bindings in set %u", tset[i]);
+        lb[tset[i]][nlb[tset[i]]++] = (VkDescriptorSetLayoutBinding){tbind[i],
+            tstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    }
+    for (unsigned i = 0; i < ns; i++) {
+        if (nlb[sset[i]] >= 1 + 2 * MAXDTEX) die("too many bindings in set %u", sset[i]);
+        lb[sset[i]][nlb[sset[i]]++] = (VkDescriptorSetLayoutBinding){sbind[i],
+            VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    }
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     for (unsigned s = 0; s <= maxset; s++) {
         VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         lci.bindingCount = nlb[s]; lci.pBindings = lb[s];
         CHK(vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl[s]));
     }
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4}};
+    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAXDTEX},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAXDTEX}, {VK_DESCRIPTOR_TYPE_SAMPLER, MAXDTEX}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = maxset + 1; dpi.poolSizeCount = 3; dpi.pPoolSizes = ps;
+    dpi.maxSets = maxset + 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
     VkDescriptorPool pool; CHK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
     VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = pool; dai.descriptorSetCount = maxset + 1; dai.pSetLayouts = dsl;
@@ -607,25 +643,29 @@ static int drawMain(const char *manifest) {
     plci.setLayoutCount = maxset + 1; plci.pSetLayouts = dsl;
     VkPipelineLayout layout; CHK(vkCreatePipelineLayout(dev, &plci, NULL, &layout));
 
-    VkWriteDescriptorSet wr[16]; unsigned nw = 0;
-    VkDescriptorBufferInfo bi[2]; VkDescriptorImageInfo ii[4], si[4];
+    VkWriteDescriptorSet wr[2 + 2 * MAXDTEX]; unsigned nw = 0;
+    VkDescriptorBufferInfo bi[2]; VkDescriptorImageInfo ii[MAXDTEX], si[MAXDTEX];
     for (int st = 0; st < 2; st++) if (haveBlk[st]) {
         bi[st] = (VkDescriptorBufferInfo){blk[st].buf, 0, 8 * nmember[st]};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[nw].dstSet = dset[blkSet[st]]; wr[nw].dstBinding = 0; wr[nw].descriptorCount = 1;
         wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wr[nw++].pBufferInfo = &bi[st];
     }
-    Img tex[MAXTEX]; Buf stage[MAXTEX];
+    Img tex[MAXDTEX]; Buf stage[MAXDTEX];
     for (unsigned i = 0; i < nt; i++) {
         unsigned bpp;
-        tex[i] = loadTexture(tfile[i], "float", tw[i], th[i], 0, &stage[i], &bpp);
-        ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        tex[i] = loadTexture(tfile[i], ttype[i], tw[i], th[i], tstore[i], &stage[i], &bpp);
+        ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view,
+            tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[nw].dstSet = dset[tset[i]]; wr[nw].dstBinding = tbind[i]; wr[nw].descriptorCount = 1;
-        wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[nw++].pImageInfo = &ii[i];
+        wr[nw].descriptorType = tstore[i] ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        wr[nw++].pImageInfo = &ii[i];
     }
     for (unsigned i = 0; i < ns; i++) {
-        si[i] = (VkDescriptorImageInfo){makeNearestSampler(sidx[i]), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkSampler sampler = eaddr[i][3] ? makeSampler(eaddr[i][0], eaddr[i][1], eaddr[i][2], sidx[i] ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
+                                        : makeNearestSampler(sidx[i]);
+        si[i] = (VkDescriptorImageInfo){sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[nw].dstSet = dset[sset[i]]; wr[nw].dstBinding = sbind[i]; wr[nw].descriptorCount = 1;
         wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[nw++].pImageInfo = &si[i];
@@ -703,7 +743,9 @@ static int drawMain(const char *manifest) {
     for (unsigned i = 0; i < nc; i++) pre[npre++] = imgBarrier(color[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     if (hasDepth) pre[npre++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
     if (npre) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, npre, pre);
-    for (unsigned i = 0; i < nt; i++) recordTextureUpload(cmd, tex[i], stage[i], tw[i], th[i], 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    for (unsigned i = 0; i < nt; i++)
+        recordTextureUpload(cmd, tex[i], stage[i], tw[i], th[i], tstore[i],
+                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     VkRenderingAttachmentInfo ca[MAXCOLOR], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     for (unsigned i = 0; i < nc; i++) {

@@ -10,8 +10,9 @@ noperspective varyings on a guard-band-clipped triangle, and Apple clips differe
 Vertex data: the field named by // DIFFCHECK-POSITION carries the geometry (w = 1); every other
 stage_in field, [[buffer]] argument and texture is seeded like a kernel's buffers. One tightly
 packed vertex buffer per attribute; the Metal vertex descriptor and the Vulkan one use the
-same bytes. A runtime sampler is nearest, clamp-to-edge, normalised coordinates, no mips.
-Textures are 4x4 RGBA32Float.
+same bytes. A runtime sampler is nearest, normalised, no mips (address mode by Metal index);
+an embedded sampler is built on Vulkan from mslc's reflection. Textures are 4x4 2D RGBA
+(float, half, int, uint, short or ushort; sample or access::read).
 
 Both hosts get one manifest body (graphics_manifest); Apple's gets the source lines, Vulkan's
 the SPIR-V. Attachments are compared with compare.compare as if they were buffers named
@@ -152,10 +153,10 @@ def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
     return lines + (["depth"] if depth else [])
 
 
-def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers):
+def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers, backend="vulkan"):
     """`shape` plus the data both hosts read: `attr_files` {location: file}, `color_outs` {index: file},
-    `buffers` [(stage, metal index, set, member, bytes, file)], `textures` [(index, set, binding, file)],
-    `samplers` [(index, set, binding)]."""
+    `buffers` [(stage, metal index, set, member, bytes, file)], `textures` and `samplers` in
+    resources.seed's shape."""
     lines = [l for l in shape if not l.startswith(("attr ", "color ", "depth"))]
     lines.append("draw %d %d" % (len(points), instances))
     for l in shape:
@@ -167,7 +168,7 @@ def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_o
     if depth_out:
         lines.append("depth %r %s" % (DEPTH_CLEAR, depth_out))
     lines += ["gbuffer %s %d %d %d %d %s" % b for b in buffers]
-    return lines + resources.lines(textures, samplers)
+    return lines + resources.lines(textures, samplers, backend=backend)
 
 
 def _skipped(res, reason):
@@ -198,7 +199,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         res.update(status="error", reason=str(e))
         return None, res
     compiled, problems = {}, []
-    allowed = {"vertex": {"Buffer", "VertexInput"}, "fragment": {"Buffer", "Texture", "Sampler"}}
+    allowed = {"vertex": {"Buffer", "VertexInput", "Texture", "Sampler"}, "fragment": {"Buffer", "Texture", "Sampler"}}
     for stage, name in (("vertex", vs), ("fragment", fs)):
         spv, refl, error = hosts.run_mslc(opts.mslc, source, work, includes, stage)
         if error:
@@ -215,8 +216,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         problems += iface["unsupported"]
         problems += ["%s binding kind %s" % (stage, b["kind"]) for b in ep["bindings"] if b["kind"] not in allowed[stage]]
         problems += ["texture %s access %s" % (b["name"], b.get("texture_access")) for b in ep["bindings"]
-                     if b["kind"] == "Texture" and b.get("texture_access") != "Sample"]
-        problems += ["embedded samplers"] if ep["embedded_samplers"] else []
+                     if b["kind"] == "Texture" and b.get("texture_access") not in ("Sample", "Read")]
         compiled[stage] = (spv, ep, iface)
     vif, fif = compiled["vertex"][2], compiled["fragment"][2]
     attributes = {}
@@ -260,27 +260,35 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         apple = hosts.apple_gfx_reflection(opts.metal, lines, shape, work)
     except hosts.HostError as e:
         return None, _skipped(res, str(e))
-    findings, layouts = [], {}
-    findings += vertex_attribute_findings(attributes, apple["vertex_attributes"])
+    layouts = {}
     for stage in ("vertex", "fragment"):
         ep, a = compiled[stage][1], apple[stage]
         if a["unsupported"]:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
-        bufs = [b for b in ep["bindings"] if b["kind"] == "Buffer"]
-        findings += ["%s: %s" % (stage, f) for f in checks.cross_check(bufs, a)]
-        findings += resources.cross_check(ep["bindings"], a, stage + ": ")
-        if any(t["type"] != "2d" or t["data"] != "float" for t in a["textures"]):
-            return None, _skipped(res, "unsupported %s texture: only 2D float textures" % stage)
+        reasons = resources.unsupported(ep, a)
+        if reasons:
+            return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(reasons)))
         layouts[stage] = {l["index"]: l for l in a["buffers"]}
         if any(l["access"] != "read" for l in layouts[stage].values()):
             return None, _skipped(res, "a %s buffer is writable (invocation order would make it racy)" % stage)
         if any(l["stride"] == 0 or not l["leaves"] for l in layouts[stage].values()):
             return None, _skipped(res, "unsupported argument: buffer element has no scalar layout")
+    findings = vertex_attribute_findings(attributes, apple["vertex_attributes"])
+    for stage in ("vertex", "fragment"):
+        ep, a = compiled[stage][1], apple[stage]
+        want_set = 0 if stage == "vertex" else 1
+        for b in ep["bindings"]:
+            if b["kind"] in ("Buffer", "Texture", "Sampler") and b["descriptor"]["set"] != want_set:
+                findings.append("%s: %s %s has descriptor set %d, expected %d" % (
+                    stage, b["kind"].lower(), b["name"], b["descriptor"]["set"], want_set))
+        bufs = [b for b in ep["bindings"] if b["kind"] == "Buffer"]
+        findings += ["%s: %s" % (stage, f) for f in checks.cross_check(bufs, a)]
+        findings += resources.cross_check(ep["bindings"], a, stage + ": ")
     if findings:
         res.update(status="reflection-mismatch", reason="; ".join(findings))
         return None, res
     return dict(res=res, compiled=compiled, attributes=attributes, position=position, colors=colors, depth=depth,
-                points=points, shape=shape, lines=lines, layouts=layouts), None
+                points=points, shape=shape, lines=lines, layouts=layouts, apple=apple), None
 
 
 def check_pair(opts, source, vs, fs, params, work, includes):
@@ -321,7 +329,8 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                 path = base + "%s-buf%d.bin" % (stage, b["metal_index"])
                 hostenv.write_bytes(path, data)
                 buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))
-            stage_textures, stage_samplers = resources.seed(ep["bindings"], rng, profile, base + stage + "-")
+            stage_textures, stage_samplers = resources.seed(
+                ep["bindings"], rng, profile, base + stage + "-", ep["embedded_samplers"], plan["apple"][stage])
             textures += stage_textures
             samplers += stage_samplers
         outs = {}
@@ -329,7 +338,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
             color_outs = {i: base + "%s-color%d.bin" % (backend, i) for i in plan["colors"]}
             depth_out = base + "%s-depth.bin" % backend if plan["depth"] else None
             body = draw_lines(plan["shape"], plan["points"], params["instances"], attr_files, color_outs, plan["colors"],
-                              depth_out, buffers, textures, samplers)
+                              depth_out, buffers, textures, samplers, backend)
             if backend == "apple":
                 text, binary = ["mode draw"] + plan["lines"] + body, opts.metal
             else:
@@ -337,7 +346,10 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                 binary = opts.vk
             manifest = base + "%s.txt" % backend
             hostenv.write_text(manifest, "\n".join(text) + "\n")
-            runner(binary, manifest)
+            try:
+                runner(binary, manifest)
+            except hosts.Refused as refused:
+                return _skipped(res, str(refused))
             outs[backend] = {i: bytearray(hostenv.read_bytes(color_outs[i])) for i in plan["colors"]}
             if depth_out:
                 outs[backend][DEPTH_INDEX] = bytearray(hostenv.read_bytes(depth_out))
