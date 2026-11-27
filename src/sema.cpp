@@ -7011,7 +7011,9 @@ namespace {
 		if (expression.kind == ExpressionKind::Identifier) {
 			if (const Binding* binding = findResourceBinding(expression.name)) {
 				const bool array = binding->isPointer && binding->pointeeMsl.arrayLength
-					&& binding->storageClass == spirv::StorageClass::Function && !binding->isAddress;
+					&& (binding->storageClass == spirv::StorageClass::Function
+						|| binding->storageClass == spirv::StorageClass::Workgroup)
+					&& !binding->isAddress;
 				if (binding->pointeeMsl.resource != ResourceKind::None) {
 					argument.kind = OverloadArgument::Kind::Resource;
 				} else if (array) {
@@ -7056,6 +7058,13 @@ namespace {
 					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
 						"buffer) chooses among overloads, which is not lowered yet");
 				}
+				return none;
+			}
+			// A local array reaches a pointer in its own address space: thread, or threadgroup for one in
+			// Workgroup storage, and no other.
+			const bool threadgroupArray = argument.binding->storageClass == spirv::StorageClass::Workgroup;
+			if ((type.addressSpace == AddressSpace::Threadgroup) != threadgroupArray
+				|| type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant) {
 				return none;
 			}
 			return !pointerFit(*argument.binding, type).matches || (argument.binding->readOnly && !type.isConst)
