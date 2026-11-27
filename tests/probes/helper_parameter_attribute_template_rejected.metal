@@ -1,6 +1,6 @@
-// EXPECT: error has an attribute, [[texture(n)]], that its type
-// QUIRK (helper parameter attributes): in a function template the check is made on the instance, where
-// Apple's compiler reports a substitution failure for T = float.
+// EXPECT: error no matching function for call to "f"
+// QUIRK (helper parameter attributes): in a function template the check is made on the instance, as a
+// substitution failure, as Apple's compiler reports for T = float ("candidate template ignored").
 #include <metal_stdlib>
 using namespace metal;
 template <typename T> T f(T x [[texture(0)]]) { return x; }

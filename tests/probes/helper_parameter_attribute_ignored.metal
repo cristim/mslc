@@ -10,7 +10,8 @@ template <typename T> T pick(T x, texture2d<float> t [[texture(0)]], texture2d_a
 	return x + t.read(uint2(0)).x * 0.0f + ta.read(uint2(0), 0).x * 0.0f + c;
 }
 float first(device float* d [[buffer(1)]], uint i [[thread_position_in_grid]]) { return d[i] * 0.0f; }
-float sum(In v [[stage_in]], uint i [[thread_position_in_grid]]) { return v.a + v.b + float(i); }
+float sum(In v [[stage_in]], uint i [[thread_position_in_grid]], float u [[user(locn0)]], uint m [[sample_mask]],
+	uint p [[primitive_id]]) { return v.a + v.b + float(i); }
 kernel void k(device float* out [[buffer(0)]], texture2d<float> t [[texture(4)]], texture2d_array<float> ta [[texture(5)]],
 	sampler s [[sampler(0)]], constant float& c [[buffer(2)]], uint i [[thread_position_in_grid]])
-{ In v; v.a = 1.0f; v.b = 2.0f; out[i] = sum(v, i * 10u) + pick(100.0f, t, ta, s, c) - c + first(out, i); }
+{ In v; v.a = 1.0f; v.b = 2.0f; out[i] = sum(v, i * 10u, 0.0f, 0u, 0u) + pick(100.0f, t, ta, s, c) - c + first(out, i); }

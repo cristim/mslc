@@ -1,4 +1,4 @@
-// EXPECT: error parameter "p" of helper function "f" has an attribute, [[texture(n)]], that its type
+// EXPECT: error parameter "p" of helper function "f" has an attribute, [[texture]], that its type
 // QUIRK (helper parameter attributes): the attribute has no effect on a helper, but it must suit the type, as
 // Apple's compiler requires ("type 'device float *' is not valid for attribute 'texture'").
 #include <metal_stdlib>

@@ -1,4 +1,4 @@
-// EXPECT: error parameter "t" of helper function "f" has an attribute, [[buffer(n)]], that its type
+// EXPECT: error parameter "t" of helper function "f" has an attribute, [[buffer]], that its type
 // QUIRK (helper parameter attributes): [[buffer(n)]] suits a pointer or a reference, not a texture, as on
 // an entry point; Apple's compiler refuses it on a helper too.
 #include <metal_stdlib>
