@@ -2483,6 +2483,8 @@ namespace {
 			std::set<std::string> reads;
 		};
 		std::map<std::string, DerivedFunctionConstant> _derivedFunctionConstants;
+		// The calls emitted so far whose function returns a reference, which is lowered as a value.
+		std::set<const Expression*> _referenceCalls;
 		// The function constants each function reads in the code emitted for it, and the functions each calls:
 		// an entry point's reflection lists the constants of every function it reaches. A helper is emitted once
 		// for the entry points that share it, so what it reads is kept with it rather than with an entry point.
@@ -2927,6 +2929,7 @@ namespace {
 		const StructDecl* adlStructOf(const Expression& argument);
 		bool inConstantSpace(const Expression& place);
 		std::optional<Type> placeType(const Expression& place);
+		void checkReferenceReturned(const Expression& returned, std::vector<const Expression*>& calls);
 		std::optional<Type> sizeofPlaceType(const Expression& place);
 		std::optional<Type> sizeofExpressionType(const Expression& expression);
 		bool namesPointerParameter(const std::string& name) const;
@@ -7876,6 +7879,9 @@ namespace {
 		const std::vector<Id>& prepared) {
 		const FunctionDecl& definition = *generic.definition;
 		noteCall(definition);
+		if (definition.returnsReference) {
+			_referenceCalls.insert(&call);
+		}
 		// The scan before emission does not follow argument-dependent lookup or template instances, so a
 		// caller it did not mark would share one body between entry points and call the first one's sampler. With
 		// one entry point there is no other to share it with.
@@ -9084,9 +9090,58 @@ namespace {
 		if (braced && !_helper->returnType.enumName.empty()) {
 			throw CompileError("a braced list is returned as " + typeName(_helper->returnType) + ", an enum, which is not lowered");
 		}
+		std::vector<const Expression*> referenceCalls;
+		if (_helper->returnsReference) {
+			checkReferenceReturned(*statement.expression, referenceCalls);
+		}
 		const Id value = braced ? emitInitListValue(_helper->returnType, *statement.expression)
 			: emitExpression(*statement.expression);
+		for (const Expression* call: referenceCalls) {
+			if (!_referenceCalls.count(call)) {
+				throw CompileError(quoted + " returns a reference, and a call that returns a value cannot be bound "
+					"to it");
+			}
+		}
 		terminate(spirv::OpReturnValue, { convertImplicit(value, declaredTypeOf(_helper->returnType)) });
+	}
+
+	// What a function returning a reference returns has to be a place the reference binds to: a variable, an
+	// element, a member, a conditional of two of them, or the result of a call that returns a reference, which
+	// is checked once it is emitted. Its type is the one the reference names, and a reference that is not const
+	// cannot bind a const place, as C++ requires ([dcl.init.ref]).
+	void Emitter::checkReferenceReturned(const Expression& returned, std::vector<const Expression*>& calls) {
+		const std::string quoted = "\"" + _helper->name + "\"";
+		if (returned.kind == ExpressionKind::Conditional) {
+			checkReferenceReturned(*returned.arguments[0], calls);
+			checkReferenceReturned(*returned.arguments[1], calls);
+			return;
+		}
+		if (returned.kind == ExpressionKind::Call) {
+			calls.push_back(&returned);
+			return;
+		}
+		const bool place = returned.kind == ExpressionKind::Identifier || returned.kind == ExpressionKind::Member
+			|| returned.kind == ExpressionKind::Index;
+		const std::optional<Type> type = place && !isTemporaryPart(returned) ? placeType(returned) : std::nullopt;
+		if (!type) {
+			throw CompileError(quoted + " returns a reference, which has to be bound to a variable, an element or a "
+				"member");
+		}
+		const auto bare = [](Type t) {
+			t.isConst = false;
+			t.isVolatile = false;
+			t.isConstexpr = false;
+			t.addressSpace = AddressSpace::None;
+			return typeName(t);
+		};
+		if (bare(*type) != bare(_helper->returnType)) {
+			throw CompileError(quoted + " returns a reference to " + bare(_helper->returnType) + ", which cannot be "
+				"bound to a " + bare(*type));
+		}
+		if (!_helper->returnType.isConst && (type->isConst || readOnlyRoot(storeRoot(returned)))) {
+			throw CompileError(quoted + " returns a reference that is not const, which cannot be bound to a const "
+				"place");
+		}
 	}
 
 	Id Emitter::emitMathBuiltin(const MathBuiltin& builtin,
@@ -15268,6 +15323,10 @@ namespace {
 				throw CompileError("no viable overloaded '=' for a " + target->name + " temporary");
 			}
 			emitExpression(left);
+			if (_referenceCalls.count(&left)) {
+				throw CompileError("assigning to the reference a call returns is not lowered yet; mslc reads a "
+					"returned reference as a value");
+			}
 			return;
 		}
 		if (left.kind == ExpressionKind::Identifier) {
