@@ -35,7 +35,7 @@ enable_testing()
 # together.
 add_executable(mslc-api-test tests/preprocess_api.cpp)
 target_link_libraries(mslc-api-test PRIVATE mslc)
-add_test(NAME api/preprocess COMMAND mslc-api-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/include)
+add_test(NAME api/preprocess COMMAND mslc-api-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/preprocessor/include)
 
 add_executable(mslc-library-api-test tests/library_api.c)
 target_link_libraries(mslc-library-api-test PRIVATE mslc)
@@ -67,7 +67,7 @@ add_test(NAME tools/check-ids-duplicate-specid
 	COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_specid_test.py $<TARGET_FILE:mslc-cli>
 		${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ids.py
 		${CMAKE_CURRENT_SOURCE_DIR}/third_party/spirv.core.grammar.json
-		${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/several_kernels_one_module.metal
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/module/several_kernels_one_module.metal
 		${CMAKE_CURRENT_SOURCE_DIR}/tests/check_ids_duplicate_specid.spvasm)
 
 # Tests that validate SPIR-V fail, never skip, when this is not found.
@@ -99,14 +99,20 @@ add_test(NAME corpus-keep-output-same-basename COMMAND ${CMAKE_COMMAND}
 add_test(NAME validate-failure-exits-nonzero COMMAND ${CMAKE_COMMAND}
 	-DMSLC=$<TARGET_FILE:mslc-cli>
 	-DFAKE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/failing-spirv-val
-	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/float_add.metal
+	-DPROBE=${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/types/float_add.metal
 	-DOUT=${CMAKE_CURRENT_BINARY_DIR}/validate_failure.spv
 	-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_validate_failure.cmake)
 
-# One test per tests/probes/*.metal; each file carries its own expectation.
-file(GLOB probes CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/*.metal)
+# One test per tests/probes/<category>/*.metal; each file carries its own expectation.
+file(GLOB_RECURSE probes CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/*.metal)
+list(FILTER probes EXCLUDE REGEX "/include/")
+set(seen_probe_names)
 foreach(probe IN LISTS probes)
 	get_filename_component(name ${probe} NAME_WE)
+	if(name IN_LIST seen_probe_names)
+		message(FATAL_ERROR "duplicate probe stem '${name}' (${probe})")
+	endif()
+	list(APPEND seen_probe_names ${name})
 	add_test(NAME probe/${name} COMMAND ${CMAKE_COMMAND}
 		-DMSLC=$<TARGET_FILE:mslc-cli>
 		-DSPIRV_VAL=${SPIRV_VAL}

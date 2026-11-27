@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
 
 	// ... and bounds them: this reaches a real file beside the directory.
 	expectError("source path, include that escapes",
-		translate("#include \"../float_add.metal\"\n" + kernel, options), "resolves outside");
+		translate("#include \"../pp_include_relative_header.metal\"\n" + kernel, options), "resolves outside");
 
 	// An include directory that is not there is refused, not skipped.
 	const char* missing[] = { "/nonexistent/include/directory" };
