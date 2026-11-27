@@ -10812,15 +10812,30 @@ namespace {
 			case ExpressionKind::BoolLiteral:
 				return checked(emitExpression(expression));
 			case ExpressionKind::Identifier: {
-				if (findResourceBinding(expression.name)) {
-					refuse();
+				// The initialiser is file-scope code: a local or parameter of the function that first reads the
+				// constant, however it is named, is not in its scope.
+				if (_functionConstants.count(expression.name)) {
+					return checked(functionConstantValue(expression.name, false));
 				}
-				if (_functionConstants.count(expression.name) || _functionConstantDefinedAliases.count(expression.name)
-					|| _derivedFunctionConstants.count(expression.name) || _constants.count(expression.name)) {
-					return checked(emitIdentifier(expression));
+				const auto alias = _functionConstantDefinedAliases.find(expression.name);
+				if (alias != _functionConstantDefinedAliases.end()) {
+					return checked(functionConstantValue(alias->second, true));
+				}
+				if (_derivedFunctionConstants.count(expression.name)) {
+					return checked(derivedFunctionConstantValue(expression.name));
+				}
+				const auto found = _constants.find(expression.name);
+				if (found != _constants.end()) {
+					return checked(found->second.id);
 				}
 				return refuse();
 			}
+			case ExpressionKind::Call:
+				if (expression.left && expression.left->kind == ExpressionKind::Identifier
+					&& builtinCalleeName(expression.left->name) == "__metal_is_function_constant_defined") {
+					return checked(emitIsFunctionConstantDefined(expression));
+				}
+				return refuse();
 			case ExpressionKind::Construct: {
 				const ScalarKind target = expression.constructType ? expression.constructType->scalar : ScalarKind::Void;
 				if (expression.arguments.size() != 1 || expression.constructType->vectorWidth > 1
@@ -10881,8 +10896,10 @@ namespace {
 						: spirv::OpLogicalNotEqual, { left, right });
 				}
 				// The usual arithmetic conversions: bools are promoted to int, and an int beside a uint becomes one.
-				const Id type = _builder.typeOf(left) == _uintType || _builder.typeOf(right) == _uintType
-					? _uintType : _intType;
+				// A shift is the exception: it has the type of its promoted left operand alone.
+				const bool shift = op == BinaryOperator::ShiftLeft || op == BinaryOperator::ShiftRight;
+				const Id type = shift ? (_builder.typeOf(left) == _uintType ? _uintType : _intType)
+					: _builder.typeOf(left) == _uintType || _builder.typeOf(right) == _uintType ? _uintType : _intType;
 				const Id a = specConstantConvert(left, type);
 				const Id b = specConstantConvert(right, type);
 				const bool isSigned = type == _intType;
