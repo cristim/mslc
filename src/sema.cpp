@@ -14553,7 +14553,7 @@ namespace {
 			if (std::any_of(entry->definition->parameters.begin(), entry->definition->parameters.end(),
 				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
 				throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
-					"takes a pointer parameter; a thread pointer is lowered per caller, so it cannot be a "
+					"takes a pointer parameter; a thread or threadgroup pointer is lowered per caller, so it cannot be a "
 					"link-time symbol");
 			}
 			helperFunctionId(*entry);
