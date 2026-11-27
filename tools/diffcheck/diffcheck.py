@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -273,17 +274,23 @@ def unknown_directives(opts, d, results):
     return errors
 
 
-def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
+def check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_position=False):
     run = d["run"]
     params = {"width": opts.width or run.get("width", graphics.DEFAULT_SIZE), "height": opts.height or run.get("height", graphics.DEFAULT_SIZE),
               "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
-              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"], "ulp": d["ulp"]}
+              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"], "ulp": d["ulp"],
+              "infer_position": infer_position}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
-    results = [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
-    return results + unknown_directives(opts, d, results)
+    return [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
+
+
+def _graphics_skip_reason(verts, frags):
+    if len(verts) > 1 or len(frags) > 1:
+        return "multiple vertex or fragment entry points (%d vertex, %d fragment): specify // RUN: vertex=<vs> fragment=<fs>" % (len(verts), len(frags))
+    return "no matching %s entry point" % ("fragment" if verts else "vertex")
 
 
 def check_file(opts, path, std=None, run=None):
@@ -299,18 +306,36 @@ def check_file(opts, path, std=None, run=None):
         if bool(vs) != bool(fs):
             return [{"entry": "*", "status": "error", "cases": [], "reason": "graphics needs both a vertex and a fragment name"}]
         if vs:
-            return check_graphics_file(opts, path, d, vs, fs, work, includes, std)
-        spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes)
+            results = check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_position=bool(opts.corpus))
+            return results + unknown_directives(opts, d, results)
+        stage = None if opts.corpus and not opts.entry else "kernel"
+        spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes, stage)
+        if error and stage is None and not error.startswith(("CRASH ", "INVALID ")) and re.search(r"\b(vertex|fragment)\b", text):
+            # Keep compute coverage if a graphics function in the same source stops combined compilation.
+            kspv, krefl, kerror = hosts.run_mslc(opts.mslc, path, work, includes, "kernel")
+            if not kerror or kerror.startswith(("CRASH ", "INVALID ")):
+                spv, refl, error = kspv, krefl, kerror
         if error:
             status, reason = hosts.mslc_failure(error)
             return [{"entry": opts.entry or "*", "status": status, "reason": reason, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
+        verts = [e["name"] for e in refl["entry_points"] if e["stage"] == "vertex"]
+        frags = [e["name"] for e in refl["entry_points"] if e["stage"] == "fragment"]
         if opts.entry:
             entries = [e for e in entries if e["name"] == opts.entry]
             if not entries:
                 return [{"entry": opts.entry, "status": "skipped", "reason": "no such kernel", "cases": []}]
         results = []
-        for e in entries:
+        if entries and (verts or frags):
+            # Re-compile pure kernel SPIR-V so compute runs do not carry graphics entry points or capabilities.
+            kspv, krefl, kerror = hosts.run_mslc(opts.mslc, path, work, includes, "kernel")
+            if kerror:
+                status, reason = hosts.mslc_failure(kerror)
+                results.append({"entry": "*", "status": status, "reason": reason, "cases": []})
+                entries = []
+            else:
+                spv, entries = kspv, [e for e in krefl["entry_points"] if e["stage"] == "compute"]
+        for i, e in enumerate(entries):
             run = d["run"]
             params = {
                 "grid": opts.grid or run.get("grid", 64), "local": opts.local or run.get("local", 8),
@@ -320,12 +345,17 @@ def check_file(opts, path, std=None, run=None):
                 "float_range": d["float_range"],
                 "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"],
             }
-            sub = os.path.join(work, e["name"])
+            sub = os.path.join(work, "compute-%d" % i)
             os.makedirs(sub)
             try:
                 results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
             except hosts.Refused as refused:
                 results.append({"entry": e["name"], "status": "skipped", "reason": str(refused), "cases": []})
+        if opts.corpus and not opts.entry:
+            if len(verts) == 1 and len(frags) == 1:
+                results += check_graphics_file(opts, path, d, verts[0], frags[0], work, includes, std, infer_position=True)
+            elif (verts or frags) and not results:
+                results.append({"entry": "*", "status": "skipped", "reason": _graphics_skip_reason(verts, frags), "cases": []})
         results += unknown_directives(opts, d, results)
         return results
     finally:

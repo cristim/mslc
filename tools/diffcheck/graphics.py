@@ -11,8 +11,9 @@ Vertex data: the field named by // DIFFCHECK-POSITION carries the geometry (w = 
 stage_in field, [[buffer]] argument and texture is seeded like a kernel's buffers. One tightly
 packed vertex buffer per attribute; the Metal vertex descriptor and the Vulkan one use the
 same bytes. A runtime sampler is nearest, normalised, no mips (address mode by Metal index);
-an embedded sampler is built on Vulkan from mslc's reflection. Textures are 4x4 2D RGBA
-(float, half, int, uint, short or ushort; sample or access::read).
+an embedded sampler is built on Vulkan from mslc's reflection. Textures may be 1d, 1d_array,
+2d, 2d_array, 3d, cube or cube_array RGBA (float, half, int, uint, short or ushort; sample or
+access::read).
 
 Both hosts get one manifest body (graphics_manifest); Apple's gets the source lines, Vulkan's
 the SPIR-V. Attachments are compared with compare.compare as if they were buffers named
@@ -176,6 +177,15 @@ def _skipped(res, reason):
     return res
 
 
+def _infer_position(attributes):
+    """Unambiguous stage_in position attribute for an unannotated corpus file, else None."""
+    floats = [a["name"] for a in attributes.values() if a["scalar"] == "float" and a["comps"] >= 2]
+    if len(floats) == 1:
+        return floats[0]
+    named = [n for n in floats if n.lower() in ("pos", "position")]
+    return named[0] if len(named) == 1 else None
+
+
 def vertex_attribute_findings(attributes, apple):
     """Findings where mslc's stage_in attribute types (read from its SPIR-V) differ from Apple's
     MTLFunction.vertexAttributes, by location, scalar kind or component count. An attribute only
@@ -242,9 +252,14 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     position = params["position"]
     names = {a["name"]: a for a in attributes.values()}
     if attributes and position is None:
-        res.update(status="error", reason="the vertex function has stage_in attributes: name the one that carries the "
-                   "position with // DIFFCHECK-POSITION: <name> (or none)")
-        return None, res
+        if params.get("infer_position"):
+            position = _infer_position(attributes)
+            if position is None:
+                return None, _skipped(res, "the vertex function has stage_in attributes without // DIFFCHECK-POSITION")
+        else:
+            res.update(status="error", reason="the vertex function has stage_in attributes: name the one that carries the "
+                       "position with // DIFFCHECK-POSITION: <name> (or none)")
+            return None, res
     if position == "none":
         position = None
     elif position and not (position in names and names[position]["scalar"] == "float" and names[position]["comps"] >= 2):
@@ -265,7 +280,7 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         ep, a = compiled[stage][1], apple[stage]
         if a["unsupported"]:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(a["unsupported"])))
-        reasons = resources.unsupported(ep, a) + ["texture %s is not a 2D texture" % t["name"] for t in a["textures"] if t["type"] != "2d"]
+        reasons = resources.unsupported(ep, a)
         if reasons:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(reasons)))
         layouts[stage] = {l["index"]: l for l in a["buffers"]}

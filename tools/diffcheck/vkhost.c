@@ -205,7 +205,7 @@ static void recordTextureUpload(VkCommandBuffer cmd, Img t, Buf stage, TexKind k
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, consumer, 0, 0, NULL, 0, NULL, 1, &rd);
 }
 
-static void checkTextureSupport(const char *type, int storage, unsigned *bpp) {
+static void checkTextureSupport(TexKind kind, const char *type, int storage, unsigned *bpp) {
     VkFormat fmt = texelFormat(type, 4, bpp);
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(gpd, fmt, &fp);
     VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
@@ -214,6 +214,58 @@ static void checkTextureSupport(const char *type, int storage, unsigned *bpp) {
         refuse("the device has no shaderStorageImageReadWithoutFormat, which a read storage image needs");
     if (storage >= 2 && !gfeatures.shaderStorageImageWriteWithoutFormat)
         refuse("the device has no shaderStorageImageWriteWithoutFormat, which a writable storage image needs");
+    if (kind == TEX_CUBE_ARRAY && !gfeatures.imageCubeArray)
+        refuse("the device has no imageCubeArray");
+    VkImageFormatProperties ifp;
+    if (vkGetPhysicalDeviceImageFormatProperties(gpd, fmt, texImageType(kind), VK_IMAGE_TILING_OPTIMAL,
+                                                 texUsage(storage), texCreateFlags(kind), &ifp) != VK_SUCCESS)
+        refuse("device lacks image support for %s texture of format %d", type, (int)fmt);
+}
+
+static void parseTextureLine(const char *line, unsigned maxTex, int allowWrite, unsigned *nt,
+                             unsigned *tset, unsigned *tbind, unsigned *tw, unsigned *th, unsigned *td,
+                             unsigned *tlayers, char (*tfile)[1024], char (*ttype)[16], char (*tout)[1024],
+                             int *tstore, TexKind *tkind) {
+    if (*nt >= maxTex) refuse("too many textures (max %u)", maxTex);
+    unsigned i = *nt;
+    strcpy(ttype[i], "float");
+    if (tout) tout[i][0] = 0;
+    td[i] = 1; tlayers[i] = 1; tkind[i] = TEX_2D;
+    char extra[16] = "", dummy[1024] = "";
+    char *out = tout ? tout[i] : dummy;
+    int ok = 0;
+    if (!strncmp(line, "texture ", 8)) {
+        int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s %15s",
+                       &tset[i], &tbind[i], &tw[i], &th[i], tfile[i], ttype[i], extra);
+        if (n == 5 || n == 6) { tstore[i] = 0; ok = 1; }
+    } else if (!strncmp(line, "storagetexture ", 15)) {
+        char mode[16] = "";
+        int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s %1023s %15s",
+                       &tset[i], &tbind[i], &tw[i], &th[i], tfile[i], ttype[i], mode, out, extra);
+        if (n == 5 || n == 6 || (allowWrite && n == 8)) {
+            if (n == 8 && strcmp(mode, "write") && strcmp(mode, "readwrite"))
+                die("storage texture mode %s is not write or readwrite", mode);
+            tstore[i] = n < 8 ? 1 : mode[0] == 'w' ? 2 : 3;
+            ok = 1;
+        }
+    } else {
+        char kindStr[16] = "", mode[16] = "";
+        int n = sscanf(line, "image %15s %15s %*u %u %u %u %u %u %u %15s %1023s %1023s %15s",
+                       kindStr, mode, &tset[i], &tbind[i], &tw[i], &th[i], &td[i], &tlayers[i],
+                       ttype[i], tfile[i], out, extra);
+        if (n == 10 || (allowWrite && n == 11)) {
+            tkind[i] = parseTexKind(kindStr);
+            if (n == 10 && !strcmp(mode, "sample")) tstore[i] = 0;
+            else if (n == 10 && !strcmp(mode, "read")) tstore[i] = 1;
+            else if (n == 11 && !strcmp(mode, "write")) tstore[i] = 2;
+            else if (n == 11 && !strcmp(mode, "readwrite")) tstore[i] = 3;
+            else die("bad image mode %s in: %s", mode, line);
+            ok = 1;
+        }
+    }
+    if (!ok) die("bad manifest line: %s", line);
+    if (!tw[i] || !th[i] || !td[i] || !tlayers[i]) die("zero texture dimension");
+    (*nt)++;
 }
 
 static void writeFile(const char *path, const void *p, size_t n);
@@ -253,39 +305,7 @@ int main(int argc, char **argv) {
         if (sscanf(line, "groups %u %u %u", groups, groups + 1, groups + 2) == 3) continue;
         if (nbuf < MAXBUF && sscanf(line, "buffer %u %llu %1023s %1023s", &member[nbuf], &bytes[nbuf], in[nbuf], out[nbuf]) == 4) { nbuf++; continue; }
         if (!strncmp(line, "texture ", 8) || !strncmp(line, "storagetexture ", 15) || !strncmp(line, "image ", 6)) {
-            if (nt >= MAXTEX) refuse("too many textures (max %d)", MAXTEX);
-            strcpy(ttype[nt], "float"); tout[nt][0] = 0; td[nt] = 1; tlayers[nt] = 1; tkind[nt] = TEX_2D;
-            int ok = 0;
-            if (!strncmp(line, "texture ", 8)) {
-                int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt]);
-                if (n == 5 || n == 6) { tstore[nt] = 0; ok = 1; }
-            } else if (!strncmp(line, "storagetexture ", 15)) {
-                char mode[16] = "";
-                int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s %1023s",
-                               &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], mode, tout[nt]);
-                if (n == 5 || n == 6 || n == 8) {
-                    if (n == 8 && strcmp(mode, "write") && strcmp(mode, "readwrite")) die("storage texture mode %s is not write or readwrite", mode);
-                    tstore[nt] = n < 8 ? 1 : mode[0] == 'w' ? 2 : 3;
-                    ok = 1;
-                }
-            } else {
-                char kindStr[16] = "", mode[16] = "";
-                int n = sscanf(line, "image %15s %15s %*u %u %u %u %u %u %u %15s %1023s %1023s",
-                               kindStr, mode, &tset[nt], &tbind[nt], &tw[nt], &th[nt], &td[nt], &tlayers[nt],
-                               ttype[nt], tfile[nt], tout[nt]);
-                if (n == 10 || n == 11) {
-                    tkind[nt] = parseTexKind(kindStr);
-                    if (n == 10 && !strcmp(mode, "sample")) tstore[nt] = 0;
-                    else if (n == 10 && !strcmp(mode, "read")) tstore[nt] = 1;
-                    else if (n == 11 && !strcmp(mode, "write")) tstore[nt] = 2;
-                    else if (n == 11 && !strcmp(mode, "readwrite")) tstore[nt] = 3;
-                    else die("bad image mode %s in: %s", mode, line);
-                    ok = 1;
-                }
-            }
-            if (!ok) die("bad manifest line: %s", line);
-            if (!tw[nt] || !th[nt] || !td[nt] || !tlayers[nt]) die("zero texture dimension");
-            nt++;
+            parseTextureLine(line, MAXTEX, 1, &nt, tset, tbind, tw, th, td, tlayers, tfile, ttype, tout, tstore, tkind);
             continue;
         }
         if (nb < MAXTB) {
@@ -339,16 +359,7 @@ int main(int argc, char **argv) {
     VkDescriptorSetLayout dsl[8]; VkDescriptorSet dset[8];
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     Img tex[MAXTEX]; Buf stage[MAXTEX], trb[MAXTEX]; Buf tbuf[MAXTB]; VkBufferView tview[MAXTB];
-    for (unsigned i = 0; i < nt; i++) {
-        checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
-        VkFormat fmt = texelFormat(ttype[i], 4, &tbpp[i]);
-        if (tkind[i] == TEX_CUBE_ARRAY && !gfeatures.imageCubeArray)
-            refuse("the device has no imageCubeArray");
-        VkImageFormatProperties ifp;
-        if (vkGetPhysicalDeviceImageFormatProperties(gpd, fmt, texImageType(tkind[i]), VK_IMAGE_TILING_OPTIMAL,
-                                                     texUsage(tstore[i]), texCreateFlags(tkind[i]), &ifp) != VK_SUCCESS)
-            refuse("device lacks image support for %s texture of format %d", ttype[i], (int)fmt);
-    }
+    for (unsigned i = 0; i < nt; i++) checkTextureSupport(tkind[i], ttype[i], tstore[i], &tbpp[i]);
     for (unsigned i = 0; i < nb; i++) {
         unsigned bytes1;
         VkFormat fmt = texelFormat(btype[i], bcomp[i], &bytes1);
@@ -487,6 +498,7 @@ int main(int argc, char **argv) {
 // Manifest lines: mode draw, spv vertex|fragment FILE, vertex NAME, fragment NAME, target W H,
 // draw V I, attr LOC FMT FILE, color I FMT C0 C1 C2 C3 OUT, depth CLEAR OUT,
 // gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
+// image KIND ACCESS INDEX SET BINDING W H D LAYERS TYPE FILE,
 // sampler INDEX SET BINDING, esampler SET BINDING S T R FILTER. Same bytes and same names as metalhost's draw mode.
 // The viewport has a negative height so framebuffer row 0 is the top, as in Metal.
 // Read-back: colour/depth attachment write -> transfer read (image barrier), then transfer
@@ -620,7 +632,8 @@ static int drawMain(const char *manifest) {
     unsigned cidx[MAXCOLOR]; char cfmt[MAXCOLOR][32], cout[MAXCOLOR][1024]; double cclear[MAXCOLOR][4];
     double dclear = 1; char dout[1024] = "";
     char gstage[MAXG][16], gfile[MAXG][1024]; unsigned gidx[MAXG], gset[MAXG], gmember[MAXG]; unsigned long long gbytes[MAXG];
-    unsigned tset[MAXDTEX], tbind[MAXDTEX], tw[MAXDTEX], th[MAXDTEX], tbpp[MAXDTEX];
+    unsigned tset[MAXDTEX], tbind[MAXDTEX], tw[MAXDTEX], th[MAXDTEX], td[MAXDTEX], tlayers[MAXDTEX], tbpp[MAXDTEX];
+    TexKind tkind[MAXDTEX];
     char tfile[MAXDTEX][1024], ttype[MAXDTEX][16]; int tstore[MAXDTEX];
     unsigned sset[MAXDTEX], sbind[MAXDTEX], sidx[MAXDTEX], eaddr[MAXDTEX][4];
     FILE *mf = fopen(manifest, "r");
@@ -640,18 +653,8 @@ static int drawMain(const char *manifest) {
         } else if (sscanf(line, "depth %lf %1023s", &dclear, dout) == 2) { hasDepth = 1;
         } else if (ng < MAXG && sscanf(line, "gbuffer %15s %u %u %u %llu %1023s", gstage[ng], &gidx[ng], &gset[ng], &gmember[ng],
                        &gbytes[ng], gfile[ng]) == 6) { ng++;
-        } else if (!strncmp(line, "texture ", 8)) {
-            if (nt >= MAXDTEX) refuse("too many textures");
-            char extra[16] = ""; strcpy(ttype[nt], "float");
-            int n = sscanf(line, "texture %*u %u %u %u %u %1023s %15s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], extra);
-            if (n != 5 && n != 6) die("bad manifest line: %s", line);
-            tstore[nt++] = 0;
-        } else if (!strncmp(line, "storagetexture ", 15)) {
-            if (nt >= MAXDTEX) refuse("too many textures");
-            char extra[16] = ""; strcpy(ttype[nt], "float");
-            int n = sscanf(line, "storagetexture %*u %u %u %u %u %1023s %15s %15s", &tset[nt], &tbind[nt], &tw[nt], &th[nt], tfile[nt], ttype[nt], extra);
-            if (n != 5 && n != 6) die("bad manifest line: %s", line);
-            tstore[nt++] = 1;
+        } else if (!strncmp(line, "texture ", 8) || !strncmp(line, "storagetexture ", 15) || !strncmp(line, "image ", 6)) {
+            parseTextureLine(line, MAXDTEX, 0, &nt, tset, tbind, tw, th, td, tlayers, tfile, ttype, NULL, tstore, tkind);
         } else if (!strncmp(line, "sampler ", 8)) {
             if (ns >= MAXDTEX) refuse("too many samplers");
             char extra[16] = "";
@@ -669,7 +672,7 @@ static int drawMain(const char *manifest) {
     for (unsigned i = 0; i < nc; i++) if (cidx[i] != i) die("colour targets must be listed 0..n-1 in order");
 
     uint32_t qf = initDevice(VK_QUEUE_GRAPHICS_BIT);
-    for (unsigned i = 0; i < nt; i++) checkTextureSupport(ttype[i], tstore[i], &tbpp[i]);
+    for (unsigned i = 0; i < nt; i++) checkTextureSupport(tkind[i], ttype[i], tstore[i], &tbpp[i]);
 
     // Address blocks, one uniform buffer per stage that has buffer arguments.
     Buf blk[2] = {{0}, {0}}; unsigned blkSet[2] = {0, 0}, nmember[2] = {0, 0}, haveBlk[2] = {0, 0};
@@ -745,7 +748,7 @@ static int drawMain(const char *manifest) {
     Img tex[MAXDTEX]; Buf stage[MAXDTEX];
     for (unsigned i = 0; i < nt; i++) {
         unsigned bpp;
-        tex[i] = loadTexture(TEX_2D, tfile[i], ttype[i], tw[i], th[i], 1, 1, tstore[i], &stage[i], &bpp);
+        tex[i] = loadTexture(tkind[i], tfile[i], ttype[i], tw[i], th[i], td[i], tlayers[i], tstore[i], &stage[i], &bpp);
         ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex[i].view,
             tstore[i] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -835,7 +838,7 @@ static int drawMain(const char *manifest) {
     if (hasDepth) pre[npre++] = imgBarrier(depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
     if (npre) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, npre, pre);
     for (unsigned i = 0; i < nt; i++)
-        recordTextureUpload(cmd, tex[i], stage[i], TEX_2D, tw[i], th[i], 1, 1, tstore[i],
+        recordTextureUpload(cmd, tex[i], stage[i], tkind[i], tw[i], th[i], td[i], tlayers[i], tstore[i],
                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     VkRenderingAttachmentInfo ca[MAXCOLOR], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};

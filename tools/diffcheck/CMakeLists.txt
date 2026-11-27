@@ -10,6 +10,7 @@ add_test(NAME diffcheck/compare COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_
 add_test(NAME diffcheck/inputs COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_inputs_test.py)
 add_test(NAME diffcheck/checks COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_checks_test.py)
 add_test(NAME diffcheck/graphics COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_graphics_test.py)
+add_test(NAME diffcheck/corpus COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_corpus_test.py)
 add_test(NAME diffcheck/kernel-resources COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_kernel_resources_test.py)
 
 if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)

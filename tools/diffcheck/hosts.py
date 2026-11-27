@@ -116,9 +116,11 @@ def run_vulkan(binary, manifest_path):
 
 
 def run_mslc(mslc, source, work, includes, stage="kernel"):
-    """(spv path, reflection, None) or (None, None, "CRASH|INVALID <reason>" or a compile error)."""
-    spv, refl = os.path.join(work, "mslc-%s.spv" % stage), os.path.join(work, "mslc-%s.json" % stage)
-    cmd = [mslc, "--stage", stage, "-o", spv, "--reflect", refl, source] + ["-I" + i for i in includes]
+    """(spv path, reflection, None) or (None, None, "CRASH|INVALID <reason>" or a compile error).
+    `stage` None compiles every entry point in one module."""
+    tag = stage or "all"
+    spv, refl = os.path.join(work, "mslc-%s.spv" % tag), os.path.join(work, "mslc-%s.json" % tag)
+    cmd = [mslc] + (["--stage", stage] if stage else []) + ["-o", spv, "--reflect", refl, source] + ["-I" + i for i in includes]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
     if r.returncode < 0:
         return None, None, "CRASH mslc died with signal %d (%s)" % (-r.returncode, signal.Signals(-r.returncode).name)

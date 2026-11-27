@@ -378,7 +378,8 @@ static id<MTLSamplerState> nearestSampler(id<MTLDevice> device, NSUInteger index
 // Reflects the render pipeline (draw == NO) or draws and writes every attachment to its file.
 // Manifest lines: vertex, fragment, target W H, draw V I, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
 // depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
-// sampler INDEX SET BINDING (set 0 is vertex, 1 is fragment). Vertex buffer slot for attribute n is 30 - n.
+// image KIND ACCESS INDEX SET BINDING W H D LAYERS TYPE FILE, sampler INDEX SET BINDING (set 0 is vertex, 1 is fragment).
+// Vertex buffer slot for attribute n is 30 - n.
 static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, NSDictionary<NSString *, NSMutableArray *> *lists, BOOL draw) {
     NSUInteger width = [m[@"target"][0] integerValue], height = [m[@"target"][1] integerValue];
     if (!width || !height) die(@"manifest has no target size");
@@ -470,15 +471,18 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         else [enc setFragmentBuffer:b offset:0 atIndex:[w[2] integerValue]];
         [keep addObject:b];
     }
-    NSArray *texSpecs = [(lists[@"texture"] ?: @[]) arrayByAddingObjectsFromArray:(lists[@"storagetexture"] ?: @[])];
-    for (NSArray *w in texSpecs) {
-        if (w.count != 7 && w.count != 8) die(@"bad texture line in draw manifest");
-        if (![w[2] isEqual:@"0"] && ![w[2] isEqual:@"1"]) die(@"unknown texture stage set in draw manifest");
-        id<MTLTexture> t = sourceTexture(device, parseTexSpec(w));
-        NSUInteger idx = [w[1] integerValue];
-        if ([w[2] isEqual:@"0"]) [enc setVertexTexture:t atIndex:idx];
-        else [enc setFragmentTexture:t atIndex:idx];
-        [keep addObject:t];
+    for (NSString *key in @[@"texture", @"storagetexture", @"image"]) {
+        BOOL isImage = [key isEqual:@"image"];
+        for (NSArray *w in lists[key]) {
+            if (isImage ? w.count != 12 : (w.count != 7 && w.count != 8)) die(@"bad texture line in draw manifest");
+            NSString *setStr = isImage ? w[4] : w[2];
+            if (![setStr isEqual:@"0"] && ![setStr isEqual:@"1"]) die(@"unknown texture stage set in draw manifest");
+            TexSpec spec = parseTexSpec(w);
+            id<MTLTexture> t = sourceTexture(device, spec);
+            if ([setStr isEqual:@"0"]) [enc setVertexTexture:t atIndex:spec.index];
+            else [enc setFragmentTexture:t atIndex:spec.index];
+            [keep addObject:t];
+        }
     }
     for (NSArray *w in lists[@"sampler"]) {
         if (w.count != 4) die(@"bad sampler line in draw manifest");
