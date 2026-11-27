@@ -39,10 +39,14 @@ uint32_t alignTo(uint32_t offset, uint32_t alignment) {
 }
 
 // The element a member is made of, before any array dimension: what Metal
-// lays out for one scalar, vector or matrix of its type, or for a pointer.
-VectorLayout elementLayout(const Type& type) {
+// lays out for one scalar, vector or matrix of its type, or for a pointer. A
+// struct element (given the unit that declares it) is the struct laid out whole.
+VectorLayout elementLayout(const Type& type, const TranslationUnit* unit) {
 	if (type.isPointer) {
 		return { 8, 8 };
+	}
+	if (!type.namedType.empty() && unit) {
+		return structElementLayout(type.namedType, *unit);
 	}
 	const uint32_t components = type.vectorWidth > 1 ? type.vectorWidth : 1;
 	const uint32_t scalarBytes = storageBytesOf(type.scalar);
@@ -54,14 +58,14 @@ VectorLayout elementLayout(const Type& type) {
 // The byte step of each array dimension of a member, outermost first. An array
 // steps by its element's size, which Metal has already rounded up to the
 // element's alignment, so a float3[4] steps 16 and a float[4] steps 4.
-std::vector<uint32_t> arrayStrides(const Type& type) {
+std::vector<uint32_t> arrayStrides(const Type& type, const TranslationUnit* unit) {
 	std::vector<uint32_t> lengths;
 	if (type.arrayLength) {
 		lengths.push_back(*type.arrayLength);
 		lengths.insert(lengths.end(), type.innerArrayLengths.begin(), type.innerArrayLengths.end());
 	}
 
-	const VectorLayout element = elementLayout(type);
+	const VectorLayout element = elementLayout(type, unit);
 	uint64_t stride = alignTo(element.size, element.alignment);
 	std::vector<uint32_t> strides(lengths.size());
 	for (size_t dimension = lengths.size(); dimension-- > 0;) {
@@ -77,10 +81,10 @@ std::vector<uint32_t> arrayStrides(const Type& type) {
 
 // A member's size and alignment in a laid-out struct: its element's alignment,
 // and the element's step times every dimension for an array.
-VectorLayout memberLayout(const Type& type) {
-	VectorLayout layout = elementLayout(type);
+VectorLayout memberLayout(const Type& type, const TranslationUnit* unit) {
+	VectorLayout layout = elementLayout(type, unit);
 	if (type.arrayLength) {
-		const std::vector<uint32_t> strides = arrayStrides(type);
+		const std::vector<uint32_t> strides = arrayStrides(type, unit);
 		const uint64_t size = uint64_t(strides.front()) * *type.arrayLength;
 		if (size > UINT32_MAX) {
 			throw CompileError("an array member is larger than 4 GiB, which a buffer offset cannot hold");
@@ -155,6 +159,14 @@ TypeLayout layoutOf(const Type& type, const TranslationUnit& unit, unsigned dept
 
 uint64_t sizeofType(const Type& type, const TranslationUnit& unit) {
 	return layoutOf(type, unit, 0).size;
+}
+
+VectorLayout structElementLayout(const std::string& name, const TranslationUnit& unit) {
+	const TypeLayout layout = structLayoutOf(name, unit, 0);
+	if (layout.size > UINT32_MAX) {
+		throw CompileError("struct \"" + name + "\" is larger than 4 GiB, which a buffer offset cannot hold");
+	}
+	return { static_cast<uint32_t>(layout.size), layout.alignment };
 }
 
 }
