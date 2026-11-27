@@ -5139,11 +5139,19 @@ bool Parser::atAsType(size_t& nameTokens) const {
 	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
 		return false;
 	}
+	// metal::as_type through a namespace alias of metal, "namespace m = metal; m::as_type<T>(x)".
+	if (const size_t prefix = libraryPrefixTokens(); prefix && lookahead(prefix).kind == TokenKind::Identifier
+		&& lookahead(prefix).text == "as_type" && lookahead(prefix + 1).kind == TokenKind::Less) {
+		nameTokens = prefix + 1;
+		return true;
+	}
 	const Token& first = at(TokenKind::ColonColon) ? lookahead() : current();
 	if (first.kind != TokenKind::Identifier || (first.text != "as_type" && first.text != "metal")) {
 		return false;
 	}
-	if (kind() == TokenKind::Identifier && current().text == "as_type" && isLocal("as_type")) {
+	// A local or a member of the enclosing struct named as_type hides the library's, unless qualified.
+	if (kind() == TokenKind::Identifier && current().text == "as_type" && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal("as_type") || memberHidesName("as_type"))) {
 		return false;
 	}
 	const std::string name = peekResolved(nameTokens);
@@ -5153,7 +5161,7 @@ bool Parser::atAsType(size_t& nameTokens) const {
 	return lookahead(nameTokens).kind == TokenKind::Less;
 }
 
-// as_type<T>(x) gives x's bits as a T. It is read as a call of the builtin __metal_as_type with T as
+// as_type<T>(x) gives x's bits as a T. It is read as a call of the builtin kAsTypeCallee with T as
 // the template argument, so that it is lowered as a reinterpretation, never as the conversion a
 // constructor or a cast makes.
 ExpressionPtr Parser::parseAsType(size_t nameTokens) {
@@ -5169,7 +5177,7 @@ ExpressionPtr Parser::parseAsType(size_t nameTokens) {
 	auto call = std::make_unique<Expression>();
 	call->kind = ExpressionKind::Call;
 	call->line = atLine;
-	call->left = makeIdentifier("__metal_as_type", atLine);
+	call->left = makeIdentifier(kAsTypeCallee, atLine);
 	call->left->hasTemplateArguments = true;
 	call->left->templateArguments.push_back(std::move(target));
 	call->arguments = parseArgumentList("to close the operand of as_type");

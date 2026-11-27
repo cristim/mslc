@@ -5986,9 +5986,9 @@ namespace {
 			constantU32(semantics) });
 	}
 
-	// as_type<T>(x), which the parser reads as a call of __metal_as_type; no declared function has that name.
+	// as_type<T>(x), which the parser reads as a call of kAsTypeCallee.
 	static bool isAsTypeCall(const Expression& call) {
-		return call.left && call.left->kind == ExpressionKind::Identifier && call.left->name == "__metal_as_type";
+		return call.left && call.left->kind == ExpressionKind::Identifier && call.left->name == kAsTypeCallee;
 	}
 
 	Id Emitter::emitCall(const Expression& expression) {

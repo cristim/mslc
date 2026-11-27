@@ -426,7 +426,7 @@ private:
 	// Whether the cursor is at metal::as_type<, spelled with or without the namespace unless the file
 	// declares its own as_type or a local hides it; nameTokens is how many tokens the name takes.
 	bool atAsType(size_t& nameTokens) const;
-	// as_type<T>(x), read as a call of the builtin __metal_as_type with T as its template argument.
+	// as_type<T>(x), read as a call of the builtin kAsTypeCallee with T as its template argument.
 	ExpressionPtr parseAsType(size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
