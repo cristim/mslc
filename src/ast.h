@@ -233,6 +233,8 @@ struct ParameterAttributes {
 		ThreadsPerThreadgroup,
 		VertexID,
 		InstanceID,
+		BaseVertex,
+		BaseInstance,
 		Position,
 		FragCoord,
 		FrontFacing,
