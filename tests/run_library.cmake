@@ -477,6 +477,12 @@ expect_library_refused(fwidth_export "float edge(float v) { return fwidth(v); }\
 expect_library_refused(implicit_lod_export
 	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv); }\n" "cannot be exported")
 expect_contains("${output}" "explicit level" "implicit_lod_export")
+expect_library_refused(bias_export
+	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv, bias(1.0)); }\n" "cannot be exported")
+expect_contains("${output}" "stage of the entry point" "bias_export")
+expect_library_refused(min_lod_clamp_export
+	"float4 look(texture2d<float> t, sampler s, float2 uv) { return t.sample(s, uv, min_lod_clamp(1.0)); }\n" "cannot be exported")
+expect_contains("${output}" "stage of the entry point" "min_lod_clamp_export")
 expect_library_refused(barrier_export "void sync() { threadgroup_barrier(mem_flags::mem_none); }\n" "cannot be exported")
 expect_library_refused(discard_export "void kill() { discard_fragment(); }\n" "cannot be exported")
 expect_contains("${output}" "discard_fragment() drops a fragment, which only a fragment function has" "discard_export")

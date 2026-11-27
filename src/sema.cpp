@@ -11721,8 +11721,9 @@ namespace {
 	// from the derivatives, which is OpImageSampleImplicitLod; a vertex or kernel
 	// function has none, so it samples level 0 with an explicit lod, and so does a
 	// sampler with pixel coordinates, which Vulkan does not allow an implicit lod on.
-	// bias and min_lod_clamp need those derivatives and so a fragment function, and an
-	// offset has to be a vector of integer literals (ConstOffset).
+	// In a vertex or kernel function bias(b) lowers to explicit Lod b and min_lod_clamp
+	// without gradients is dropped, matching Apple GPU; an offset has to be a vector of
+	// integer literals (ConstOffset).
 	// The comparison value of sample_compare and gather_compare, a float.
 	Id Emitter::compareValue(const Expression& argument, const std::string& callName) {
 		const Id value = emitExpression(argument);
@@ -11755,7 +11756,6 @@ namespace {
 		}
 
 		const Id floatType = _types.scalar(ScalarKind::Float);
-		bool minLodLiteral = false;
 		const auto scalarArgument = [&](const Expression& option, const std::string& what) {
 			if (option.arguments.size() != 1) {
 				throw CompileError(what + " takes one argument");
@@ -11809,8 +11809,6 @@ namespace {
 				}
 				stage = 2;
 				minLod = scalarArgument(option, "min_lod_clamp");
-				minLodLiteral = option.arguments[0]->kind == ExpressionKind::FloatLiteral
-					&& !option.arguments[0]->floatIsHalf && option.arguments[0]->floatValue == 1.0;
 			} else {
 				if (stage > 2 || offset != InvalidId || isCubeKind(kind)) {
 					throw CompileError(isCubeKind(kind) ? "a cube sample takes no offset"
@@ -11839,34 +11837,23 @@ namespace {
 				"implicit lod or gradients only");
 		}
 		const bool library = _entryPoint == &_libraryScope;
-		// Measured on Apple GPU only for a texture2d sample in a kernel function with a constant
-		// min_lod_clamp(1.0) alone (RGBA32F 4x4, nearest mips, no offset): it reads level 0, as if ignored
-		// (the AIR carries it, the hardware does not clamp), so exactly that shape drops it. Any other
-		// value, an integer literal, an offset, a half or int texture, a depth or compare sample, a
-		// non-constant argument, gradients and a helper function were not measured.
-		if (!library && _helper == nullptr && minLodLiteral && offset == InvalidId && texture.pointeeMsl.scalar == ScalarKind::Float && !compare && !texture.pointeeMsl.isDepth
-			&& kind == ResourceKind::Texture2D && bias == InvalidId && gradientX == InvalidId && lod == InvalidId
-			&& _entryPoint->stage == Stage::Kernel) {
-			minLod = InvalidId;
-		}
-		if (!library && minLod != InvalidId && gradientX != InvalidId && _entryPoint->stage == Stage::Kernel) {
-			throw CompileError("min_lod_clamp with gradients in a kernel is not lowered: Apple's result there is not measured");
-		}
 		if (derivatives && !sampler.unnormalizedSampler && (bias != InvalidId || minLod != InvalidId)) {
 			if (library) {
-				throw StageError("bias or min_lod_clamp in a library helper: they need derivatives, which exist only in a "
-					"fragment function, and a library does not know its caller's stage");
+				throw StageError("bias or min_lod_clamp without gradients in a library helper: their lowering depends on "
+					"the stage of the entry point that calls it, which a library does not know");
 			}
-			// Measured on Apple GPU: in a kernel, bias(b) samples level b (clamped at 0), the level
-			// a plain sample takes there being 0.
-			const bool kernelBias = bias != InvalidId && minLod == InvalidId && _entryPoint->stage == Stage::Kernel;
-			if (kernelBias) {
-				lod = bias;
-				bias = InvalidId;
+			// Measured on Apple M1 Pro GPU (multi-mip textures, nearest and linear mip filters):
+			// in vertex and kernel functions (and helpers called from them) there are no derivatives,
+			// plain sample takes level 0, bias(b) samples level b (clamped at 0 and sampler lod bounds),
+			// and min_lod_clamp without gradients is ignored (alone or with bias).
+			if (_entryPoint->stage == Stage::Kernel || _entryPoint->stage == Stage::Vertex) {
+				minLod = InvalidId;
+				if (bias != InvalidId) {
+					lod = bias;
+					bias = InvalidId;
+				}
 			} else if (_entryPoint->stage != Stage::Fragment) {
-				throw CompileError("min_lod_clamp, and bias outside a kernel, are lowered in a fragment function only: "
-					"they act on the level the derivatives give, which a vertex function does not have, and "
-					"Apple's min_lod_clamp result in a kernel is not lowered");
+				throw CompileError("min_lod_clamp and bias are lowered in a fragment, vertex or kernel function only");
 			}
 		}
 

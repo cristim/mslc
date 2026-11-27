@@ -918,3 +918,19 @@ Apple's value is undefined.
   which lavapipe evaluates to NaN and Apple apparently skips. Both probes therefore declare `cases=1` (the moderate,
   finite profile) with a per-buffer `DIFFCHECK-ULP`. Whether real shaders can see it is open: it needs a texture
   holding inf or NaN.
+
+## Sample `bias` and `min_lod_clamp` in vertex and kernel functions (#360)
+
+- Measured on Apple M1 Pro GPU across multi-mip textures (4-level 8x8 RGBA32F, RGBA16F, RGBA32S/Uint,
+  RGBA16S/Uint, 2D array, 3D, cube, cube array, depth2d/array/cube/cube_array `sample` and `sample_compare`,
+  nearest and linear mip filters, anisotropy, runtime `lodMinClamp`/`lodMaxClamp`, `int2` offsets, and helpers):
+  in both vertex and kernel functions, plain `sample` reads level 0, `bias(b)` reads level `b` (clamped to `[0, max]`
+  and the sampler's `[lodMinClamp, lodMaxClamp]`), `gradient*` with `min_lod_clamp(m)` clamps the gradient LOD to `m`,
+  and `min_lod_clamp(m)` without gradients is ignored (both alone and alongside `bias(b)`).
+- mslc matches that hardware behaviour (`Lod = b` for `bias(b)`, `Grad | MinLod` with gradients, and dropping
+  non-gradient `min_lod_clamp` in vertex and kernel). Two assumptions remain: negative `bias(b)` clamps to 0 only
+  when the host sampler's `minLod >= 0`, and dropping non-gradient `min_lod_clamp` assumes other Metal GPUs ignore it
+  in vertex and kernel stages the same way Apple M1 Pro does.
+- A library helper (`--compile-library`) naming `bias` or non-gradient `min_lod_clamp` still fails with `StageError`
+  because fragment callers emit `Bias`/`MinLod` on `OpImageSampleImplicitLod` while vertex/kernel callers lower them
+  to explicit `Lod`.

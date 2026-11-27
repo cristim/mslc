@@ -1,5 +1,8 @@
-// EXPECT: error min_lod_clamp, and bias outside a kernel
-// Apple was measured only for a texture2d sample with a constant argument; a depth compare is not.
+// EXPECT: valid
+// DISASM: OpImageSampleDrefExplicitLod
+// DISASM-NOT: OpImageSampleDrefImplicitLod
+// DISASM-NOT: MinLod
+// Measured on Apple M1 Pro GPU (4-level 8x8 Depth32Float): depth sample_compare with min_lod_clamp in a kernel reads level 0.
 #include <metal_stdlib>
 using namespace metal;
 kernel void k(depth2d<float> a [[texture(0)]], sampler s [[sampler(0)]], device float* o [[buffer(0)]]) {
