@@ -102,13 +102,13 @@ typedef float4x4 simd_float4x4;
 	constexpr char kBuiltinHeaderList[] = "<metal_stdlib>, <metal_matrix>, <simd/simd.h>, <simd/matrix_types.h>, "
 		"<simd/packed.h>, <simd/vector_types.h> and the <metal_stdlib> sub-headers <metal_texture>, "
 		"<metal_math>, <metal_common>, <metal_geometric>, <metal_integer>, <metal_relational>, "
-		"<metal_graphics>, <metal_types> and <metal_atomic>";
+		"<metal_graphics>, <metal_types>, <metal_atomic> and <metal_pack>";
 
 	// The <metal_stdlib> sub-headers whose declarations <metal_stdlib> already has built in.
 	// Each reads as <metal_stdlib> itself, so the two share one include-once state.
 	// Apple has the rest of the metal_* family; mslc does not declare what they hold.
 	constexpr const char* kStdlibSubHeaders[] = {"<metal_texture>", "<metal_math>", "<metal_common>",
-		"<metal_geometric>", "<metal_integer>", "<metal_relational>", "<metal_graphics>", "<metal_types>", "<metal_atomic>"};
+		"<metal_geometric>", "<metal_integer>", "<metal_relational>", "<metal_graphics>", "<metal_types>", "<metal_atomic>", "<metal_pack>"};
 
 	// The built-in header a name stands for: a stdlib sub-header is <metal_stdlib>.
 	const std::string& builtinHeaderKey(const std::string& name) {
