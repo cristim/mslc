@@ -2806,6 +2806,7 @@ namespace {
 		void commitInstance(TemplateInstance& instance);
 		bool isInstance(const FunctionDecl* function) const { return function && _instanceOf.count(function) != 0; }
 		bool callsDependentTemplate(const Expression& call);
+		bool deducedResultIsFundamental(const Expression& call);
 		bool dependsOnTemplate(const Expression& call);
 		std::string describeTemplate(const FunctionTemplate& declaration, const FunctionDecl& pattern) const;
 		HelperFunction* definedHelper(HelperFunction* entry);
@@ -6265,7 +6266,8 @@ namespace {
 		for (const ExpressionPtr& argument: call.arguments) {
 			const StructDecl* decl = adlStructOf(*argument);
 			std::string type = decl ? decl->name : std::string();
-			if (!decl && argument->kind == ExpressionKind::Call && callsDependentTemplate(*argument)) {
+			if (!decl && argument->kind == ExpressionKind::Call && callsDependentTemplate(*argument)
+				&& !deducedResultIsFundamental(*argument)) {
 				// Its type is known only once deduced: that matters only if a function of this name is in a namespace.
 				const bool elsewhere = std::any_of(_unit.helpers.begin(), _unit.helpers.end(), [&](const FunctionDecl& helper) {
 						return helper.name.size() > last.size() + 2
@@ -6960,6 +6962,41 @@ namespace {
 			}
 		}
 		return false;
+	}
+
+	// Whether every template a call may be to returns a type parameter deduced, from a parameter of exactly that
+	// type, a reference to it included, from an argument of no struct or enum type: the result is then a scalar or
+	// vector, which brings no namespace to argument-dependent lookup ([basic.lookup.argdep]), whatever is deduced.
+	// Deduction allows no conversion there ([temp.deduct.call]), so the argument's type is the parameter's.
+	bool Emitter::deducedResultIsFundamental(const Expression& call) {
+		if (call.left->kind != ExpressionKind::Identifier) {
+			return false;
+		}
+		for (const FunctionTemplate* declaration: templatesCalled(call)) {
+			std::vector<TemplateArgument> arguments;
+			const FunctionDecl* pattern = declaration->order > callerOrder() ? nullptr
+				: templatePattern(*declaration, call.left->templateArguments, arguments);
+			if (!pattern || !isTemplateMarker(pattern->returnType)) {
+				continue;
+			}
+			const std::string& marker = pattern->returnType.namedType;
+			bool fundamental = false;
+			for (size_t i = 0; i < pattern->parameters.size() && i < call.arguments.size() && !fundamental; ++i) {
+				const Type& type = pattern->parameters[i].type;
+				if (type.namedType != marker || type.isPointer || type.arrayLength) {
+					continue;
+				}
+				const Expression& argument = *call.arguments[i];
+				const bool nested = argument.kind == ExpressionKind::Call && callsDependentTemplate(argument);
+				const std::optional<std::string> tag = nested ? std::optional<std::string>(std::string()) : enumOf(argument);
+				fundamental = argument.kind != ExpressionKind::Conditional && !adlStructOf(argument)
+					&& tag && tag->empty() && (!nested || deducedResultIsFundamental(argument));
+			}
+			if (!fundamental) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	std::string Emitter::describeTemplate(const FunctionTemplate& declaration, const FunctionDecl& pattern) const {
