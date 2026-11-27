@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -36,8 +37,9 @@ OK, MISMATCH, ERROR, SKIPPED = 0, 1, 2, 3
 
 def run_backend(backend, run, case, textures, tag="", texels=()):
     """{key: output bytes} of one backend for one case: a device buffer under its Metal index, a texel
-    buffer under resources.texel_key. The inputs are the files in-<case>-<index>.bin; `textures` is
-    resources.seed's list and `texels` resources.seed_texels'; `tag` keeps repeat runs' files apart."""
+    buffer under resources.texel_key, a writable texture under resources.texture_key. The inputs are
+    the files in-<case>-<index>.bin; `textures` is resources.seed's list and `texels` resources.seed_texels';
+    `tag` keeps repeat runs' files apart."""
     work, mbuf = run["work"], run["mbuf"]
     rows, outs = [], {}
     for b in mbuf:
@@ -46,8 +48,10 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
         rows.append("buffer %d %d %s %s" % (idx if backend == "apple" else b["member"], run["sizes"][idx],
                                             os.path.join(work, "in-%d-%d.bin" % (case, idx)), out))
         outs[idx] = out
+    wouts = {i: os.path.join(work, "%s%s-out-tex%d-%d.bin" % (backend, tag, case, i))
+             for i, _, _, _, a, *_ in textures if a in ("Write", "ReadWrite")}
     touts = {tb.index: os.path.join(work, "%s%s-out-t%d-%d.bin" % (backend, tag, case, tb.index)) for tb, _, _ in texels}
-    extra = (resources.lines(textures, run["samplers"]) + resources.texel_lines(texels, touts)
+    extra = (resources.lines(textures, run["samplers"], backend, wouts) + resources.texel_lines(texels, touts)
              + resources.threadgroup_lines(run["threadgroups"], run["local"], backend))
     if backend == "apple":
         text = ["mode run"] + run["lines"] + ["entry " + run["entry"], "local %d 1 1" % run["local"],
@@ -61,6 +65,7 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
     hostenv.write_text(manifest, "\n".join(text) + "\n")
     runner(binary, manifest)
     outs = {idx: bytearray(hostenv.read_bytes(path)) for idx, path in outs.items()}
+    outs.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p)) for i, p in wouts.items()})
     outs.update({resources.texel_key(tb): bytearray(hostenv.read_bytes(touts[tb.index])) for tb, _, _ in texels})
     return outs
 
@@ -68,16 +73,26 @@ def run_backend(backend, run, case, textures, tag="", texels=()):
 def unused_textures(run, params, textures, texels, bindings, compared, apple_outs, profile):
     """Names of the textures and texel buffers Apple's output does not depend on: with that one
     resource's contents replaced by others, every compared leaf is unchanged. One the kernel never reads
-    would make the whole binding path untested while the outputs match. A write-only texel buffer is an
-    output, not an input, and is not a candidate."""
+    would make the whole binding path untested while the outputs match. A write-only texture or texel
+    buffer is an output, not an input, and is not a candidate."""
     names = {b["metal_index"]: b["name"] for b in bindings if b["kind"] == "Texture"}
     unused = []
-    for n, (index, set_, binding, path, access) in enumerate(textures):
+    for n, (index, set_, binding, path, access, *rest) in enumerate(textures):
+        if access == "Write":
+            continue
+        scalar = rest[0] if rest else "float"
+        kind = rest[1] if len(rest) > 1 else "2d"
+        nmips = rest[2] if len(rest) > 2 else 1
+        key, data = resources.texture_key(index), hostenv.read_bytes(path)
         alt = os.path.join(run["work"], "alt-tex%d.bin" % index)
-        hostenv.write_bytes(alt, resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile))
-        swapped = [(i, s, b, alt if i == index else f, a) for i, s, b, f, a in textures]
+        alt_data = resources.texture_data(random.Random(params["seed"] * 1000 + 7919 + n), profile, scalar, kind, nmips)
+        hostenv.write_bytes(alt, alt_data)
+        swapped = [(i, s, b, alt if i == index else f, a, *r) for i, s, b, f, a, *r in textures]
         again = run_backend("apple", run, 0, swapped, "-alt%d" % index, texels)
-        if not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items()):
+        stride = 4 * compare.SCALARS[scalar][0]
+        own = key in compared and any((apple_outs[key][o:o + stride] != data[o:o + stride] or again[key][o:o + stride] != alt_data[o:o + stride])
+                                      and apple_outs[key][o:o + stride] != again[key][o:o + stride] for o in range(0, len(data), stride))
+        if not own and not any(compare.compare(l, apple_outs[i], again[i], 0) for i, l in compared.items() if i != key):
             unused.append(names[index])
     for n, (tb, path, data) in enumerate(texels):
         if tb.layout["access"] == "write":
@@ -99,18 +114,7 @@ def unused_textures(run, params, textures, texels, bindings, compared, apple_out
     return unused
 
 
-def control_holds(groups, mine, apple):
-    """The negative control: in each group of layouts (device buffers, texel buffers) that has a writable
-    one, a copy of mslc's result with one leaf changed must compare unequal to Apple's, or the comparison
-    could not have told a miscompile from a match. False when nothing could be perturbed at all."""
-    held = []
-    for g in groups:
-        fired = checks.perturb(g, mine, apple)
-        if fired:
-            copy, name, _ = fired
-            index = next(i for i, l in g.items() if l["name"] == name)
-            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
-    return bool(held) and all(held)
+control_holds = checks.control_holds
 
 
 def check_entry(opts, source, spv, reflection, entry, params, work, includes):
@@ -139,7 +143,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     if apple["unsupported"]:
         result.update(status="skipped", reason="unsupported argument: " + "; ".join(apple["unsupported"]))
         return result
-    reasons = resources.unsupported(reflection, apple)
+    reasons = resources.unsupported(reflection, apple, params.get("mips"))
     if reasons:
         result.update(status="skipped", reason="unsupported argument: " + "; ".join(reasons))
         return result
@@ -161,7 +165,8 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         result.update(status="reflection-mismatch", reason="; ".join(findings))
         return result
     tplan = resources.texel_plan(bindings, apple, params["texel"])
-    if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan):
+    wlayouts = resources.texture_layouts(apple)
+    if not any(l["access"] != "read" for l in layouts.values()) and not any(tb.layout["access"] != "read" for tb in tplan) and not wlayouts:
         result.update(status="skipped", reason="no writable buffer to compare")
         return result
     if local > apple["max_threads"]:
@@ -170,13 +175,17 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     set_index = mbuf[0]["descriptor"]["set"] if mbuf else 0
     elements = params.get("elems") or max(64, 4 * params["grid"])
     ulp = compare.ulp_bound_for_source(text)
+    ulp_by_buffer = compare.ulp_bounds_by_root(text)
     excluded = dict(params["exclude"])
     tlayouts = {resources.texel_key(tb): tb.layout for tb in tplan}
-    result["buffers"] = sorted([l["name"] for l in layouts.values()] + [l["name"] for l in tlayouts.values()])
+    all_layouts = {**layouts, **tlayouts, **wlayouts}
+    result["buffers"] = sorted(l["name"] for l in all_layouts.values())
+    result["range_buffers"] = sorted(l["name"] for l in {**layouts, **tlayouts}.values())
     result["textures"] = sorted(t["name"] for t in apple["textures"])
     result["texel_buffers"] = sorted(tb.layout["name"] for tb in tplan)
     compared = {i: l for i, l in layouts.items() if l["name"] not in excluded}
     tcompared = {i: l for i, l in tlayouts.items() if l["name"] not in excluded}
+    wcompared = {i: l for i, l in wlayouts.items() if l["name"] not in excluded}
 
     profiles = [(opts.profiles[c % len(opts.profiles)], False) for c in range(params["cases"])]
     if opts.sentinel:
@@ -188,7 +197,9 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         data = {i: inputs.fill_buffer(l, elements, rng, profile, sentinel, opts.poison_padding,
                                   params["range"].get(l["name"]), case, params["float_range"].get(l["name"]))
                 for i, l in sorted(layouts.items())}
-        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case))
+        textures, samplers = resources.seed(bindings, rng, profile, os.path.join(work, "case%d-" % case), reflection["embedded_samplers"], apple, params.get("mips"))
+        data.update({resources.texture_key(i): bytearray(hostenv.read_bytes(p))
+                     for i, _, _, p, *_ in textures if resources.texture_key(i) in wlayouts})
         for i, l in sorted(layouts.items()):
             hostenv.write_bytes(os.path.join(work, "in-%d-%d.bin" % (case, i)), data[i])
         run = dict(opts=opts, work=work, lines=lines, spv=spv, entry=entry, local=local, groups=groups, mbuf=mbuf,
@@ -199,23 +210,23 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         outs = {backend: run_backend(backend, run, case, textures, texels=texels) for backend in ("apple", "mslc")}
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")
-            for i, l in {**layouts, **tlayouts}.items():
+            for i, l in all_layouts.items():
                 if l["name"] == name:
                     outs["mslc"][i][int(at)] ^= 0xff
         case_diffs = []
-        for i, lay in sorted({**layouts, **tlayouts}.items()):
+        for i, lay in sorted(all_layouts.items()):
             if lay["name"] in excluded:
                 continue
-            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], params["ulp"].get(lay["name"], ulp)):
+            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], ulp, ulp_by_root=ulp_by_buffer, explicit_ulp=params["ulp"]):
                 case_diffs.append(d.to_json())
-        both = {**compared, **tcompared}
+        both = {**compared, **tcompared, **wcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])
-        # Negative control (control_holds): excluded buffers are not candidates, perturbing one would test nothing.
-        control_ok = control_holds([compared, tcompared], outs["mslc"], outs["apple"])
+        # Negative control (checks.control_holds): excluded buffers are not candidates, perturbing one would test nothing.
+        control_ok = checks.control_holds([compared, tcompared, wcompared], outs["mslc"], outs["apple"])
         result["cases"].append({"case": case, "profile": profile, "diffs": case_diffs[:16],
                                 "diff_count": len(case_diffs), "negative_control": control_ok})
         if case == 0:
-            unused = unused_textures(run, params, textures, texels, bindings, {**compared, **tcompared}, outs["apple"], profile)
+            unused = unused_textures(run, params, textures, texels, bindings, both, outs["apple"], profile)
     declared = dict(params["unused"])
     undeclared = sorted(set(unused) - set(declared))
     result["status"], result["reason"] = checks.verdict(result["cases"], nonzero, params["writes_zero"], undeclared)
@@ -234,61 +245,91 @@ def unknown_directives(opts, d, results):
     """A directive naming no buffer (or, for UNUSED, texture) of any compared kernel is a typo that
     would silently do nothing."""
     known = set().union(*(r.get("buffers", []) for r in results))
+    ranged = set().union(*(r.get("range_buffers", r.get("buffers", [])) for r in results))
     textures = set().union(*(r.get("textures", []) for r in results))
+    unused_tex = set().union(*(r.get("unused_textures", r.get("textures", [])) for r in results))
     texel_buffers = set().union(*(r.get("texel_buffers", []) for r in results))
     errors = []
     if known:
-        named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], known),
-                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], known), "DIFFCHECK-UNUSED": (d["unused"], textures),
-                 "DIFFCHECK-ULP": (d["ulp"], known), "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
+        named = {"DIFFCHECK-EXCLUDE": (d["exclude"], known), "DIFFCHECK-RANGE": (d["range"], ranged),
+                 "DIFFCHECK-FLOAT-RANGE": (d["float_range"], ranged), "DIFFCHECK-UNUSED": (d["unused"], unused_tex),
+                 "DIFFCHECK-MIPS": (d["mips"], textures), "DIFFCHECK-ULP": (d["ulp"], known),
+                 "DIFFCHECK-TEXEL": (d["texel"], texel_buffers)}
         if not opts.corpus:
-            named["--range"] = (opts.ranges, known)
+            named["--range"] = (opts.ranges, ranged)
         for directive, (table, names) in named.items():
             unknown = sorted(set(table) - names)
             if unknown:
+                kind = "texture" if (names is textures or names is unused_tex) else "texture_buffer" if names is texel_buffers else "buffer"
                 errors.append({"entry": "*", "status": "error", "cases": [], "reason": "%s names %s, which is not "
-                               "a %s (%s: %s)" % (directive, ", ".join(unknown), "texture" if names is textures else "texture_buffer" if names is texel_buffers else "buffer",
-                                                  "textures" if names is textures else "texture_buffers" if names is texel_buffers else "buffers", ", ".join(sorted(names)) or "none")})
+                               "a %s (%ss: %s)" % (directive, ", ".join(unknown), kind, kind, ", ".join(sorted(names)) or "none")})
     return errors
 
 
-def check_graphics_file(opts, path, d, vs, fs, work, includes, std):
+def check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_position=False):
     run = d["run"]
     params = {"width": opts.width or run.get("width", graphics.DEFAULT_SIZE), "height": opts.height or run.get("height", graphics.DEFAULT_SIZE),
-              "instances": opts.instances or run.get("instances", 1), "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
+              "instances": opts.instances or run.get("instances", 1),
+              "base_vertex": run.get("base_vertex", 0), "base_instance": run.get("base_instance", 0),
+              "seed": opts.seed if opts.seed is not None else run.get("seed", 1),
               "cases": opts.cases or run.get("cases", 2), "elems": opts.elems or run.get("elems"), "std": std or opts.std,
               "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
-              "geometry": d["geometry"], "position": d["position"], "depth": d["depth"], "float_range": d["float_range"], "ulp": d["ulp"]}
+              "geometry": d["geometry"], "indexes": d["indexes"], "position": d["position"], "depth": d["depth"],
+              "float_range": d["float_range"], "ulp": d["ulp"], "mips": d["mips"], "infer_position": infer_position}
     sub = os.path.join(work, "graphics")
     os.makedirs(sub)
-    results = [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
-    return results + unknown_directives(opts, d, results)
+    return [graphics.check_pair(opts, path, vs, fs, params, sub, includes)]
 
 
-def check_file(opts, path, std=None):
+def _graphics_skip_reason(verts, frags):
+    if len(verts) > 1 or len(frags) > 1:
+        return "multiple vertex or fragment entry points (%d vertex, %d fragment): specify // RUN: vertex=<vs> fragment=<fs>" % (len(verts), len(frags))
+    return "no matching %s entry point" % ("fragment" if verts else "vertex")
+
+
+def check_file(opts, path, std=None, run=None):
     """Results for every kernel in `path` (or the one named by --entry)."""
     here = os.path.dirname(os.path.abspath(path))
     includes = opts.includes + [here, os.path.dirname(here)]
     text = hostenv.read_text(path)
     d = directives.parse(text)
+    d["run"].update(run or {})
     work = tempfile.mkdtemp(prefix="diffcheck-", dir=os.environ.get("TMPDIR"))
     try:
         vs, fs = opts.vertex or d["run"].get("vertex"), opts.fragment or d["run"].get("fragment")
         if bool(vs) != bool(fs):
             return [{"entry": "*", "status": "error", "cases": [], "reason": "graphics needs both a vertex and a fragment name"}]
         if vs:
-            return check_graphics_file(opts, path, d, vs, fs, work, includes, std)
-        spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes)
+            results = check_graphics_file(opts, path, d, vs, fs, work, includes, std, infer_position=bool(opts.corpus))
+            return results + unknown_directives(opts, d, results)
+        stage = None if opts.corpus and not opts.entry else "kernel"
+        spv, refl, error = hosts.run_mslc(opts.mslc, path, work, includes, stage)
+        if error and stage is None and not error.startswith(("CRASH ", "INVALID ")) and re.search(r"\b(vertex|fragment)\b", text):
+            # Keep compute coverage if a graphics function in the same source stops combined compilation.
+            kspv, krefl, kerror = hosts.run_mslc(opts.mslc, path, work, includes, "kernel")
+            if not kerror or kerror.startswith(("CRASH ", "INVALID ")):
+                spv, refl, error = kspv, krefl, kerror
         if error:
             status, reason = hosts.mslc_failure(error)
             return [{"entry": opts.entry or "*", "status": status, "reason": reason, "cases": []}]
         entries = [e for e in refl["entry_points"] if e["stage"] == "compute"]
+        verts = [e["name"] for e in refl["entry_points"] if e["stage"] == "vertex"]
+        frags = [e["name"] for e in refl["entry_points"] if e["stage"] == "fragment"]
         if opts.entry:
             entries = [e for e in entries if e["name"] == opts.entry]
             if not entries:
                 return [{"entry": opts.entry, "status": "skipped", "reason": "no such kernel", "cases": []}]
         results = []
-        for e in entries:
+        if entries and (verts or frags):
+            # Re-compile pure kernel SPIR-V so compute runs do not carry graphics entry points or capabilities.
+            kspv, krefl, kerror = hosts.run_mslc(opts.mslc, path, work, includes, "kernel")
+            if kerror:
+                status, reason = hosts.mslc_failure(kerror)
+                results.append({"entry": "*", "status": status, "reason": reason, "cases": []})
+                entries = []
+            else:
+                spv, entries = kspv, [e for e in krefl["entry_points"] if e["stage"] == "compute"]
+        for i, e in enumerate(entries):
             run = d["run"]
             params = {
                 "grid": opts.grid or run.get("grid", 64), "local": opts.local or run.get("local", 8),
@@ -296,14 +337,19 @@ def check_file(opts, path, std=None):
                 "cases": opts.cases or run.get("cases", 3), "elems": opts.elems or run.get("elems"),
                 "std": std or opts.std, "exclude": d["exclude"], "range": dict(d["range"], **opts.ranges), "writes_zero": d["writes_zero"],
                 "float_range": d["float_range"],
-                "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"],
+                "unused": d["unused"], "ulp": d["ulp"], "texel": d["texel"], "mips": d["mips"],
             }
-            sub = os.path.join(work, e["name"])
+            sub = os.path.join(work, "compute-%d" % i)
             os.makedirs(sub)
             try:
                 results.append(check_entry(opts, path, spv, e, e["name"], params, sub, includes))
             except hosts.Refused as refused:
                 results.append({"entry": e["name"], "status": "skipped", "reason": str(refused), "cases": []})
+        if opts.corpus and not opts.entry:
+            if len(verts) == 1 and len(frags) == 1:
+                results += check_graphics_file(opts, path, d, verts[0], frags[0], work, includes, std, infer_position=True)
+            elif (verts or frags) and not results:
+                results.append({"entry": "*", "status": "skipped", "reason": _graphics_skip_reason(verts, frags), "cases": []})
         results += unknown_directives(opts, d, results)
         return results
     finally:
@@ -314,7 +360,9 @@ def check_file(opts, path, std=None):
 
 
 def corpus_files(listing, root):
-    """(path, std) for each line of a corpus list: `path [std=3.1]`, # comments, relative to root."""
+    """(path, std, run) for each line of a corpus list: `path [std=3.1] [vertex=vs fragment=fs width=32 ...]`,
+    # comments, relative to root. The run fields are those of a `// RUN:` line and override it, so a file
+    you do not edit can still be drawn as a graphics pair."""
     files = []
     for line in hostenv.read_text(listing).splitlines():
         line = line.split("#", 1)[0].strip()
@@ -322,13 +370,31 @@ def corpus_files(listing, root):
             continue
         fields = line.split()
         std = next((f[4:] for f in fields[1:] if f.startswith("std=")), None)
-        files.append((os.path.join(root, fields[0]), std))
+        path = os.path.join(root, fields[0])
+        if "=" in fields[0]:
+            files.append((path, std, None, "bad corpus list line %r: %r is a field, the path comes first"
+                          % (line, fields[0])))
+            continue
+        if sum(f.startswith("std=") for f in fields[1:]) > 1:
+            files.append((path, std, None, "bad corpus list line %r: std= given more than once" % line))
+            continue
+        if std == "":
+            files.append((path, std, None, "bad corpus list line %r: std= needs a value" % line))
+            continue
+        try:
+            run = directives.parse_run_pairs([f for f in fields[1:] if not f.startswith("std=")])
+        except ValueError as e:
+            files.append((path, std, None, "bad corpus list line %r: %s" % (line, e)))
+            continue
+        files.append((path, std, run))
     return files
 
 
-def check_one(opts, path, std):
+def check_one(opts, path, std, run=None, bad_line=None):
+    if bad_line:
+        return [{"file": path, "entry": "*", "status": "error", "reason": bad_line, "cases": []}]
     try:
-        return [dict(r, file=path) for r in check_file(opts, path, std)]
+        return [dict(r, file=path) for r in check_file(opts, path, std, run)]
     except (hosts.HostError, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:
         return [{"file": path, "entry": "*", "status": "error", "reason": "%s: %s" % (type(e).__name__, e), "cases": []}]
 
@@ -420,7 +486,7 @@ def main(argv=None):
             root = opts.root or os.path.dirname(os.path.abspath(opts.corpus))
             results = run_files(opts, corpus_files(opts.corpus, root))
         else:
-            results = run_files(opts, [(opts.file, None)])
+            results = run_files(opts, [(opts.file, None, {})])
     except hosts.Unavailable as e:
         print("SKIPPED: %s" % e)
         return hostenv.SKIP
@@ -436,12 +502,12 @@ def main(argv=None):
     if not results:
         print("diffcheck: nothing to check", file=sys.stderr)
         return ERROR
+    if "error" in statuses:
+        return ERROR
     compared = sum(1 for r in results if r["status"] not in ("skipped", "error", "invalid"))
     if compared < opts.min_compared:
         print("diffcheck: %d compared, --min-compared wants %d" % (compared, opts.min_compared), file=sys.stderr)
         return MISMATCH
-    if "error" in statuses:
-        return ERROR
     if statuses <= {"matched"}:
         return OK
     if statuses <= {"skipped"}:

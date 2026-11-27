@@ -20,11 +20,56 @@
 include_guard()
 set(MSLC_LIBRARY_SOURCES
 	${CMAKE_CURRENT_LIST_DIR}/src/lexer.cpp
-	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor/directives.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor/expand.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor/expr.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/preprocessor/files.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/ast.cpp
-	${CMAKE_CURRENT_LIST_DIR}/src/parser.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/core.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/declarations.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/enums_constants.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/expr_ops.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/expr_primary.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/functions.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/lookup.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/names.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/scope.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/stmt_control.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/stmt_decl.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/structs.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/templates_class.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/templates_decl.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/templates_inst.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/parser/types.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/layout.cpp
-	${CMAKE_CURRENT_LIST_DIR}/src/sema.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/atomics_calls.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/common.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/construct_init.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/convert.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/fold_matrix.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/fold_scalar.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/globals_expr.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/helpers_call.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/helpers_emit_math.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/helpers_validate.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/index_element.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/local_decls.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/member_swizzle.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/module.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/operators.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/overloads.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/parameters.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/resources_samplers.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/sizeof_places.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/spec_constants.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/stage_entry.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/stage_in_out.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/statements.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/templates.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/textures_core.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/textures_sample_read.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/types_core.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/sema/types_structs.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/spirv.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/mslc.cpp
 )

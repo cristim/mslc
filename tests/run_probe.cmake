@@ -618,6 +618,8 @@ if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 	endif()
 elseif(expectation MATCHES "^error (.+)$")
 	set(needle "${CMAKE_MATCH_1}")
+	# file(STRINGS) escapes a ";" in the line, which a needle may contain.
+	string(REPLACE "\\;" ";" needle "${needle}")
 	if(status EQUAL 0)
 		message(FATAL_ERROR "${name}: expected a compile error containing \"${needle}\", but it compiled")
 	endif()

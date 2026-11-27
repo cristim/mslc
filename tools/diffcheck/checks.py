@@ -71,6 +71,18 @@ def written_nonzero(layouts, before, after):
     return False
 
 
+def control_holds(groups, mine, apple):
+    """True when every non-empty output group compares unequal after a single-leaf perturbation."""
+    held = []
+    for g in groups:
+        fired = perturb(g, mine, apple)
+        if fired:
+            copy, name, _ = fired
+            index = next(i for i, l in g.items() if l["name"] == name)
+            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
+    return bool(held) and all(held)
+
+
 def verdict(cases, nonzero, writes_zero, unused=()):
     """(status, reason) for the cases of one kernel. A control that did not fire outranks a
     match, because a comparison that cannot fail proves nothing. `unused` names the textures the

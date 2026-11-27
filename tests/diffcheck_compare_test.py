@@ -105,10 +105,168 @@ class UlpBound(unittest.TestCase):
         self.assertEqual(compare.ulp_bound_for_source('// sin( here\nconst char* s = "pow(";\n/* exp( */ x = a + b;'), 0)
 
     def test_exact_only_source_has_no_bound(self):
-        self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + sqrt(c) / d;"), 0)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = a * b + fma(c, d, e) / d;"), 0)
+
+    def test_correctly_rounded_functions_have_no_bound(self):
+        self.assertNotIn("fma", compare.ULP_BOUNDS)
+
+    def test_sqrt_gets_vulkan_inversesqrt_bound(self):
+        self.assertEqual(compare.ULP_BOUNDS["sqrt"], 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = sqrt(v[i]);"), 2)
+
+    def test_rsqrt_gets_vulkan_inversesqrt_bound(self):
+        self.assertEqual(compare.ULP_BOUNDS["rsqrt"], 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = rsqrt(v[i]);"), 2)
+
+    def test_bounds_follow_msl_table_8_1(self):
+        self.assertEqual([compare.ULP_BOUNDS[n] for n in ("tan", "atan", "atan2", "tanh", "log10")], [6, 5, 6, 5, 4])
+
+    def test_bounds_not_pinned_elsewhere_follow_table_8_1(self):
+        names = ("sinpi", "cospi", "tanpi", "sincos", "atanh", "asin", "acos")
+        self.assertEqual([compare.ULP_BOUNDS[n] for n in names], [4, 4, 6, 4, 5, 4, 4])
 
     def test_a_name_that_merely_contains_a_function_does_not_count(self):
         self.assertEqual(compare.ulp_bound_for_source("float mysin(float x); y = mysin(x);"), 0)
+
+    def test_half_divide_gets_the_half_divide_bound(self):
+        self.assertEqual(compare.HALF_DIVIDE_ULP, 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 3.0h;"), 2)
+        self.assertEqual(compare.ulp_bound_for_source("half4 a = x; a /= y;"), 2)
+
+    def test_float_divide_and_half_without_divide_stay_exact(self):
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 3.0f;"), 0)
+        self.assertEqual(compare.ulp_bound_for_source("half x = v[i] * 3.0h; // a / b"), 0)
+
+    def test_half_divide_bound_covers_apple_and_lavapipe_1870_667(self):
+        apple, lvp = struct.pack("<H", 0x334e), struct.pack("<H", 0x3350)
+        self.assertFalse(compare.leaf_equal(apple, lvp, "half", 0))
+        self.assertTrue(compare.leaf_equal(apple, lvp, "half", compare.HALF_DIVIDE_ULP))
+
+    def test_half_divide_bound_rejects_three_ulp_around_the_correct_result(self):
+        good = 0x334f
+        b = lambda v: struct.pack("<H", v)
+        for off in (-3, 3):
+            self.assertFalse(compare.leaf_equal(b(good), b(good + off), "half", compare.HALF_DIVIDE_ULP))
+        for off in (-2, 2):
+            self.assertTrue(compare.leaf_equal(b(good), b(good + off), "half", compare.HALF_DIVIDE_ULP))
+
+    def test_half_literals_without_leading_digit_or_with_exponent(self):
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / .5h;"), 2)
+        self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 1e3h;"), 2)
+
+
+class UlpBoundsByRoot(unittest.TestCase):
+    ENTRY = "kernel void k(device float *a, device float *b, uint i [[thread_position_in_grid]]) { %s }"
+
+    def by(self, body, before=""):
+        return compare.ulp_bounds_by_root(before + self.ENTRY % body)
+
+    def test_sqrt_bound_does_not_leak_onto_an_exactly_rounded_buffer(self):
+        src = self.ENTRY % "a[i] = sqrt(b[i]); b[i] = 1.0f;"
+        self.assertEqual(compare.ulp_bounds_by_root(src), {"a": 2, "b": 0})
+        self.assertEqual(compare.ulp_bound_for_source(src), 2)
+
+    def test_each_buffer_gets_its_own_loosest_bound(self):
+        src = "kernel void k(device float *a, device float *b, device float *c, device float *v) { a[0] = rsqrt(v[0]); b[0] = pow(v[0], v[1]); c[0] = sin(v[0]) + a[0]; }"
+        self.assertEqual(compare.ulp_bounds_by_root(src), {"a": 2, "b": 16, "c": 4})
+
+    def test_a_local_carries_its_bound_to_the_buffer_it_feeds(self):
+        by = self.by("float t = pow(b[0], b[1]); float u = t + 1.0f; a[i] = u;")
+        self.assertEqual(by["a"], 16)
+
+    def test_a_subscripted_read_of_a_written_buffer_carries_its_bound(self):
+        self.assertEqual(self.by("b[0] = sqrt(2.0f); a[0] = b[0] * 2.0f;")["a"], 2)
+
+    def test_compound_assignment_and_vector_locals(self):
+        by = self.by("float2 t = float2(1.0f, 2.0f); t += sqrt(b[i]); a[i] += t[0];")
+        self.assertEqual(by["a"], 2)
+
+    def test_a_comma_in_a_call_still_splits(self):
+        by = self.by("a[0] = sqrt(2.0f); b[0] = max(3.0f, 4.0f);")
+        self.assertEqual((by["a"], by["b"]), (2, 0))
+
+    def test_not_an_entry_point_gives_no_split(self):
+        self.assertEqual(compare.ulp_bounds_by_root("a[i] = sqrt(x);"), {})
+
+    def test_condition_or_loop_gives_no_split(self):
+        self.assertEqual(self.by("if (sqrt(b[0]) > 1.0f) a[0] = 1.0f;"), {})
+        self.assertEqual(self.by("for (int j = 0; j < 4; j++) a[j] = sqrt(b[j]);"), {})
+        self.assertEqual(self.by("if (i < 4) { a[i] = sqrt(b[i]); }"), {})
+
+    def test_helper_function_gives_no_split(self):
+        self.assertEqual(self.by("a[0] = h(1.0f);", "float h(float x) { float r = sqrt(x); return r; }\n"), {})
+        self.assertEqual(self.by("float t; f(1.0f, t); a[0] = t;", "void f(float x, thread float &o) { o = sqrt(x); }\n"), {})
+        self.assertEqual(self.by("float t = sqrt(2.0f); st(a, t);", "void st(device float *p, float v) { p[0] = v; }\n"), {})
+
+    def test_aliases_give_no_split(self):
+        for body in ("device float *p = a; p[1] = sqrt(2.0f);",
+                     "device float &r = a[0]; r = sqrt(2.0f);",
+                     "auto p = a; p[1] = sqrt(2.0f);",
+                     "auto p(a); p[1] = sqrt(2.0f);",
+                     "auto p{a}; p[1] = sqrt(2.0f);",
+                     "auto &p = a[0]; p = sqrt(2.0f);",
+                     "decltype(a) p = a; p[1] = sqrt(2.0f);",
+                     "device float *p[2] = {a, b}; p[0][1] = sqrt(2.0f);",
+                     "float t = *(device float *)a; a[0] = sqrt(t);",
+                     "device float *p = (device float *)a; p[1] = sqrt(2.0f);",
+                     "device float *p = reinterpret_cast<device float *>(a); p[1] = sqrt(2.0f);",
+                     "S s = {a}; s.p[1] = sqrt(2.0f);",
+                     "ref<float> p = a; p[1] = sqrt(2.0f);"):
+            self.assertEqual(self.by(body), {}, body)
+
+    def test_using_and_typedef_give_no_split(self):
+        for decl in ("using P = device float *;", "typedef device float *P;"):
+            self.assertEqual(self.by("P p = a; p[1] = sqrt(2.0f);", decl + "\n"), {}, decl)
+
+    def test_struct_member_and_cast_give_no_split(self):
+        self.assertEqual(self.by("float2 v; v.x = sqrt(b[0]); a[0] = v.x;"), {})
+        self.assertEqual(self.by("a[0] = (float)sqrt(b[0]);"), {})
+        self.assertEqual(self.by("a[0] = static_cast<float>(sqrt(b[0]));"), {})
+
+    def test_comma_declaration_gives_no_split(self):
+        self.assertEqual(self.by("float t = 1.0f, u = sqrt(2.0f); a[0] = u;"), {})
+
+    def test_bare_buffer_name_in_an_expression_gives_no_split(self):
+        self.assertEqual(self.by("float t = sqrt(2.0f); a[0] = t; b[0] = foo(a);"), {})
+
+    def test_per_field_struct_bounds(self):
+        src = ("struct Out { float root; float loose; float exact; };\n"
+               "kernel void k(device const float *in, device Out *out, uint i [[thread_position_in_grid]]) {\n"
+               "  out[i].root = sqrt(in[i]); out[i].loose = exp(in[i]); out[i].exact = in[i] * 3.0f;\n}")
+        by = compare.ulp_bounds_by_root(src)
+        self.assertEqual(by, {"out.root": 2, "out.loose": 4, "out.exact": 0})
+        lay = {"name": "out", "stride": 12,
+               "leaves": [{"off": 0, "scalar": "float", "field": "root"},
+                          {"off": 4, "scalar": "float", "field": "loose"},
+                          {"off": 8, "scalar": "float", "field": "exact"}]}
+        a = bits(0x3f800000) + bits(0x3f800000) + bits(0x3f800000)
+        b = bits(0x3f800002) + bits(0x3f800004) + bits(0x3f800000)
+        self.assertEqual(compare.compare(lay, a, b, 4, ulp_by_root=by), [])
+        bad_exact = bits(0x3f800002) + bits(0x3f800004) + bits(0x3f800001)
+        (diff,) = compare.compare(lay, a, bad_exact, 4, ulp_by_root=by)
+        self.assertEqual(diff.offset, 8)
+        bad_root = bits(0x3f800003) + bits(0x3f800004) + bits(0x3f800000)
+        (diff,) = compare.compare(lay, a, bad_root, 4, ulp_by_root=by)
+        self.assertEqual(diff.offset, 0)
+
+    def test_per_field_read_propagates_and_mixed_whole_struct_store_gives_no_split(self):
+        src = ("struct S { float a; float b; };\n"
+               "kernel void k(device S *s, device float *o, uint i [[thread_position_in_grid]]) {\n"
+               "  s[i].a = sqrt(2.0f); s[i].b = 1.0f; o[i] = s[i].a + 1.0f;\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(src), {"s.a": 2, "s.b": 0, "o": 2})
+        mixed = ("struct S { float a; float b; };\n"
+                 "kernel void k(device S *s, device const S *in, uint i [[thread_position_in_grid]]) {\n"
+                 "  s[i] = in[i]; s[i].a = sqrt(2.0f);\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(mixed), {})
+        unknown_field = ("struct S { float a; };\n"
+                         "kernel void k(device S *s, uint i [[thread_position_in_grid]]) { s[i].b = sqrt(2.0f); }")
+        self.assertEqual(compare.ulp_bounds_by_root(unknown_field), {})
+        multi_sub = ("struct S { float a; };\n"
+                     "kernel void k(device S *s, uint i [[thread_position_in_grid]]) { s[i][0].a = sqrt(2.0f); }")
+        self.assertEqual(compare.ulp_bounds_by_root(multi_sub), {})
+        ref_param = ("struct S { float a; };\n"
+                     "kernel void k(constant S &s, device float *o, uint i [[thread_position_in_grid]]) { o[i] = s[0].a; }")
+        self.assertEqual(compare.ulp_bounds_by_root(ref_param), {})
 
 
 if __name__ == "__main__":

@@ -114,7 +114,7 @@ class Parser {
 		// overload, so a call is resolved (or found ambiguous) where it is made.
 		std::map<std::string, std::set<std::string>> declarations;
 		// Standard library names a using declaration brought in, as "using metal::clamp;".
-		std::set<std::string> stdlibDeclarations;
+		std::map<std::string, std::set<std::string>> stdlibDeclarations;
 	};
 	std::vector<std::string> _namespacePath;
 	std::set<std::string> _namespaces;
@@ -134,9 +134,17 @@ class Parser {
 		// declares without an entry here is one whose type is not known (auto, a resource).
 		std::map<std::string, Type> objectTypes;
 		std::vector<std::string> directives;
+		// The "using T = type;" aliases written in this block, which leave _typedefs with it.
+		std::vector<std::string> typedefs;
 		// Set on the outermost block of a function body or a for body, whose names share a C++
 		// scope with the enclosing parameters or init declaration.
 		bool sharesEnclosingScope = false;
+		// The locals whose declared type names no template parameter, no block name and no auto, so a
+		// member call on one is not dependent. A local not listed here is taken as dependent.
+		std::set<std::string> independent;
+		// The locals declared with the injected class name of the enclosing class template: the call on one is not
+		// dependent, but its fields have the types of the class's own members, which may be parameters.
+		std::set<std::string> injected;
 	};
 	std::vector<BlockScope> _blocks;
 
@@ -157,7 +165,7 @@ public:
 	// nesting is capped by kMaxNestingDepth.
 	static constexpr uint32_t kMaxExpressionHeight = 4000;
 
-	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); }
+	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); seedStdlibEnums(); }
 
 	TranslationUnit parse();
 
@@ -223,6 +231,8 @@ private:
 		std::string helper;
 		size_t parameters = 0;
 		bool hasDefault = false;
+		bool hasNonTemplate = false;
+		bool hasTemplate = false;
 	};
 	std::map<std::string, ConstructorInfo> _constructors;
 
@@ -241,6 +251,8 @@ private:
 		std::map<std::string, NamespaceScope> scopes;
 		std::deque<StructDecl> structs;
 		std::set<std::string> functionTemplates;
+		std::set<std::string> entryTemplateNames;
+		std::set<std::string> helperNames;
 		std::map<std::string, std::shared_ptr<const ClassTemplate>> classTemplates;
 		std::map<std::string, ConstantInt> constantInts;
 		std::map<std::string, ConstantIntArray> constantIntArrays;
@@ -257,7 +269,25 @@ private:
 	// names a template parameter.
 	size_t _parameterBlock = SIZE_MAX;
 	std::set<std::string> _dependentParameters;
+	// Class template instances over a template parameter that the signature being read names, by marker type.
+	std::map<std::string, DependentInstance> _dependentInstances;
 	bool namesDependentParameter(const std::string& name) const;
+	// Whether the type spelled by the tokens from "from" to the current one names no template parameter, no
+	// block-scope name and no auto; set by the local declarations, read by noteLocal.
+	bool typeTokensIndependent(size_t from, size_t to = SIZE_MAX) const;
+	bool _localIndependent = false;
+	bool namesInjectedClass(size_t from, size_t to = SIZE_MAX) const;
+	bool _localInjected = false;
+	bool injectedLocal(const std::string& name) const;
+	bool injectedBase(const Expression& chain) const;
+	void noteLocal(const std::string& name);
+	// A receiver of a member call that is a local or parameter of a template instance whose type does not depend on
+	// a template parameter, and "this".
+	bool receiverIndependent(const Expression& receiver) const;
+	bool classContext() const;
+	void noteAutoConstruction(const std::string& name, size_t from);
+	// An instance of a class template, or of a member template of one, is read: its class names are not tracked.
+	bool _classMemberInstance = false;
 	friend FunctionDecl instantiateTemplate(const FunctionTemplate&, const std::vector<TemplateArgument>&, bool);
 	friend TemplateArgument templateDefault(const FunctionTemplate&, size_t, const std::vector<TemplateArgument>&);
 	FunctionDecl parseInstance(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments,
@@ -344,7 +374,7 @@ private:
 	void parseExplicitSpecialization(size_t headerStart);
 	// "template <...> R f(...) const {...}" in a struct body: kept as tokens until the struct is complete,
 	// then declared as a function template whose first parameter is the object (see finishStructFunctions).
-	void parseMemberTemplate(const StructDecl& decl);
+	void parseMemberTemplate(StructDecl& decl);
 	std::vector<FunctionTemplate> _pendingMemberTemplates;
 	// The names of the member function templates declared so far, so that "v.f<float>(x)" reads its arguments.
 	std::set<std::string> _memberTemplateNames;
@@ -356,11 +386,13 @@ private:
 	std::map<std::string, bool> _memberFunctions;
 	std::string _memberStruct;
 	void parseTypedef();
+	void registerTypedef(const std::string& name, const Type& target);
 
 	// "enum Tag { A, B = 2 }" up to and including the closing brace, or just
 	// "enum Tag" when there is no brace, which says so in hadBody. Returns the
 	// tag, empty for an enum without one.
 	std::string parseEnumDeclaration(bool& hadBody);
+	void seedStdlibEnums();
 
 	// Records a file-scope name, or throws when it is already taken by something
 	// the typedef and enum support has to keep distinct from it.
@@ -461,14 +493,17 @@ private:
 	// any, without reporting several as ambiguous (a declaration site is not a use). With
 	// "besideStdlib", also whether the standard library's names are visible there or nearer:
 	// the level is namespace metal, or a using directive or declaration brings them to it.
-	std::set<std::string> unqualifiedFound(const std::string& last, bool* besideStdlib = nullptr) const;
+	std::set<std::string> unqualifiedFound(const std::string& last, std::set<std::string>* stdlibBeside = nullptr,
+		std::set<std::string>* stdlibTargets = nullptr) const;
 	// The name at the current token, resolved, and how many tokens spell it.
 	std::string peekResolved(size_t& tokens, std::vector<std::string>* alternatives = nullptr) const;
 	void collectOwn(const std::string& scope, const std::string& name, std::set<std::string>& found) const;
-	// With "besideStdlib", also whether the walk visited namespace metal or a scope with a
-	// "using metal::name;" of this name, directly or through a directive it follows.
+	bool collectStdlibOwn(const std::string& scope, const std::string& name, std::set<std::string>* targets,
+		std::set<std::string>* beside) const;
+	// With "stdlibBeside", also collects standard library names visible on the walk.
 	void collectMembers(const std::string& scope, const std::string& name, std::set<std::string>& seen,
-		std::set<std::string>& found, bool qualified, bool* besideStdlib = nullptr) const;
+		std::set<std::string>& found, bool qualified, std::set<std::string>* stdlibBeside = nullptr,
+		std::set<std::string>* stdlibTargets = nullptr, bool* reachedMetal = nullptr) const;
 	bool isLocal(const std::string& name) const;
 	// What the innermost block that declares the name binds it to: "" for a local,
 	// the declaration a using declaration names, or nullptr when no block does.
@@ -480,7 +515,12 @@ private:
 
 	public:
 		explicit LocalScope(Parser& parser): _parser(parser) { _parser._blocks.emplace_back(); }
-		~LocalScope() { _parser._blocks.pop_back(); }
+		~LocalScope() {
+			for (const std::string& alias: _parser._blocks.back().typedefs) {
+				_parser._typedefs.erase(alias);
+			}
+			_parser._blocks.pop_back();
+		}
 		LocalScope(const LocalScope&) = delete;
 		LocalScope& operator=(const LocalScope&) = delete;
 	};
@@ -514,6 +554,8 @@ private:
 	int64_t parseConstantIndex(const std::string& context, bool isAttribute = false);
 	void parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate);
 	FunctionDecl parseFunctionDeclaration(Stage stage);
+	void checkUniqueResourceSlots(const FunctionDecl& decl) const;
+	void parseEntryParameterList(std::vector<Parameter>& out, const std::string& quoted, bool allowUnnamed);
 	// A file-scope function that is not an entry point. False, with the position
 	// restored, when the tokens ahead are not a function's return type, name and
 	// opening parenthesis, so a file-scope constant still reaches its own parser.
@@ -521,8 +563,25 @@ private:
 	Type deducedReturnType();
 	bool tryParseHelperFunction();
 	void parseTemplateDeclaration();
+	void parseExplicitInstantiation();
+	// Queued until end of parse() so template bodies have full tokens and class seeds.
+	struct PendingEntryInstantiation {
+		size_t slotIndex = 0, line = 0;
+		Stage stage = Stage::None;
+		std::string hostName, spelled;
+		std::set<std::string> candidateNames;
+		Type returnType;
+		std::vector<TemplateArgument> explicitArgs;
+		std::vector<Parameter> parameters;
+	};
+	std::set<std::string> _entryTemplateNames, _helperNames;
+	std::vector<PendingEntryInstantiation> _pendingEntryInstantiations;
+	void resolveEntryInstantiations();
+	bool deduceEntryArguments(const FunctionTemplate& tmpl, const FunctionDecl& pattern,
+		size_t given, const std::vector<Parameter>& got, std::vector<TemplateArgument>& arguments) const;
 	void skipBalanced(TokenKind open, TokenKind close);
 	void skipFunctionAttribute();
+	bool skipStandardFunctionAttribute(bool forTemplateInstance = false);
 	// The <type_traits> subset (is_same, is_floating_point, enable_if, make_scalar ...), folded
 	// where the types are known.
 	void closeAngle(const char* what);
@@ -573,7 +632,7 @@ private:
 	// Parameters
 	// helperName is set for a helper function's parameter, which has fewer forms
 	// than an entry point's: no attribute, no resource, no pointer or reference.
-	Parameter parseParameter(const std::string& helperName = std::string());
+	Parameter parseParameter(const std::string& helperName = std::string(), bool allowUnnamed = false);
 	ParameterAttributes parseParameterAttributes();
 	// The attributes on a parameter of a function that is not an entry point: read, checked against the
 	// parameter's type, and dropped.
@@ -585,8 +644,8 @@ private:
 	// One [[...]] attribute list, handing each attribute's name and its optional
 	// constant integer argument to visit. Parameters and struct fields spell the
 	// list the same way, so they share the scanner.
-	void parseAttributeList(const std::function<void(const std::string&, std::optional<uint32_t>,
-		const std::string&)>& visit);
+	void parseAttributeList(std::set<std::string>& seen, const std::function<void(const std::string&,
+		std::optional<uint32_t>, const std::string&)>& visit);
 
 	// Statements
 	StatementPtr parseStatement();

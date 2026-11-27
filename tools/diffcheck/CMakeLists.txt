@@ -10,6 +10,7 @@ add_test(NAME diffcheck/compare COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_
 add_test(NAME diffcheck/inputs COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_inputs_test.py)
 add_test(NAME diffcheck/checks COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_checks_test.py)
 add_test(NAME diffcheck/graphics COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_graphics_test.py)
+add_test(NAME diffcheck/corpus COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_corpus_test.py)
 add_test(NAME diffcheck/kernel-resources COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_kernel_resources_test.py)
 
 if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)
@@ -19,6 +20,10 @@ if(DIFFCHECK_VULKAN_LIB AND DIFFCHECK_VULKAN_INCLUDE)
 	add_test(NAME diffcheck/vkhost COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_vkhost_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-vkhost> ${DIFFCHECK_TESTS}/diffcheck/fma_kernel.metal)
 	set_tests_properties(diffcheck/vkhost PROPERTIES SKIP_RETURN_CODE 77)
+	# Half fragment fwidth against host-computed values, with planted miscompiles that must be caught (#173).
+	add_test(NAME diffcheck/half-fwidth-expected COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/half_fwidth_expected_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/half-fwidth-expected PROPERTIES SKIP_RETURN_CODE 77)
 else()
 	message(STATUS "diffcheck: no Vulkan loader or headers, the Vulkan host is not built")
 endif()
@@ -48,7 +53,8 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 	# needles, a wrong decoration, an inverted select or a swapped lane changes the result.
 	# Graphics probes (tests/diffcheck/graphics) are drawn on both backends the same way.
 	function(diffcheck_probe_tests directory prefix)
-		file(GLOB diffcheck_probes CONFIGURE_DEPENDS ${directory}/*.metal)
+		file(GLOB_RECURSE diffcheck_probes CONFIGURE_DEPENDS ${directory}/*.metal)
+		list(FILTER diffcheck_probes EXCLUDE REGEX "/include/")
 		foreach(probe IN LISTS diffcheck_probes)
 			file(STRINGS ${probe} run_line LIMIT_COUNT 1 REGEX "^// RUN:")
 			if(run_line)
@@ -67,6 +73,10 @@ if(TARGET diffcheck-vkhost AND TARGET diffcheck-metalhost)
 	add_test(NAME diffcheck/kernel-driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_kernel_driver_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
 	set_tests_properties(diffcheck/kernel-driver PROPERTIES SKIP_RETURN_CODE 77)
+
+	add_test(NAME diffcheck/denormal COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_denormal_test.py
+		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
+	set_tests_properties(diffcheck/denormal PROPERTIES SKIP_RETURN_CODE 77)
 
 	add_test(NAME diffcheck/graphics-driver COMMAND ${PYTHON3} ${DIFFCHECK_TESTS}/diffcheck_graphics_driver_test.py
 		$<TARGET_FILE:mslc-cli> $<TARGET_FILE:diffcheck-metalhost> $<TARGET_FILE:diffcheck-vkhost>)
