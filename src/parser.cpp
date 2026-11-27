@@ -5959,6 +5959,37 @@ StatementPtr Parser::parseStatement() {
 		return parseCompoundStatement();
 	}
 
+	// A GNU statement expression that is a statement of its own, "({ ... });", which Apple's compiler takes as
+	// clang does: its value is dropped, so it runs as the block it holds, in a scope of its own, and a break,
+	// continue or return in it acts as one in that block would. One whose value is used is refused (parsePrimary).
+	if (at(TokenKind::LParen) && lookahead().kind == TokenKind::LBrace) {
+		size_t depth = 0;
+		size_t close = 0;
+		for (size_t k = 0;; ++k) {
+			const TokenKind tokenKind = lookahead(k).kind;
+			if (tokenKind == TokenKind::EndOfFile) {
+				break;
+			}
+			if (tokenKind == TokenKind::LParen || tokenKind == TokenKind::LBrace || tokenKind == TokenKind::LBracket) {
+				++depth;
+			} else if (tokenKind == TokenKind::RParen || tokenKind == TokenKind::RBrace
+				|| tokenKind == TokenKind::RBracket) {
+				if (--depth == 0) {
+					close = k;
+					break;
+				}
+			}
+		}
+		if (close && lookahead(close).kind == TokenKind::RParen && lookahead(close - 1).kind == TokenKind::RBrace
+			&& lookahead(close + 1).kind == TokenKind::Semicolon) {
+			advance();
+			StatementPtr block = parseCompoundStatement();
+			expect(TokenKind::RParen, "to close a statement expression");
+			expect(TokenKind::Semicolon, "after a statement expression");
+			return block;
+		}
+	}
+
 	if (at(TokenKind::Semicolon)) {
 		advance();
 		statement->kind = StatementKind::ExpressionStatement;
@@ -7716,6 +7747,10 @@ ExpressionPtr Parser::parsePrimary() {
 	}
 
 	if (at(TokenKind::LParen)) {
+		if (lookahead().kind == TokenKind::LBrace) {
+			throw CompileError("a statement expression \"({ ... })\" whose value is used is not lowered; one that is a "
+				"statement of its own is");
+		}
 		advance();
 		const RestoreFlag freshExpression(_noGreater, false);
 		auto expression = parseExpression();
