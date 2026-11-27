@@ -2598,6 +2598,7 @@ namespace {
 		const std::string* functionConstantNamed(const std::string& name) const;
 		Id functionConstantValue(const std::string& name, bool defined);
 		Id emitIsFunctionConstantDefined(const Expression& call);
+		Id emitAsType(const Expression& call);
 		std::string functionConstantsJson();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
@@ -5985,7 +5986,15 @@ namespace {
 			constantU32(semantics) });
 	}
 
+	// as_type<T>(x), which the parser reads as a call of __metal_as_type; no declared function has that name.
+	static bool isAsTypeCall(const Expression& call) {
+		return call.left && call.left->kind == ExpressionKind::Identifier && call.left->name == "__metal_as_type";
+	}
+
 	Id Emitter::emitCall(const Expression& expression) {
+		if (isAsTypeCall(expression)) {
+			return emitAsType(expression);
+		}
 		const Expression* receiver = nullptr;
 		std::vector<Id> prepared;
 		HelperFunction* helper = findHelper(expression, receiver, prepared);
@@ -9723,6 +9732,72 @@ namespace {
 				kFunctionConstantDefinedSpecializationID + index });
 		}
 		return defined ? constant.defined : constant.value;
+	}
+
+	// The size in bits of a component of a scalar kind, or 0 for one as_type does not take: bool, whose
+	// storage Apple does not define, void and double.
+	static uint32_t asTypeComponentBits(ScalarKind kind) {
+		switch (kind) {
+			case ScalarKind::Char: case ScalarKind::UChar: return 8;
+			case ScalarKind::Short: case ScalarKind::UShort: case ScalarKind::Half: return 16;
+			case ScalarKind::Int: case ScalarKind::UInt: case ScalarKind::Float: return 32;
+			case ScalarKind::Long: case ScalarKind::ULong: return 64;
+			default: return 0;
+		}
+	}
+
+	// as_type<T>(x): x's bits as a T, one OpBitcast. T and x are scalars or vectors of the same size in
+	// bytes; a three-component vector, which Metal stores as four, is taken only with another
+	// three-component vector of components of the same size, where the two agree however the padding
+	// is counted.
+	Id Emitter::emitAsType(const Expression& call) {
+		const Expression& callee = *call.left;
+		if (callee.templateArguments.size() != 1 || !callee.templateArguments[0].isType || call.arguments.size() != 1) {
+			throw CompileError("as_type takes one type as its template argument and one operand");
+		}
+		const Type& target = callee.templateArguments[0].type;
+		const std::string spelled = typeName(target);
+		if (target.isPointer || target.arrayLength || !target.namedType.empty() || target.isMatrix()
+			|| target.isPacked || target.isAtomic || !target.enumName.empty() || target.resource != ResourceKind::None
+			|| target.addressSpace != AddressSpace::None || asTypeComponentBits(target.scalar) == 0) {
+			throw CompileError("as_type<" + spelled + "> is not lowered: mslc reinterprets as a scalar or a vector "
+				"of the integer, half and float types");
+		}
+		const Id value = emitExpression(*call.arguments[0]);
+		const Id valueType = _builder.typeOf(value);
+		ScalarKind fromScalar;
+		uint32_t fromWidth = 1;
+		if (const auto scalar = _types.scalarKindOf(valueType)) {
+			fromScalar = *scalar;
+		} else if (const Id component = _types.componentOf(valueType); component != InvalidId
+			&& !_types.matrixInfo(valueType)) {
+			fromScalar = *_types.scalarKindOf(component);
+			fromWidth = _types.vectorWidth(valueType);
+		} else {
+			throw CompileError("as_type<" + spelled + "> of this operand is not lowered: mslc reinterprets a "
+				"scalar or a vector of the integer, half and float types");
+		}
+		const uint32_t fromBits = asTypeComponentBits(fromScalar);
+		if (fromBits == 0) {
+			throw CompileError("as_type<" + spelled + "> of a " + scalarKindName(fromScalar) + " value is not "
+				"lowered: mslc reinterprets a scalar or a vector of the integer, half and float types");
+		}
+		const uint32_t toBits = asTypeComponentBits(target.scalar);
+		const uint32_t toWidth = target.vectorWidth ? target.vectorWidth : 1;
+		if ((fromWidth == 3 || toWidth == 3) && (fromWidth != toWidth || fromBits != toBits)) {
+			throw CompileError("as_type<" + spelled + "> with a three-component vector is lowered only from "
+				"another three-component vector of components of the same size");
+		}
+		if (fromBits * fromWidth != toBits * toWidth) {
+			throw CompileError("as_type<" + spelled + "> needs an operand of the same size: it is "
+				+ std::to_string(toBits * toWidth / 8) + " bytes, and the operand is "
+				+ std::to_string(fromBits * fromWidth / 8));
+		}
+		const Id toType = declaredTypeOf(target);
+		if (toType == valueType) {
+			return value;
+		}
+		return _builder.emitTyped(spirv::OpBitcast, toType, { value });
 	}
 
 	Id Emitter::emitIsFunctionConstantDefined(const Expression& call) {
@@ -13786,6 +13861,10 @@ namespace {
 
 		// A call whose value is dropped, which is the only way to call a void helper.
 		if (expression.kind == ExpressionKind::Call) {
+			if (isAsTypeCall(expression)) {
+				emitAsType(expression);
+				return;
+			}
 			const Expression* receiver = nullptr;
 			std::vector<Id> prepared;
 			if (HelperFunction* helper = findHelper(expression, receiver, prepared)) {

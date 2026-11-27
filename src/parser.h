@@ -423,6 +423,11 @@ private:
 	bool atStdArray(size_t& nameTokens) const;
 	// array<T, N> after its qualifiers, folded into type as the array T[N] with isStdArray set.
 	void parseStdArray(Type& type, size_t nameTokens);
+	// Whether the cursor is at metal::as_type<, spelled with or without the namespace unless the file
+	// declares its own as_type or a local hides it; nameTokens is how many tokens the name takes.
+	bool atAsType(size_t& nameTokens) const;
+	// as_type<T>(x), read as a call of the builtin __metal_as_type with T as its template argument.
+	ExpressionPtr parseAsType(size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.
