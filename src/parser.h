@@ -423,6 +423,11 @@ private:
 	bool atStdArray(size_t& nameTokens) const;
 	// array<T, N> after its qualifiers, folded into type as the array T[N] with isStdArray set.
 	void parseStdArray(Type& type, size_t nameTokens);
+	// Whether the cursor is at metal::vec<, spelled with or without the namespace unless the file
+	// declares its own vec; nameTokens is how many tokens the name takes.
+	bool atLibraryVec(size_t& nameTokens) const;
+	// vec<T, N> after its qualifiers, folded into type as the vector of N T.
+	void parseLibraryVec(Type& type, size_t nameTokens);
 	// Whether a using directive in scope, directly or through the namespaces it nominates, reaches metal.
 	bool libraryNominatedFromHere() const;
 	// The library's resource type name that a library prefix qualifies, or 0.

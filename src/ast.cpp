@@ -87,6 +87,10 @@ std::string typeName(const Type& type) {
 		if (type.isPacked) {
 			name = "packed_" + name;
 		}
+	} else if (type.vectorWidth > 1 && type.namedType.size() > 2 && type.namedType.front() == '<'
+		&& type.namedType.back() == '>') {
+		// vec<T, N> of a template parameter still to deduce, whose marker is "<T>".
+		name = "vec<" + type.namedType.substr(1, type.namedType.size() - 2) + ", " + std::to_string(type.vectorWidth) + ">";
 	}
 	if (type.isAtomic) {
 		name = "atomic_" + name;

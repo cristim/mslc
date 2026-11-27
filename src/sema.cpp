@@ -6757,9 +6757,9 @@ namespace {
 	}
 
 	// Fills the type parameters left, from the argument types: T takes the argument's type by value or
-	// reference, and T* a local array's element type; T used twice takes one type or the template is no
-	// candidate. What C++ deduces and mslc does not model is an error, never a template dropped, which
-	// could let another function win.
+	// reference, T* a local array's element type and vec<T, N> a vector's component type; T used twice
+	// takes one type or the template is no candidate. What C++ deduces and mslc does not model is an
+	// error, never a template dropped, which could let another function win.
 	bool Emitter::deduceTemplateArguments(const FunctionTemplate& declaration, const FunctionDecl& pattern,
 		size_t given, const std::vector<OverloadArgument>& arguments, std::vector<TemplateArgument>& deduced) {
 		const auto parameterIndex = [&](const Type& type) {
@@ -6796,6 +6796,14 @@ namespace {
 				if (value.arrayLength || value.isPointer || value.resource != ResourceKind::None) {
 					throw refuse(i, "which is an array of arrays");
 				}
+				// thread vec<T, N>* takes T from an array of vectors of N components.
+				if (parameter.type.isVector()) {
+					if (value.vectorWidth != parameter.type.vectorWidth || value.isMatrix() || value.isPacked
+						|| !value.namedType.empty() || !value.enumName.empty()) {
+						return false;
+					}
+					value.vectorWidth = 0;
+				}
 				value.addressSpace = AddressSpace::None;
 				value.isConst = argument.binding->readOnly && !parameter.type.isConst;
 			} else {
@@ -6815,6 +6823,14 @@ namespace {
 						"deduces an address-space-qualified type");
 				}
 				value = deduceAutoType(Type(), _builder.typeOf(argument.value), "argument " + std::to_string(i + 1));
+				// vec<T, N> takes T from a vector of N components and fails to deduce from anything else.
+				if (parameter.type.isVector()) {
+					if (value.vectorWidth != parameter.type.vectorWidth || value.isMatrix() || value.isPacked
+						|| !value.namedType.empty() || !value.enumName.empty()) {
+						return false;
+					}
+					value.vectorWidth = 0;
+				}
 				// A mutable reference to a const object has T = "const float".
 				value.isConst = parameter.isMutableReference() && argument.kind == OverloadArgument::Kind::Variable
 					&& argument.inThread && !argument.changeable;
