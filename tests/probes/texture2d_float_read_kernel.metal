@@ -1,17 +1,16 @@
 // EXPECT: valid
-// A float access::read texture2d is a storage image with a float sampled type, as for uint.
-// DISASM-MATCH: OpTypeImage %float 2D 0 0 0 2 Unknown
+// DISASM-MATCH: OpTypeImage %float 2D 2 0 0 1 Unknown
 // DISASM-NOT: OpTypeImage %uint
-// DISASM: NonWritable
+// DISASM-NOT: NonWritable
 // DISASM-NOT: NonReadable
-// DISASM: OpCapability StorageImageReadWithoutFormat
+// DISASM-NOT: StorageImageReadWithoutFormat
 // DISASM-NOT: StorageImageWriteWithoutFormat
-// DISASM-MATCH: OpImageRead %v4float
-// DISASM-NOT: OpImageFetch
+// DISASM-MATCH: OpImageFetch %v4float
+// DISASM-NOT: OpImageRead
 // DISASM-NOT: OpFConvert
-// DISASM: OpImageQuerySize %v2uint
-// DISASM-NOT: OpImageQuerySizeLod
+// DISASM: OpImageQuerySizeLod %v2uint
 // REFLECT: "metal_index": 5, "descriptor": { "set": 0, "binding": 1 }, "texture_access": "Read"
+// A float access::read texture2d is a sampled image with a float sampled type, fetched from, as for uint.
 #include <metal_stdlib>
 using namespace metal;
 kernel void hit(texture2d<float, access::read> src [[texture(5)]], device float4* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {

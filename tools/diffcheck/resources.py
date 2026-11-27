@@ -87,7 +87,7 @@ def unsupported(entry, apple):
 def seed(bindings, rng, profile, base):
     """Writes one texture file per Texture binding to `base`+name and returns the manifest
     tuples ([(index, set, binding, file, access)], [(index, set, binding)]), in binding order;
-    `access` is mslc's texture_access: a `Read` texture is a storage image in SPIR-V, the rest are sampled."""
+    `access` is mslc's texture_access; a `Read` texture is a sampled image fetched from, like a `Sample` one."""
     textures, samplers = [], []
     for b in bindings:
         if b["kind"] == "Texture":
@@ -101,8 +101,7 @@ def seed(bindings, rng, profile, base):
 
 def lines(textures, samplers):
     """The manifest lines both hosts read."""
-    return (["%s %d %d %d %d %d %s" % ("storagetexture" if a == "Read" else "texture", i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f)
-             for i, s, b, f, a in textures]
+    return (["texture %d %d %d %d %d %s" % (i, s, b, TEXTURE_SIZE, TEXTURE_SIZE, f) for i, s, b, f, a in textures]
             + ["sampler %d %d %d" % s for s in samplers])
 
 

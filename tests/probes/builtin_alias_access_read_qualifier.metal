@@ -1,5 +1,5 @@
 // EXPECT: valid
-// DISASM: OpImageRead
+// DISASM: OpImageFetch
 // REFLECT: "texture_access": "Read"
 // M::access::read is the read access qualifier.
 #include <metal_stdlib>

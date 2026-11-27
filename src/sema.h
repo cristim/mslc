@@ -334,6 +334,11 @@ struct ModuleOptions {
 // fragment's own pixel. A consumer binds the colour attachment's view as an input
 // attachment descriptor at that binding and maps pInputAttachments[n] to colour attachment n
 // in the subpass. A half4 is a float image; the module converts.
+// A "Texture" entry's "texture_access" says how the host binds it. "Sample" and "Read" are sampled
+// images (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) of every level of the texture: an access::read texture is
+// fetched from by integer coordinate and lod, and an access::read cube or cube array is declared as the
+// 2D array of its faces (layer * 6 + face), so the host binds a 2D array view of it. "Write" and
+// "ReadWrite" are storage images (VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) of one level.
 // A texture_buffer<T, access> parameter is its own kind, never "Texture":
 // { "kind": "TextureBuffer", "metal_index": n, "descriptor": { "set": s, "binding": b },
 // "descriptor_type": "UniformTexelBuffer"|"StorageTexelBuffer", "texture_access": "Read"|"Write"|"ReadWrite",
