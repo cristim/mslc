@@ -2571,7 +2571,8 @@ namespace {
 		void declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex);
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
-		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
+		// Whether it reserved any.
+		bool reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
 		void reserveThreadgroupLocals(const Statement& statement);
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
@@ -10777,26 +10778,29 @@ namespace {
 	//
 	// Every one in the body is reserved before the entry point is emitted, since
 	// the variable has to be in the OpEntryPoint interface, which comes first.
-	void Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
+	bool Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
+		bool any = false;
 		if (statement.declaration && statement.declaration->sampler
 			&& used.count(statement.declaration->name)) {
 			reserveSampler(*statement.declaration);
+			any = true;
 		}
 
 		for (const StatementPtr& child: statement.children) {
-			reserveLocalSamplers(*child, used);
+			any = reserveLocalSamplers(*child, used) || any;
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
-				reserveLocalSamplers(*nested, used);
+				any = reserveLocalSamplers(*nested, used) || any;
 			}
 		}
 		for (const SwitchCase& kase: statement.switchCases) {
 			for (const StatementPtr& child: kase.body) {
-				reserveLocalSamplers(*child, used);
+				any = reserveLocalSamplers(*child, used) || any;
 			}
 		}
+		return any;
 	}
 
 	void Emitter::reserveThreadgroupLocals(const Statement& statement) {
@@ -10923,6 +10927,15 @@ namespace {
 						pending.push_back(callee);
 						if (scan(*callee)) {
 							naming.insert(callee);
+						}
+						// A constexpr sampler a helper declares and names is one of this entry point's, as one the
+						// entry point declares is, so the helper is emitted per entry point too.
+						if (callee->body) {
+							std::set<std::string> used;
+							collectIdentifiers(*callee->body, used);
+							if (reserveLocalSamplers(*callee->body, used)) {
+								naming.insert(callee);
+							}
 						}
 					}
 				}
