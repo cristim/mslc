@@ -2493,6 +2493,8 @@ namespace {
 		// for the entry points that share it, so what it reads is kept with it rather than with an entry point.
 		std::map<const FunctionDecl*, std::set<std::string>> _functionConstantReads;
 		std::map<const FunctionDecl*, std::set<const FunctionDecl*>> _functionCallees;
+		// The functions whose emitted code calls get_num_samples(), kept the same way.
+		std::set<const FunctionDecl*> _numSamplesReaders;
 		// The file-scope samplers, by name, and the ones the entry point being
 		// emitted names, which are looked up after its own parameters and locals.
 		std::map<std::string, const VariableDeclaration*> _fileScopeSamplers;
@@ -2595,10 +2597,8 @@ namespace {
 		Id _gridSize[3] = { InvalidId, InvalidId, InvalidId };
 		Id _globalInvocationVariable = InvalidId;
 		bool _masksGridSize = false;
-		// The sample count get_num_samples() reads, one spec constant for the module, and whether the entry point
-		// being emitted reads it.
+		// The sample count get_num_samples() reads, one spec constant for the module.
 		Id _numSamples = InvalidId;
-		bool _readsNumSamples = false;
 		std::vector<StageVariable> _stageInputs;
 		// Framebuffer fetch: a [[color(n)]] parameter and the value it is read into.
 		struct AttachmentParameter {
@@ -2768,6 +2768,7 @@ namespace {
 		Id emitNumSamples(const Expression& call);
 		Id emitAsType(const Expression& call);
 		std::string functionConstantsJson();
+		std::set<const FunctionDecl*> reachedFunctions();
 		std::vector<const FunctionDecl*> functionsCalledBy(const Expression& call);
 		void declareLocalSampler(const VariableDeclaration& declaration);
 		void bindResourceAlias(const VariableDeclaration& declaration, const Type* declared);
@@ -4974,10 +4975,12 @@ namespace {
 		const size_t targets = _jumpTargets.size();
 		// what the lifted code reads is not read
 		const auto functionConstantReads = _functionConstantReads;
+		const auto numSamplesReaders = _numSamplesReaders;
 		emit();
 		_builder.takeFunctionsFrom(mark);
 		_builder.truncateLocals(locals);
 		_functionConstantReads = functionConstantReads;
+		_numSamplesReaders = numSamplesReaders;
 		// A short-circuit or ?: inside the element moved these to a label that the lift removed.
 		_currentBlock = block;
 		_terminated = terminated;
@@ -10742,8 +10745,10 @@ namespace {
 	}
 
 	// get_num_samples(), the number of samples of what a fragment function renders to. A helper is emitted for each
-	// entry point that calls it, so the stage is the caller's; Apple's compiler refuses it in a vertex or kernel
+	// stage that calls it, so the stage is the caller's; Apple's compiler refuses it in a vertex or kernel
 	// function, a helper's call included. Its default is 1, a pipeline that does not set it renders one sample.
+	// The helper's body is shared by the fragment functions that call it, so the read is kept with the function
+	// and the reflection of each entry point that reaches it names the constant.
 	Id Emitter::emitNumSamples(const Expression& call) {
 		if (!call.arguments.empty()) {
 			throw CompileError("get_num_samples() takes no arguments");
@@ -10761,7 +10766,7 @@ namespace {
 			_builder.emit(spirv::OpDecorate, { _numSamples, static_cast<uint32_t>(spirv::Decoration::SpecId),
 				kNumSamplesSpecializationID });
 		}
-		_readsNumSamples = true;
+		_numSamplesReaders.insert(_helper ? _helper : _entryPoint);
 		return _numSamples;
 	}
 
@@ -10961,21 +10966,28 @@ namespace {
 		}
 	}
 
-	// The reflection of the function constants the entry point reads, itself or in a function it reaches, by index.
-	std::string Emitter::functionConstantsJson() {
-		std::map<uint32_t, std::string> byIndex;
+	// The entry point and every function its emitted code reaches through calls.
+	std::set<const FunctionDecl*> Emitter::reachedFunctions() {
 		std::set<const FunctionDecl*> reached { _entryPoint };
 		std::vector<const FunctionDecl*> pending { _entryPoint };
 		while (!pending.empty()) {
 			const FunctionDecl* function = pending.back();
 			pending.pop_back();
-			for (const std::string& name: _functionConstantReads[function]) {
-				byIndex[*_functionConstants.at(name).declaration->functionConstantIndex] = name;
-			}
 			for (const FunctionDecl* callee: _functionCallees[function]) {
 				if (reached.insert(callee).second) {
 					pending.push_back(callee);
 				}
+			}
+		}
+		return reached;
+	}
+
+	// The reflection of the function constants the entry point reads, itself or in a function it reaches, by index.
+	std::string Emitter::functionConstantsJson() {
+		std::map<uint32_t, std::string> byIndex;
+		for (const FunctionDecl* function: reachedFunctions()) {
+			for (const std::string& name: _functionConstantReads[function]) {
+				byIndex[*_functionConstants.at(name).declaration->functionConstantIndex] = name;
 			}
 		}
 		std::string json;
@@ -16058,7 +16070,6 @@ namespace {
 			_threadsPerThreadgroup = nullptr;
 			_globalInvocationVariable = InvalidId;
 			_masksGridSize = false;
-			_readsNumSamples = false;
 			_stageInputs.clear();
 			_attachmentParameters.clear();
 			_attachmentIndices.clear();
@@ -16081,7 +16092,9 @@ namespace {
 					+ std::to_string(kGridSizeSpecializationID + 1) + ", "
 					+ std::to_string(kGridSizeSpecializationID + 2) + "],\n";
 			}
-			if (_readsNumSamples) {
+			const std::set<const FunctionDecl*> reached = reachedFunctions();
+			if (std::any_of(reached.begin(), reached.end(),
+				[&](const FunctionDecl* function) { return _numSamplesReaders.count(function) > 0; })) {
 				document += "\t\t\t\"num_samples_spec_id\": " + std::to_string(kNumSamplesSpecializationID) + ",\n";
 			}
 			const std::string functionConstants = functionConstantsJson();

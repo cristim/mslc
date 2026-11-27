@@ -94,6 +94,9 @@
 #   a misspelt or unspaced prefix cannot be silently ignored.
 #   // REFLECT: <substring>       the reflection JSON contains <substring>
 #   // REFLECT-NOT: <substring>   the reflection JSON does not contain <substring>
+#   // REFLECT-COUNT: <n> <substring>
+#                                 the reflection JSON contains <substring> exactly
+#                                 <n> times, as once for each of n entry points
 #
 # Invoked by ctest as:
 #   cmake -DMSLC=... -DSPIRV_VAL=... -DSPIRV_DIS=... -DPROBE=... -DOUT_DIR=... -P run_probe.cmake
@@ -542,6 +545,7 @@ if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 
 	file(STRINGS "${PROBE}" wantedReflection REGEX "^// REFLECT: ")
 	file(STRINGS "${PROBE}" unwantedReflection REGEX "^// REFLECT-NOT: ")
+	file(STRINGS "${PROBE}" countedReflection REGEX "^// REFLECT-COUNT: ")
 
 	# A needle whose prefix is misspelled matches neither REGEX above, so it would
 	# be ignored and the probe would pass without ever checking anything. The
@@ -552,13 +556,13 @@ if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 	# is unaffected, since the search is case-sensitive.
 	file(STRINGS "${PROBE}" reflectionNeedles REGEX "REFLECT")
 	foreach(line IN LISTS reflectionNeedles)
-		if(NOT line MATCHES "^// REFLECT(-NOT)?: .+")
+		if(NOT line MATCHES "^// REFLECT(-NOT)?: .+" AND NOT line MATCHES "^// REFLECT-COUNT: [0-9]+ .+")
 			message(FATAL_ERROR "${name}: \"${line}\" is not a reflection needle; "
-				"the prefix is \"// REFLECT: \" or \"// REFLECT-NOT: \"")
+				"the prefix is \"// REFLECT: \", \"// REFLECT-NOT: \" or \"// REFLECT-COUNT: <n> \"")
 		endif()
 	endforeach()
 
-	if(wantedReflection OR unwantedReflection)
+	if(wantedReflection OR unwantedReflection OR countedReflection)
 		if(NOT EXISTS "${reflection}")
 			message(FATAL_ERROR "${name}: mslc wrote no reflection, so it cannot be checked")
 		endif()
@@ -591,6 +595,24 @@ if(expectation STREQUAL "valid" OR expectation STREQUAL "no module")
 			string(FIND "${reported}" "${needle}" found)
 			if(NOT found EQUAL -1)
 				message(FATAL_ERROR "${name}: reflection contains \"${needle}\":\n${reported}")
+			endif()
+		endforeach()
+		foreach(line IN LISTS countedReflection)
+			string(REGEX REPLACE "^// REFLECT-COUNT: ([0-9]+) .*$" "\\1" wanted "${line}")
+			string(REGEX REPLACE "^// REFLECT-COUNT: [0-9]+ " "" needle "${line}")
+			# each match is cut out of what is left, so the count is of occurrences that do not overlap
+			set(rest "${reported}")
+			set(count 0)
+			string(LENGTH "${needle}" needleLength)
+			string(FIND "${rest}" "${needle}" found)
+			while(NOT found EQUAL -1)
+				math(EXPR count "${count} + 1")
+				math(EXPR after "${found} + ${needleLength}")
+				string(SUBSTRING "${rest}" ${after} -1 rest)
+				string(FIND "${rest}" "${needle}" found)
+			endwhile()
+			if(NOT count EQUAL wanted)
+				message(FATAL_ERROR "${name}: reflection contains \"${needle}\" ${count} times, not ${wanted}:\n${reported}")
 			endif()
 		endforeach()
 	endif()
