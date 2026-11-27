@@ -15,11 +15,20 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 	// "constant BufferClearParams &params" and "constant BufferClearParams
 	// *params" name the same buffer and lower to the same descriptor, so a
 	// reference is consumed and nothing is recorded for it.
+	// "thread texture2d<float>& t" names the caller's texture, as a by-value texture parameter does: both are
+	// that descriptor, so the reference is consumed. One without an address space is not valid MSL.
+	// An entry point's texture or sampler parameter is taken by value only (Apple: "type 'texture2d<float> &' is
+	// not valid for attribute 'texture'").
 	if (at(TokenKind::Ampersand) && param.type.resource != ResourceKind::None) {
-		throw CompileError("a reference to " + typeName(param.type) + " is not valid; a texture or "
-			"sampler parameter is taken by value");
+		if (helperName.empty() || param.type.addressSpace != AddressSpace::Thread || param.type.isPointer) {
+			throw CompileError("a reference to " + typeName(param.type) + " is not valid; a texture or "
+				"sampler parameter is taken by value" + std::string(helperName.empty() ? "" : " or by a thread reference"));
+		}
+		advance();
+		param.type.addressSpace = AddressSpace::None;
+		param.isReference = true;
 	}
-	param.isReference = match(TokenKind::Ampersand);
+	param.isReference = param.isReference || match(TokenKind::Ampersand);
 
 	// A prototype and an unused parameter may leave the name out.
 	const bool unnamed = (helper || allowUnnamed)
@@ -63,7 +72,7 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 			&& param.type.resource == ResourceKind::None && !param.type.isAtomic
 			&& (param.type.addressSpace == AddressSpace::Device
 				|| param.type.addressSpace == AddressSpace::Constant);
-		if (param.type.isPointer && !threadPointer && !bufferPointer) {
+		if (param.type.isPointer && !threadPointer && !bufferPointer && !isResourcePointer(param.type)) {
 			throw CompileError(what + "is a pointer outside the thread, threadgroup, device and constant "
 				"address spaces or to an atomic or a resource, which a helper function does not take yet; it "
 				"takes scalar, vector, matrix and struct values, a thread or threadgroup pointer to a local "
@@ -83,7 +92,7 @@ Parameter Parser::parseParameter(const std::string& helperName, bool allowUnname
 		}
 		if (param.type.addressSpace != AddressSpace::None && !constantReference && !bufferPointer
 			&& !((param.isReference || threadPointer) && param.type.addressSpace == AddressSpace::Thread)
-			&& !threadPointer) {
+			&& !threadPointer && !isResourcePointer(param.type)) {
 			throw CompileError(what + "is in the " + addressSpaceName(param.type.addressSpace)
 				+ " address space, which a helper function does not take yet");
 		}

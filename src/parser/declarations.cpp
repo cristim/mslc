@@ -141,10 +141,14 @@ bool Parser::tryParseHelperFunction() {
 			if (deducedReturn) {
 				decl.returnType = deducedReturnType();
 			} else {
-				decl.returnType = parseType();
+				// A texture or sampler is a return type only as a pointer or a reference to one: "sampler s(...)"
+				// at file scope is a sampler, not a function.
+				decl.returnType = parseType(true);
 			}
+			const bool resourceValue = decl.returnType.resource != ResourceKind::None && !decl.returnType.isPointer
+				&& !at(TokenKind::Ampersand);
 			referenceReturn = match(TokenKind::Ampersand);
-			if (kind() == TokenKind::Identifier) {
+			if (!resourceValue && kind() == TokenKind::Identifier) {
 				decl.name = std::string(advance().text);
 				isHelper = at(TokenKind::LParen);
 			}
@@ -169,7 +173,9 @@ bool Parser::tryParseHelperFunction() {
 	if (referenceReturn) {
 		takeReferenceReturn(decl, quoted);
 	}
-	rejectUnloweredReturn(decl.returnType, quoted, true);
+	if (!(decl.returnsReference && decl.returnType.resource != ResourceKind::None)) {
+		rejectUnloweredReturn(decl.returnType, quoted, true);
+	}
 
 	Type builtin;
 	if (isTypeName(decl.name, builtin) || isSimdVectorName(decl.name, builtin)) {

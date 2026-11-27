@@ -60,6 +60,9 @@ void Emitter::emitHelper(const HelperFunction& helper) {
 			bound.pointeeType = resourcePointee(parameter.type);
 			bound.storageClass = spirv::StorageClass::UniformConstant;
 			bound.pointeeMsl = parameter.type;
+			bound.pointeeMsl.isPointer = false;
+			bound.pointeeMsl.addressSpace = AddressSpace::None;
+			bound.resourcePointer = parameter.type.isPointer;
 			_bindings[parameter.name] = bound;
 			continue;
 		}

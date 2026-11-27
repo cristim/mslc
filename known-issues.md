@@ -851,13 +851,26 @@ initialiser has to be a bare name, of the same kind, element type, depth, multis
 (Apple refuses a mismatch too). Apple treats a texture or sampler as a run-time value, so what it
 accepts and mslc refuses is everything that would make the descriptor a run-time choice, each with a
 diagnostic: assigning to a texture or sampler local or parameter (`b = a2;`, also `sampler t; t = s;`), an initialiser that is not a name (`c ? a : a2`), a
-texture local with no initialiser or a default-constructed one, a self-initialised one, a pointer, an
-array or a reference to a texture, a texture as a struct field, a texture local in a `for` initialiser
+texture local with no initialiser or a default-constructed one, a self-initialised one, an
+array of textures, a texture as a struct field, a texture local in a `for` initialiser
 or beside a second declarator, `auto` from a conditional, a copy of a sampler at file scope, and a
 template parameter deduced from a texture (`template T q = t;`). Other Apple forms refused:
 brace or paren initialisation of a texture or sampler local (`b{t}`, `b(t)`, `sampler u(s)`,
 `= {s}`), `thread auto& b = t;`, and a struct texture member picked by a conditional. A dead chain (`sampler u = t;` never sampled) still lists
 the embedded sampler it names, which Apple would not record.
+
+## Pointers and references to textures and samplers
+
+`thread texture2d<float>* p = &t;` (also for a sampler), a thread pointer or thread reference parameter of a helper,
+and a helper returning a thread pointer or reference to one are names for a descriptor resolved while compiling, as
+a texture local is: `*p`, `p[0]`, `p->sample(...)` and `&t` reach it, and a call to such a returning helper is
+resolved from its one return statement (with its parameters bound to the arguments' descriptors) instead of being
+emitted. The module is the one the same shader written with plain names gives. Tests: `tests/probes/texture_*pointer*`,
+`tests/probes/helper_texture_*`.
+
+Apple accepts, and mslc refuses (each a loud error): reassigning a pointer, a pointer from a conditional, `p[n]` for
+n other than 0, a pointer-returning helper whose body is more than one return statement or that takes a value that is
+not a texture or sampler, an overloaded such helper, and a pointer to a pointer.
 
 ## `metal::array<T, N>` (#362)
 

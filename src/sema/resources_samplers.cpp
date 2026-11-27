@@ -436,6 +436,7 @@ Binding Emitter::embeddedSamplerBinding(const VariableDeclaration& declaration) 
 	bound.storageClass = spirv::StorageClass::UniformConstant;
 	bound.pointeeMsl = declaration.type;
 	bound.unnormalizedSampler = !declaration.sampler->normalizedCoordinates;
+	bound.embeddedSampler = true;
 	return bound;
 }
 
@@ -455,26 +456,38 @@ void Emitter::declareLocalSampler(const VariableDeclaration& declaration) {
 // so there is no run-time choice among descriptors for the alias to stand for.
 void Emitter::bindResourceAlias(const VariableDeclaration& declaration, const Type* declared) {
 	const Expression& source = *declaration.initializer;
+	const bool pointer = declared && declared->isPointer;
 	const std::string what = std::string("the ") + (declared && declared->resource == ResourceKind::Sampler
-		? "sampler" : "texture or sampler") + " \"" + declaration.name + "\"";
-	if (source.kind != ExpressionKind::Identifier) {
-		throw CompileError(what + " has to be initialised from the name of a texture or sampler: a "
-			"conditional, a call, a member or an element would pick the descriptor at run time, which "
-			"mslc does not lower");
-	}
-	if (source.name == declaration.name && !source.fileScope) {
+		? "sampler" : "texture or sampler") + (pointer ? " pointer" : "") + " \"" + declaration.name + "\"";
+	if (source.kind == ExpressionKind::Identifier && source.name == declaration.name && !source.fileScope) {
 		throw CompileError(what + " is initialised from itself");
 	}
-	const Binding* named = findResourceBinding(source.name, source.fileScope);
-	if (!named || named->pointeeMsl.resource == ResourceKind::None) {
-		throw CompileError(what + " is initialised from \"" + source.name + "\", which is not a texture or "
-			"a sampler");
+	const std::optional<ResolvedResource> resolved = resourceOf(source);
+	if (!resolved && source.kind != ExpressionKind::Identifier) {
+		throw CompileError(what + " has to be initialised from the name of a texture or sampler"
+			+ std::string(pointer ? ", its address, " : " ") + "or a call that returns one: a "
+			"conditional, a member or an element would pick the descriptor at run time, which "
+			"mslc does not lower");
 	}
-	if (declared && !sameResourceType(named->pointeeMsl, *declared)) {
-		throw CompileError(what + " is initialised from \"" + source.name + "\", which is not a "
-			+ typeName(*declared));
+	const std::string from = source.kind == ExpressionKind::Identifier ? "\"" + source.name + "\""
+		: resolved ? "a " + typeName(resolved->binding.pointeeMsl) : std::string("its initialiser");
+	if (!resolved) {
+		throw CompileError(what + " is initialised from " + from + ", which is not a texture or a sampler");
 	}
-	_bindings[declaration.name] = *named;
+	if (declared && !sameResourceType(resolved->binding.pointeeMsl, *declared)) {
+		throw CompileError(what + " is initialised from " + from + ", which is not a " + typeName(*declared));
+	}
+	if (resolved->pointer != pointer) {
+		throw CompileError(what + " is initialised from " + (resolved->pointer
+			? "the address of a texture or sampler; it is not a pointer"
+			: "a texture or sampler; it is a pointer, and takes its address"));
+	}
+	if (pointer && resolved->binding.embeddedSampler && !declared->isConst) {
+		throw CompileError(what + " points at a constexpr sampler, which is const; it has to be a pointer to const");
+	}
+	Binding alias = resolved->binding;
+	alias.resourcePointer = pointer;
+	_bindings[declaration.name] = alias;
 }
 
 // A half texture is sampled as a float image, a short one as an int image and a
@@ -500,19 +513,152 @@ Id Emitter::textureTexel(const Binding& texture, Id sampled) {
 		? convert(depth, _types.scalar(ScalarKind::Float), _types.scalar(ScalarKind::Half)) : depth;
 }
 
-const Binding& Emitter::textureReceiver(const Expression& call) {
+Binding Emitter::textureReceiver(const Expression& call) {
 	const Expression& member = *call.left;
-	if (member.left->kind != ExpressionKind::Identifier) {
+	const std::optional<ResolvedResource> resolved = resourceOf(*member.left);
+	if (!resolved && member.left->kind != ExpressionKind::Identifier) {
 		throw CompileError("the receiver of \"." + member.memberName + "\" has to be a texture parameter");
 	}
-
-	const Binding* found = findBinding(*member.left);
-	if (!found || !found->pointeeMsl.isTexture()) {
-		throw CompileError("\"" + member.left->name + "\" is not a texture parameter, so "
+	if (!resolved || !resolved->binding.pointeeMsl.isTexture()) {
+		throw CompileError((member.left->kind == ExpressionKind::Identifier ? "\"" + member.left->name + "\""
+			: std::string("the receiver")) + " is not a texture parameter, so "
 			"\"." + member.memberName + "\" is not a call mslc lowers");
 	}
+	if (resolved->pointer != member.isArrow) {
+		throw CompileError(member.isArrow
+			? "\"->" + member.memberName + "\" is called on a texture, not on a pointer to one; use \".\""
+			: "\"." + member.memberName + "\" is called on a pointer to a texture; use \"->\"");
+	}
 
-	return *found;
+	return resolved->binding;
+}
+
+// The descriptor an expression names, resolved while compiling, as a texture local is: a texture or sampler
+// name, *p (p[0]) for a pointer to one, &t, and a call to a helper that returns a texture or sampler pointer
+// or reference, resolved from its return. Nothing for any other expression; an expression that is about a
+// texture but cannot be resolved this way is refused, so that no descriptor is chosen at run time.
+std::optional<Emitter::ResolvedResource> Emitter::resourceOf(const Expression& expression, unsigned depth) {
+	if (depth > 16) {
+		throw CompileError("a texture or sampler is reached through calls nested more than 16 deep");
+	}
+	switch (expression.kind) {
+		case ExpressionKind::Identifier: {
+			const Binding* binding = findResourceBinding(expression.name, expression.fileScope);
+			if (!binding || binding->pointeeMsl.resource == ResourceKind::None) {
+				return std::nullopt;
+			}
+			return ResolvedResource{ *binding, binding->resourcePointer };
+		}
+		case ExpressionKind::Index: {
+			std::optional<ResolvedResource> inner = expression.left ? resourceOf(*expression.left, depth) : std::nullopt;
+			if (!inner) {
+				return std::nullopt;
+			}
+			const std::optional<int64_t> index = expression.arguments.empty() ? std::nullopt
+				: literalIndex(*expression.arguments.front());
+			if (!inner->pointer || !index || *index != 0) {
+				throw CompileError(inner->pointer
+					? "a pointer to a texture or sampler is dereferenced (*p or p[0]) only, not indexed"
+					: "a texture or sampler is dereferenced or indexed, and it is not a pointer");
+			}
+			inner->pointer = false;
+			return inner;
+		}
+		case ExpressionKind::Unary: {
+			if (expression.unaryOperator != UnaryOperator::AddressOf || !expression.left) {
+				return std::nullopt;
+			}
+			std::optional<ResolvedResource> inner = resourceOf(*expression.left, depth);
+			if (!inner) {
+				return std::nullopt;
+			}
+			if (inner->pointer) {
+				throw CompileError("the address of a pointer to a texture or sampler is not lowered");
+			}
+			inner->pointer = true;
+			return inner;
+		}
+		case ExpressionKind::Call:
+			return resourceCall(expression, depth);
+		default:
+			return std::nullopt;
+	}
+}
+
+// A call to a helper that returns a texture or sampler pointer or reference ("thread T* addressOf(thread T& r)
+// { return &r; }"): there is no such value at run time, so the helper's one return statement is resolved with
+// its parameters bound to the arguments' descriptors, and the helper is not emitted.
+std::optional<Emitter::ResolvedResource> Emitter::resourceCall(const Expression& call, unsigned depth) {
+	if (!call.left || call.left->kind != ExpressionKind::Identifier) {
+		return std::nullopt;
+	}
+	const std::vector<HelperFunction*> named = helpersCalled(call);
+	const auto returnsResource = [](const HelperFunction* helper) {
+		return helper->definition->returnType.resource != ResourceKind::None;
+	};
+	if (std::none_of(named.begin(), named.end(), returnsResource)) {
+		return std::nullopt;
+	}
+	const FunctionDecl& function = *named.front()->definition;
+	const std::string quoted = "\"" + function.name + "\"";
+	if (named.size() != 1) {
+		throw CompileError(quoted + " is overloaded and returns a texture or sampler, which mslc resolves "
+			"for a function of one signature only");
+	}
+	const Statement* body = function.body.get();
+	while (body && body->kind == StatementKind::Compound && body->children.size() == 1) {
+		body = body->children.front().get();
+	}
+	if (!body || body->kind != StatementKind::Return || !body->expression) {
+		throw CompileError(quoted + " returns a texture or sampler pointer or reference, which mslc resolves "
+			"while compiling from a body that is one return statement");
+	}
+	if (function.parameters.size() != call.arguments.size()) {
+		throw CompileError(quoted + " takes " + std::to_string(function.parameters.size()) + " arguments, and "
+			"the call gives " + std::to_string(call.arguments.size()));
+	}
+
+	std::vector<std::pair<std::string, Binding>> parameters;
+	for (size_t i = 0; i < function.parameters.size(); ++i) {
+		const Parameter& parameter = function.parameters[i];
+		if (parameter.type.resource == ResourceKind::None) {
+			throw CompileError(quoted + " returns a texture or sampler and takes \"" + parameter.name
+				+ "\", which is not one; mslc resolves such a function from texture and sampler arguments only");
+		}
+		const std::optional<ResolvedResource> argument = resourceOf(*call.arguments[i], depth + 1);
+		if (!argument || !sameResourceType(argument->binding.pointeeMsl, parameter.type)
+			|| argument->pointer != parameter.type.isPointer) {
+			throw CompileError("argument " + std::to_string(i + 1) + " of the call to " + quoted + " is not a "
+				+ typeName(parameter.type) + (parameter.type.isPointer ? " pointer" : ""));
+		}
+		if (argument->binding.embeddedSampler && (parameter.type.isPointer || parameter.isReference)
+			&& !parameter.type.isConst) {
+			throw CompileError("argument " + std::to_string(i + 1) + " of the call to " + quoted + " is a constexpr "
+				"sampler, which is const, and parameter \"" + parameter.name + "\" is a pointer or reference that "
+				"is not to const");
+		}
+		Binding bound = argument->binding;
+		bound.resourcePointer = parameter.type.isPointer;
+		parameters.emplace_back(parameter.name, bound);
+	}
+
+	std::optional<ResolvedResource> returned;
+	{
+		const BindingScope scope(_bindings);
+		_bindings.clear();
+		for (const auto& [name, binding]: parameters) {
+			_bindings[name] = binding;
+		}
+		returned = resourceOf(*body->expression, depth + 1);
+	}
+	const Type& declared = function.returnType;
+	if (!returned || returned->pointer != declared.isPointer
+		|| !sameResourceType(returned->binding.pointeeMsl, declared)) {
+		throw CompileError(quoted + " returns a " + typeName(declared) + (declared.isPointer ? " pointer" : "")
+			+ ", which mslc resolves only when its return statement names one of its texture or sampler "
+			"parameters, its address, or such a call");
+	}
+	return returned;
 }
 
 } // namespace mslc
