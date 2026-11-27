@@ -854,3 +854,23 @@ Apple's value is undefined.
   `Outer<float>` made before `Box<float>`) is refused with "argument types are declared after the template".
   Apple accepts it. The seeds are made in request order and a member template captures its names when the
   struct ends. The message is wrong for this case; the refusal is loud.
+
+## `metal::fast::` and `metal::precise::` lower as the plain functions
+
+A call of one of the functions both scopes declare (of those mslc lowers: abs, acos, asin, atan, atan2, ceil,
+clamp, cos, distance, exp, exp2, floor, fma, fmod, fract, length, log, log2, max, min, normalize, pow, powr,
+rint, round, rsqrt, saturate, select, sin, sqrt, tan and trunc) is that function on float: a scalar of another
+type converts to float and a vector of another type is refused, as Apple's float-only overloads do. The
+instructions are the plain function's, with the precision Vulkan gives them. Neither variant's bound in the
+MSL specification is promised; the fast variants are what Apple's default fast math compiles the plain names
+to, so they are the closer of the two. A function both scopes declare that mslc does not lower (sinh, cospi
+and so on) is refused like its plain name. Tests: `tests/probes/math_fast_*`.
+
+Where this differs from Apple:
+
+- A function named through a using declaration or directive (`using metal::fast::clamp;`,
+  `using namespace metal::fast;`) is recorded under its bare name, so it gets the plain function's typing:
+  `clamp(5, 0, 3) / 2` is 1 where Apple, converting to float, gives 1.5. A wrong value, not a refusal; it was
+  the same before the qualified spelling was lowered.
+- False refusals: `fast::select` of two scalars of different types (`select(1, 2.0h, c)`), and a bool argument
+  (`fast::select(true, false, c)`, `fast::abs(true)`). Apple converts each to float.
