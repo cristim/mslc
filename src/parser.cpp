@@ -6156,10 +6156,11 @@ FieldAttributes Parser::parseFieldAttributes() {
 		}
 	});
 
-	// A gated stage input or output other than a colour would change the interface between stages, which is
-	// fixed when a pipeline is made here.
-	if (!attributes.functionConstant.empty() && !attributes.colorIndex) {
-		throw CompileError("[[function_constant]] on a struct field is lowered on a [[color(n)]] field only");
+	// A gated stage input or output other than a colour or the sample mask would change the interface between
+	// stages, which is fixed when a pipeline is made here.
+	if (!attributes.functionConstant.empty() && !attributes.colorIndex && !attributes.sampleMask) {
+		throw CompileError("[[function_constant]] on a struct field is lowered on a [[color(n)]] or [[sample_mask]] "
+			"field only");
 	}
 
 	return attributes;

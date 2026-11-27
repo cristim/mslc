@@ -1,4 +1,4 @@
-// EXPECT: error is lowered on a [[color(n)]] field only
+// EXPECT: error is lowered on a [[color(n)]] or [[sample_mask]] field only
 // A gated vertex input would change the vertex layout of a pipeline, which is not lowered yet.
 #include <metal_stdlib>
 using namespace metal;
