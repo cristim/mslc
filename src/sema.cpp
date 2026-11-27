@@ -11222,6 +11222,8 @@ namespace {
 				return "threads_per_threadgroup";
 			case ParameterAttributes::Builtin::VertexID: return "vertex_id";
 			case ParameterAttributes::Builtin::InstanceID: return "instance_id";
+			case ParameterAttributes::Builtin::BaseVertex: return "base_vertex";
+			case ParameterAttributes::Builtin::BaseInstance: return "base_instance";
 			case ParameterAttributes::Builtin::Position: return "position";
 			case ParameterAttributes::Builtin::FragCoord: return "frag_coord";
 			case ParameterAttributes::Builtin::FrontFacing: return "front_facing";
@@ -11245,6 +11247,8 @@ namespace {
 				return stage == Stage::Kernel;
 			case ParameterAttributes::Builtin::VertexID:
 			case ParameterAttributes::Builtin::InstanceID:
+			case ParameterAttributes::Builtin::BaseVertex:
+			case ParameterAttributes::Builtin::BaseInstance:
 				return stage == Stage::Vertex;
 			case ParameterAttributes::Builtin::FragCoord:
 			case ParameterAttributes::Builtin::FrontFacing:
@@ -11475,6 +11479,13 @@ namespace {
 							return spirv::BuiltIn::VertexIndex;
 						case ParameterAttributes::Builtin::InstanceID:
 							return spirv::BuiltIn::InstanceIndex;
+						// An indexed draw's vertexOffset and a draw's firstInstance,
+						// which are Metal's base vertex and base instance when the
+						// runtime passes them through.
+						case ParameterAttributes::Builtin::BaseVertex:
+							return spirv::BuiltIn::BaseVertex;
+						case ParameterAttributes::Builtin::BaseInstance:
+							return spirv::BuiltIn::BaseInstance;
 						case ParameterAttributes::Builtin::FragCoord:
 						case ParameterAttributes::Builtin::Position:
 							return spirv::BuiltIn::FragCoord;
@@ -11492,6 +11503,8 @@ namespace {
 				switch (spvBuiltin) {
 					case spirv::BuiltIn::VertexIndex:
 					case spirv::BuiltIn::InstanceIndex:
+					case spirv::BuiltIn::BaseVertex:
+					case spirv::BuiltIn::BaseInstance:
 						typeId = _types.scalar(ScalarKind::UInt);
 						break;
 					// A scalar, unlike the compute ids above: LocalInvocationIndex
@@ -11578,6 +11591,23 @@ namespace {
 					throw CompileError("parameter \"" + parameter.name + "\" is [[" +
 						builtinName(*parameter.attributes.builtin) + "]], which has to be a uint or ushort "
 						"scalar");
+				}
+
+				// Apple takes the base vertex and base instance as a uint or ushort scalar by value, and
+				// reports a reference, a pointer or an atomic.
+				const bool drawParameter = spvBuiltin == spirv::BuiltIn::BaseVertex
+					|| spvBuiltin == spirv::BuiltIn::BaseInstance;
+				if (drawParameter) {
+					if (parameter.type.vectorWidth > 0 || parameter.type.isMatrix() || parameter.type.arrayLength
+						|| !parameter.type.namedType.empty() || parameter.isReference || parameter.type.isPointer
+						|| parameter.type.isAtomic
+						|| (parameter.type.scalar != ScalarKind::UInt && parameter.type.scalar != ScalarKind::UShort)) {
+						throw CompileError("parameter \"" + parameter.name + "\" is [[" +
+							builtinName(*parameter.attributes.builtin) + "]], which has to be a uint or ushort "
+							"scalar");
+					}
+					// Core since SPIR-V 1.3. Vulkan also needs the shaderDrawParameters feature.
+					_types.requireCapability(spirv::Capability::DrawParameters);
 				}
 
 				_builder.setSection(spirv::Section::Annotations);

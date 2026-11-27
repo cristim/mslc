@@ -274,6 +274,8 @@ namespace {
 		if (name == "threads_per_threadgroup") { return Builtin::ThreadsPerThreadgroup; }
 		if (name == "vertex_id") { return Builtin::VertexID; }
 		if (name == "instance_id") { return Builtin::InstanceID; }
+		if (name == "base_vertex") { return Builtin::BaseVertex; }
+		if (name == "base_instance") { return Builtin::BaseInstance; }
 		if (name == "position") { return Builtin::Position; }
 		if (name == "frag_coord") { return Builtin::FragCoord; }
 		if (name == "front_facing") { return Builtin::FrontFacing; }
@@ -328,6 +330,8 @@ bool isMSLBuiltinName(std::string_view name) {
 		"thread_index_in_threadgroup",
 		"vertex_id",
 		"instance_id",
+		"base_vertex",
+		"base_instance",
 		"position",
 		"frag_coord",
 		"front_facing",
@@ -5888,7 +5892,8 @@ Parameter Parser::parseParameter(const std::string& helperName) {
 // effect: the argument is what the call passes, and indices may repeat. Some must still suit the type, else it
 // is an error: [[buffer(n)]] a pointer or reference to device or constant memory, [[threadgroup(n)]] one to
 // threadgroup memory, [[texture(n)]] a texture, [[sampler(n)]] a sampler, [[position]] a float4, and the
-// thread and threadgroup position, index and size builtins a uint or ushort scalar or vector. In a function
+// thread and threadgroup position, index and size builtins a uint or ushort scalar or vector, and
+// [[base_vertex]] and [[base_instance]] a uint or ushort scalar by value. In a function
 // template the check is made on the instance, as a substitution failure. [[flat]] and the other interpolation
 // attributes apply to struct members only. The other attributes are accepted and dropped without a check of the
 // type. The MSL specification does not say. Evidence: black-box observation of Apple's compiler (tier 2; metal
@@ -5904,6 +5909,7 @@ void Parser::checkHelperParameterAttributes(const Parameter& param, const std::s
 	const bool resource = type.resource != ResourceKind::None;
 	const bool integerBuiltinType = !type.isPointer && !type.arrayLength && !type.isMatrix() && type.namedType.empty()
 		&& (type.scalar == ScalarKind::UInt || type.scalar == ScalarKind::UShort) && type.vectorWidth <= 3;
+	const bool integerScalarType = integerBuiltinType && type.vectorWidth == 0 && !place && !type.isAtomic;
 	std::string wrong;
 	parseAttributeList([&](const std::string& name, std::optional<uint32_t>, const std::string&) {
 		if (interpolationFromName(name)) {
@@ -5919,6 +5925,7 @@ void Parser::checkHelperParameterAttributes(const Parameter& param, const std::s
 			: name == "sampler" ? type.resource == ResourceKind::Sampler && !type.isPointer && !type.arrayLength
 			: name == "position" ? !place && !resource && type.namedType.empty() && type.scalar == ScalarKind::Float
 				&& type.vectorWidth == 4 && !type.isMatrix() && !type.arrayLength
+			: name == "base_vertex" || name == "base_instance" ? integerScalarType
 			: builtinFromName(name) && name != "front_facing" && name != "vertex_id" && name != "instance_id"
 				&& name != "frag_coord" ? integerBuiltinType
 			: true;
