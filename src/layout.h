@@ -26,9 +26,15 @@ VectorLayout vectorLayoutFor(uint32_t scalarBytes, uint32_t components);
 VectorLayout packedVectorLayoutFor(uint32_t scalarBytes, uint32_t components);
 VectorLayout matrixLayoutFor(uint32_t scalarBytes, uint32_t columns, uint32_t rows);
 uint32_t alignTo(uint32_t offset, uint32_t alignment);
-VectorLayout elementLayout(const Type& type);
-std::vector<uint32_t> arrayStrides(const Type& type);
-VectorLayout memberLayout(const Type& type);
+// A struct-typed member is laid out whole when the unit that declares it is given, and has no layout
+// of its own here without it.
+VectorLayout elementLayout(const Type& type, const TranslationUnit* unit = nullptr);
+std::vector<uint32_t> arrayStrides(const Type& type, const TranslationUnit* unit = nullptr);
+VectorLayout memberLayout(const Type& type, const TranslationUnit* unit = nullptr);
+
+// A struct's size, rounded up to its alignment, and that alignment: how it sits as a member of another
+// struct or as an array element.
+VectorLayout structElementLayout(const std::string& name, const TranslationUnit& unit);
 
 // What sizeof gives a type: its size with Metal's alignment and tail padding, a struct as
 // big as its members laid out in order rounded up to its own alignment, a pointer 8 bytes.

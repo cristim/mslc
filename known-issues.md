@@ -480,8 +480,7 @@ Apple accepts the first five, which are refused loudly. It also rejects the last
   member of a namespace"). It needs the parser's using and lookup code; `typedef S T; T{1,2}` works,
   at statement start too.
 - A struct with an array member is brace-initialised with the array in its own braces (`A x{{1,2},3}`, designators
-  included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`), a
-  struct member that is an array of structs ("an array of structs field in value struct is not lowered yet"),
+  included). Still refused where Apple accepts: brace elision into the array member (`A x{1,2,3}`),
   indexing a temporary (`S{{1,2},3}.a[1]`), a braced return from an entry point (a helper's `return {1,2};` works, #362), and the
   parenthesised copy `A z(A{{1},2})` ("constructing a A is not lowered yet", as for any struct).
 - File-scope `constant` structs with a positional or array-member initialiser (a plain `constant P g = {1, 4};` gets the same "initialised by field name" error; designators on a plain struct work), which Apple accepts: `constant Q g =
@@ -674,8 +673,6 @@ below the template that rebinds a name, and a later overload found by argument-d
   float>` another; a struct argument's namespace is spelled `$` in the instance's name (never shown).
 - Older gap (master, not templates): calling a non-device member function on a `device const` object is accepted
   where Apple rejects it.
-- A struct that contains an instance by value inherits the older gap that a struct field of struct type is not
-  represented in a buffer struct.
 
 ## Member function templates: what is refused or approximated (#341, slice 5c)
 

@@ -971,20 +971,27 @@ std::vector<Id> TypeTable::storageTypesFor(const std::string& name, const std::v
 		if (field.isPointer) {
 			continue;
 		}
+		const bool nested = !field.namedType.empty();
 		if (field.arrayLength) {
-			// Only the array wrappers differ between the forms: a laid-out array
-			// carries ArrayStride, and the element is the same type in both.
-			const std::vector<uint32_t> strides = arrayStrides(field);
+			// The array wrappers differ between the forms: a laid-out array carries
+			// ArrayStride. The element is the same type in both, except a struct,
+			// whose laid-out form is the array-element struct.
+			const std::vector<uint32_t> strides = arrayStrides(field, &_unit);
 			std::vector<uint32_t> lengths { *field.arrayLength };
 			lengths.insert(lengths.end(), field.innerArrayLengths.begin(), field.innerArrayLengths.end());
 			Id element = types[i];
 			for (size_t dimension = 0; dimension < lengths.size(); ++dimension) {
 				element = arrayElement(element);
 			}
+			if (nested) {
+				element = arrayElementStruct(field.namedType);
+			}
 			for (size_t dimension = lengths.size(); dimension-- > 0;) {
 				element = laidOutArray(element, lengths[dimension], strides[dimension]);
 			}
 			types[i] = element;
+		} else if (nested) {
+			types[i] = arrayElementStruct(field.namedType);
 		} else if (field.isPacked) {
 			types[i] = packedStorage(field.scalar, field.vectorWidth);
 		} else if (field.scalar == ScalarKind::Bool && !field.isPointer && field.namedType.empty()) {
@@ -1428,7 +1435,7 @@ uint32_t TypeTable::alignmentOf(Id type, bool packed) const {
 
 		uint32_t alignment = 1;
 		for (const StructField& field: decl->fields) {
-			alignment = std::max(alignment, memberLayout(field.type).alignment);
+			alignment = std::max(alignment, memberLayout(field.type, &_unit).alignment);
 		}
 
 		return alignment;
@@ -1619,9 +1626,9 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 	uint32_t alignment = 1;
 
 	for (const StructField& field: decl->fields) {
-		if (!field.type.isPointer && !field.type.namedType.empty()) {
-			throw CompileError("struct \"" + decl->name + "\" has a field whose type is itself "
-				"a struct, which mslc cannot represent yet (\"" + field.name + "\")");
+		const bool nested = !field.type.isPointer && !field.type.namedType.empty();
+		if (nested && _unit.findStruct(field.type.namedType) == decl) {
+			throw CompileError("struct \"" + decl->name + "\" contains itself (\"" + field.name + "\")");
 		}
 
 		if (field.type.arrayLength && (field.type.isPacked || field.type.scalar == ScalarKind::Bool)) {
@@ -1643,9 +1650,11 @@ bool TypeTable::structMembersFor(const std::string& name, std::vector<Id>& outTy
 		}
 
 		const uint32_t components = field.type.vectorWidth > 1 ? field.type.vectorWidth : 1;
-		const VectorLayout layout = memberLayout(field.type);
+		const VectorLayout layout = memberLayout(field.type, &_unit);
 
-		Id valueType = field.type.isMatrix()
+		// A struct member is the struct's value form here; storageTypesFor gives its laid-out form.
+		Id valueType = nested ? valueStruct(field.type.namedType)
+			: field.type.isMatrix()
 			? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
 			: components > 1
 			? vector(field.type.scalar, field.type.vectorWidth)
@@ -1728,9 +1737,8 @@ Id TypeTable::valueStruct(const std::string& name) {
 	_valueStructs.emplace(name, InvalidId);
 	std::vector<Id> fieldTypes;
 	for (const StructField& field: decl->fields) {
-		if (field.type.isPointer || (field.type.arrayLength && !field.type.namedType.empty())) {
-			throw CompileError(std::string(field.type.isPointer ? "a pointer" : "an array of structs")
-				+ " field in value struct \"" + name + "\" is not lowered yet");
+		if (field.type.isPointer) {
+			throw CompileError("a pointer field in value struct \"" + name + "\" is not lowered yet");
 		}
 		Id fieldType = !field.type.namedType.empty() ? valueStruct(field.type.namedType)
 			: field.type.isMatrix() ? matrix(field.type.scalar, field.type.matrixColumns, field.type.vectorWidth)
@@ -3358,8 +3366,11 @@ namespace {
 			Id member = _builder.emitTyped(spirv::OpCompositeExtract, from.declared[i],
 				{ value, static_cast<uint32_t>(i) });
 
+			TypeTable::StructForm memberForm;
 			if (from.declared[i] != to.declared[i] && _types.arrayElement(from.declared[i]) != InvalidId) {
 				member = convertArray(member, from.declared[i], to.declared[i]);
+			} else if (from.declared[i] != to.declared[i] && _types.structForm(from.declared[i], memberForm)) {
+				member = convert(member, from.declared[i], to.declared[i]);
 			} else if (from.declared[i] != to.declared[i] && _types.isBool(from.value[i])) {
 				// A bool member is bytes in the laid-out form and a bool in the value
 				// form, whichever way the copy goes.
@@ -4582,6 +4593,10 @@ namespace {
 			for (size_t dimension = memberOwner->fields[memberField].type.arrayRank(); dimension > current.arrayRank(); --dimension) {
 				outFieldType = _types.arrayElement(outFieldType);
 			}
+		} else if (!current.namedType.empty() && !current.isPointer && arrayInBuffer) {
+			// A struct in a buffer, a member of another or an element of an array member, is the laid-out
+			// form, as a buffer of that struct's element is.
+			outFieldType = _types.arrayElementStruct(current.namedType);
 		}
 
 		const spirv::StorageClassValue storageClass = fromBuffer
