@@ -6071,6 +6071,15 @@ namespace {
 			&& name.find("::", prefix.size()) == std::string::npos) {
 			return name.substr(prefix.size());
 		}
+		// The library's fast and precise variants of a function (metal::fast::normalize,
+		// metal::precise::sqrt, metal::fast::select) lower as the function itself. Implementation limit:
+		// SPIR-V's extended instructions carry Vulkan's precision, which neither variant's bound in the MSL
+		// specification is promised to match.
+		for (const std::string_view scope : { std::string_view("metal::fast::"), std::string_view("metal::precise::") }) {
+			if (name.compare(0, scope.size(), scope) == 0 && name.find("::", scope.size()) == std::string::npos) {
+				return name.substr(scope.size());
+			}
+		}
 		return name;
 	}
 

@@ -854,3 +854,11 @@ Apple's value is undefined.
   `Outer<float>` made before `Box<float>`) is refused with "argument types are declared after the template".
   Apple accepts it. The seeds are made in request order and a member template captures its names when the
   struct ends. The message is wrong for this case; the refusal is loud.
+
+## `metal::fast::` and `metal::precise::` lower as the plain functions
+
+`metal::fast::sqrt`, `metal::precise::normalize`, `fast::select` and the rest of those two scopes are the
+library's functions without the prefix: the same GLSL.std.450 instructions, with the precision Vulkan gives
+them. Neither variant's bound in the MSL specification is promised; the fast variants are what Apple's default
+fast math compiles the plain names to, so they are the closer of the two. Test:
+`tests/probes/math_fast_and_precise_variants.metal`.
