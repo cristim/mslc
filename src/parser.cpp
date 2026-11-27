@@ -6152,8 +6152,13 @@ void Parser::parseAttributeList(const std::function<void(const std::string&, std
 void Parser::parseFunctionConstantArgument(std::optional<uint32_t>& index, std::string& gate) {
 	const size_t start = _position;
 	const ExpressionPtr expression = parseAssignment();
-	// The file-scope names, which the parser of a template's instance is given as well (restoreNames).
-	if (expression->kind == ExpressionKind::Identifier) {
+	// The file-scope names, which the parser of a template's instance is given as well (restoreNames). A
+	// parameter or local of that name hides the constant, and is not a program-scope constant.
+	bool hidden = false;
+	for (const auto& block: _blocks) {
+		hidden = hidden || block.names.count(expression->name);
+	}
+	if (expression->kind == ExpressionKind::Identifier && !hidden) {
 		const auto declared = _declared.find(expression->name);
 		if (declared != _declared.end() && declared->second == "variable") {
 			gate = expression->name;
@@ -6163,10 +6168,10 @@ void Parser::parseFunctionConstantArgument(std::optional<uint32_t>& index, std::
 	_position = start;
 	try {
 		index = static_cast<uint32_t>(parseConstantIndex("attribute \"function_constant\"", true));
-	} catch (const CompileError&) {
+	} catch (const CompileError& error) {
 		if (gate.empty()) {
-			throw CompileError("attribute \"function_constant\" needs the index of a function constant on a "
-				"file-scope constant and the name of a program-scope constant anywhere else");
+			throw CompileError(std::string(error.what()) + "; on a declaration other than a file-scope constant, it "
+				"names a program-scope constant");
 		}
 		index.reset();
 	}

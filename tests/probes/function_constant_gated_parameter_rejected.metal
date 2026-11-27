@@ -1,4 +1,4 @@
-// EXPECT: error needs the index of a function constant on a file-scope constant and the name of a program-scope constant anywhere else
+// EXPECT: error on a declaration other than a file-scope constant, it names a program-scope constant
 // A parameter is not a program-scope constant.
 #include <metal_stdlib>
 using namespace metal;
