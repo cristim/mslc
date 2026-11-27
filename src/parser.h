@@ -165,7 +165,7 @@ public:
 	// nesting is capped by kMaxNestingDepth.
 	static constexpr uint32_t kMaxExpressionHeight = 4000;
 
-	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); }
+	explicit Parser(std::vector<Token> tokens): _tokens(std::move(tokens)) { reserveSplits(_tokens); seedStdlibEnums(); }
 
 	TranslationUnit parse();
 
@@ -392,6 +392,7 @@ private:
 	// "enum Tag" when there is no brace, which says so in hadBody. Returns the
 	// tag, empty for an enum without one.
 	std::string parseEnumDeclaration(bool& hadBody);
+	void seedStdlibEnums();
 
 	// Records a file-scope name, or throws when it is already taken by something
 	// the typedef and enum support has to keep distinct from it.

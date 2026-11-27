@@ -3849,7 +3849,8 @@ bool Parser::resolveTypeName(std::string_view text, Type& out) const {
 	// arithmetic, so it is that type here. sema rejects an int or another enum
 	// where an enum is expected in an initializer or an assignment
 	// (requireEnumValue); other conversion sites are tracked in #235.
-	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()) {
+	if (const auto enumType = _enumTypes.find(std::string(text)); enumType != _enumTypes.end()
+		&& !(enumType->second == "metal::component" && _declared.count("metal::component"))) {
 		out.scalar = _enumUnderlying.at(enumType->second);
 		out.vectorWidth = 0;
 		out.matrixColumns = 0;
@@ -4824,6 +4825,9 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		if (!stdlibTargets.empty()) {
 			return pick(stdlibTargets, last);
 		}
+		if (last == "component" && libraryNominatedFromHere()) {
+			return "metal::component";
+		}
 		return last;
 	}
 
@@ -4967,7 +4971,8 @@ std::string Parser::resolveNameUnchecked(const QualifiedName& name, std::vector<
 		if (resolveTypeName(ownerName, ownerType) && !ownerType.enumName.empty()) {
 			const std::string& tag = ownerType.enumName;
 			const size_t enclosing = tag.rfind("::");
-			const std::string key = enclosing == std::string::npos ? last : tag.substr(0, enclosing + 2) + last;
+			const std::string key = tag == "metal::component" ? tag + "::" + last
+				: enclosing == std::string::npos ? last : tag.substr(0, enclosing + 2) + last;
 			const auto constant = _enumConstants.find(key);
 			if (constant != _enumConstants.end() && constant->second.owner == tag) {
 				return key;
@@ -5235,6 +5240,15 @@ void Parser::registerTypedef(const std::string& name, const Type& target) {
 	_typedefs[name] = target;
 }
 
+void Parser::seedStdlibEnums() {
+	_enumTypes["metal::component"] = "metal::component";
+	_enumUnderlying["metal::component"] = ScalarKind::Int;
+	_enumConstants["metal::component::x"] = { 0, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::y"] = { 1, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::z"] = { 2, ScalarKind::Int, "metal::component" };
+	_enumConstants["metal::component::w"] = { 3, ScalarKind::Int, "metal::component" };
+}
+
 std::string Parser::parseEnumDeclaration(bool& hadBody) {
 	expectKeyword("enum", "to start an enum");
 
@@ -5421,6 +5435,9 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
+			if (expression.enumName == "metal::component") {
+				throw CompileError("a value of scoped enum metal::component is not an integer constant expression");
+			}
 			// A sizeof is a ulong, which unsigned arithmetic would wrap but this does not, so
 			// the operators below refuse the one case where a signed result differs.
 			if (expression.isSizeof) {
@@ -5724,7 +5741,8 @@ void Parser::recordConstant(const VariableDeclaration& declaration, bool local) 
 		return;
 	}
 	if (!(type.isConst || type.isConstexpr || !local) || type.isPointer || (!local && type.isAtomic)
-		|| !type.isScalar() || !type.namedType.empty() || !declaration.initializer) {
+		|| !type.isScalar() || !type.namedType.empty() || type.enumName == "metal::component"
+		|| !declaration.initializer) {
 		return;
 	}
 	int64_t low = 0;
@@ -5841,6 +5859,9 @@ std::optional<Type> Parser::declaredObjectType(const Expression& operand) const 
 static bool isSixtyFourBit(const Expression& expression) {
 	switch (expression.kind) {
 		case ExpressionKind::IntLiteral:
+			if (expression.enumName == "metal::component") {
+				throw CompileError("a value of scoped enum metal::component is not an integer constant expression");
+			}
 			return expression.intKind == ScalarKind::Long || expression.intKind == ScalarKind::ULong;
 		case ExpressionKind::Unary:
 			return isSixtyFourBit(*expression.left);

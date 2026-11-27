@@ -2989,6 +2989,11 @@ namespace {
 		void validateConstexprInitializer(const VariableDeclaration& declaration);
 		void validateConstexprInitializer(const VariableDeclaration& declaration, const Type& type);
 		std::optional<std::string> enumOf(const Expression& expression);
+		bool isComponentValue(const Expression& expression);
+		void checkBinaryComponentOperands(BinaryOperator op, const Expression& left, const Expression& right);
+		void checkConditionalOperands(const Expression& condition, const Expression& whenTrue,
+			const Expression& whenFalse);
+		Id emitNonComponent(const Expression& expression, const std::string& what);
 		void requireEnumValue(const std::string& target, const Expression& value, const std::string& what);
 		bool readsRuntimeValue(const Expression& expression) const;
 		void requireSameReferent(const VariableDeclaration& declaration, const Type& type, Id referent);
@@ -3224,6 +3229,7 @@ namespace {
 		Id constantStruct(Id type, const std::vector<uint32_t>& parts);
 		Id convertImplicit(Id value, Id toType);
 		Id asCondition(Id value);
+		Id emitCondition(const Expression& expression);
 		Id broadcast(Id value, Id vectorType);
 	};
 
@@ -3652,6 +3658,10 @@ namespace {
 		return convert(value, type, _boolType);
 	}
 
+	Id Emitter::emitCondition(const Expression& expression) {
+		return asCondition(emitNonComponent(expression, "a condition"));
+	}
+
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		// The entry point's own names first, then the module's: a constant declared
 		// at file scope is not a parameter of the entry point that reads it.
@@ -4063,6 +4073,9 @@ namespace {
 		switch (expression.kind) {
 			case ExpressionKind::BoolLiteral: return expression.boolValue ? 1 : 0;
 			case ExpressionKind::IntLiteral:
+				if (expression.enumName == "metal::component") {
+					return std::nullopt;
+				}
 				return static_cast<int64_t>(std::min(expression.intValue, kBeyondAnyWidth));
 			case ExpressionKind::Unary: {
 				const auto operand = literalIndex(*expression.left);
@@ -4086,6 +4099,7 @@ namespace {
 	// and its own type is checked here, so the lowering does not depend on what
 	// the generic index path relabels it as.
 	Emitter::ElementIndex Emitter::elementIndex(const Expression& expression, uint32_t width) {
+		requireEnumValue("", expression, "a vector index");
 		if (const auto literal = literalIndex(expression)) {
 			if (*literal < 0 || *literal >= static_cast<int64_t>(width)) {
 				throw CompileError("the index " + std::to_string(*literal) + " is outside a vector of "
@@ -4113,7 +4127,7 @@ namespace {
 	}
 
 	Id Emitter::stepIndex(const Expression& expression, const char* what) {
-		const Id index = wordIndex(emitExpression(expression), what);
+		const Id index = wordIndex(emitNonComponent(expression, std::string("the ") + what + " index"), what);
 		_builder.setType(index, _uintType);
 		return index;
 	}
@@ -4835,7 +4849,7 @@ namespace {
 	// of another shape is not a conversion Apple has either.
 	Id Emitter::emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
 		const std::string& spelled) {
-		const Id value = emitExpression(argument);
+		const Id value = emitNonComponent(argument, "the constructor for " + spelled);
 		const Id fromType = _builder.typeOf(value);
 		const auto* to = _types.matrixInfo(toType);
 
@@ -4928,7 +4942,7 @@ namespace {
 				const Id componentType = _types.componentOf(_types.matrixInfo(toType)->column);
 				std::vector<uint32_t> scalars;
 				for (const ExpressionPtr& argument: expression.arguments) {
-					const Id value = emitExpression(*argument);
+					const Id value = emitNonComponent(*argument, "the constructor for " + spelled);
 					const Id valueType = _builder.typeOf(value);
 					if (_types.vectorWidth(valueType) != 1 || _types.bitWidth(valueType) == 0) {
 						throw CompileError("no matching constructor for " + spelled + ": " + std::to_string(scalars.size() + 1)
@@ -4979,7 +4993,9 @@ namespace {
 			return emitConstructList(expression, toType);
 		}
 
-		const Id value = emitExpression(*expression.arguments.front());
+		const Id value = target.isVector()
+			? emitNonComponent(*expression.arguments.front(), "the constructor for " + spelled)
+			: emitExpression(*expression.arguments.front());
 		const Id fromType = _builder.typeOf(value);
 
 		if (_types.vectorWidth(fromType) == 1 && _types.vectorWidth(toType) > 1) {
@@ -5004,7 +5020,7 @@ namespace {
 		std::vector<uint32_t> pieces;
 		uint32_t components = 0;
 		for (const ExpressionPtr& argument: expression.arguments) {
-			const Id value = emitExpression(*argument);
+			const Id value = emitNonComponent(*argument, "an argument of " + spelled);
 			const Id type = _builder.typeOf(value);
 
 			if (_types.componentOf(type) != InvalidId) {
@@ -5078,7 +5094,8 @@ namespace {
 					const Type& type = expression.left->templateArguments.front().type;
 					return !type.isVector() && !type.isMatrix() && !type.isPointer
 						&& !type.arrayLength && type.namedType.empty() && type.enumName.empty()
-						&& expression.arguments.size() == 1 && canFoldExpression(*expression.arguments.front(), excluded);
+						&& expression.arguments.size() == 1 && !isComponentValue(*expression.arguments.front())
+						&& canFoldExpression(*expression.arguments.front(), excluded);
 				}
 				return false;
 			}
@@ -5179,9 +5196,7 @@ namespace {
 	}
 
 	Id Emitter::convertListScalar(Id value, const Type& target, const Expression& expression) {
-		if (!target.enumName.empty()) {
 			requireEnumValue(target.enumName, expression, "an element of the initializer list");
-		}
 		const auto from = _types.scalarKindOf(_builder.typeOf(value));
 		if (!from) { throw CompileError("a scalar initializer list needs a scalar value"); }
 		const ScalarKind to = target.scalar;
@@ -5322,6 +5337,9 @@ namespace {
 		if (slot.group) { return emitInitPlan(field, *slot.group, values); }
 		const Expression& expression = *slot.element->value;
 		if (expression.kind == ExpressionKind::InitList) { return emitInitListValue(field, expression); }
+		if (!field.isPointer && !field.arrayLength) {
+			requireEnumValue(field.enumName, expression, "an element of the initializer list");
+		}
 		if (!values[slot.index]) { values[slot.index] = emitExpression(expression); }
 		const Id value = *values[slot.index];
 		return field.namedType.empty() && field.isScalar()
@@ -5461,6 +5479,9 @@ namespace {
 		if (expression.unaryOperator == UnaryOperator::AddressOf) {
 			throw CompileError("taking an address with '&' is not supported; only an atomic_*_explicit "
 				"function takes the address of an element");
+		}
+		if (isComponentValue(*expression.left)) {
+			throw CompileError("unary operator does not accept a value of scoped enum metal::component without a cast");
 		}
 		const Id operand = emitExpression(*expression.left);
 		const Id type = _builder.typeOf(operand);
@@ -5642,7 +5663,7 @@ namespace {
 
 		beginBlock(rightLabel);
 		const ControlDepthScope depth(_controlDepth);
-		const Id right = asCondition(emitExpression(rightExpression));
+		const Id right = emitCondition(rightExpression);
 		const Id rightBlock = _currentBlock;
 		terminate(spirv::OpBranch, { mergeLabel });
 
@@ -5771,7 +5792,8 @@ namespace {
 	// Otherwise the values go in their own blocks and meet in an OpPhi, as in
 	// emitShortCircuit, so `i < n ? buf[i] : 0.0f` never reads buf[n].
 	Id Emitter::emitConditional(const Expression& expression) {
-		const Id condition = asCondition(emitExpression(*expression.left));
+		checkConditionalOperands(*expression.left, *expression.arguments[0], *expression.arguments[1]);
+		const Id condition = emitCondition(*expression.left);
 		const Expression& whenTrue = *expression.arguments[0];
 		const Expression& whenFalse = *expression.arguments[1];
 
@@ -5842,6 +5864,7 @@ namespace {
 	}
 
 	Id Emitter::emitBinary(const Expression& expression) {
+		checkBinaryComponentOperands(expression.binaryOperator, *expression.left, *expression.right);
 		const Id left = emitExpression(*expression.left);
 
 		const bool isLogical = expression.binaryOperator == BinaryOperator::LogicalAnd
@@ -6342,7 +6365,7 @@ namespace {
 			return _builder.emitTyped(spirv::OpAtomicLoad, type, { address, scope, semantics });
 		}
 
-		const Id value = convertImplicit(emitExpression(*expression.arguments[1]), type);
+		const Id value = convertImplicit(emitNonComponent(*expression.arguments[1], name), type);
 		if (isStore) {
 			_builder.emit(spirv::OpAtomicStore, { address, scope, semantics, value });
 			return InvalidId;
@@ -6407,7 +6430,7 @@ namespace {
 				+ ", and \"" + expected->name + "\" is not one");
 		}
 
-		const Id desired = convertImplicit(emitExpression(*expression.arguments[2]), type);
+		const Id desired = convertImplicit(emitNonComponent(*expression.arguments[2], name), type);
 		const Id comparator = emitExpression(*expected);
 		const Id scope = constantU32(_types.storageClassOf(_builder.typeOf(address)) == spirv::StorageClass::Workgroup ? 2 : 1);
 		const Id semantics = constantU32(0);  // Relaxed
@@ -6555,7 +6578,7 @@ namespace {
 
 		Id values[3];
 		for (size_t i = 0; i < 3; ++i) {
-			values[i] = emitExpression(*expression.arguments[i]);
+			values[i] = emitNonComponent(*expression.arguments[i], "select");
 		}
 
 		for (size_t i = 0; i < 2; ++i) {
@@ -6619,7 +6642,7 @@ namespace {
 			throw CompileError(name + " takes 1 argument, and this call passes "
 				+ std::to_string(expression.arguments.size()));
 		}
-		const Id value = emitExpression(*expression.arguments[0]);
+		const Id value = emitNonComponent(*expression.arguments[0], name);
 		const Id type = _builder.typeOf(value);
 		if (_types.matrixInfo(type) || _types.bitWidth(type) == 0) {
 			throw CompileError(name + " takes a bool or a bool vector");
@@ -8315,6 +8338,9 @@ namespace {
 		if (!fromKind) {
 			return none;
 		}
+		if (enumArgument && *argument.tag == "metal::component") {
+			return none;
+		}
 		if (_types.vectorWidth(to) > 1) {
 			return _types.scalarKindOf(_types.componentOf(to)) ? ConversionCost { kSplat, -1 } : none;
 		}
@@ -8570,10 +8596,8 @@ namespace {
 				continue;
 			}
 
-			if (!parameter.type.enumName.empty()) {
-				requireEnumValue(parameter.type.enumName, *call.arguments[i],
-					"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
-			}
+			requireEnumValue(parameter.type.enumName, *call.arguments[i],
+				"argument " + std::to_string(i + 1) + " of the call to \"" + definition.name + "\"");
 			const Id value = prepared.empty() ? emitExpression(*call.arguments[i]) : prepared[i];
 			if (parameter.type.enumName.empty()) {
 				argumentOperands[i] = stdlibArgumentOperand(_builder.typeOf(value));
@@ -8977,7 +9001,8 @@ namespace {
 			throw CompileError(what + " is not a variable of this function; a reference parameter takes "
 				"a local, a member of one, or a reference parameter of the caller");
 		}
-		if (valueTypeAt(address) != declaredTypeOf(parameter.type)) {
+		if (valueTypeAt(address) != declaredTypeOf(parameter.type)
+			|| (parameter.type.enumName == "metal::component") != isComponentValue(argument)) {
 			throw CompileError(what + " is not the type of parameter \"" + parameter.name + "\", "
 				+ typeName(parameter.type) + "; a conversion would make a temporary");
 		}
@@ -9588,12 +9613,15 @@ namespace {
 		const auto tag = enumOf(argument);
 		if (!parameter.type.enumName.empty()) {
 			requireEnumValue(parameter.type.enumName, argument, what);
+		} else {
+			requireEnumValue("", argument, what);
 		}
 		const Id value = prepared != InvalidId ? prepared : emitExpression(argument);
 		// A struct read out of a buffer has the buffer's layout, which the by-value conversion maps.
 		const bool structValue = !parameter.type.namedType.empty() && !parameter.type.isPointer;
 		if ((!structValue && _builder.typeOf(value) != declaredTypeOf(parameter.type))
-			|| (tag && *tag != parameter.type.enumName)) {
+			|| (tag && *tag != parameter.type.enumName)
+			|| (parameter.type.enumName == "metal::component" && (!tag || *tag != "metal::component"))) {
 			throw CompileError(what + " is not the type of parameter \"" + parameter.name + "\", "
 				+ typeName(parameter.type) + "; a conversion would make a temporary in another address space");
 		}
@@ -9779,7 +9807,7 @@ namespace {
 
 	// c ? a : b with no value, as the if it stands for. With returnedBy, each value is a return operand.
 	void Emitter::emitVoidConditional(const Expression& expression, const std::string* returnedBy) {
-		const Id condition = asCondition(emitExpression(*expression.left));
+		const Id condition = emitCondition(*expression.left);
 		const Id thenLabel = _builder.nextId();
 		const Id elseLabel = _builder.nextId();
 		const Id mergeLabel = _builder.nextId();
@@ -9816,7 +9844,7 @@ namespace {
 				+ ", so a return needs a value");
 		}
 
-		if (!_helper->returnType.enumName.empty()) {
+		if (!returnsVoid(*_helper)) {
 			requireEnumValue(_helper->returnType.enumName, *statement.expression, "the value " + quoted + " returns");
 		}
 		const bool braced = statement.expression->kind == ExpressionKind::InitList && !statement.expression->constructType;
@@ -9846,7 +9874,7 @@ namespace {
 
 		std::vector<Id> values;
 		for (const ExpressionPtr& argument: arguments) {
-			const Id value = emitExpression(*argument);
+			const Id value = emitNonComponent(*argument, name);
 			const Id type = _builder.typeOf(value);
 			if (_types.matrixInfo(type)) {
 				throw CompileError(name + " takes scalars or vectors, not a matrix");
@@ -10144,7 +10172,7 @@ namespace {
 
 		if (!builtin.pack) {
 			// The argument is a uint, any other scalar converted to one as a call converts it (MSL 2.24).
-			const Id value = emitExpression(*arguments[0]);
+			const Id value = emitNonComponent(*arguments[0], name);
 			const Id valueType = _builder.typeOf(value);
 			if (!_types.scalarKindOf(valueType) || _types.bitWidth(valueType) == 0) {
 				throw CompileError(name + " takes a uint");
@@ -10197,7 +10225,7 @@ namespace {
 		}
 
 		// A scalar fills the vector, converted as a call converts it; a vector has to be of the type (MSL 2.24).
-		Id value = emitExpression(*arguments[0]);
+		Id value = emitNonComponent(*arguments[0], name);
 		Id valueType = _builder.typeOf(value);
 		if (_types.scalarKindOf(valueType) && _types.bitWidth(valueType) != 0) {
 			value = broadcast(convert(value, valueType, _types.scalar(builtin.floatKind)), floatTypeOut);
@@ -10476,6 +10504,7 @@ namespace {
 						throw CompileError("a constant's initialiser has to be a value that can be worked out "
 							"from the declarations before it, and this is not one");
 					}
+					requireEnumValue("", *expression.arguments.front(), "as_type<" + typeName(*asTypeTarget) + ">");
 					const FoldedConstant operand = foldExpression(*expression.arguments.front());
 					const bool numeric = !operand.isComposite && operand.scalar != ScalarKind::Bool
 						&& operand.scalar != ScalarKind::Double;
@@ -10570,6 +10599,7 @@ namespace {
 	// type both arms meet in, so an arm that does not fold is emitted and lifted out again
 	// for its type, which needs a function to emit into.
 	FoldedConstant Emitter::foldConditional(const Expression& expression) {
+		checkConditionalOperands(*expression.left, *expression.arguments[0], *expression.arguments[1]);
 		const FoldedConstant condition = foldExpression(*expression.left);
 		if (condition.isComposite) {
 			throw CompileError("a composite constant cannot be a condition");
@@ -10689,6 +10719,9 @@ namespace {
 	}
 
 	FoldedConstant Emitter::foldUnary(const Expression& expression) {
+		if (isComponentValue(*expression.left)) {
+			throw CompileError("unary operator does not accept a value of scoped enum metal::component without a cast");
+		}
 		FoldedConstant operand = foldExpression(*expression.left);
 
 		if (operand.isComposite) {
@@ -10786,6 +10819,7 @@ namespace {
 	}
 
 	FoldedConstant Emitter::foldBinary(const Expression& expression) {
+		checkBinaryComponentOperands(expression.binaryOperator, *expression.left, *expression.right);
 		// && and || do not evaluate the right operand once the left decides the
 		// result, so an operation in it that no constant expression holds is not
 		// reached either.
@@ -11007,7 +11041,7 @@ namespace {
 					"(not a single value, another constant or an expression)");
 			}
 
-			if (!type.enumName.empty() && !type.isPointer) {
+			if (!type.isPointer) {
 				requireEnumValue(type.enumName, initializer, "an element of the initializer list");
 			}
 
@@ -11116,6 +11150,7 @@ namespace {
 			throw CompileError("a matrix element has to be a scalar here");
 		}
 
+		requireEnumValue("", expression, "a matrix constant element");
 		const FoldedConstant folded = foldExpression(expression);
 		if (folded.isComposite || folded.scalar == ScalarKind::Bool) {
 			throw CompileError("a matrix or vector constant element has to be a float or half value; a bool or "
@@ -11152,6 +11187,7 @@ namespace {
 					pieces.push_back(convertScalarForConstruct(nested, type.scalar));
 				}
 			} else {
+				requireEnumValue("", *argument, "an argument of " + typeName(type));
 				pieces.push_back(convertScalarForConstruct(foldExpression(*argument), type.scalar));
 			}
 		}
@@ -11433,7 +11469,7 @@ namespace {
 			throw CompileError("constexpr variable \"" + declaration.name
 				+ "\" must be initialized by a constant expression");
 		}
-		if (!declaration.type.enumName.empty()) {
+		if (!declaration.type.isPointer && declaration.type.isScalar() && declaration.type.namedType.empty()) {
 			const Expression* entry = declaration.initializer.get();
 			while (entry->kind == ExpressionKind::InitList && !entry->constructType
 				&& entry->elements.size() == 1 && entry->elements.front().fieldName.empty()) {
@@ -11564,7 +11600,7 @@ namespace {
 			throw CompileError("as_type<" + spelled + "> is not lowered: mslc reinterprets as a scalar or a vector "
 				"of the integer, half and float types");
 		}
-		const Id value = emitExpression(*call.arguments[0]);
+		const Id value = emitNonComponent(*call.arguments[0], "as_type<" + spelled + ">");
 		const Id valueType = _builder.typeOf(value);
 		ScalarKind fromScalar;
 		uint32_t fromWidth = 1;
@@ -11651,6 +11687,7 @@ namespace {
 			}
 			derived.emitting = true;
 			const Type& type = derived.declaration->type;
+			requireEnumValue("", *derived.declaration->initializer, "the constant \"" + name + "\"");
 			const Id value = emitSpecConstantExpression(*derived.declaration->initializer, name);
 			derived.value = specConstantConvert(value, _types.scalar(type.scalar));
 			derived.emitting = false;
@@ -11736,6 +11773,9 @@ namespace {
 					_types.scalar(target));
 			}
 			case ExpressionKind::Unary: {
+				if (isComponentValue(*expression.left)) {
+					throw CompileError("unary operator does not accept a value of scoped enum metal::component without a cast");
+				}
 				const Id operand = emitSpecConstantExpression(*expression.left, constant);
 				switch (expression.unaryOperator) {
 					case UnaryOperator::Plus:
@@ -11757,6 +11797,7 @@ namespace {
 				if (expression.arguments.size() != 2) {
 					return refuse();
 				}
+				checkConditionalOperands(*expression.left, *expression.arguments[0], *expression.arguments[1]);
 				const Id condition = specConstantConvert(emitSpecConstantExpression(*expression.left, constant), _boolType);
 				Id yes = emitSpecConstantExpression(*expression.arguments[0], constant);
 				Id no = emitSpecConstantExpression(*expression.arguments[1], constant);
@@ -11770,6 +11811,7 @@ namespace {
 				return operation(_builder.typeOf(yes), spirv::OpSelect, { condition, yes, no });
 			}
 			case ExpressionKind::Binary: {
+				checkBinaryComponentOperands(expression.binaryOperator, *expression.left, *expression.right);
 				const Id left = emitSpecConstantExpression(*expression.left, constant);
 				const Id right = emitSpecConstantExpression(*expression.right, constant);
 				const BinaryOperator op = expression.binaryOperator;
@@ -13346,7 +13388,7 @@ namespace {
 		if (call.arguments.size() != 2 + layers) {
 			throw CompileError(takes);
 		}
-		const Id value = emitExpression(*call.arguments[0]);
+		const Id value = emitNonComponent(*call.arguments[0], "texture write");
 		Id coordinate = emitExpression(*call.arguments[1]);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		const Id valueType = _builder.typeOf(value);
@@ -13533,7 +13575,7 @@ namespace {
 	// last component, which is where an arrayed image instruction takes it. The
 	// layer is a uint in Metal, so an int wraps to uint before a sample sees it.
 	Id Emitter::layerIndex(const Expression& layer, const std::string& callName, const char* what) {
-		const Id value = emitExpression(layer);
+		const Id value = emitNonComponent(layer, callName);
 		const Id valueType = _builder.typeOf(value);
 		if (_types.vectorWidth(valueType) != 1 || _types.isFloat(valueType) || _types.bitWidth(valueType) < 8) {
 			throw CompileError(std::string("the ") + what + " of " + callName + " has to be an integer");
@@ -13629,7 +13671,7 @@ namespace {
 		const std::string& callName) {
 		const uint32_t width = textureCoordinateWidth(kind);
 		const Id coordinateVector = _types.vector(ScalarKind::Float, width);
-		Id coordinate = emitExpression(argument);
+		Id coordinate = emitNonComponent(argument, callName);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		if (coordinateType != coordinateVector) {
 			if (_types.vectorWidth(coordinateType) != 1 || _types.bitWidth(coordinateType) < 8) {
@@ -13677,23 +13719,27 @@ namespace {
 		bool componentSeen = false;
 		for (size_t i = fixed; i < arguments.size(); ++i) {
 			const Expression& argument = *arguments[i];
-			const std::string tail = argument.kind == ExpressionKind::Identifier
-				? argument.name.substr(argument.name.rfind("::") == std::string::npos ? 0 : argument.name.rfind("::") + 2)
-				: std::string();
-			const bool isComponent = argument.kind == ExpressionKind::Identifier
-				&& argument.name.find("component::") != std::string::npos;
+			const auto givenEnum = enumOf(argument);
+			const bool isComponent = givenEnum && *givenEnum == "metal::component";
 			if (isComponent && (compare || texture.pointeeMsl.isDepth)) {
 				throw CompileError(compare ? "gather_compare takes no component: it compares the depth channel"
 					: "gather on a depth texture takes no component: it gathers the depth channel");
 			}
 			if (isComponent) {
-				const auto found = std::string("xyzw").find(tail);
 				// Apple takes the component only after the offset, where there is one.
-				if (componentSeen || i != (isCubeKind(kind) ? fixed : fixed + 1)
-					|| tail.size() != 1 || found == std::string::npos) {
+				if (componentSeen || i != (isCubeKind(kind) ? fixed : fixed + 1)) {
 					throw CompileError("gather takes one component::x, y, z or w, after the offset where the texture has one");
 				}
-				component = static_cast<uint32_t>(found);
+				if (!canFoldExpression(argument)) {
+					throw CompileError("gather requires a constant component::x, y, z or w");
+				}
+				const FoldedConstant folded = foldExpression(argument);
+				if (folded.isComposite || isFloatKind(folded.scalar)
+					|| (isSignedInteger(folded.scalar) && static_cast<int64_t>(folded.integer) < 0)
+					|| folded.integer > 3) {
+					throw CompileError("gather takes one component::x, y, z or w (value 0 to 3)");
+				}
+				component = static_cast<uint32_t>(folded.integer);
 				componentSeen = true;
 			} else if (i == fixed && !isCubeKind(kind)) {
 				offset = literalOffset(argument, 2);
@@ -13743,7 +13789,7 @@ namespace {
 	// An integer written as a literal, with an optional minus: the only constant a
 	// texel offset can be here, since SPIR-V takes it as an OpConstant.
 	static bool literalInteger(const Expression& expression, int32_t& value) {
-		if (expression.kind == ExpressionKind::IntLiteral) {
+		if (expression.kind == ExpressionKind::IntLiteral && expression.enumName != "metal::component") {
 			value = static_cast<int32_t>(expression.intValue);
 			return expression.intValue <= INT32_MAX;
 		}
@@ -13766,7 +13812,7 @@ namespace {
 	// integer literals (ConstOffset).
 	// The comparison value of sample_compare and gather_compare, a float.
 	Id Emitter::compareValue(const Expression& argument, const std::string& callName) {
-		const Id value = emitExpression(argument);
+		const Id value = emitNonComponent(argument, callName);
 		const Id type = _builder.typeOf(value);
 		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) < 8) {
 			throw CompileError("the comparison value of " + callName + " has to be a number");
@@ -13800,7 +13846,7 @@ namespace {
 			if (option.arguments.size() != 1) {
 				throw CompileError(what + " takes one argument");
 			}
-			const Id value = emitExpression(*option.arguments[0]);
+			const Id value = emitNonComponent(*option.arguments[0], what);
 			const Id valueType = _builder.typeOf(value);
 			if (_types.vectorWidth(valueType) != 1 || _types.bitWidth(valueType) < 8) {
 				throw CompileError(what + " takes a scalar number");
@@ -14133,7 +14179,7 @@ namespace {
 
 	// A mip level argument: any number, converted to the uint the instruction takes.
 	Id Emitter::emitLod(const Expression& expression, const std::string& callName) {
-		const Id value = emitExpression(expression);
+		const Id value = emitNonComponent(expression, callName);
 		const Id type = _builder.typeOf(value);
 		if (_types.vectorWidth(type) != 1 || _types.bitWidth(type) < 8) {
 			throw CompileError("the lod of " + callName + " has to be a number");
@@ -14941,6 +14987,8 @@ namespace {
 			return;
 		}
 
+		requireEnumValue(_entryPoint->returnType.enumName, *statement.expression,
+			"the return value of \"" + _entryPoint->name + "\"");
 		const Id value = emitExpression(*statement.expression);
 		const Id declared = declaredTypeOf(_entryPoint->returnType);
 
@@ -15121,6 +15169,15 @@ namespace {
 	// place reached by address, which the binding then holds.
 	void Emitter::emitReferenceDeclaration(const VariableDeclaration& declaration) {
 		const Expression& place = *declaration.initializer;
+		if (declaration.type.isAuto) {
+			if (const auto given = enumOf(place); given && !given->empty()) {
+				throw CompileError("the auto variable \"" + declaration.name + "\" would have the enum type "
+					+ *given + ", which is not lowered yet; write the enum type");
+			}
+		} else if ((declaration.type.enumName == "metal::component") != isComponentValue(place)) {
+			throw CompileError("the reference \"" + declaration.name + "\" is not the type of the place "
+				"it is bound to");
+		}
 		if (place.kind != ExpressionKind::Identifier && place.kind != ExpressionKind::Index
 			&& place.kind != ExpressionKind::Member) {
 			throw CompileError("the reference \"" + declaration.name + "\" has to be bound to a variable, "
@@ -15365,7 +15422,10 @@ namespace {
 			case ExpressionKind::FloatLiteral:
 			case ExpressionKind::BoolLiteral:
 			case ExpressionKind::Binary:
+			case ExpressionKind::Sizeof:
 				return std::string();
+			case ExpressionKind::Assign:
+				return enumOf(*expression.left);
 			case ExpressionKind::Unary:
 				// Arithmetic on an enum is an int. ++ and -- keep the operand's type but
 				// are not allowed on an enum at all.
@@ -15395,7 +15455,7 @@ namespace {
 			case ExpressionKind::Member: {
 				const StructDecl* decl = structOf(*expression.left);
 				if (!decl) {
-					return std::nullopt;
+					return std::string();
 				}
 				std::string declName;
 				const size_t field = fieldIndexOf(*decl, expression.memberName, declName);
@@ -15428,12 +15488,31 @@ namespace {
 				return std::nullopt;
 			}
 			case ExpressionKind::Call: {
-				if (expression.left->kind != ExpressionKind::Identifier) {
-					return std::nullopt;
+				const Type* returnedType = nullptr;
+				if (expression.left->kind == ExpressionKind::Identifier) {
+					returnedType = returningType(expression, [](const Type& type) {
+						return type.isPointer || type.arrayLength ? std::string("*") : type.enumName;
+					});
+				} else if (expression.left->kind == ExpressionKind::Member) {
+					const StructDecl* owner = structOf(*expression.left->left);
+					const auto found = owner ? _helpers.find(owner->name + "::" + expression.left->memberName)
+						: _helpers.end();
+					returnedType = found == _helpers.end() ? nullptr : &found->second.definition->returnType;
+					if (owner && found == _helpers.end()) {
+						for (const FunctionTemplate* declaration:
+							memberTemplatesOf(owner->name, expression.left->memberName)) {
+							std::vector<TemplateArgument> arguments;
+							const FunctionDecl* pattern = templatePattern(*declaration, expression.left->templateArguments, arguments);
+							if (!pattern || pattern->parameters.size() != expression.arguments.size() + 1) {
+								continue;
+							}
+							if (returnedType && returnedType->enumName != pattern->returnType.enumName) {
+								return std::nullopt;
+							}
+							returnedType = &pattern->returnType;
+						}
+					}
 				}
-				const Type* returnedType = returningType(expression, [](const Type& type) {
-					return type.isPointer || type.arrayLength ? std::string("*") : type.enumName;
-				});
 				if (!returnedType) {
 					return std::nullopt;
 				}
@@ -15452,15 +15531,50 @@ namespace {
 				if (const Type* pointer = pointerMemberType(*expression.left)) {
 					return pointer->enumName;
 				}
-				if (expression.left->kind != ExpressionKind::Identifier) return std::nullopt;
-				const auto& table = expression.left->fileScope ? _fileScopeBound : _bindings;
-				const auto local = table.find(expression.left->name);
-				if (local == table.end()) return std::nullopt;
-				return local->second.pointeeMsl.enumName;
+				if (expression.left->kind == ExpressionKind::Identifier) {
+					const auto& table = expression.left->fileScope ? _fileScopeBound : _bindings;
+					const auto local = table.find(expression.left->name);
+					if (local != table.end() && local->second.pointeeMsl.innerArrayLengths.empty()
+						&& (!local->second.isBuffer || !local->second.pointeeMsl.arrayLength)) {
+						return local->second.pointeeMsl.enumName;
+					}
+				}
+				if (const std::optional<Type> resolved = placeType(expression);
+					resolved && !resolved->isPointer && !resolved->arrayLength) {
+					return resolved->enumName;
+				}
+				return std::nullopt;
 			}
 			default:
 				return std::nullopt;
 		}
+	}
+
+	bool Emitter::isComponentValue(const Expression& expression) {
+		const auto tag = enumOf(expression);
+		return tag && *tag == "metal::component";
+	}
+
+	void Emitter::checkBinaryComponentOperands(BinaryOperator op, const Expression& left, const Expression& right) {
+		const bool leftComp = isComponentValue(left);
+		const bool rightComp = isComponentValue(right);
+		if ((leftComp || rightComp) && !(isComparisonOperator(op) && leftComp && rightComp)) {
+			throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
+				+ " does not accept a value of scoped enum metal::component without a cast");
+		}
+	}
+
+	void Emitter::checkConditionalOperands(const Expression& condition, const Expression& whenTrue,
+		const Expression& whenFalse) {
+		requireEnumValue("", condition, "the condition of ?:");
+		if (isComponentValue(whenTrue) != isComponentValue(whenFalse)) {
+			throw CompileError("conditional operator '?:' cannot mix scoped enum metal::component with another type");
+		}
+	}
+
+	Id Emitter::emitNonComponent(const Expression& expression, const std::string& what) {
+		requireEnumValue("", expression, what);
+		return emitExpression(expression);
 	}
 
 	// The error for a store of something that is not the target's enum. An
@@ -15468,6 +15582,12 @@ namespace {
 	void Emitter::requireEnumValue(const std::string& target, const Expression& value,
 		const std::string& what) {
 		const auto given = enumOf(value);
+		if (target.empty()) {
+			if (given && *given == "metal::component") {
+				throw CompileError(what + " does not accept a value of scoped enum metal::component without a cast");
+			}
+			return;
+		}
 		if (!given || *given == target || *given == "<anonymous>") {
 			return;
 		}
@@ -15558,6 +15678,9 @@ namespace {
 			}
 			if (entry->kind == ExpressionKind::InitList) {
 				return emitInitListValue(leaf, *entry);
+			}
+			if (!leaf.isPointer && !leaf.arrayLength) {
+				requireEnumValue(leaf.enumName, *entry, "an element of the initializer list");
 			}
 			const Id value = emitExpression(*entry);
 			return leaf.namedType.empty() && leaf.isScalar()
@@ -15823,8 +15946,9 @@ namespace {
 		if (!storageOnly) {
 			validateConstexprInitializer(declaration, type);
 		}
-		if (!storageOnly && !type.enumName.empty() && declaration.initializer
-			&& declaration.initializer->kind != ExpressionKind::InitList) {
+		if (!storageOnly && declaration.initializer
+			&& declaration.initializer->kind != ExpressionKind::InitList
+			&& (!type.enumName.empty() || (!type.isPointer && !type.arrayLength))) {
 			requireEnumValue(type.enumName, *declaration.initializer,
 				"the variable \"" + declaration.name + "\"");
 		}
@@ -16267,12 +16391,23 @@ namespace {
 					: "array type " + typeName(named->pointeeMsl) + " is not assignable");
 			}
 		}
-		if (const auto target = enumOf(left); target && !target->empty() && *target != "<anonymous>") {
-			if (compound) {
+		std::optional<std::string> target = enumOf(left);
+		if (!target) {
+			if (left.kind == ExpressionKind::Member && !structOf(*left.left)) {
+				target = std::string();
+			} else if (const std::optional<Type> place = placeType(left);
+				place && !place->isPointer && !place->arrayLength) {
+				target = place->enumName;
+			}
+		}
+		if (target && *target != "<anonymous>") {
+			if (!target->empty() && compound) {
 				throw CompileError("a compound assignment does not apply to the enum " + *target
 					+ "; Apple does not convert the integer result back to it");
 			}
 			requireEnumValue(*target, right, "the target of the assignment");
+		} else if (!target) {
+			requireEnumValue("", right, "the target of the assignment");
 		}
 
 		if (left.kind == ExpressionKind::Member
@@ -16342,6 +16477,7 @@ namespace {
 	// branches to the next for a fall-through or, through a break, to the merge.
 	// A switch with no default sends every unmatched value to the merge.
 	void Emitter::emitSwitch(const Statement& statement) {
+		const bool selectorComponent = isComponentValue(*statement.expression);
 		Id selector = emitExpression(*statement.expression);
 		const Id emittedType = _builder.typeOf(selector);
 
@@ -16394,6 +16530,11 @@ namespace {
 					}
 					defaultLabel = labels[i];
 				} else {
+					if (selectorComponent != isComponentValue(*kase.value)) {
+						throw CompileError(selectorComponent
+							? "a switch over metal::component requires case labels of type metal::component"
+							: "a value of scoped enum metal::component cannot be used as a case label for a non-component switch");
+					}
 					FoldedConstant folded;
 					try {
 						folded = foldExpression(*kase.value);
@@ -16559,7 +16700,7 @@ namespace {
 			// Vulkan requires structured control flow: every conditional branch
 			// is preceded by a merge instruction naming where its paths rejoin.
 			case StatementKind::If: {
-				const Id condition = asCondition(emitExpression(*statement.expression));
+				const Id condition = emitCondition(*statement.expression);
 				const Id thenLabel = _builder.nextId();
 				const Id mergeLabel = _builder.nextId();
 				const Id elseLabel = statement.elseBranch ? _builder.nextId() : mergeLabel;
@@ -16621,14 +16762,14 @@ namespace {
 				const bool splitsCondition = condition && !isDoWhile && containsBranchingOperator(*condition);
 				Id conditionValue = InvalidId;
 				if (condition && !splitsCondition && !isDoWhile) {
-					conditionValue = asCondition(emitExpression(*condition));
+					conditionValue = emitCondition(*condition);
 				}
 				_builder.emit(spirv::OpLoopMerge, { mergeLabel, continueLabel, kLoopControlNone });
 				if (splitsCondition) {
 					const Id conditionLabel = _builder.nextId();
 					terminate(spirv::OpBranch, { conditionLabel });
 					beginBlock(conditionLabel);
-					conditionValue = asCondition(emitExpression(*condition));
+					conditionValue = emitCondition(*condition);
 				}
 				if (isDoWhile) {
 					terminate(spirv::OpBranch, { bodyLabel });
@@ -16647,7 +16788,7 @@ namespace {
 					emitExpressionStatement(*statement.forIncrement);
 				}
 				if (isDoWhile) {
-					const Id again = asCondition(emitExpression(*condition));
+					const Id again = emitCondition(*condition);
 					terminate(spirv::OpBranchConditional, { again, headerLabel, mergeLabel });
 				} else {
 					terminate(spirv::OpBranch, { headerLabel });
