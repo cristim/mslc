@@ -696,6 +696,11 @@ struct FunctionDecl {
 	// translation unit, so a Linkage object keeps it local instead of exporting it.
 	bool isLocal = false;
 
+	// Declared to return a thread reference ("thread T& f(...)"). The call is lowered as a value of T: reading the
+	// result reads the referred object as it is at the return, which nothing changes before the caller reads it.
+	// A use as a place is refused.
+	bool returnsReference = false;
+
 	// A function that is not an entry point.
 	bool isHelper() const { return stage == Stage::None; }
 };

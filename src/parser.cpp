@@ -895,6 +895,21 @@ void Parser::parseUsing() {
 	}
 }
 
+// "thread T&" after a function's return type: the function returns a reference, which is read as a T. Apple requires
+// the address space; mslc lowers a thread one only, since a pointer is not a value a SPIR-V function returns here.
+static void takeReferenceReturn(FunctionDecl& decl, const std::string& quoted) {
+	if (decl.returnType.addressSpace == AddressSpace::None) {
+		throw CompileError(quoted + " returns a reference without an address space, which MSL requires");
+	}
+	if (decl.returnType.addressSpace != AddressSpace::Thread || decl.returnType.isPointer
+		|| decl.returnType.resource != ResourceKind::None) {
+		throw CompileError(quoted + " returns a reference to " + std::string(addressSpaceName(decl.returnType.addressSpace))
+			+ " memory or to a pointer or resource, which is not lowered yet; mslc lowers a thread reference");
+	}
+	decl.returnType.addressSpace = AddressSpace::None;
+	decl.returnsReference = true;
+}
+
 static void rejectUnloweredReturn(const Type& returned, const std::string& quoted, bool allowStdArray = false) {
 	if (returned.isPointer || (returned.arrayLength && !(allowStdArray && returned.isStdArray))
 		|| returned.resource != ResourceKind::None
@@ -1466,6 +1481,10 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 		decl.returnType = Type();
 		decl.returnType.namedType = "<dependent return type>";
 		dependentReturn = true;
+	}
+	if (!dependentReturn && at(TokenKind::Ampersand)) {
+		advance();
+		takeReferenceReturn(decl, quoted);
 	}
 	rejectUnloweredReturn(decl.returnType, quoted);
 	if (kind() != TokenKind::Identifier || current().text != written) {
@@ -2503,8 +2522,10 @@ bool Parser::tryParseHelperFunction() {
 		}
 	}
 
+	bool referenceReturn = false;
 	try {
 		decl.returnType = parseType();
+		referenceReturn = match(TokenKind::Ampersand);
 		if (kind() != TokenKind::Identifier) {
 			_position = start;
 			return false;
@@ -2527,6 +2548,9 @@ bool Parser::tryParseHelperFunction() {
 	decl.globalsBefore = _unit.globals.size();
 
 	const std::string quoted = "helper function \"" + decl.name + "\"";
+	if (referenceReturn) {
+		takeReferenceReturn(decl, quoted);
+	}
 	rejectUnloweredReturn(decl.returnType, quoted, true);
 
 	Type builtin;
@@ -2544,6 +2568,14 @@ bool Parser::tryParseHelperFunction() {
 	const bool redeclaration = std::any_of(_unit.helpers.begin(), _unit.helpers.end(), [&](const FunctionDecl& other) {
 		return other.name == decl.name && sameParameterTypes(other, decl);
 	});
+	// A redeclaration returns a reference where the first declaration does ([over.load]): a prototype that returns
+	// a reference and a definition that returns a value differ only there. A differing type is reported by sema.
+	for (const FunctionDecl& other: _unit.helpers) {
+		if (other.name == decl.name && sameParameterTypes(other, decl) && other.returnsReference != decl.returnsReference) {
+			throw CompileError(quoted + " is declared again with another return type; functions that differ only in "
+				"their return type cannot be overloaded");
+		}
+	}
 	if (!redeclaration) {
 		for (const auto& scope: _scopes) {
 			for (const auto& brought: scope.second.declarations) {
