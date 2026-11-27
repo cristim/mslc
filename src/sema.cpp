@@ -7213,6 +7213,15 @@ namespace {
 						Type value = signature.parameters[i].type;
 						value.isConst = false;
 						value.addressSpace = AddressSpace::None;
+						// vec<T, N> takes T from a vector of N components, as a call deduces it (deduceTemplateArguments).
+						if (wanted.isVector()) {
+							if (value.vectorWidth != wanted.vectorWidth || value.isMatrix() || value.isPacked
+								|| !value.namedType.empty() || !value.enumName.empty()) {
+								fits = false;
+								break;
+							}
+							value.vectorWidth = 0;
+						}
 						// A call cannot give these as an argument either (parseTemplateArgument, deduceTemplateArguments),
 						// and the instance's key does not tell an enum from its underlying type.
 						if (value.isPointer || value.arrayLength || value.resource != ResourceKind::None
