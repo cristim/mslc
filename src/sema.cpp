@@ -7047,9 +7047,25 @@ namespace {
 					throw CompileError("a literal 0 chooses among overloads one of which takes a pointer; the "
 						"null pointer conversion is not lowered yet");
 				}
+				// A whole buffer reaches a device or constant pointer to its element type exactly, as
+				// bufferPointerArgument takes it, adding const as a qualification conversion; it reaches no
+				// other pointer.
+				if (argument.pointerLike && argument.expression->kind == ExpressionKind::Identifier
+					&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
+					&& argument.binding->bufferPointeeType != InvalidId && !argument.expression->fileScope
+					&& (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant)) {
+					const Binding& buffer = *argument.binding;
+					const Type& given = buffer.pointeeMsl;
+					const bool canWrite = type.addressSpace == AddressSpace::Device && !type.isConst;
+					const bool fits = given.addressSpace == type.addressSpace && given.isAtomic == type.isAtomic
+						&& given.enumName == type.enumName
+						&& buffer.bufferPointeeType == bufferParamTypes(type).second
+						&& !(buffer.readOnly && canWrite);
+					return fits ? exact(type.isConst && !buffer.readOnly ? 1 : 0) : none;
+				}
 				if (argument.pointerLike) {
-					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
-						"buffer) chooses among overloads, which is not lowered yet");
+					throw CompileError("a pointer argument other than a local array or a whole buffer (&x, a + n, "
+						"or a pointer) chooses among overloads, which is not lowered yet");
 				}
 				return none;
 			}
