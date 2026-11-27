@@ -4845,8 +4845,7 @@ namespace {
 					&& op != UnaryOperator::BitNot && op != UnaryOperator::Not)
 					|| !canFoldExpression(*expression.left, excluded)) { return false; }
 				const FoldedConstant operand = foldExpression(*expression.left);
-				if ((operand.scalar == ScalarKind::Bool && op != UnaryOperator::Not)
-					|| (isFloatKind(operand.scalar) && op == UnaryOperator::BitNot)) { return false; }
+				if (isFloatKind(operand.scalar) && op == UnaryOperator::BitNot) { return false; }
 				if (op == UnaryOperator::Negate && isSignedInteger(operand.scalar)) {
 					const ScalarKind promoted = promotedKind(operand.scalar);
 					const uint64_t minimum = normalizeInteger(promoted, uint64_t{ 1 } << (mappingFor(promoted).width - 1));
@@ -5210,9 +5209,17 @@ namespace {
 			throw CompileError("a unary operator on the struct " + form.name + " is not lowered");
 		}
 
-		if (_types.isBool(type) && expression.unaryOperator != UnaryOperator::Not) {
-			throw CompileError("a unary operator on a bool is not lowered yet; "
-				"convert the bool to an int first");
+		// ~ on a bool vector is the componentwise complement, a bool vector (MSL 3.1).
+		if (_types.isBool(type) && _types.vectorWidth(type) > 1 && expression.unaryOperator == UnaryOperator::BitNot) {
+			return _builder.emitTyped(spirv::OpLogicalNot, type, { operand });
+		}
+		if (_types.isBool(type) && _types.vectorWidth(type) > 1 && expression.unaryOperator != UnaryOperator::Not) {
+			throw CompileError("a unary operator other than ! and ~ on a bool vector is not lowered yet");
+		}
+		// A scalar bool is promoted to int ([conv.prom]): -true is the int -1 and ~true the int -2.
+		if (_types.isBool(type) && _types.vectorWidth(type) == 1 && expression.unaryOperator != UnaryOperator::Not) {
+			const Id intType = _types.scalar(ScalarKind::Int);
+			return emitUnaryOperation(expression.unaryOperator, convert(operand, type, intType), intType);
 		}
 
 		// The integer promotion: + - ~ on a scalar narrower than int give an int (! gives a bool; a
@@ -5634,11 +5641,48 @@ namespace {
 				_types.isFloat(commonType), operandsSigned), _boolType, { leftOperand, rightOperand });
 		}
 
-		// Apple promotes a bool operand to int. mslc has no such promotion, and
-		// OpIAdd on a bool is a module spirv-val rejects.
-		if (_types.isBool(leftType) || _types.isBool(_builder.typeOf(right))) {
-			throw CompileError("an arithmetic, bitwise or comparison operator on a bool is not lowered yet; "
-				"convert the bool to an int first");
+		// & | ^ act componentwise on a bool vector and give one (MSL 3.1): a scalar beside it is converted to bool
+		// and widened. On booleans they are the logical and, or and inequality.
+		const bool bitwise = op == BinaryOperator::BitAnd || op == BinaryOperator::BitOr
+			|| op == BinaryOperator::BitXor;
+		const Id rightType = _builder.typeOf(right);
+		const bool leftBoolVector = _types.isBool(leftType) && _types.vectorWidth(leftType) > 1;
+		const bool rightBoolVector = _types.isBool(rightType) && _types.vectorWidth(rightType) > 1;
+		if (leftBoolVector || rightBoolVector) {
+			if (!bitwise) {
+				throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
+					+ " on a bool vector is not lowered yet; only & | and ^ are");
+			}
+			const Id vectorType = leftBoolVector ? leftType : rightType;
+			const auto operand = [&](Id value) {
+				const Id type = _builder.typeOf(value);
+				if (type == vectorType) {
+					return value;
+				}
+				if (_types.vectorWidth(type) > 1) {
+					throw CompileError("the operands of an operator are vectors of different widths or types");
+				}
+				// Bitwise operators take no floating-point operand (MSL 3.1), and a vector of an integral
+				// element type takes no floating-point scalar beside it.
+				if (_types.isFloat(type)) {
+					throw CompileError(std::string("operator ") + binaryOperatorSpelling(op)
+						+ " needs integer operands, and a floating-point scalar is beside a bool vector");
+				}
+				return broadcast(convert(value, type, _boolType), vectorType);
+			};
+			const uint16_t opcode = op == BinaryOperator::BitAnd ? spirv::OpLogicalAnd
+				: op == BinaryOperator::BitOr ? spirv::OpLogicalOr : spirv::OpLogicalNotEqual;
+			return _builder.emitTyped(opcode, vectorType, { operand(left), operand(right) });
+		}
+
+		// A scalar bool operand undergoes the integer promotion to int ([conv.prom]), as Apple's compiler
+		// does: true | false is the int 1, and true * 2.0f the float 2.
+		const Id intType = _types.scalar(ScalarKind::Int);
+		if (_types.isBool(leftType)) {
+			left = convert(left, leftType, intType);
+		}
+		if (_types.isBool(rightType)) {
+			right = convert(right, rightType, intType);
 		}
 
 		return emitArithmetic(op, left, right);
@@ -5847,6 +5891,14 @@ namespace {
 		const Id targetType = _builder.typeOf(current);
 		const Id valueType = _builder.typeOf(value);
 		const std::string spelled = std::string(binaryOperatorSpelling(op)) + "=";
+
+		// A bool operand, scalar or vector, follows the binary operator's own rules (a scalar is promoted to
+		// int, a bool vector takes & | ^), and the store converts the result back to the target's type.
+		const auto isBoolish = [&](Id type) { return type == _boolType || _types.componentOf(type) == _boolType; };
+		if (isBoolish(targetType) || isBoolish(valueType)) {
+			const Id result = emitBinaryOperation(op, current, value);
+			return isBoolish(targetType) ? convert(result, _builder.typeOf(result), targetType) : result;
+		}
 
 		for (const Id type: { targetType, valueType }) {
 			const bool isMatrix = _types.matrixInfo(type) != nullptr;
@@ -9752,6 +9804,14 @@ namespace {
 		return convertConstant(folded, to);
 	}
 
+	// A folded bool as the int it promotes to: 1 for true, 0 for false.
+	static FoldedConstant promotedBool(const FoldedConstant& value) {
+		FoldedConstant promoted = value;
+		promoted.scalar = ScalarKind::Int;
+		promoted.integer = value.boolean ? 1 : 0;
+		return promoted;
+	}
+
 	FoldedConstant Emitter::foldUnary(const Expression& expression) {
 		FoldedConstant operand = foldExpression(*expression.left);
 
@@ -9774,8 +9834,9 @@ namespace {
 			throw CompileError("this unary operator is recognised but not folded yet");
 		}
 
+		// A bool is promoted to int ([conv.prom]), as emitUnary promotes it.
 		if (isBool) {
-			throw CompileError("a unary operator on a bool is not folded; convert the bool to an int first");
+			operand = promotedBool(operand);
 		}
 
 		if (isFloat) {
@@ -9869,8 +9930,8 @@ namespace {
 			return folded;
 		}
 
-		const FoldedConstant left = foldExpression(*expression.left);
-		const FoldedConstant right = foldExpression(*expression.right);
+		FoldedConstant left = foldExpression(*expression.left);
+		FoldedConstant right = foldExpression(*expression.right);
 
 		if (left.isComposite || right.isComposite) {
 			throw CompileError("a composite constant cannot be an operand of a binary operator");
@@ -9882,9 +9943,12 @@ namespace {
 			return foldComparison(op, left, right);
 		}
 
-		if (left.scalar == ScalarKind::Bool || right.scalar == ScalarKind::Bool) {
-			throw CompileError("an arithmetic or bitwise operator on a bool is not folded; "
-				"convert the bool to an int first");
+		// A bool operand is promoted to int ([conv.prom]), as emitBinary promotes it.
+		if (left.scalar == ScalarKind::Bool) {
+			left = promotedBool(left);
+		}
+		if (right.scalar == ScalarKind::Bool) {
+			right = promotedBool(right);
 		}
 
 		if (isFloatKind(left.scalar) || isFloatKind(right.scalar)) {
@@ -14793,6 +14857,12 @@ namespace {
 			if (const auto stepped = enumOf(*expression.left); stepped && !stepped->empty()) {
 				throw CompileError("++ and -- do not apply to the enum " + *stepped
 					+ "; Apple does not convert an integer back to it");
+			}
+			// C++17 removed ++ on a bool and never had --, and Apple refuses both; the compound path below
+			// would take one as b += 1.
+			if (const std::optional<Type> target = placeType(*expression.left);
+				target && target->scalar == ScalarKind::Bool && !target->isPointer) {
+				throw CompileError("++ and -- do not apply to a bool");
 			}
 			Expression one;
 			one.kind = ExpressionKind::IntLiteral;
