@@ -2788,6 +2788,8 @@ namespace {
 			HelperFunction helper;
 			size_t depth = 0;
 			bool committed = false;
+			// instantiationOrder() for the calls in the instance: set when it is first committed.
+			size_t rootOrder = 0;
 		};
 		std::map<std::string, std::vector<const FunctionTemplate*>> _templatesByName;
 		std::map<std::string, std::unique_ptr<TemplateInstance>> _instances;
@@ -2826,6 +2828,12 @@ namespace {
 		std::set<std::string> _memberTemplateNames;
 		const Type* returningType(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
+		// Where a call is instantiated, as clang places it: for a call in a template's instance, after the function
+		// outside any template whose call led to the instance; for any other call, the caller.
+		size_t instantiationOrder() const {
+			const auto instance = _helper ? _instanceOf.find(_helper) : _instanceOf.end();
+			return instance == _instanceOf.end() ? callerOrder() : instance->second->rootOrder;
+		}
 		void noteCall(const FunctionDecl& callee);
 		bool isPlainVariable(const Expression& expression) const;
 		bool isWholeVariable(const Expression& expression) const;
@@ -6871,8 +6879,19 @@ namespace {
 		for (const ExplicitSpecialization& specialization: _unit.specializations) {
 			const FunctionTemplate& written = specialization.declaration;
 			const FunctionDecl signature = instantiateTemplate(written, {}, false);
+			// The function types are compared as C++ does: a by-value parameter's top-level const is not part of it,
+			// and the address space and enum are, which typeName does not spell.
 			const auto sameParameter = [](const Parameter& a, const Parameter& b) {
-				return a.isReference == b.isReference && typeName(a.type) == typeName(b.type);
+				Type left = a.type;
+				Type right = b.type;
+				if (!a.isReference && !left.isPointer) {
+					left.isConst = false;
+				}
+				if (!b.isReference && !right.isPointer) {
+					right.isConst = false;
+				}
+				return a.isReference == b.isReference && typeName(left) == typeName(right)
+					&& left.addressSpace == right.addressSpace && left.enumName == right.enumName;
 			};
 			std::vector<std::pair<const FunctionTemplate*, std::vector<TemplateArgument>>> matches;
 			const auto found = _templatesByName.find(written.name);
@@ -6903,6 +6922,14 @@ namespace {
 						Type value = signature.parameters[i].type;
 						value.isConst = false;
 						value.addressSpace = AddressSpace::None;
+						// A call cannot give these as an argument either (parseTemplateArgument, deduceTemplateArguments),
+						// and the instance's key does not tell an enum from its underlying type.
+						if (value.isPointer || value.arrayLength || value.resource != ResourceKind::None
+							|| !value.enumName.empty() || value.isVolatile) {
+							throw CompileError("the explicit specialization of \"" + written.name + "\" at line "
+								+ std::to_string(written.line) + " gives the template parameter \"" + primary->parameters[j].name
+								+ "\" a pointer, array, resource, enum or volatile type, which is not lowered");
+						}
 						if (known[j]) {
 							fits = sameValueType(arguments[j].type, value);
 						} else {
@@ -6964,7 +6991,7 @@ namespace {
 		if (found == _specializationOf.end()) {
 			return nullptr;
 		}
-		if (found->second->declaration.order > callerOrder()) {
+		if (found->second->declaration.order > instantiationOrder()) {
 			throw CompileError("the explicit specialization of \"" + instance.declaration->name + "\" at line "
 				+ std::to_string(found->second->declaration.line) + " is declared after a use of the instance it "
 				"specializes");
@@ -6997,6 +7024,7 @@ namespace {
 		if (instance.committed) {
 			return;
 		}
+		instance.rootOrder = instantiationOrder();
 		const FunctionTemplate& declaration = *instance.declaration;
 		std::string spelled = declaration.name + "<";
 		for (size_t i = 0; i < instance.arguments.size(); ++i) {

@@ -1285,17 +1285,20 @@ void Parser::parseExplicitSpecialization(size_t headerStart) {
 	const size_t end = _position;
 	if (group.second) {
 		_position = group.first + 1;
-		while (!at(TokenKind::Greater)) {
+		const size_t before = _tokens.size();
+		while (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight)) {
 			specialization.given.push_back(parseTemplateArgument());
 			if (!match(TokenKind::Comma)) {
 				break;
 			}
 		}
-		if (_position != group.second) {
+		// closeAngle splits a ">>" that closes the last argument and this list into two tokens.
+		const size_t inserted = _tokens.size() - before;
+		if (_position != group.second + inserted || (!at(TokenKind::Greater) && !at(TokenKind::ShiftRight))) {
 			throw CompileError("the template arguments of the explicit specialization of \"" + qualified
 				+ "\" are not lowered: expected \">\" where \"" + std::string(current().text) + "\" is");
 		}
-		_position = end;
+		_position = end + inserted;
 		// The tokens without the arguments, so the declarator reads as a function's.
 		const size_t from = group.first - declaratorStart;
 		const size_t to = group.second + 1 - declaratorStart;
