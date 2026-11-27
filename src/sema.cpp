@@ -506,68 +506,80 @@ namespace {
 // The Offset image operand, a runtime texel offset (ImageGatherExtended on a gather).
 constexpr uint32_t kImageOperandsOffset = 0x10;
 
-	// Every name an expression or statement refers to. A constexpr sampler nothing
-	// refers to has no state in Apple's AIR, so it gets no binding either.
-	void collectIdentifiers(const Expression& expression, std::set<std::string>& names) {
+	template <typename Visit>
+	void visitExpressionIdentifiers(const Expression& expression, const Visit& visit) {
 		if (expression.kind == ExpressionKind::Identifier) {
-			names.insert(expression.name);
+			visit(expression);
 		}
 		for (const Expression* child: { expression.left.get(), expression.right.get() }) {
 			if (child && !(expression.kind == ExpressionKind::Call && child == expression.left.get()
 				&& child->kind == ExpressionKind::Identifier)) {
-				collectIdentifiers(*child, names);
+				visitExpressionIdentifiers(*child, visit);
 			}
 		}
 		for (const ExpressionPtr& argument: expression.arguments) {
-			collectIdentifiers(*argument, names);
+			visitExpressionIdentifiers(*argument, visit);
 		}
 		for (const InitializerElement& element: expression.elements) {
-			collectIdentifiers(*element.value, names);
+			visitExpressionIdentifiers(*element.value, visit);
 		}
 	}
 
-	void collectIdentifiers(const Statement& statement, std::set<std::string>& names) {
+	// Every name an expression or statement refers to. A constexpr sampler nothing
+	// refers to has no state in Apple's AIR, so it gets no binding either.
+	// File-scope "::name" identifiers are excluded when includeFileScope is false so
+	// they do not mark a shadowing local or count against a local alias.
+	void collectIdentifiers(const Expression& expression, std::set<std::string>& names,
+		bool includeFileScope = true) {
+		visitExpressionIdentifiers(expression, [&](const Expression& id) {
+			if (includeFileScope || !id.fileScope) {
+				names.insert(id.name);
+			}
+		});
+	}
+
+	void collectIdentifiers(const Statement& statement, std::set<std::string>& names,
+		bool includeFileScope = true) {
 		for (const Expression* expression: { statement.expression.get(), statement.forCondition.get(),
 			statement.forIncrement.get(), statement.whileCondition.get() }) {
-			if (expression) collectIdentifiers(*expression, names);
+			if (expression) collectIdentifiers(*expression, names, includeFileScope);
 		}
 		for (const std::optional<VariableDeclaration>* declaration: { &statement.declaration, &statement.forInitializer }) {
 			if (*declaration && (*declaration)->initializer) {
-				collectIdentifiers(*(*declaration)->initializer, names);
+				collectIdentifiers(*(*declaration)->initializer, names, includeFileScope);
 			}
 		}
 		for (const StatementPtr& child: statement.children) {
-			collectIdentifiers(*child, names);
+			collectIdentifiers(*child, names, includeFileScope);
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
-			if (nested) collectIdentifiers(*nested, names);
+			if (nested) collectIdentifiers(*nested, names, includeFileScope);
 		}
 		for (const SwitchCase& kase: statement.switchCases) {
-			if (kase.value) collectIdentifiers(*kase.value, names);
+			if (kase.value) collectIdentifiers(*kase.value, names, includeFileScope);
 			for (const StatementPtr& child: kase.body) {
-				collectIdentifiers(*child, names);
+				collectIdentifiers(*child, names, includeFileScope);
 			}
 		}
 		for (const StatementPtr& child: statement.switchPreamble) {
-			collectIdentifiers(*child, names);
+			collectIdentifiers(*child, names, includeFileScope);
 		}
 	}
 
 	// The identifiers a body names where no parameter or local of that name is in
 	// scope, which is where a file-scope name is what they refer to. A local hides
-	// the file-scope name from its declaration on, its own initialiser included.
+	// the file-scope name from its declaration on, its own initialiser included,
+	// unless written "::name" (fileScope).
 	using ScopeStack = std::vector<std::set<std::string>>;
 
 	void collectUnshadowed(const Expression* expression, const ScopeStack& scopes, std::set<std::string>& names) {
 		if (!expression) return;
-		std::set<std::string> mentioned;
-		collectIdentifiers(*expression, mentioned);
-		for (const std::string& name: mentioned) {
-			const bool hidden = std::any_of(scopes.begin(), scopes.end(),
-				[&](const std::set<std::string>& scope) { return scope.count(name) != 0; });
-			if (!hidden) names.insert(name);
-		}
+		visitExpressionIdentifiers(*expression, [&](const Expression& id) {
+			const bool hidden = !id.fileScope && std::any_of(scopes.begin(), scopes.end(),
+				[&](const std::set<std::string>& scope) { return scope.count(id.name) != 0; });
+			if (!hidden) names.insert(id.name);
+		});
 	}
 
 	void collectUnshadowed(const Statement* statement, ScopeStack& scopes, std::set<std::string>& names) {
@@ -2559,21 +2571,29 @@ namespace {
 		void reserveThreadgroupLocals(const Statement& statement);
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
-		// The entry point's own name first, then a file-scope sampler it names.
+		// Look up an identifier's value/storage binding, skipping locals when marked file-scope ("::name").
+		const Binding* findBinding(const Expression& id) const {
+			if (id.kind != ExpressionKind::Identifier) return nullptr;
+			const auto& table = id.fileScope ? _fileScopeBound : _bindings;
+			const auto it = table.find(id.name);
+			return it == table.end() ? nullptr : &it->second;
+		}
+		// The entry point's own name first (or file-scope arrays for "::name"), then a file-scope sampler it names.
 		// A helper the pre-emission scan did not mark would share one body between entry points, so
 		// a file-scope sampler it names is refused: that is argument-dependent lookup, a template
 		// instance or any other path the scan does not follow.
-		const Binding* findResourceBinding(const std::string& name) const {
-			const auto own = _bindings.find(name);
-			if (own != _bindings.end()) return &own->second;
-			const auto fileScope = _fileScopeSamplerBindings.find(name);
-			if (fileScope == _fileScopeSamplerBindings.end()) return nullptr;
+		const Binding* findResourceBinding(const std::string& name, bool fileScope = false) const {
+			const auto& table = fileScope ? _fileScopeBound : _bindings;
+			const auto own = table.find(name);
+			if (own != table.end()) return &own->second;
+			const auto fileScopeSampler = _fileScopeSamplerBindings.find(name);
+			if (fileScopeSampler == _fileScopeSamplerBindings.end()) return nullptr;
 			if (_helper && _helper->body && !_samplerDependent.count(_helper)) {
 				throw CompileError("\"" + _helper->name + "\" names the file-scope sampler \"" + name
 					+ "\" but is reached by a path mslc does not follow (argument-dependent lookup or a "
 					"template instance); pass the sampler as a parameter or call it by a qualified name");
 			}
-			return &fileScope->second;
+			return &fileScopeSampler->second;
 		}
 		Binding embeddedSamplerBinding(const VariableDeclaration& declaration) const;
 		void reserveFileScopeSamplers();
@@ -3351,7 +3371,7 @@ namespace {
 	Id Emitter::emitIdentifier(const Expression& expression) {
 		// The entry point's own names first, then the module's: a constant declared
 		// at file scope is not a parameter of the entry point that reads it.
-		const Binding* found = findResourceBinding(expression.name);
+		const Binding* found = findResourceBinding(expression.name, expression.fileScope);
 		if (!found) {
 			const auto constant = _constants.find(expression.name);
 			if (constant != _constants.end()) {
@@ -3466,11 +3486,11 @@ namespace {
 		if (depth == 0 || current->kind != ExpressionKind::Identifier) {
 			return nullptr;
 		}
-		const auto it = _bindings.find(current->name);
-		if (it == _bindings.end()) {
+		const Binding* found = findBinding(*current);
+		if (!found) {
 			return nullptr;
 		}
-		const Binding& binding = it->second;
+		const Binding& binding = *found;
 		const bool ownStorage = isLocalStorage(binding.storageClass);
 		return ownStorage && binding.isPointer && !binding.isBuffer && binding.bufferPointeeType == InvalidId
 			&& binding.pointeeMsl.arrayRank() >= 2 && depth <= binding.pointeeMsl.arrayRank() ? &binding : nullptr;
@@ -3629,17 +3649,17 @@ namespace {
 				: "indexing an expression is not supported yet; index a parameter or local directly");
 		}
 
-		const auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end() || !it->second.isPointer) {
+		const Binding* found = findBinding(*expression.left);
+		if (!found || !found->isPointer) {
 			throw CompileError("\"" + expression.left->name + "\" is not a pointer, so it cannot "
 				"be indexed");
 		}
 
-		if (expression.isDereference && !it->second.isBuffer && !it->second.pointeeMsl.arrayLength) {
+		if (expression.isDereference && !found->isBuffer && !found->pointeeMsl.arrayLength) {
 			throw CompileError(notAPointer(expression.left->name));
 		}
 
-		const Binding& binding = it->second;
+		const Binding& binding = *found;
 
 		if (binding.pointeeMsl.isAtomic) {
 			throw CompileError("\"" + expression.left->name + "\" points at atomics, which are read and written "
@@ -3733,12 +3753,12 @@ namespace {
 			return true;
 		}
 
-		const auto it = _bindings.find(expression.left->name);
-		if (it == _bindings.end()) {
+		const Binding* found = findBinding(*expression.left);
+		if (!found) {
 			return _constants.count(expression.left->name) > 0;
 		}
-		return !it->second.isBuffer && !_types.matrixInfo(it->second.pointeeType)
-			&& _types.arrayElement(it->second.pointeeType) == InvalidId;
+		return !found->isBuffer && !_types.matrixInfo(found->pointeeType)
+			&& _types.arrayElement(found->pointeeType) == InvalidId;
 	}
 
 	// The index of a literal, with a sign. Anything else is not known here and is
@@ -3920,9 +3940,9 @@ namespace {
 			return nullptr;
 		}
 
-		// An entry point's own name wins: a parameter may be called the same as
+		// An entry point's own name wins unless qualified with "::": a parameter may be called the same as
 		// a constant, and then it is the parameter the source means.
-		if (_bindings.count(expression->name) > 0) {
+		if (!expression->fileScope && _bindings.count(expression->name) > 0) {
 			return nullptr;
 		}
 
@@ -3947,7 +3967,7 @@ namespace {
 	// is part of the chain rather than the end of it: a buffer element's member is
 	// reached as "buffer[index].field", and loading the element first would hand
 	// OpAccessChain a value where it needs an address.
-	static void accessChain(const Expression& expression, std::string& outName,
+	static const Expression* accessChain(const Expression& expression, std::string& outName,
 		std::vector<AccessStep>& outSteps) {
 
 		std::vector<AccessStep> reversed;
@@ -3984,6 +4004,7 @@ namespace {
 
 		outName = current->name;
 		outSteps.assign(reversed.rbegin(), reversed.rend());
+		return current;
 	}
 
 	// Distinguish struct members from vector swizzles before emitting the left side.
@@ -4206,10 +4227,10 @@ namespace {
 		}
 		std::string rootName;
 		std::vector<AccessStep> steps;
-		accessChain(expression, rootName, steps);
-		const auto root = _bindings.find(rootName);
-		return root != _bindings.end() && (root->second.bufferPointeeType != InvalidId
-				|| root->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)
+		const Expression* rootExpr = accessChain(expression, rootName, steps);
+		const Binding* root = findBinding(*rootExpr);
+		return root && (root->bufferPointeeType != InvalidId
+				|| root->storageClass == spirv::StorageClass::PhysicalStorageBuffer)
 			? loadFromBuffer(address, fieldType) : loadFrom(address, fieldType);
 	}
 
@@ -4271,7 +4292,7 @@ namespace {
 		// name on the left of the '.' when that is an index.
 		std::string rootName;
 		std::vector<AccessStep> steps;
-		accessChain(expression, rootName, steps);
+		const Expression* rootExpr = accessChain(expression, rootName, steps);
 
 		Id fieldType = InvalidId;
 		const Id address = emitMemberAddress(expression, fieldType);
@@ -4279,9 +4300,9 @@ namespace {
 		// A member read yields the field and a member write needs its address, so
 		// the address form does the work and this loads. A buffer's load carries the
 		// Aligned operand the same rule as any other access through its pointer.
-		const auto it = _bindings.find(rootName);
-		return it != _bindings.end() && (it->second.bufferPointeeType != InvalidId
-				|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)
+		const Binding* it = findBinding(*rootExpr);
+		return it && (it->bufferPointeeType != InvalidId
+				|| it->storageClass == spirv::StorageClass::PhysicalStorageBuffer)
 			? loadFromBuffer(address, fieldType)
 			: loadFrom(address, fieldType);
 	}
@@ -4295,14 +4316,14 @@ namespace {
 	Id Emitter::emitMemberAddress(const Expression& expression, Id& outFieldType) {
 		std::string rootName;
 		std::vector<AccessStep> steps;
-		accessChain(expression, rootName, steps);
+		const Expression* rootExpr = accessChain(expression, rootName, steps);
 
-		const auto it = _bindings.find(rootName);
-		if (it == _bindings.end()) {
+		const Binding* found = findBinding(*rootExpr);
+		if (!found) {
 			throw CompileError("\"" + rootName + "\" is not a parameter or local");
 		}
 
-		const Binding& binding = it->second;
+		const Binding& binding = *found;
 		const bool fromBuffer = binding.bufferPointeeType != InvalidId;
 
 		// What the chain points at now, as the source spelled it, so the next step
@@ -4706,7 +4727,7 @@ namespace {
 			case ExpressionKind::BoolLiteral: return true;
 			case ExpressionKind::FloatLiteral: return std::isfinite(foldExpression(expression).number);
 			case ExpressionKind::Identifier: {
-				if (expression.name == excluded) { return false; }
+				if (expression.name == excluded && !expression.fileScope) { return false; }
 				const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 				if (local != _bindings.end()) { return _localFolded.count(local->second.id) != 0; }
 				const auto value = _folded.find(expression.name);
@@ -5318,7 +5339,7 @@ namespace {
 			case ExpressionKind::Sizeof:
 				return true;
 			case ExpressionKind::Identifier: {
-				const Binding* binding = findResourceBinding(expression.name);
+				const Binding* binding = findResourceBinding(expression.name, expression.fileScope);
 				return !binding || (binding->bufferPointeeType == InvalidId
 					&& binding->storageClass != spirv::StorageClass::PhysicalStorageBuffer);
 			}
@@ -5872,15 +5893,15 @@ namespace {
 			throw CompileError(function + " takes &local for a scalar threadgroup atomic, an atomic buffer "
 				"pointer, or the address of one of its elements");
 		}
-		const auto found = _bindings.find(pointer->name);
-		if (found == _bindings.end() || !found->second.pointeeMsl.isAtomic
-			|| (!found->second.isBuffer && found->second.storageClass != spirv::StorageClass::Workgroup)) {
+		const Binding* found = findBinding(*pointer);
+		if (!found || !found->pointeeMsl.isAtomic
+			|| (!found->isBuffer && found->storageClass != spirv::StorageClass::Workgroup)) {
 			throw CompileError(function + " takes a device atomic_uint or atomic_int pointer, or &local for a "
 				"scalar threadgroup atomic, and \""
 				+ pointer->name + "\" is not one");
 		}
 
-		const Binding& binding = found->second;
+		const Binding& binding = *found;
 		if (binding.storageClass == spirv::StorageClass::Workgroup && (!addressOfLocal || index)) {
 			throw CompileError(function + " takes the address of a scalar threadgroup atomic, as &" + pointer->name);
 		}
@@ -5994,15 +6015,15 @@ namespace {
 			throw CompileError(name + " takes &expected, the address of a local scalar variable, as its "
 				"second argument");
 		}
-		const auto found = _bindings.find(expected->name);
-		if (found == _bindings.end() || !found->second.isPointer || found->second.isBuffer
-			|| found->second.isAddress || found->second.storageClass != spirv::StorageClass::Function
-			|| found->second.bufferPointeeType != InvalidId) {
+		const Binding* found = findBinding(*expected);
+		if (!found || !found->isPointer || found->isBuffer
+			|| found->isAddress || found->storageClass != spirv::StorageClass::Function
+			|| found->bufferPointeeType != InvalidId) {
 			throw CompileError(name + " takes &expected, the address of a local scalar variable, and \""
 				+ expected->name + "\" is not one");
 		}
-		const Type& expectedType = found->second.pointeeMsl;
-		if (found->second.readOnly) {
+		const Type& expectedType = found->pointeeMsl;
+		if (found->readOnly) {
 			throw CompileError(name + " writes the old value to \"" + expected->name + "\", which is const");
 		}
 		if (expectedType.isAtomic || expectedType.isPointer || !expectedType.isScalar() || expectedType.isMatrix()
@@ -6018,7 +6039,7 @@ namespace {
 		const Id semantics = constantU32(0);  // Relaxed
 		const Id old = _builder.emitTyped(spirv::OpAtomicCompareExchange, type,
 			{ address, scope, semantics, semantics, desired, comparator });
-		_builder.emit(spirv::OpStore, { found->second.id, old });
+		_builder.emit(spirv::OpStore, { found->id, old });
 		return _builder.emitTyped(spirv::OpIEqual, _boolType, { old, comparator });
 	}
 
@@ -6210,8 +6231,7 @@ namespace {
 				return name.size() > suffix.size()
 					&& name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 			};
-			const auto texture = member.left->kind == ExpressionKind::Identifier
-				? _bindings.find(member.left->name) : _bindings.end();
+			const Binding* texture = findBinding(*member.left);
 			// A name only a member template has is looked up through the receiver's struct, which structOf
 			// reads without emitting anything, so a call such as a texture's own method is left alone.
 			const bool templateNamed = _memberTemplateNames.count(member.memberName)
@@ -6220,7 +6240,7 @@ namespace {
 					const StructDecl* owner = structOf(*member.left);
 					return owner && !memberTemplatesOf(owner->name, member.memberName).empty();
 				}();
-			if ((texture != _bindings.end() && texture->second.pointeeMsl.isTexture())
+			if ((texture && texture->pointeeMsl.isTexture())
 				|| (std::none_of(_helpers.begin(), _helpers.end(), isMember) && !templateNamed)) {
 				return nullptr;
 			}
@@ -6228,8 +6248,8 @@ namespace {
 			// A local names its struct, so the receiver is evaluated as the first
 			// argument is; any other receiver is evaluated to learn what it is.
 			std::string ownerName;
-			if (texture != _bindings.end() && !texture->second.pointeeMsl.namedType.empty()) {
-				ownerName = texture->second.pointeeMsl.namedType;
+			if (texture && !texture->pointeeMsl.namedType.empty()) {
+				ownerName = texture->pointeeMsl.namedType;
 			} else {
 				_pendingObject = emitExpression(*member.left);
 				if (const std::string* owner = _types.structNameOf(_builder.typeOf(_pendingObject), nullptr)) {
@@ -7443,10 +7463,10 @@ namespace {
 		if (root == &expression) {
 			return true;
 		}
-		const auto binding = _bindings.find(root->name);
-		return binding != _bindings.end() && binding->second.pointeeMsl.arrayLength
-			&& binding->second.pointeeMsl.vectorWidth <= 1 && binding->second.pointeeMsl.matrixColumns == 0
-			&& binding->second.pointeeMsl.namedType.empty();
+		const Binding* binding = findBinding(*root);
+		return binding && binding->pointeeMsl.arrayLength
+			&& binding->pointeeMsl.vectorWidth <= 1 && binding->pointeeMsl.matrixColumns == 0
+			&& binding->pointeeMsl.namedType.empty();
 	}
 
 	// A name, an element or a member of one, with nothing in it that evaluating twice would repeat.
@@ -7469,14 +7489,8 @@ namespace {
 			|| expression.kind == ExpressionKind::Index || expression.kind == ExpressionKind::Member)
 			&& !isComputedValue(expression);
 		argument.kind = place ? OverloadArgument::Kind::Variable : OverloadArgument::Kind::Value;
-		const auto lookupBinding = [&](const Expression& id) -> const Binding* {
-			if (!id.fileScope) { return findResourceBinding(id.name); }
-			if (const auto arr = _fileScopeBound.find(id.name); arr != _fileScopeBound.end()) { return &arr->second; }
-			const auto sampler = _fileScopeSamplerBindings.find(id.name);
-			return sampler != _fileScopeSamplerBindings.end() ? &sampler->second : nullptr;
-		};
 		if (expression.kind == ExpressionKind::Identifier) {
-			if (const Binding* binding = lookupBinding(expression)) {
+			if (const Binding* binding = findResourceBinding(expression.name, expression.fileScope)) {
 				const bool array = binding->isPointer && binding->pointeeMsl.arrayLength
 					&& binding->storageClass == spirv::StorageClass::Function && !binding->isAddress;
 				if (binding->pointeeMsl.resource != ResourceKind::None) {
@@ -7694,7 +7708,7 @@ namespace {
 				"in the shader, or a texture or sampler parameter of the calling helper");
 		}
 
-		const Binding* binding = findResourceBinding(argument.name);
+		const Binding* binding = findResourceBinding(argument.name, argument.fileScope);
 		const Type& wanted = parameter.type;
 		if (!binding || !sameResourceType(binding->pointeeMsl, wanted)) {
 			throw CompileError(what + " is \"" + argument.name + "\", which is not a "
@@ -7982,16 +7996,15 @@ namespace {
 				continue;
 			}
 
-			const auto binding = argument.kind == ExpressionKind::Identifier
-				? _bindings.find(argument.name) : _bindings.end();
-			if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.pointeeMsl.arrayLength
-				|| binding->second.storageClass != spirv::StorageClass::Function || binding->second.isAddress) {
+			const Binding* binding = findBinding(argument);
+			if (!binding || !binding->isPointer || !binding->pointeeMsl.arrayLength
+				|| binding->storageClass != spirv::StorageClass::Function || binding->isAddress) {
 				throw CompileError(what + " has to name a local array (or a pointer parameter of the calling "
 					"helper), since parameter \"" + parameter.name + "\" is a pointer to its elements; "
 					"&x, a + n and pointers into a buffer are not lowered yet");
 			}
 
-			const PointerFit fit = pointerFit(binding->second, parameter.type);
+			const PointerFit fit = pointerFit(*binding, parameter.type);
 			const Type& element = fit.element;
 			const Type& wanted = fit.wanted;
 			const std::vector<uint32_t>& shape = fit.shape;
@@ -8005,13 +8018,13 @@ namespace {
 				throw CompileError(what + " is an array of " + spelled(element, shape) + ", and parameter \""
 					+ parameter.name + "\" points at " + spelled(wanted, wantedShape));
 			}
-			if (binding->second.readOnly && !parameter.type.isConst) {
+			if (binding->readOnly && !parameter.type.isConst) {
 				throw CompileError(what + " is const, and parameter \"" + parameter.name
 					+ "\" is a pointer that can change it");
 			}
 
-			lengths[first + i] = *binding->second.pointeeMsl.arrayLength;
-			arrays[first + i] = binding->second.id;
+			lengths[first + i] = *binding->pointeeMsl.arrayLength;
+			arrays[first + i] = binding->id;
 		}
 
 		if (!any) {
@@ -8031,7 +8044,7 @@ namespace {
 	// bare variables are the same pointer and alias as C++ does.
 	void Emitter::rejectAliasedReferenceArguments(const Expression& call, const FunctionDecl& definition,
 		size_t first) {
-		struct Passed { std::string root; bool temporary; std::vector<AccessStep> steps; };
+		struct Passed { const Expression* rootExpr; std::string root; bool temporary; std::vector<AccessStep> steps; };
 		std::vector<Passed> passed;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
 			if (!definition.parameters[first + i].isMutableReference()) {
@@ -8046,12 +8059,12 @@ namespace {
 			if (root.kind != ExpressionKind::Identifier || isComputedValue(argument)) {
 				continue;
 			}
-			const auto bound = _bindings.find(root.name);
+			const Binding* bound = findBinding(root);
 			std::string rootName;
 			std::vector<AccessStep> steps;
 			accessChain(argument, rootName, steps);
-			passed.push_back({ root.name, argument.kind != ExpressionKind::Identifier
-				|| (bound != _bindings.end() && bound->second.isAddress), std::move(steps) });
+			passed.push_back({ &root, root.name, argument.kind != ExpressionKind::Identifier
+				|| (bound && bound->isAddress), std::move(steps) });
 		}
 
 		// A copied-in element or member is stale for anything else that reads or writes the same
@@ -8094,7 +8107,7 @@ namespace {
 					continue;
 				}
 				std::set<std::string> names;
-				collectIdentifiers(*call.arguments[i], names);
+				collectIdentifiers(*call.arguments[i], names, false);
 				const bool sharesRoot = std::any_of(names.begin(), names.end(),
 					[&](const std::string& n) { return roots.count(n) > 0; });
 				if ((parameter.type.isPointer && sharesRoot) || mayWrite(mayWrite, *call.arguments[i])) {
@@ -8136,10 +8149,12 @@ namespace {
 
 		for (size_t i = 0; i < passed.size(); ++i) {
 			for (size_t j = i + 1; j < passed.size(); ++j) {
-				const bool sameRoot = passed[i].root == passed[j].root;
+				const bool sameRoot = passed[i].root == passed[j].root
+					&& passed[i].rootExpr->fileScope == passed[j].rootExpr->fileScope;
+				const Binding* bi = findBinding(*passed[i].rootExpr);
+				const Binding* bj = findBinding(*passed[j].rootExpr);
 				const bool viaAddress = (passed[i].temporary || passed[j].temporary)
-					&& (_bindings.count(passed[i].root) && _bindings.at(passed[i].root).isAddress
-						|| _bindings.count(passed[j].root) && _bindings.at(passed[j].root).isAddress);
+					&& ((bi && bi->isAddress) || (bj && bj->isAddress));
 				const bool apart = sameRoot && !viaAddress && disjoint(passed[i].steps, passed[j].steps);
 				if (!apart && ((sameRoot && (passed[i].temporary || passed[j].temporary)) || viaAddress)) {
 					throw CompileError("the call to \"" + definition.name + "\" passes the same variable "
@@ -8222,8 +8237,8 @@ namespace {
 				+ parameter.name + "\" cannot bind as a reference");
 		}
 		if (root.kind == ExpressionKind::Identifier) {
-			const auto binding = _bindings.find(root.name);
-			if (binding != _bindings.end() && binding->second.readOnly) {
+			const Binding* binding = findBinding(root);
+			if ((binding && binding->readOnly) || (!binding && _constants.count(root.name))) {
 				throw CompileError(what + " is const or in constant memory, and parameter \""
 					+ parameter.name + "\" is a reference that can change it");
 			}
@@ -8243,11 +8258,8 @@ namespace {
 		// A function parameter has to be a pointer to a variable, which an element
 		// or a member of one is not, so those go through a temporary copied back
 		// after the call.
-		if (argument.kind == ExpressionKind::Identifier) {
-			const auto named = _bindings.find(argument.name);
-			if (named != _bindings.end() && !named->second.isAddress) {
-				return address;
-			}
+		if (const Binding* named = findBinding(argument); named && !named->isAddress) {
+			return address;
 		}
 
 		const Id type = declaredTypeOf(parameter.type);
@@ -8558,7 +8570,7 @@ namespace {
 				// The return type of the one function the name can find: any overload, template, library
 				// function beside it or argument-dependent lookup would need the arguments' types.
 				if (expression.left->kind != ExpressionKind::Identifier || expression.left->hasTemplateArguments
-					|| _bindings.count(expression.left->name) > 0) {
+					|| (!expression.left->fileScope && _bindings.count(expression.left->name) > 0)) {
 					return std::nullopt;
 				}
 				std::set<std::string> adl;
@@ -10104,7 +10116,7 @@ namespace {
 		switch (expression.kind) {
 			case ExpressionKind::Construct: return expression.constructType && expression.constructType->isMatrix();
 			case ExpressionKind::Identifier: {
-				if (_bindings.count(expression.name)) { return false; }
+				if (!expression.fileScope && _bindings.count(expression.name)) { return false; }
 				const auto found = _folded.find(expression.name);
 				return found != _folded.end() && found->second.matrixColumns > 0;
 			}
@@ -10297,7 +10309,8 @@ namespace {
 				folded = foldMatrixConstruct(expression);
 				break;
 			case ExpressionKind::Identifier: {
-				const auto found = _bindings.count(expression.name) ? _folded.end() : _folded.find(expression.name);
+				const auto found = (!expression.fileScope && _bindings.count(expression.name))
+					? _folded.end() : _folded.find(expression.name);
 				if (found == _folded.end() || found->second.matrixColumns == 0) {
 					throw CompileError("\"" + expression.name + "\" is not a matrix constant this source "
 						"declares before this one");
@@ -11123,7 +11136,7 @@ namespace {
 
 		declareResources(resources);
 		std::set<std::string> used;
-		collectIdentifiers(*_entryPoint->body, used);
+		collectIdentifiers(*_entryPoint->body, used, false);
 		reserveLocalSamplers(*_entryPoint->body, used);
 		_threadgroupLocals.clear();
 		reserveThreadgroupLocals(*_entryPoint->body);
@@ -11574,10 +11587,10 @@ namespace {
 				"conditional, a call, a member or an element would pick the descriptor at run time, which "
 				"mslc does not lower");
 		}
-		if (source.name == declaration.name) {
+		if (source.name == declaration.name && !source.fileScope) {
 			throw CompileError(what + " is initialised from itself");
 		}
-		const Binding* named = findResourceBinding(source.name);
+		const Binding* named = findResourceBinding(source.name, source.fileScope);
 		if (!named || named->pointeeMsl.resource == ResourceKind::None) {
 			throw CompileError(what + " is initialised from \"" + source.name + "\", which is not a texture or "
 				"a sampler");
@@ -11618,13 +11631,13 @@ namespace {
 			throw CompileError("the receiver of \"." + member.memberName + "\" has to be a texture parameter");
 		}
 
-		const auto it = _bindings.find(member.left->name);
-		if (it == _bindings.end() || !it->second.pointeeMsl.isTexture()) {
+		const Binding* found = findBinding(*member.left);
+		if (!found || !found->pointeeMsl.isTexture()) {
 			throw CompileError("\"" + member.left->name + "\" is not a texture parameter, so "
 				"\"." + member.memberName + "\" is not a call mslc lowers");
 		}
 
-		return it->second;
+		return *found;
 	}
 
 	static bool isArrayKind(ResourceKind kind) {
@@ -11914,7 +11927,7 @@ namespace {
 		if (argument.kind != ExpressionKind::Identifier) {
 			throw CompileError("the first argument of " + callName + " has to name a sampler");
 		}
-		const Binding* samplerBinding = findResourceBinding(argument.name);
+		const Binding* samplerBinding = findResourceBinding(argument.name, argument.fileScope);
 		if (!samplerBinding || samplerBinding->pointeeMsl.resource != ResourceKind::Sampler) {
 			throw CompileError("\"" + argument.name + "\" is not a sampler, and " + callName + " takes one "
 				"as its first argument");
@@ -13419,8 +13432,9 @@ namespace {
 			throw CompileError("the reference \"" + declaration.name + "\" is bound to a place mslc "
 				"cannot name");
 		}
-		const auto rootBinding = _bindings.find(root.name);
-		const bool rootReadOnly = rootBinding != _bindings.end() && rootBinding->second.readOnly;
+		const Binding* rootBinding = findBinding(root);
+		const bool rootReadOnly = (rootBinding && rootBinding->readOnly)
+			|| (!rootBinding && _constants.count(root.name));
 		const bool constReference = declaration.type.isConst
 			|| declaration.type.addressSpace == AddressSpace::Constant;
 		if (rootReadOnly && !constReference) {
@@ -13428,10 +13442,10 @@ namespace {
 				"constant memory or a const variable");
 		}
 
-		if (place.kind == ExpressionKind::Identifier && rootBinding != _bindings.end()
-			&& rootBinding->second.bufferPointeeType == InvalidId && rootBinding->second.isPointer
-			&& rootBinding->second.storageClass == spirv::StorageClass::Function) {
-			Binding alias = rootBinding->second;
+		if (place.kind == ExpressionKind::Identifier && rootBinding
+			&& rootBinding->bufferPointeeType == InvalidId && rootBinding->isPointer
+			&& rootBinding->storageClass == spirv::StorageClass::Function) {
+			Binding alias = *rootBinding;
 			alias.readOnly = alias.readOnly || constReference;
 			const Type referenced = declaration.type.isAuto
 				? deduceAutoType(declaration.type, alias.pointeeType, declaration.name) : declaration.type;
@@ -13536,7 +13550,7 @@ namespace {
 	// validated where it was declared.
 	bool Emitter::namesConstexprAggregate(const Expression& expression) {
 		if (expression.kind != ExpressionKind::Identifier) { return false; }
-		const auto local = _bindings.find(expression.name);
+		const auto local = expression.fileScope ? _bindings.end() : _bindings.find(expression.name);
 		if (local != _bindings.end()) {
 			const Type& type = local->second.pointeeMsl;
 			return type.isConstexpr && !type.isPointer && !type.arrayLength && !type.isMatrix()
@@ -13990,14 +14004,14 @@ namespace {
 		}
 
 		std::set<std::string> names;
-		collectIdentifiers(initializer, names);
+		collectIdentifiers(initializer, names, false);
 		if (names.count(declaration.name)) {
 			throw CompileError("variable \"" + declaration.name + "\" declared with deduced type 'auto' "
 				"cannot appear in its own initializer");
 		}
 
 		if (initializer.kind == ExpressionKind::Identifier) {
-			const Binding* named = findResourceBinding(initializer.name);
+			const Binding* named = findResourceBinding(initializer.name, initializer.fileScope);
 			if (named && named->pointeeMsl.resource != ResourceKind::None) {
 				bindResourceAlias(declaration, nullptr);
 				return;
@@ -14228,21 +14242,21 @@ namespace {
 			// A local names a Function-storage pointer, so the variable itself is
 			// the address to store to. A buffer parameter is a descriptor and a
 			// plain value is loaded, so only this case takes the binding.
-			const auto it = _bindings.find(left.name);
-			if (it != _bindings.end() && it->second.pointeeMsl.isAtomic) {
+			const Binding* it = findBinding(left);
+			if (it && it->pointeeMsl.isAtomic) {
 				throw CompileError("the atomic \"" + left.name + "\" cannot be used as an ordinary place; "
 					"use the atomic functions");
 			}
-			if (it != _bindings.end() && it->second.isPointer
-				&& it->second.bufferPointeeType == InvalidId
-				&& (it->second.storageClass == spirv::StorageClass::Function
-					|| it->second.storageClass == spirv::StorageClass::Workgroup
-					|| it->second.storageClass == spirv::StorageClass::PhysicalStorageBuffer)) {
-				address = it->second.id;
-			} else if (it != _bindings.end() && it->second.bufferPointeeType != InvalidId
-				&& !it->second.isBuffer) {
+			if (it && it->isPointer
+				&& it->bufferPointeeType == InvalidId
+				&& (it->storageClass == spirv::StorageClass::Function
+					|| it->storageClass == spirv::StorageClass::Workgroup
+					|| it->storageClass == spirv::StorageClass::PhysicalStorageBuffer)) {
+				address = it->id;
+			} else if (it && it->bufferPointeeType != InvalidId
+				&& !it->isBuffer) {
 				// A reference parameter is the one value its buffer holds.
-				address = bufferBase(it->second);
+				address = bufferBase(*it);
 			} else {
 				address = emitExpression(left);
 			}
@@ -14281,8 +14295,9 @@ namespace {
 		}
 
 		const Expression* root = &storeRoot(base);
-		const auto rootBinding = _bindings.find(root->name);
-		if (rootBinding != _bindings.end() && rootBinding->second.readOnly) {
+		const Binding* rootBinding = findBinding(*root);
+		if ((rootBinding && rootBinding->readOnly)
+			|| (!rootBinding && root->kind == ExpressionKind::Identifier && _constants.count(root->name))) {
 			throw CompileError("assigning to " + quoted + " of \"" + root->name
 				+ "\", which is const or in constant memory");
 		}
@@ -14368,7 +14383,8 @@ namespace {
 			// sampler or a buffer name has no value to evaluate, so naming a parameter is
 			// all there is to do. An undeclared name is still reported.
 			const Expression& operand = *expression.arguments.front();
-			if (operand.kind == ExpressionKind::Identifier && findResourceBinding(operand.name)) {
+			if (operand.kind == ExpressionKind::Identifier
+				&& findResourceBinding(operand.name, operand.fileScope)) {
 				return;
 			}
 			emitExpressionStatement(operand);
@@ -14477,8 +14493,7 @@ namespace {
 			throw CompileError("expression is not assignable");
 		}
 		rejectPlaceThroughConditional(target, "assigning to");
-		if (root.kind == ExpressionKind::Identifier && _bindings.find(root.name) == _bindings.end()
-			&& _constants.count(root.name)) {
+		if (root.kind == ExpressionKind::Identifier && !findBinding(root) && _constants.count(root.name)) {
 			throw CompileError("cannot store to \"" + root.name + "\", a constant declared at file scope");
 		}
 	}
@@ -14505,18 +14520,18 @@ namespace {
 			return;
 		}
 		if (left.kind == ExpressionKind::Identifier) {
-			const auto named = _bindings.find(left.name);
-			if (named != _bindings.end() && named->second.pointeeMsl.resource != ResourceKind::None
-				&& !named->second.pointeeMsl.arrayLength) {
-				throw CompileError("\"" + left.name + "\" is a " + typeName(named->second.pointeeMsl)
+			const Binding* named = findResourceBinding(left.name, left.fileScope);
+			if (named && named->pointeeMsl.resource != ResourceKind::None
+				&& !named->pointeeMsl.arrayLength) {
+				throw CompileError("\"" + left.name + "\" is a " + typeName(named->pointeeMsl)
 					+ ", which cannot be assigned: mslc binds a texture or sampler name to one descriptor "
 					"and does not lower choosing another at run time");
 			}
-			if (named != _bindings.end() && named->second.pointeeMsl.arrayLength && !named->second.isBuffer
-				&& !(named->second.pointeeMsl.isStdArray && isLocalStorage(named->second.storageClass))) {
-				const bool unsized = *named->second.pointeeMsl.arrayLength == UINT32_MAX;
+			if (named && named->pointeeMsl.arrayLength && !named->isBuffer
+				&& !(named->pointeeMsl.isStdArray && isLocalStorage(named->storageClass))) {
+				const bool unsized = *named->pointeeMsl.arrayLength == UINT32_MAX;
 				throw CompileError(unsized ? "the threadgroup argument \"" + left.name + "\" is not assignable; assign through it"
-					: "array type " + typeName(named->second.pointeeMsl) + " is not assignable");
+					: "array type " + typeName(named->pointeeMsl) + " is not assignable");
 			}
 		}
 		if (const auto target = enumOf(left); target && !target->empty() && *target != "<anonymous>") {
@@ -14535,8 +14550,8 @@ namespace {
 
 		const Expression* root = &storeRoot(left);
 		if (root->kind == ExpressionKind::Identifier) {
-			const auto target = _bindings.find(root->name);
-			if (target != _bindings.end() && target->second.readOnly) {
+			const Binding* target = findBinding(*root);
+			if (target && target->readOnly) {
 				throw CompileError("cannot store through \"" + root->name + "\", which is in the "
 					"constant address space or declared const");
 			}
