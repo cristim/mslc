@@ -3054,6 +3054,7 @@ namespace {
 		Id emitAtomicCall(const Expression& expression);
 		Id emitAtomicCompareExchange(const Expression& expression);
 		Id emitSelectCall(const Expression& expression);
+		Id emitAllAnyCall(const Expression& expression, const std::string& name);
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
 		Id emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
@@ -6253,6 +6254,10 @@ namespace {
 			return emitSelectCall(expression);
 		}
 
+		if (name == "all" || name == "any") {
+			return emitAllAnyCall(expression, name);
+		}
+
 		if (const PackBuiltin* pack = findPackBuiltin(name)) {
 			return emitPackBuiltin(*pack, expression.arguments);
 		}
@@ -6329,6 +6334,28 @@ namespace {
 		}
 
 		return _builder.emitTyped(spirv::OpSelect, aType, { condition, values[1], values[0] });
+	}
+
+	// all(x) and any(x) of <metal_relational>: whether every, or some, component of a bool or boolN holds. Apple's
+	// library declares them for those types only, so a numeric scalar converts to bool as in an if, and a numeric
+	// vector, which does not convert to a bool vector, finds no function.
+	Id Emitter::emitAllAnyCall(const Expression& expression, const std::string& name) {
+		if (expression.arguments.size() != 1) {
+			throw CompileError(name + " takes 1 argument, and this call passes "
+				+ std::to_string(expression.arguments.size()));
+		}
+		const Id value = emitExpression(*expression.arguments[0]);
+		const Id type = _builder.typeOf(value);
+		if (_types.matrixInfo(type) || _types.bitWidth(type) == 0) {
+			throw CompileError(name + " takes a bool or a bool vector");
+		}
+		if (_types.vectorWidth(type) == 1) {
+			return asCondition(value);
+		}
+		if (_types.componentOf(type) != _boolType) {
+			throw CompileError(name + " takes a bool vector, and a numeric vector does not convert to one");
+		}
+		return _builder.emitTyped(name == "all" ? spirv::OpAll : spirv::OpAny, _boolType, { value });
 	}
 
 	// The helper a call names. A call through "." is a member function when the
