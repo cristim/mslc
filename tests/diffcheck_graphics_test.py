@@ -58,6 +58,14 @@ class VertexAttributes(unittest.TestCase):
         self.assertEqual(len(graphics.vertex_attribute_findings(mine, apple)), 3)
         self.assertEqual(len(graphics.vertex_attribute_findings({}, apple[:1])), 1)
 
+    def test_half_attributes_match_widened_spirv_inputs_only_when_apple_is_half(self):
+        half_mine = {0: {"scalar": "float", "comps": 1}, 1: {"scalar": "float", "comps": 3}}
+        half_apple = [{"index": 0, "scalar": "half", "comps": 1}, {"index": 1, "scalar": "half", "comps": 3}]
+        self.assertEqual(graphics.vertex_attribute_findings(half_mine, half_apple), [])
+        self.assertEqual(len(graphics.vertex_attribute_findings({0: {"scalar": "half", "comps": 2}},
+                                                               [{"index": 0, "scalar": "float", "comps": 2}])), 1)
+        self.assertEqual(len(graphics.vertex_attribute_findings({0: {"scalar": "int", "comps": 1}}, half_apple[:1])), 1)
+
 
 class Directives(unittest.TestCase):
     def test_graphics_directives(self):
@@ -379,6 +387,97 @@ class Resources(unittest.TestCase):
             self.assertIn("texture 0 1 0 4 4 ", seen["vkhost"])
             self.assertIn("half", seen["vkhost"])
             self.assertIn("esampler 1 1 0 3 1 1", seen["vkhost"])
+
+    def test_prepare_upgrades_half_vertex_attributes_and_guards_position(self):
+        refl = self._refl(v_bindings=[{"kind": "VertexInput", "location": 0, "name": "pos"},
+                                      {"kind": "VertexInput", "location": 1, "name": "h1"},
+                                      {"kind": "VertexInput", "location": 2, "name": "h3"}])
+        v_iface = {"inputs": {0: {"scalar": "float", "comps": 2, "flat": False},
+                              1: {"scalar": "float", "comps": 1, "flat": False},
+                              2: {"scalar": "float", "comps": 3, "flat": False}},
+                   "outputs": {}, "frag_depth": False, "unsupported": []}
+        apple = dict(self._apple(), vertex_attributes=[
+            {"index": 0, "name": "pos", "scalar": "float", "comps": 2},
+            {"index": 1, "name": "h1", "scalar": "half", "comps": 1},
+            {"index": 2, "name": "h3", "scalar": "half", "comps": 3},
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write(self.SOURCE)
+            ifaces = {"vertex": v_iface, "fragment": self.IFACE}
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: (a[4] + ".spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", side_effect=lambda spv: spv[:-4]), \
+                 mock.patch.object(spirvio, "interface", side_effect=lambda tag, _: ifaces[tag]), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple):
+                plan, early = graphics._prepare(self.OPTS, src, "vs", "fs", dict(self.PARAMS, position="pos"), d, [])
+                self.assertIsNone(early)
+                self.assertEqual(plan["attributes"][1]["scalar"], "half")
+                self.assertIn("attr 1 half", plan["shape"])
+                self.assertIn("attr 2 half3", plan["shape"])
+                _, bad = graphics._prepare(self.OPTS, src, "vs", "fs", dict(self.PARAMS, position="h3"), d, [])
+                self.assertEqual(bad["status"], "error")
+                self.assertIn("is half", bad["reason"])
+                apple_half_pos = dict(apple, vertex_attributes=[
+                    {"index": 0, "name": "pos", "scalar": "half", "comps": 2},
+                    {"index": 1, "name": "h1", "scalar": "half", "comps": 1},
+                    {"index": 2, "name": "h3", "scalar": "half", "comps": 3},
+                ])
+                with mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple_half_pos):
+                    _, skipped = graphics._prepare(self.OPTS, src, "vs", "fs", dict(self.PARAMS, position=None, infer_position=True), d, [])
+                    self.assertEqual(skipped["status"], "skipped")
+                    self.assertIn("without // DIFFCHECK-POSITION", skipped["reason"])
+
+    def test_writable_buffers_require_single_instance_and_read_back(self):
+        buf = {"kind": "Buffer", "metal_index": 0, "descriptor": {"set": 1, "binding": 0}, "member": 0, "name": "fout"}
+        ro = {"kind": "Buffer", "metal_index": 1, "descriptor": {"set": 1, "binding": 1}, "member": 1, "name": "fin"}
+        refl = self._refl(f_bindings=[buf, ro])
+        lay_w = {"index": 0, "name": "fout", "access": "readwrite", "stride": 4, "leaves": [{"off": 0, "scalar": "uint"}]}
+        lay_r = {"index": 1, "name": "fin", "access": "read", "stride": 4, "leaves": [{"off": 0, "scalar": "uint"}]}
+        apple = self._apple()
+        apple["fragment"]["buffers"] = [lay_w, lay_r]
+        _, skip = self._run_prepare(refl, apple, dict(self.PARAMS, instances=2))
+        self.assertEqual(skip["status"], "skipped")
+        self.assertIn("instances > 1", skip["reason"])
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.metal")
+            with open(src, "w") as f:
+                f.write(self.SOURCE)
+            manifests = []
+
+            def run_host(binary, manifest):
+                with open(manifest) as mf:
+                    text = mf.read()
+                manifests.append(text)
+                for line in text.splitlines():
+                    w = line.split()
+                    if w[0] == "color":
+                        with open(w[-1], "wb") as out:
+                            out.write(struct.pack("<4f", 1.0, 2.0, 3.0, 4.0) * (32 * 32))
+                    elif w[0] == "gbuffer" and len(w) == 8:
+                        with open(w[6], "rb") as src_f, open(w[7], "wb") as out:
+                            out.write(struct.pack("<I", 42) + src_f.read()[4:])
+
+            with mock.patch.object(hosts, "run_mslc", side_effect=lambda *a: ("s.spv", refl[a[4]], None)), \
+                 mock.patch.object(spirvio, "disassemble", return_value=""), \
+                 mock.patch.object(spirvio, "interface", return_value=self.IFACE), \
+                 mock.patch.object(hosts, "apple_source_lines", return_value=["source " + src]), \
+                 mock.patch.object(hosts, "apple_gfx_reflection", return_value=apple), \
+                 mock.patch.object(hosts, "run_metal", side_effect=run_host), \
+                 mock.patch.object(hosts, "run_vulkan", side_effect=run_host):
+                res = graphics.check_pair(self.OPTS, src, "vs", "fs", self.PARAMS, d, [])
+                self.assertEqual(res["status"], "matched")
+                self.assertTrue(res["cases"][0]["negative_control"])
+                self.assertEqual(res["buffers"], ["color0", "fin", "fout"])
+                gbuf_lines = [l for l in manifests[0].splitlines() if l.startswith("gbuffer ")]
+                self.assertEqual([len(l.split()) for l in gbuf_lines], [8, 7])
+                corrupt_opts = type("O", (type(self.OPTS),), {"corrupt_mslc": "fout:0"})()
+                os.makedirs(os.path.join(d, "bad"))
+                bad = graphics.check_pair(corrupt_opts, src, "vs", "fs", self.PARAMS, os.path.join(d, "bad"), [])
+                self.assertEqual(bad["status"], "mismatched")
+                self.assertEqual(bad["cases"][0]["diffs"][0]["buffer"], "fout")
 
 
 if __name__ == "__main__":

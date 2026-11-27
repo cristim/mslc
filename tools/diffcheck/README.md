@@ -90,9 +90,12 @@ interpolated values drift apart by about 1e-3. `DIFFCHECK-GEOMETRY` is checked; 
 that moves positions (instance offsets) must keep them on the grid when the output is smooth.
 
 Inputs: the `DIFFCHECK-POSITION` field is filled from the geometry (w = 1); every other stage_in
-field is seeded per vertex, one tightly packed vertex buffer per attribute (Metal slot
-`30 - location`, so a `[[buffer(n)]]` argument must not use those); `[[buffer]]` arguments are
-seeded like kernel buffers, in both stages; a texture (`1d`, `1d_array`, `2d`, `2d_array`, `3d`,
+field (including scalar and vector `half`, for which `mslc` widens the SPIR-V Input to `float` and
+narrows with `OpFConvert`, while both hosts feed the 16-bit vertex format) is seeded per vertex,
+one tightly packed vertex buffer per attribute (Metal slot `30 - location`, so a `[[buffer(n)]]`
+argument must not use those); `[[buffer]]` arguments are seeded like kernel buffers in both stages
+(and when `instances` is 1, writable `device` buffers are read back and compared leaf by leaf under
+`DIFFCHECK-ULP` / source ULP bounds); a texture (`1d`, `1d_array`, `2d`, `2d_array`, `3d`,
 `cube` or `cube_array`) is RGBA of `float`, `half`, `int`, `uint`, `short` or `ushort` (`sample`
 or `access::read`), a runtime sampler is nearest,
 normalised, no mips with address mode picked by its Metal index (`0` clamp-to-edge, `1` repeat,
@@ -120,13 +123,13 @@ the audited transfer-write to host-read barrier of PR #148. Vertex-stage values 
 back (there is no transfer-feedback path), so a vertex miscompile shows only through what it
 puts in the attachments.
 
-Skipped with the reason (follow-up work): a writable `[[buffer]]` or writable texture (`access::write`
-or `access::read_write`) in either stage, depth or multisample textures, framebuffer fetch, a scalar half vertex
-attribute, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws, blending,
-stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
+Skipped with the reason (follow-up work): a writable `[[buffer]]` with `instances > 1`, writable
+textures (`access::write` or `access::read_write`) in either stage, depth or multisample textures,
+framebuffer fetch, colour outputs that are not 0..n-1 in the source. Not covered: indexed draws,
+blending, stencil, multisampling, `noperspective`/`centroid` inputs, tessellation.
 
 Graphics probes live in `tests/diffcheck/graphics` and, like the kernel probes, become ctest tests
-(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 26
+(`diffcheck/graphics/<name>`) with the option on. `diffcheck/graphics-driver` plants 32
 miscompiles in the SPIR-V of the real output (`tests/diffcheck_mutate_mslc.py`, which takes
 `MSLC_REAL`, `MUT` and `MUT_STAGE`) and requires each to be reported as a mismatch.
 

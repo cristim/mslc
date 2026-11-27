@@ -200,7 +200,8 @@ static const VFmt kVertexFormats[] = {
     {"float4", MTLVertexFormatFloat4, 16}, {"int", MTLVertexFormatInt, 4}, {"int2", MTLVertexFormatInt2, 8},
     {"int3", MTLVertexFormatInt3, 12}, {"int4", MTLVertexFormatInt4, 16}, {"uint", MTLVertexFormatUInt, 4},
     {"uint2", MTLVertexFormatUInt2, 8}, {"uint3", MTLVertexFormatUInt3, 12}, {"uint4", MTLVertexFormatUInt4, 16},
-    {"half2", MTLVertexFormatHalf2, 4}, {"half3", MTLVertexFormatHalf3, 6}, {"half4", MTLVertexFormatHalf4, 8},
+    {"half", MTLVertexFormatHalf, 2}, {"half2", MTLVertexFormatHalf2, 4}, {"half3", MTLVertexFormatHalf3, 6},
+    {"half4", MTLVertexFormatHalf4, 8},
 };
 
 struct CFmt { const char *name; MTLPixelFormat format; NSUInteger bytes; };
@@ -377,7 +378,7 @@ static id<MTLSamplerState> nearestSampler(id<MTLDevice> device, NSUInteger index
 
 // Reflects the render pipeline (draw == NO) or draws and writes every attachment to its file.
 // Manifest lines: vertex, fragment, target W H, draw V I, attr LOC FMT [FILE], color I FMT [C0..C3 FILE],
-// depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
+// depth [CLEAR FILE], gbuffer STAGE INDEX SET MEMBER BYTES FILE [OUTFILE], texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
 // image KIND ACCESS INDEX SET BINDING W H D LAYERS TYPE FILE, sampler INDEX SET BINDING (set 0 is vertex, 1 is fragment).
 // Vertex buffer slot for attribute n is 30 - n.
 static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, NSDictionary<NSString *, NSMutableArray *> *lists, BOOL draw) {
@@ -464,12 +465,17 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
         [enc setVertexBuffer:b offset:0 atIndex:30 - [w[1] integerValue]];
         [keep addObject:b];
     }
+    NSMutableArray<id<MTLBuffer>> *goutBufs = [NSMutableArray array];
+    NSMutableArray<NSString *> *goutFiles = [NSMutableArray array];
     for (NSArray *w in lists[@"gbuffer"]) {
+        if (w.count != 7 && w.count != 8) die(@"bad gbuffer line in draw manifest");
         NSData *d = slurp(w[6], [w[5] integerValue]);
         id<MTLBuffer> b = [device newBufferWithBytes:d.bytes length:d.length ?: 4 options:MTLResourceStorageModeShared];
         if ([w[1] isEqual:@"vertex"]) [enc setVertexBuffer:b offset:0 atIndex:[w[2] integerValue]];
-        else [enc setFragmentBuffer:b offset:0 atIndex:[w[2] integerValue]];
+        else if ([w[1] isEqual:@"fragment"]) [enc setFragmentBuffer:b offset:0 atIndex:[w[2] integerValue]];
+        else die(@"unknown buffer stage in draw manifest");
         [keep addObject:b];
+        if (w.count == 8) { [goutBufs addObject:b]; [goutFiles addObject:w[7]]; }
     }
     for (NSString *key in @[@"texture", @"storagetexture", @"image"]) {
         BOOL isImage = [key isEqual:@"image"];
@@ -521,6 +527,8 @@ static int drawMain(id<MTLDevice> device, id<MTLLibrary> lib, NSDictionary *m, N
     for (NSUInteger i = 0; i < outs.count; i++)
         if (![[NSData dataWithBytes:outs[i].contents length:outs[i].length] writeToFile:lists[@"color"][i][7] atomically:YES]) die(@"cannot write a colour file");
     if (depthOut && ![[NSData dataWithBytes:depthOut.contents length:depthOut.length] writeToFile:m[@"depth"][1] atomically:YES]) die(@"cannot write the depth file");
+    for (NSUInteger i = 0; i < goutBufs.count; i++)
+        if (![[NSData dataWithBytes:goutBufs[i].contents length:goutBufs[i].length] writeToFile:goutFiles[i] atomically:YES]) die(@"cannot write a buffer output file");
     printf("device: %s\n", device.name.UTF8String);
     return 0;
 }

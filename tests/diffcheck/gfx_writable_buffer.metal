@@ -1,6 +1,6 @@
-// RUN: vertex=vs fragment=fs
+// RUN: vertex=vs fragment=fs instances=2
 // DIFFCHECK-POSITION: pos
-// A fragment function that writes a device buffer: invocation order would make it racy, so it is skipped.
+// A fragment function that writes a device buffer across multiple instances: invocation order would make it racy, so it is skipped.
 #include <metal_stdlib>
 using namespace metal;
 struct VIn { float2 pos [[attribute(0)]]; };

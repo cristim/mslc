@@ -8,16 +8,16 @@ fragment's output types, plus a depth target when the fragment writes depth or t
 noperspective varyings on a guard-band-clipped triangle, and Apple clips differently.
 
 Vertex data: the field named by // DIFFCHECK-POSITION carries the geometry (w = 1); every other
-stage_in field, [[buffer]] argument and texture is seeded like a kernel's buffers. One tightly
-packed vertex buffer per attribute; the Metal vertex descriptor and the Vulkan one use the
-same bytes. A runtime sampler is nearest, normalised, no mips (address mode by Metal index);
-an embedded sampler is built on Vulkan from mslc's reflection. Textures may be 1d, 1d_array,
-2d, 2d_array, 3d, cube or cube_array RGBA (float, half, int, uint, short or ushort; sample or
-access::read).
+stage_in field (including scalar and vector half), [[buffer]] argument and texture is seeded
+like a kernel's buffers. One tightly packed vertex buffer per attribute; the Metal vertex
+descriptor and the Vulkan one use the same bytes. A runtime sampler is nearest, normalised,
+no mips (address mode by Metal index); an embedded sampler is built on Vulkan from mslc's
+reflection. Textures may be 1d, 1d_array, 2d, 2d_array, 3d, cube or cube_array RGBA (float,
+half, int, uint, short or ushort; sample or access::read).
 
 Both hosts get one manifest body (graphics_manifest); Apple's gets the source lines, Vulkan's
-the SPIR-V. Attachments are compared with compare.compare as if they were buffers named
-color0, color1, ... and depth.
+the SPIR-V. Attachments (color0, color1, ... and depth) and, at single instance, writable
+[[buffer]] arguments are read back and compared with compare.compare.
 """
 
 import os
@@ -41,6 +41,7 @@ CLEAR = {"float": (-1.5, -2.5, -3.5, -4.5), "half": (-1.5, -2.5, -3.5, -4.5),
          "int": (-12345, 54321, -777, 31), "uint": (123456, 654321, 77777, 4242)}
 DEPTH_CLEAR = 0.375
 DEPTH_INDEX = 100
+BUFFER_INDEX = 200  # writable vertex/fragment buffers sit above attachment indices in compare maps
 # Interpolated floats: barycentric interpolation is not specified to the bit. Absolute epsilon
 # because a ULP bound is useless near zero; measured on the probes, then rounded up.
 INTERP_ULP, INTERP_EPS = 32, 2e-5
@@ -156,7 +157,7 @@ def pipeline_lines(width, height, vs, fs, attributes, colors, depth):
 
 def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_out, buffers, textures, samplers, backend="vulkan"):
     """`shape` plus the data both hosts read: `attr_files` {location: file}, `color_outs` {index: file},
-    `buffers` [(stage, metal index, set, member, bytes, file)], `textures` and `samplers` in
+    `buffers` [(stage, metal index, set, member, bytes, file[, out_file])], `textures` and `samplers` in
     resources.seed's shape."""
     lines = [l for l in shape if not l.startswith(("attr ", "color ", "depth"))]
     lines.append("draw %d %d" % (len(points), instances))
@@ -168,7 +169,7 @@ def draw_lines(shape, points, instances, attr_files, color_outs, colors, depth_o
             lines.append("%s %s %s" % (l, " ".join(repr(float(v)) if colors[i][0] in ("float", "half") else str(v) for v in CLEAR[colors[i][0]]), color_outs[i]))
     if depth_out:
         lines.append("depth %r %s" % (DEPTH_CLEAR, depth_out))
-    lines += ["gbuffer %s %d %d %d %d %s" % b for b in buffers]
+    lines += ["gbuffer " + " ".join(str(x) for x in b) for b in buffers]
     return lines + resources.lines(textures, samplers, backend=backend)
 
 
@@ -186,6 +187,15 @@ def _infer_position(attributes):
     return named[0] if len(named) == 1 else None
 
 
+def _wbuf_key(stage, index):
+    return BUFFER_INDEX + (0 if stage == "vertex" else 100) + index
+
+
+def _attr_match(mine, theirs):
+    """mslc widens half/halfN stage_in inputs to float/floatN in SPIR-V; Apple feeds the 16-bit format."""
+    return mine == theirs or (theirs is not None and theirs[0] == "half" and mine == ("float", theirs[1]))
+
+
 def vertex_attribute_findings(attributes, apple):
     """Findings where mslc's stage_in attribute types (read from its SPIR-V) differ from Apple's
     MTLFunction.vertexAttributes, by location, scalar kind or component count. An attribute only
@@ -194,7 +204,7 @@ def vertex_attribute_findings(attributes, apple):
     theirs = {a["index"]: (a["scalar"], a["comps"]) for a in apple}
     return ["vertex attribute %d: mslc has %s x%d, Apple has %s x%d" % (
         loc, *(mine.get(loc) or ("nothing", 0)), *(theirs.get(loc) or ("nothing", 0)))
-        for loc in sorted(set(mine) | set(theirs)) if mine.get(loc) != theirs.get(loc)]
+        for loc in sorted(set(mine) | set(theirs)) if not _attr_match(mine.get(loc), theirs.get(loc))]
 
 
 def _prepare(opts, source, vs, fs, params, work, includes):
@@ -233,7 +243,6 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     for b in compiled["vertex"][1]["bindings"]:
         if b["kind"] == "VertexInput" and b["location"] in vif["inputs"]:
             attributes[b["location"]] = dict(vif["inputs"][b["location"]], name=b["name"])
-    problems += ["half scalar vertex attribute %s" % a["name"] for a in attributes.values() if a["scalar"] == "half" and a["comps"] == 1]
     try:
         colors, src_depth = outputs.fragment_outputs(hostenv.read_text(source), fs)
     except outputs.Unsupported as e:
@@ -284,8 +293,8 @@ def _prepare(opts, source, vs, fs, params, work, includes):
         if reasons:
             return None, _skipped(res, "unsupported %s argument: %s" % (stage, "; ".join(reasons)))
         layouts[stage] = {l["index"]: l for l in a["buffers"]}
-        if any(l["access"] != "read" for l in layouts[stage].values()):
-            return None, _skipped(res, "a %s buffer is writable (invocation order would make it racy)" % stage)
+        if params["instances"] > 1 and any(l["access"] != "read" for l in layouts[stage].values()):
+            return None, _skipped(res, "a %s buffer is writable with instances > 1 (invocation order would make it racy)" % stage)
         if any(l["stride"] == 0 or not l["leaves"] for l in layouts[stage].values()):
             return None, _skipped(res, "unsupported argument: buffer element has no scalar layout")
     findings = vertex_attribute_findings(attributes, apple["vertex_attributes"])
@@ -302,8 +311,29 @@ def _prepare(opts, source, vs, fs, params, work, includes):
     if findings:
         res.update(status="reflection-mismatch", reason="; ".join(findings))
         return None, res
+    for a in apple["vertex_attributes"]:
+        if a["index"] in attributes and a["scalar"] == "half":
+            if attributes[a["index"]]["name"] == position:
+                if params.get("infer_position") and params["position"] is None:
+                    return None, _skipped(res, "the vertex function has stage_in attributes without // DIFFCHECK-POSITION")
+                res.update(status="error", reason="DIFFCHECK-POSITION %s is half, must be float2 to float4" % position)
+                return None, res
+            attributes[a["index"]]["scalar"] = "half"
+    shape = pipeline_lines(width, height, vs, fs, attributes, colors, depth)
     return dict(res=res, compiled=compiled, attributes=attributes, position=position, colors=colors, depth=depth,
                 points=points, shape=shape, lines=lines, layouts=layouts, apple=apple), None
+
+
+def _control_holds(groups, mine, apple):
+    """True when every non-empty output group compares unequal after a single-leaf perturbation."""
+    held = []
+    for g in groups:
+        fired = checks.perturb(g, mine, apple)
+        if fired:
+            copy, name, _ = fired
+            index = next(i for i, l in g.items() if l["name"] == name)
+            held.append(bool(compare.compare(g[index], apple[index], copy[index], 0)))
+    return bool(held) and all(held)
 
 
 def check_pair(opts, source, vs, fs, params, work, includes):
@@ -317,8 +347,14 @@ def check_pair(opts, source, vs, fs, params, work, includes):
     attach = {i: attachment_layout("color%d" % i, s, c) for i, (s, c) in plan["colors"].items()}
     if plan["depth"]:
         attach[DEPTH_INDEX] = depth_layout()
+    writable = {_wbuf_key(stage, b["metal_index"]): plan["layouts"][stage][b["metal_index"]]
+                for stage in ("vertex", "fragment")
+                for b in sorted((x for x in plan["compiled"][stage][1]["bindings"] if x["kind"] == "Buffer"),
+                                key=lambda x: x["member"])
+                if plan["layouts"][stage][b["metal_index"]]["access"] != "read"}
     excluded = dict(params["exclude"])
     compared = {i: l for i, l in attach.items() if l["name"] not in excluded}
+    wcompared = {i: l for i, l in writable.items() if l["name"] not in excluded}
     before = {i: clear_image(*plan["colors"][i], pixels) for i in plan["colors"]}
     if plan["depth"]:
         before[DEPTH_INDEX] = bytearray(struct.pack("<f", DEPTH_CLEAR) * pixels)
@@ -330,6 +366,7 @@ def check_pair(opts, source, vs, fs, params, work, includes):
     for case, profile in enumerate(profiles):
         rng = random.Random(params["seed"] * 1000 + case)
         base = os.path.join(work, "case%d-" % case)
+        case_before = {i: bytearray(v) for i, v in before.items()}
         attr_files, buffers, textures, samplers = {}, [], [], []
         for loc, data in vertex_data(plan["attributes"], plan["points"], plan["position"], width, height, rng, profile).items():
             attr_files[loc] = base + "attr%d.bin" % loc
@@ -343,6 +380,9 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                                           params["float_range"].get(layout["name"]))
                 path = base + "%s-buf%d.bin" % (stage, b["metal_index"])
                 hostenv.write_bytes(path, data)
+                k = _wbuf_key(stage, b["metal_index"])
+                if k in writable:
+                    case_before[k] = bytearray(data)
                 buffers.append((stage, b["metal_index"], b["descriptor"]["set"], b["member"], len(data), path))
             stage_textures, stage_samplers = resources.seed(
                 ep["bindings"], rng, profile, base + stage + "-", ep["embedded_samplers"], plan["apple"][stage])
@@ -352,8 +392,12 @@ def check_pair(opts, source, vs, fs, params, work, includes):
         for backend, runner in (("apple", hosts.run_metal), ("mslc", hosts.run_vulkan)):
             color_outs = {i: base + "%s-color%d.bin" % (backend, i) for i in plan["colors"]}
             depth_out = base + "%s-depth.bin" % backend if plan["depth"] else None
+            buf_outs = {_wbuf_key(b[0], b[1]): base + "%s-%s-buf%d-out.bin" % (backend, b[0], b[1])
+                        for b in buffers if _wbuf_key(b[0], b[1]) in writable}
+            backend_buffers = [b + ((buf_outs[_wbuf_key(b[0], b[1])],) if _wbuf_key(b[0], b[1]) in buf_outs else ())
+                               for b in buffers]
             body = draw_lines(plan["shape"], plan["points"], params["instances"], attr_files, color_outs, plan["colors"],
-                              depth_out, buffers, textures, samplers, backend)
+                              depth_out, backend_buffers, textures, samplers, backend)
             if backend == "apple":
                 text, binary = ["mode draw"] + plan["lines"] + body, opts.metal
             else:
@@ -368,9 +412,11 @@ def check_pair(opts, source, vs, fs, params, work, includes):
             outs[backend] = {i: bytearray(hostenv.read_bytes(color_outs[i])) for i in plan["colors"]}
             if depth_out:
                 outs[backend][DEPTH_INDEX] = bytearray(hostenv.read_bytes(depth_out))
+            for k, p in buf_outs.items():
+                outs[backend][k] = bytearray(hostenv.read_bytes(p))
         if opts.corrupt_mslc:
             name, _, at = opts.corrupt_mslc.partition(":")
-            for i, l in attach.items():
+            for i, l in {**attach, **writable}.items():
                 if l["name"] == name:
                     outs["mslc"][i][int(at)] ^= 0xff
         diffs = []
@@ -381,13 +427,12 @@ def check_pair(opts, source, vs, fs, params, work, includes):
                 if leaves:
                     sub = dict(layout, leaves=leaves)
                     diffs += [d.to_json() for d in compare.compare(sub, outs["apple"][i], outs["mslc"][i], u, eps=DEPTH_EPS if i == DEPTH_INDEX else e)]
-        nonzero = nonzero or any(checks.written_nonzero(compared, before, outs[b]) for b in ("apple", "mslc"))
-        control = checks.perturb(compared, outs["mslc"], outs["apple"])
-        control_ok = False
-        if control is not None:
-            copy, name, _ = control
-            index = next(i for i, l in attach.items() if l["name"] == name)
-            control_ok = bool(compare.compare(attach[index], outs["apple"][index], copy[index], 0))
+        for k, layout in sorted(wcompared.items()):
+            bound = params["ulp"].get(layout["name"], ulp)
+            diffs += [d.to_json() for d in compare.compare(layout, outs["apple"][k], outs["mslc"][k], bound)]
+        all_compared = {**compared, **wcompared}
+        nonzero = nonzero or any(checks.written_nonzero(all_compared, case_before, outs[b]) for b in ("apple", "mslc"))
+        control_ok = _control_holds([g for g in (compared, wcompared) if g], outs["mslc"], outs["apple"])
         res["cases"].append({"case": case, "profile": profile, "diffs": diffs[:16], "diff_count": len(diffs), "negative_control": control_ok})
     res["status"], res["reason"] = checks.verdict(res["cases"], nonzero, params["writes_zero"])
     if excluded:

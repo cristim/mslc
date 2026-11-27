@@ -67,6 +67,12 @@ MUTANTS = [
     ("texture_non2d", "vertex", [[r"(OpImageQuerySize %v2uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 1$", r"\1 0"]]),
     ("texture_non2d", "fragment", [[r"(OpCompositeConstruct %v3uint %\S+) (%\S+) (%\S+)", r"\1 \3 \2"]]),
     ("texture_non2d", "fragment", [[r"(OpImageQuerySize %v3uint %\d+\n\s+%\d+ = OpCompositeExtract %uint %\d+) 2$", r"\1 1"]]),
+    ("writable_buffer", "vertex", [["OpISub %int", "OpIAdd %int"]]),
+    ("writable_buffer", "vertex", [["OpConstant %float 0.25", "OpConstant %float 0.75"]]),
+    ("writable_buffer", "fragment", [[r"(OpAccessChain %_ptr_PhysicalStorageBuffer_v4uint %\d+ %\w+ )%\d+(\n\s+%\d+ = OpLoad %v4uint %\d+\n\s+OpStore)", r"\1%uint_960\2"]]),
+    ("vertex_attr_half", "vertex", [["Location 1$", "Location 9"], ["Location 2$", "Location 1"], ["Location 9$", "Location 2"]], "reflection-mismatch"),
+    ("vertex_attr_half", "vertex", [[r"(OpVectorShuffle %v2half %\d+ %\d+) 2 3", r"\1 3 2"]]),
+    ("vertex_attr_half", "vertex", [["OpFAdd %half", "OpFSub %half"]]),
 ]
 
 rc, out, data = run(probe("flat_colour"))
@@ -76,7 +82,8 @@ if rc == 77:
 
 for name in ("flat_colour", "interpolated_varying", "integer_output", "texture_sample", "instancing", "depth_output",
              "multi_target", "mixed_components", "half_fwidth", "half_fwidth_special",
-             "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d"):
+             "vertex_texture_sampler", "texture_nonfloat", "embedded_sampler", "texture_non2d",
+             "writable_buffer", "vertex_attr_half"):
     rc, out, data = run(probe(name))
     assert rc == 0 and data["status"] == "matched", (name, rc, out)
     assert data["cases"] and all(c["negative_control"] for c in data["cases"]), (name, data)
@@ -115,6 +122,8 @@ rc, out, data = run(fixture("gfx_off_grid_geometry"))
 assert rc == 2 and "subpixel grid" in data["reason"], (rc, out)
 rc, out, data = run(fixture("gfx_writable_buffer"))
 assert rc == 3 and "writable" in data["reason"], (rc, out)
+rc, out, data = run(fixture("gfx_writable_buffer"), "--instances", "1")
+assert rc == 0 and data["status"] == "matched" and "log" in data["buffers"], (rc, out)
 
 # Unsupported graphics textures/samplers and host refusals skip with the reason, never error or pass.
 with tempfile.TemporaryDirectory() as d:

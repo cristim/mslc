@@ -497,7 +497,7 @@ int main(int argc, char **argv) {
 //
 // Manifest lines: mode draw, spv vertex|fragment FILE, vertex NAME, fragment NAME, target W H,
 // draw V I, attr LOC FMT FILE, color I FMT C0 C1 C2 C3 OUT, depth CLEAR OUT,
-// gbuffer STAGE INDEX SET MEMBER BYTES FILE, texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
+// gbuffer STAGE INDEX SET MEMBER BYTES FILE [OUTFILE], texture|storagetexture INDEX SET BINDING W H FILE [TYPE],
 // image KIND ACCESS INDEX SET BINDING W H D LAYERS TYPE FILE,
 // sampler INDEX SET BINDING, esampler SET BINDING S T R FILTER. Same bytes and same names as metalhost's draw mode.
 // The viewport has a negative height so framebuffer row 0 is the top, as in Metal.
@@ -514,7 +514,8 @@ static const Fmt VFMT[] = {
     {"float4", VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {"int", VK_FORMAT_R32_SINT, 4}, {"int2", VK_FORMAT_R32G32_SINT, 8},
     {"int3", VK_FORMAT_R32G32B32_SINT, 12}, {"int4", VK_FORMAT_R32G32B32A32_SINT, 16}, {"uint", VK_FORMAT_R32_UINT, 4},
     {"uint2", VK_FORMAT_R32G32_UINT, 8}, {"uint3", VK_FORMAT_R32G32B32_UINT, 12}, {"uint4", VK_FORMAT_R32G32B32A32_UINT, 16},
-    {"half2", VK_FORMAT_R16G16_SFLOAT, 4}, {"half3", VK_FORMAT_R16G16B16_SFLOAT, 6}, {"half4", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+    {"half", VK_FORMAT_R16_SFLOAT, 2}, {"half2", VK_FORMAT_R16G16_SFLOAT, 4}, {"half3", VK_FORMAT_R16G16B16_SFLOAT, 6},
+    {"half4", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
 };
 static const Fmt CFMT[] = {
     {"rgba32float", VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {"rgba32sint", VK_FORMAT_R32G32B32A32_SINT, 16},
@@ -631,7 +632,7 @@ static int drawMain(const char *manifest) {
     unsigned aloc[MAXATTR]; char afmt[MAXATTR][32], afile[MAXATTR][1024];
     unsigned cidx[MAXCOLOR]; char cfmt[MAXCOLOR][32], cout[MAXCOLOR][1024]; double cclear[MAXCOLOR][4];
     double dclear = 1; char dout[1024] = "";
-    char gstage[MAXG][16], gfile[MAXG][1024]; unsigned gidx[MAXG], gset[MAXG], gmember[MAXG]; unsigned long long gbytes[MAXG];
+    char gstage[MAXG][16], gfile[MAXG][1024], gout[MAXG][1024]; unsigned gidx[MAXG], gset[MAXG], gmember[MAXG]; unsigned long long gbytes[MAXG];
     unsigned tset[MAXDTEX], tbind[MAXDTEX], tw[MAXDTEX], th[MAXDTEX], td[MAXDTEX], tlayers[MAXDTEX], tbpp[MAXDTEX];
     TexKind tkind[MAXDTEX];
     char tfile[MAXDTEX][1024], ttype[MAXDTEX][16]; int tstore[MAXDTEX];
@@ -651,8 +652,14 @@ static int drawMain(const char *manifest) {
         } else if (nc < MAXCOLOR && sscanf(line, "color %u %31s %lf %lf %lf %lf %1023s", &cidx[nc], cfmt[nc], &cclear[nc][0],
                        &cclear[nc][1], &cclear[nc][2], &cclear[nc][3], cout[nc]) == 7) { nc++;
         } else if (sscanf(line, "depth %lf %1023s", &dclear, dout) == 2) { hasDepth = 1;
-        } else if (ng < MAXG && sscanf(line, "gbuffer %15s %u %u %u %llu %1023s", gstage[ng], &gidx[ng], &gset[ng], &gmember[ng],
-                       &gbytes[ng], gfile[ng]) == 6) { ng++;
+        } else if (!strncmp(line, "gbuffer ", 8)) {
+            if (ng >= MAXG) refuse("too many buffers");
+            gout[ng][0] = 0;
+            int n = sscanf(line, "gbuffer %15s %u %u %u %llu %1023s %1023s", gstage[ng], &gidx[ng], &gset[ng], &gmember[ng],
+                           &gbytes[ng], gfile[ng], gout[ng]);
+            if ((n != 6 && n != 7) || (strcmp(gstage[ng], "vertex") && strcmp(gstage[ng], "fragment")))
+                die("bad manifest line: %s", line);
+            ng++;
         } else if (!strncmp(line, "texture ", 8) || !strncmp(line, "storagetexture ", 15) || !strncmp(line, "image ", 6)) {
             parseTextureLine(line, MAXDTEX, 0, &nt, tset, tbind, tw, th, td, tlayers, tfile, ttype, NULL, tstore, tkind);
         } else if (!strncmp(line, "sampler ", 8)) {
@@ -877,8 +884,9 @@ static int drawMain(const char *manifest) {
         vkCmdCopyImageToBuffer(cmd, depth.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, drb.buf, 1, &bc);
     }
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     CHK(vkEndCommandBuffer(cmd));
     VkQueue q; vkGetDeviceQueue(dev, qf, 0, &q);
     VkSubmitInfo sub = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; sub.commandBufferCount = 1; sub.pCommandBuffers = &cmd;
@@ -892,6 +900,10 @@ static int drawMain(const char *manifest) {
     if (hasDepth) {
         void *m; CHK(vkMapMemory(dev, drb.mem, 0, VK_WHOLE_SIZE, 0, &m));
         writeFile(dout, m, (size_t)width * height * 4); vkUnmapMemory(dev, drb.mem);
+    }
+    for (unsigned i = 0; i < ng; i++) if (gout[i][0]) {
+        void *m; CHK(vkMapMemory(dev, gb[i].mem, 0, VK_WHOLE_SIZE, 0, &m));
+        writeFile(gout[i], m, (size_t)gbytes[i]); vkUnmapMemory(dev, gb[i].mem);
     }
     return 0;
 }
