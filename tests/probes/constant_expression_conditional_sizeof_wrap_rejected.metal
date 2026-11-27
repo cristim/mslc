@@ -1,4 +1,4 @@
-// EXPECT: error mixes sizeof with a negative value or subtracts below zero
+// EXPECT: error mixes an unsigned operand with a negative value or subtracts below zero
 // A sizeof in either value of a conditional makes it unsigned, so subtracting below zero wraps.
 #include <metal_stdlib>
 using namespace metal;
