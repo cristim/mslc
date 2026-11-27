@@ -154,6 +154,20 @@ class UlpBound(unittest.TestCase):
         self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / .5h;"), 2)
         self.assertEqual(compare.ulp_bound_for_source("o[i] = v[i] / 1e3h;"), 2)
 
+    def test_half_divide_bound_does_not_loosen_float_leaves(self):
+        src = "o[i].h = v[i] / 3.0h; o[i].f = w[i] / 3.0f;"
+        self.assertEqual(compare.ulp_bound_for_source(src), 2)
+        self.assertEqual(compare.ulp_bound_for_source(src, scalar="float"), 0)
+        lay = {"name": "o", "stride": 8,
+               "leaves": [{"off": 0, "scalar": "half", "field": "h"},
+                          {"off": 4, "scalar": "float", "field": "f"}]}
+        a = struct.pack("<HxxI", 0x334e, 0x3f800000)
+        b_ok = struct.pack("<HxxI", 0x3350, 0x3f800000)
+        b_bad_float = struct.pack("<HxxI", 0x3350, 0x3f800001)
+        self.assertEqual(compare.compare(lay, a, b_ok, ulp=2, float_ulp=0), [])
+        (diff,) = compare.compare(lay, a, b_bad_float, ulp=2, float_ulp=0)
+        self.assertEqual((diff.offset, diff.scalar), (4, "float"))
+
 
 class UlpBoundsByRoot(unittest.TestCase):
     ENTRY = "kernel void k(device float *a, device float *b, uint i [[thread_position_in_grid]]) { %s }"
@@ -254,6 +268,22 @@ class UlpBoundsByRoot(unittest.TestCase):
                "kernel void k(device S *s, device float *o, uint i [[thread_position_in_grid]]) {\n"
                "  s[i].a = sqrt(2.0f); s[i].b = 1.0f; o[i] = s[i].a + 1.0f;\n}")
         self.assertEqual(compare.ulp_bounds_by_root(src), {"s.a": 2, "s.b": 0, "o": 2})
+        mixed_half_float = ("struct Out { half h; float f; };\n"
+                            "kernel void k(device const half *hv, device const float *fv, device Out *o, uint i [[thread_position_in_grid]]) {\n"
+                            "  o[i].h = hv[i] / 3.0h; o[i].f = fv[i] + 1.0f;\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(mixed_half_float), {"o.h": 2, "o.f": 0})
+        float_cast_half_div = ("kernel void k(device const half *hv, device float *fo, device half *ho, uint i [[thread_position_in_grid]]) {\n"
+                               "  ho[i] = hv[i] / 3.0h; fo[i] = 1.0f / 3.0f;\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(float_cast_half_div), {"ho": 2, "fo": 0})
+        half_into_float = ("kernel void k(device const half *hv, device float *fo, uint i [[thread_position_in_grid]]) {\n"
+                           "  fo[i] = float(hv[i] / 3.0h);\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(half_into_float), {"fo": 2})
+        half_var_div = ("kernel void k(device const half *ha, device const half *hb, device half *ho, device float *fo, uint i [[thread_position_in_grid]]) {\n"
+                        "  ho[i] = ha[i] / hb[i]; fo[i] = float(ha[i] / hb[i]);\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(half_var_div), {"ho": 2, "fo": 2})
+        half_compound_div = ("kernel void k(device const half *ha, device half *ho, device float *fo, uint i [[thread_position_in_grid]]) {\n"
+                             "  half x = ha[i]; x /= ha[0]; ho[i] /= 3.0h; fo[i] = float(x);\n}")
+        self.assertEqual(compare.ulp_bounds_by_root(half_compound_div), {"x": 2, "ho": 2, "fo": 2})
         mixed = ("struct S { float a; float b; };\n"
                  "kernel void k(device S *s, device const S *in, uint i [[thread_position_in_grid]]) {\n"
                  "  s[i] = in[i]; s[i].a = sqrt(2.0f);\n}")

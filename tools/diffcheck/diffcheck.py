@@ -175,6 +175,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
     set_index = mbuf[0]["descriptor"]["set"] if mbuf else 0
     elements = params.get("elems") or max(64, 4 * params["grid"])
     ulp = compare.ulp_bound_for_source(text)
+    ulp_float = compare.ulp_bound_for_source(text, scalar="float")
     ulp_by_buffer = compare.ulp_bounds_by_root(text)
     excluded = dict(params["exclude"])
     tlayouts = {resources.texel_key(tb): tb.layout for tb in tplan}
@@ -217,7 +218,7 @@ def check_entry(opts, source, spv, reflection, entry, params, work, includes):
         for i, lay in sorted(all_layouts.items()):
             if lay["name"] in excluded:
                 continue
-            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], ulp, ulp_by_root=ulp_by_buffer, explicit_ulp=params["ulp"]):
+            for d in compare.compare(lay, outs["apple"][i], outs["mslc"][i], ulp, ulp_by_root=ulp_by_buffer, explicit_ulp=params["ulp"], float_ulp=ulp_float):
                 case_diffs.append(d.to_json())
         both = {**compared, **tcompared, **wcompared}
         nonzero = nonzero or checks.written_nonzero(both, data, outs["apple"]) or checks.written_nonzero(both, data, outs["mslc"])
