@@ -45,7 +45,7 @@ def mutated(path, edits):
 
 BASELINES = ("texture_read", "texture_sample_two", "texture_unused", "texture_write", "texture_read_write",
              "texture_nonfloat_read", "texture_nonfloat_write", "texture_non2d_read", "texture_non2d_write",
-             "texture_cube_read_write", "sampler_modes",
+             "texture_cube_read_write", "sampler_modes", "atomic_device_ops", "atomic_buffer_only",
              "layout_unread_member", "ulp_per_buffer", "ulp_per_field", "threadgroup_argument", "texel_buffer_read", "texel_buffer_write",
              "texel_buffer_read_write", "texel_buffer_unused", "texel_buffer_r_read", "texel_buffer_rg_read",
              "texel_buffer_r_write", "texel_buffer_rg_write", "texel_buffer_narrow_read_write")
@@ -148,6 +148,21 @@ MUTANTS = [
     ("texel_buffer_rg_write", [[r"(OpCompositeConstruct %v4uint %\d+) (%\d+) (%\d+) (%\d+)", r"\1 \3 \2 \4"]], "mismatched"),
     # R and RG texel buffers, read_write: the R float and the RG float buffer change bindings
     ("texel_buffer_narrow_read_write", [["Binding 1$", "Binding 9"], ["Binding 2$", "Binding 1"], ["Binding 9$", "Binding 2"]], "mismatched"),
+    # atomics: unsigned atomic fetch_sub replaced by fetch_add
+    ("atomic_device_ops", [[r"OpAtomicISub %uint", "OpAtomicIAdd %uint"]], "mismatched"),
+    # atomics: unsigned min/max confused with signed min/max
+    ("atomic_device_ops", [[r"OpAtomicUMin %uint", "OpAtomicSMin %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicUMax %uint", "OpAtomicSMax %uint"]], "mismatched"),
+    # atomics: signed min/max confused with unsigned min/max
+    ("atomic_device_ops", [[r"OpAtomicSMin %int", "OpAtomicUMin %int"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicSMax %int", "OpAtomicUMax %int"]], "mismatched"),
+    # atomics: exchange replaced by fetch_add, xor by or, CAS equality flipped
+    ("atomic_device_ops", [[r"OpAtomicExchange %uint", "OpAtomicIAdd %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"OpAtomicXor %uint", "OpAtomicOr %uint"]], "mismatched"),
+    ("atomic_device_ops", [[r"(OpAtomicCompareExchange %uint [^\n]+\n\s+OpStore %\d+ %\d+\n\s+%\d+ =) OpIEqual (%bool)", r"\1 OpINotEqual \2"]], "mismatched"),
+    # atomic-only buffers: layout stride mismatch and wrong atomic op
+    ("atomic_buffer_only", [[r"OpDecorate (%_runtimearr_uint\S*) ArrayStride 4", r"OpDecorate \1 ArrayStride 8"]], "reflection-mismatch"),
+    ("atomic_buffer_only", [[r"OpAtomicIAdd %uint", "OpAtomicISub %uint"]], "mismatched"),
 ]
 
 # Equivalent mutant: components past the texel format are not stored, so swapping z and w of a write to an RG buffer
@@ -216,6 +231,8 @@ rc, out, data = mutated(probe("texel_buffer_read_write"), [["Binding 1$", "Bindi
 assert rc == 2 and data["status"] == "error", (rc, out)
 rc, out, data = run(fixture("texture_kernel"))
 assert rc == 0 and data["status"] == "matched", (rc, out)
+rc, out, data = run(probe("atomic_buffer_only"), "--sentinel")
+assert rc == 0 and data["status"] == "matched" and data["cases"][-1]["profile"] == "sentinel", (rc, out)
 with tempfile.TemporaryDirectory() as d:
     typo = os.path.join(d, "typo.metal")
     with open(probe("texture_unused")) as src, open(typo, "w") as dst:

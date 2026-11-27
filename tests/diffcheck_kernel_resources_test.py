@@ -106,6 +106,23 @@ class Layout(unittest.TestCase):
         with self.assertRaises(ValueError):
             layout.spirv_layouts(DISASM, "nope", BUFFERS)
 
+    def test_atomic_buffer_layout(self):
+        # Apple reflects atomic_int / atomic_uint as struct { __s }; SPIR-V lowers to a runtime array of 32-bit int.
+        text = (DISASM.replace("OpDecorate %10 ArrayStride 16", "OpDecorate %10 ArrayStride 4")
+                .replace("%10 = OpTypeRuntimeArray %8", "%10 = OpTypeRuntimeArray %9")
+                .replace("%9 = OpTypeFloat 32", "%9 = OpTypeInt 32 0"))
+        atomic_bufs = [BUFFERS[1]]
+        got = layout.spirv_layouts(text, "k", atomic_bufs)
+        self.assertEqual(got[1], {"stride": 4, "leaves": [(0, 4, "int")]})
+        for scalar in ("int", "uint"):
+            apple_atomic = {1: {"stride": 4, "leaves": [{"off": 0, "scalar": scalar, "field": "__s"}]}}
+            self.assertEqual(layout.cross_check(atomic_bufs, apple_atomic, got), [])
+        bad_apple = {1: {"stride": 4, "leaves": [{"off": 0, "scalar": "float", "field": "__s"}]}}
+        self.assertTrue(layout.cross_check(atomic_bufs, bad_apple, got))
+        self.assertIn("stride is 8", layout.cross_check(
+            atomic_bufs, {1: {"stride": 4, "leaves": [{"off": 0, "scalar": "uint", "field": "__s"}]}},
+            layout.spirv_layouts(text.replace("ArrayStride 4", "ArrayStride 8"), "k", atomic_bufs))[0])
+
 
 class Resources(unittest.TestCase):
     def test_seed_is_deterministic_and_binds_by_reflection(self):

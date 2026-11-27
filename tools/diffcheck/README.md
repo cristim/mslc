@@ -171,7 +171,7 @@ Textures have one mip level, so a wrong LOD or mip selection cannot be seen (tra
   graphics attachment.
 - `// DIFFCHECK-TEXEL: <texture_buffer> <1|2|4>` runs that texel buffer with R, RG or RGBA texels (default 4; see Kernel texel buffers).
 - `// DIFFCHECK-UNUSED: <texture> <reason>` declares that the kernel ignores a texture (see below).
-- Not supported yet in kernel mode, skipped with the reason: argument buffers, atomics (#374),
+- Not supported yet in kernel mode, skipped with the reason: argument buffers,
   multisample and depth textures. Graphics pairs have their
   own mode, below.
 
@@ -183,6 +183,22 @@ writes `local` into the argument's specialization constant (`spec_id` of mslc's 
 reflection entry, `spec <id> <value>` in vkhost's manifest). The indices, names and element sizes of
 mslc's reflection are cross-checked against Apple's threadgroup bindings. A kernel must therefore index
 its threadgroup arguments below the local size.
+
+## Kernel atomic buffers
+
+`device atomic_int *`, `device atomic_uint *` and `device const atomic_int|atomic_uint *` (and typedef
+aliases of them) work in kernel mode with `#include <metal_stdlib>` and `using namespace metal;` (or
+`metal::atomic_*`). Apple reflects `_atomic<T>` as a 4-byte struct with scalar field `__s` (`int` or
+`uint`), which `metalhost` decomposes to `{off: 0, scalar: "int"|"uint", field: "__s"}`, `layout.py`
+cross-checks against mslc's `OpTypeRuntimeArray` layout, and `compare.py` compares bit-exact (readable
+`const` pointers reflect `access: "read"`, mutable pointers `readwrite` so writable atomic-only kernels
+are compared and perturbed by the negative control). Non-commutative ops in probes must use isolated slots
+per invocation, and shared slots across threads must use associative, commutative operations (`fetch_add`,
+`fetch_min`, `fetch_max`, `fetch_and`, `fetch_or`, `fetch_xor`). Files omitting `using namespace metal;`
+fail Apple compile as usual, and atomic struct members or non-32-bit atomics are rejected by mslc.
+Probes (`tests/diffcheck/kernel/atomic_device_ops.metal`, `tests/diffcheck/kernel/atomic_buffer_only.metal`)
+and planted SPIR-V mutants in `diffcheck/kernel-driver` cover load, store, exchange, compare_exchange_weak,
+signed/unsigned fetch_* ops, threadgroup atomic locals and layout checks.
 
 ## Kernel textures and samplers
 
