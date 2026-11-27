@@ -81,6 +81,11 @@ public:
 	void setSection(Section section) { _currentSection = section; }
 	Section section() const { return _currentSection; }
 
+	// The function whose locals new OpVariables join. A function emitted inside another's body (to deduce its
+	// return type) sets it, and the outer one's is put back afterwards.
+	Id currentFunction() const { return _currentFunction; }
+	void setCurrentFunction(Id function) { _currentFunction = function; }
+
 	// Emits an instruction with the given opcode and operand words. The word
 	// count in the first header word is filled in by finalize(), so callers
 	// pass only operands.

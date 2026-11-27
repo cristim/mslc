@@ -323,6 +323,16 @@ expect_contains("${half_helper_dis}" "OpCapability Float16" "half helper")
 expect_contains("${half_helper_dis}" "SignedZeroInfNanPreserve 16" "half helper")
 expect_contains("${half_helper_dis}" "SignedZeroInfNanPreserve 32" "half helper")
 
+# An exported auto helper is emitted to deduce its return type with no body open, and its body still lands in the
+# module, after any other export or none.
+file(WRITE "${OUT_DIR}/auto_export.metal"
+	"#include <metal_stdlib>\nauto twice(float x) { return x * 2; }\n")
+run_mslc(output 0 --compile-library -o "${OUT_DIR}/auto_export.spv" "${OUT_DIR}/auto_export.metal")
+validate_file("${OUT_DIR}/auto_export.spv" spv1.5 TRUE "--compile-library on an auto helper")
+disassemble("${OUT_DIR}/auto_export.spv" auto_export_dis)
+expect_contains("${auto_export_dis}" "LinkageAttributes \"twice\" Export" "auto helper library")
+expect_contains("${auto_export_dis}" "OpFunctionEnd" "auto helper library")
+
 # Importing one overload of an overloaded name is refused (#266).
 run_mslc(output 1 --compile-library -o "${OUT_DIR}/overload_import.spv" "${TEST_DIR}/library/overload_import.metal")
 expect_contains("${output}" "importing one overload of a name is not lowered yet" "overload import")

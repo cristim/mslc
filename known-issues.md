@@ -871,3 +871,23 @@ Where this differs from Apple:
   the same before the qualified spelling was lowered.
 - False refusals: `fast::select` of two scalars of different types (`select(1, 2.0h, c)`), and a bool argument
   (`fast::select(true, false, c)`, `fast::abs(true)`). Apple converts each to float.
+
+## Deduced return types (`auto f(...)`)
+
+A helper or function template declared `auto f(...)` takes the type of its first return's value, as C++ deduces it
+([dcl.spec.auto]); a later return has to give the same type, and a function no return gives a value to returns void.
+The body is emitted at the first call, inside the caller's, so the type is known there; it is put after the caller's
+body. Tests: `tests/probes/helper_auto_return_*`.
+
+Apple accepts, and mslc refuses (each a loud error):
+
+- `auto&`, `const auto&`, `auto*`, `decltype(auto)` and a trailing return type (`auto f() -> T`).
+- A deduced return of an enum value (Apple deduces the enum), an array, a pointer or a resource.
+- A member of the result of a call whose auto return type is not known before the call is emitted: a function
+  template, an overloaded name, or a helper with a thread or threadgroup pointer parameter (`f(a).x` there; one
+  non-overloaded helper without such a parameter works). The diagnostic misleads: "\".x\" swizzles a value that is
+  not a vector". Assigning the call to a local first works.
+- `sizeof(f(x))` before any call of `f` ("sizeof of this expression is not lowered").
+- `return g();` where `g` returns void (C++ deduces void): "a call to \"g\" returns void and has no value".
+- An auto function declared with no body ("declared auto with no body here").
+- `auto` member functions of a struct.
