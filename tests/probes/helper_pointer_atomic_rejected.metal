@@ -1,4 +1,4 @@
-// EXPECT: error parameter "p" of helper function "f" is a pointer outside the thread, device and constant address spaces or to an atomic or a resource
+// EXPECT: error parameter "p" of helper function "f" is a pointer outside the thread, threadgroup, device and constant address spaces or to an atomic or a resource
 #include <metal_stdlib>
 using namespace metal;
 float f(device atomic_uint* p) { return atomic_load_explicit(p + 0, memory_order_relaxed); }

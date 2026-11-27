@@ -339,6 +339,8 @@ namespace {
 		{ "atan", 1, MathShape::Componentwise, 18, kNoInstruction, kNoInstruction },
 		{ "atan2", 2, MathShape::Componentwise, 25, kNoInstruction, kNoInstruction },
 		{ "pow", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
+		// powr is pow for x >= 0 (MSL 6.6); GLSL.std.450 Pow is undefined for x < 0 too.
+		{ "powr", 2, MathShape::Componentwise, 26, kNoInstruction, kNoInstruction },
 		{ "exp", 1, MathShape::Componentwise, 27, kNoInstruction, kNoInstruction },
 		{ "log", 1, MathShape::Componentwise, 28, kNoInstruction, kNoInstruction },
 		{ "exp2", 1, MathShape::Componentwise, 29, kNoInstruction, kNoInstruction },
@@ -368,6 +370,52 @@ namespace {
 		{ "dfdx", 1, MathShape::Dfdx, kNoInstruction, kNoInstruction, kNoInstruction },
 		{ "dfdy", 1, MathShape::Dfdy, kNoInstruction, kNoInstruction, kNoInstruction },
 	};
+
+	// The <metal_pack> functions (MSL specification 6.15) that mslc lowers: four 8-bit or two 16-bit
+	// normalized integers in a uint, from or to a float or half vector. The 10a2 and 565 forms (Metal 4)
+	// are not here.
+	enum class PackEncoding { Unorm, Snorm, Srgb };
+
+	struct PackBuiltin {
+		const char* name;
+		bool pack;
+		PackEncoding encoding;
+		uint32_t count;
+		uint32_t bits;
+		ScalarKind floatKind;
+	};
+
+	constexpr PackBuiltin kPackBuiltins[] = {
+		{ "pack_float_to_unorm4x8", true, PackEncoding::Unorm, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_unorm4x8", true, PackEncoding::Unorm, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_snorm4x8", true, PackEncoding::Snorm, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_snorm4x8", true, PackEncoding::Snorm, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_srgb_unorm4x8", true, PackEncoding::Srgb, 4, 8, ScalarKind::Float },
+		{ "pack_half_to_srgb_unorm4x8", true, PackEncoding::Srgb, 4, 8, ScalarKind::Half },
+		{ "pack_float_to_unorm2x16", true, PackEncoding::Unorm, 2, 16, ScalarKind::Float },
+		{ "pack_half_to_unorm2x16", true, PackEncoding::Unorm, 2, 16, ScalarKind::Half },
+		{ "pack_float_to_snorm2x16", true, PackEncoding::Snorm, 2, 16, ScalarKind::Float },
+		{ "pack_half_to_snorm2x16", true, PackEncoding::Snorm, 2, 16, ScalarKind::Half },
+		{ "unpack_unorm4x8_to_float", false, PackEncoding::Unorm, 4, 8, ScalarKind::Float },
+		{ "unpack_unorm4x8_to_half", false, PackEncoding::Unorm, 4, 8, ScalarKind::Half },
+		{ "unpack_snorm4x8_to_float", false, PackEncoding::Snorm, 4, 8, ScalarKind::Float },
+		{ "unpack_snorm4x8_to_half", false, PackEncoding::Snorm, 4, 8, ScalarKind::Half },
+		{ "unpack_unorm4x8_srgb_to_float", false, PackEncoding::Srgb, 4, 8, ScalarKind::Float },
+		{ "unpack_unorm4x8_srgb_to_half", false, PackEncoding::Srgb, 4, 8, ScalarKind::Half },
+		{ "unpack_unorm2x16_to_float", false, PackEncoding::Unorm, 2, 16, ScalarKind::Float },
+		{ "unpack_unorm2x16_to_half", false, PackEncoding::Unorm, 2, 16, ScalarKind::Half },
+		{ "unpack_snorm2x16_to_float", false, PackEncoding::Snorm, 2, 16, ScalarKind::Float },
+		{ "unpack_snorm2x16_to_half", false, PackEncoding::Snorm, 2, 16, ScalarKind::Half },
+	};
+
+	const PackBuiltin* findPackBuiltin(const std::string& name) {
+		for (const PackBuiltin& builtin: kPackBuiltins) {
+			if (name == builtin.name) {
+				return &builtin;
+			}
+		}
+		return nullptr;
+	}
 
 	// A construct whose type is void: the cast (void)e.
 	static bool isVoidCast(const Expression& expression) {
@@ -2165,7 +2213,7 @@ namespace {
 				declared(parameter.type);
 			}
 
-			if (findMathBuiltin(helper.name)) {
+			if (findMathBuiltin(helper.name) || findPackBuiltin(helper.name)) {
 				throw CompileError("helper function \"" + helper.name + "\" has the name of a builtin "
 					"function; Apple's compiler reports a call that matches both as ambiguous, "
 					"which mslc does not model");
@@ -2420,6 +2468,7 @@ namespace {
 		bool _gatherExtendedDeclared = false;
 		bool _minLodDeclared = false;
 		std::map<int32_t, Id> _intConstants;
+		bool _stencilExportDeclared = false;
 		bool _sampleRateShadingDeclared = false;
 		// Ids the entry point lists as its interface, in declaration order.
 		std::vector<Id> _interface;
@@ -2469,6 +2518,11 @@ namespace {
 			// array bound to each parameter (zero for any other): the helper is
 			// emitted once per distinct list, so its pointer is to the whole array.
 			std::vector<uint32_t> arrayLengths;
+			// For a threadgroup pointer parameter, the caller's threadgroup variable (InvalidId for any other).
+			// A Workgroup variable is the module's own, so the helper is emitted once per list of them and names
+			// each directly rather than taking a pointer: drivers mishandle a Workgroup pointer parameter (the
+			// NVIDIA one loses stores made through one), and glslang never emits one.
+			std::vector<Id> threadgroupVariables;
 			// Where the first declaration of this signature sits (FunctionDecl::order):
 			// an overload is a candidate only from there down.
 			size_t firstOrder = 0;
@@ -2571,7 +2625,8 @@ namespace {
 		void declareThreadgroupArgument(const Parameter& parameter, size_t index, uint32_t metalIndex);
 		void declareResources(const std::vector<std::pair<size_t, const Parameter*>>& resources);
 		Id declareDescriptorVariable(Id pointee, uint32_t binding);
-		void reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used);
+		// Whether it found any; reserve false only looks.
+		bool reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used, bool reserve = true);
 		void reserveThreadgroupLocals(const Statement& statement);
 		void reserveThreadgroupLocal(const VariableDeclaration& declaration);
 		void reserveSampler(const VariableDeclaration& declaration);
@@ -2788,11 +2843,18 @@ namespace {
 			HelperFunction helper;
 			size_t depth = 0;
 			bool committed = false;
+			// instantiationOrder() for the calls in the instance: set when it is first committed.
+			size_t rootOrder = 0;
 		};
 		std::map<std::string, std::vector<const FunctionTemplate*>> _templatesByName;
 		std::map<std::string, std::unique_ptr<TemplateInstance>> _instances;
 		std::map<const FunctionDecl*, TemplateInstance*> _instanceOf;
 		std::map<std::string, std::unique_ptr<FunctionDecl>> _patterns;
+		// The explicit specialization that is the body of an instance, by the instance's key.
+		std::map<std::string, const ExplicitSpecialization*> _specializationOf;
+		std::string instanceKey(const FunctionTemplate& declaration, const std::vector<TemplateArgument>& arguments) const;
+		void resolveSpecializations();
+		const ExplicitSpecialization* specializationFor(const TemplateInstance& instance) const;
 		std::vector<const FunctionTemplate*> templatesNamed(const std::string& name) const;
 		std::vector<const FunctionTemplate*> visibleTemplates(const std::vector<std::string>& names,
 			const std::set<std::string>& adl) const;
@@ -2806,6 +2868,8 @@ namespace {
 		void commitInstance(TemplateInstance& instance);
 		bool isInstance(const FunctionDecl* function) const { return function && _instanceOf.count(function) != 0; }
 		bool callsDependentTemplate(const Expression& call);
+		bool deducedResultIsFundamental(const Expression& call);
+		bool bringsNoNamespace(const Expression& argument);
 		bool dependsOnTemplate(const Expression& call);
 		std::string describeTemplate(const FunctionTemplate& declaration, const FunctionDecl& pattern) const;
 		HelperFunction* definedHelper(HelperFunction* entry);
@@ -2821,6 +2885,12 @@ namespace {
 		std::set<std::string> _memberTemplateNames;
 		const Type* returningType(const Expression& call, std::string (*aspect)(const Type&));
 		size_t callerOrder() const { return (_helper ? _helper : _entryPoint)->order; }
+		// Where a call is instantiated, as clang places it: for a call in a template's instance, after the function
+		// outside any template whose call led to the instance; for any other call, the caller.
+		size_t instantiationOrder() const {
+			const auto instance = _helper ? _instanceOf.find(_helper) : _instanceOf.end();
+			return instance == _instanceOf.end() ? callerOrder() : instance->second->rootOrder;
+		}
 		void noteCall(const FunctionDecl& callee);
 		bool isPlainVariable(const Expression& expression) const;
 		bool isWholeVariable(const Expression& expression) const;
@@ -2885,6 +2955,9 @@ namespace {
 		Id resourcePointee(const Type& type);
 		void emitHelper(const HelperFunction& helper);
 		void emitHelperReturn(const Statement& statement);
+		void emitVoidReturnValue(const Expression& expression, const std::string& quoted);
+		bool emitVoidCall(const Expression& call, const std::string* returnedBy);
+		void emitVoidConditional(const Expression& expression, const std::string* returnedBy);
 		bool returnsVoid(const FunctionDecl& function) const;
 		Id emitRoundHalfAway(Id value, Id type, uint32_t bits);
 		Id emitSignExact(Id value, Id type, uint32_t bits);
@@ -2895,6 +2968,11 @@ namespace {
 		Id emitAllAnyCall(const Expression& expression, const std::string& name);
 		void emitBarrierCall(const Expression& expression);
 		Id emitMathBuiltin(const MathBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
+		Id emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments);
+		Id packFloatConstant(Id type, float value);
+		Id packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words);
+		Id glslInstruction(uint32_t instruction, Id type, const std::vector<Id>& operands);
+		Id normalizedQuotient(Id magnitudes, uint32_t period, uint32_t count);
 		Id emitConstruct(const Expression& expression);
 		Id emitConstructList(const Expression& expression, Id toType);
 		Id emitMatrixFromValue(const Expression& argument, const Type& target, Id toType,
@@ -6031,6 +6109,10 @@ namespace {
 			return emitAllAnyCall(expression, name);
 		}
 
+		if (const PackBuiltin* pack = findPackBuiltin(name)) {
+			return emitPackBuiltin(*pack, expression.arguments);
+		}
+
 		const MathBuiltin* builtin = findMathBuiltin(name);
 		if (!builtin) {
 			throw CompileError("function \"" + expression.left->name + "\" is not a builtin mslc "
@@ -6292,7 +6374,8 @@ namespace {
 		for (const ExpressionPtr& argument: call.arguments) {
 			const StructDecl* decl = adlStructOf(*argument);
 			std::string type = decl ? decl->name : std::string();
-			if (!decl && argument->kind == ExpressionKind::Call && callsDependentTemplate(*argument)) {
+			if (!decl && argument->kind == ExpressionKind::Call && callsDependentTemplate(*argument)
+				&& !deducedResultIsFundamental(*argument)) {
 				// Its type is known only once deduced: that matters only if a function of this name is in a namespace.
 				const bool elsewhere = std::any_of(_unit.helpers.begin(), _unit.helpers.end(), [&](const FunctionDecl& helper) {
 						return helper.name.size() > last.size() + 2
@@ -6355,7 +6438,7 @@ namespace {
 				if (visible && std::find(names.begin(), names.end(), associated) == names.end()) {
 					// The library's own overloads compete with it, which mslc does not model here.
 					// (A struct argument matches no library overload, so there is nothing to compete with.)
-					if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last))) {
+					if (!decl && (isMSLBuiltinName(last) || findMathBuiltin(last) || findPackBuiltin(last))) {
 						throw CompileError("argument-dependent lookup finds \"" + associated + "\", which competes with the "
 							"standard library's \"" + last + "\"; Apple resolves the two by overload, which mslc "
 							"does not model");
@@ -6784,9 +6867,9 @@ namespace {
 	}
 
 	// Fills the type parameters left, from the argument types: T takes the argument's type by value or
-	// reference, and T* a local array's element type; T used twice takes one type or the template is no
-	// candidate. What C++ deduces and mslc does not model is an error, never a template dropped, which
-	// could let another function win.
+	// reference, T* a local array's element type and vec<T, N> a vector's component type; T used twice
+	// takes one type or the template is no candidate. What C++ deduces and mslc does not model is an
+	// error, never a template dropped, which could let another function win.
 	bool Emitter::deduceTemplateArguments(const FunctionTemplate& declaration, const FunctionDecl& pattern,
 		size_t given, const std::vector<OverloadArgument>& arguments, std::vector<TemplateArgument>& deduced) {
 		const auto parameterIndex = [&](const Type& type) {
@@ -6823,11 +6906,48 @@ namespace {
 				if (value.arrayLength || value.isPointer || value.resource != ResourceKind::None) {
 					throw refuse(i, "which is an array of arrays");
 				}
+				// thread vec<T, N>* takes T from an array of vectors of N components.
+				if (parameter.type.isVector()) {
+					if (value.vectorWidth != parameter.type.vectorWidth || value.isMatrix() || value.isPacked
+						|| !value.namedType.empty() || !value.enumName.empty()) {
+						return false;
+					}
+					value.vectorWidth = 0;
+				}
 				value.addressSpace = AddressSpace::None;
 				value.isConst = argument.binding->readOnly && !parameter.type.isConst;
+			} else if (parameter.type.isTexture() && !parameter.type.arrayLength) {
+				// texture2d<T> takes T from a texture of the same kind, depth, multisampling and access.
+				if (argument.kind != OverloadArgument::Kind::Resource) {
+					return false;
+				}
+				const Type& texture = argument.binding->pointeeMsl;
+				if (texture.resource != parameter.type.resource || texture.isDepth != parameter.type.isDepth
+					|| texture.isMultisampled != parameter.type.isMultisampled
+					|| texture.textureAccess != parameter.type.textureAccess || texture.arrayLength) {
+					return false;
+				}
+				value = Type();
+				value.scalar = texture.scalar;
 			} else {
 				if (parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
 					throw refuse(i, "to a parameter that is an array or a texture");
+				}
+				// A T taken by value from a texture or a sampler is that texture's or sampler's type.
+				if (argument.kind == OverloadArgument::Kind::Resource && !parameter.isReference
+					&& !parameter.type.isVector() && !argument.binding->pointeeMsl.arrayLength) {
+					value = argument.binding->pointeeMsl;
+					value.isConst = false;
+					value.addressSpace = AddressSpace::None;
+					if (known[index]) {
+						if (!sameResourceType(deduced[index].type, value) || !deduced[index].type.isTexture() != !value.isTexture()) {
+							return false;
+						}
+						continue;
+					}
+					known[index] = true;
+					deduced[index].type = value;
+					continue;
 				}
 				if (argument.kind == OverloadArgument::Kind::Array || argument.kind == OverloadArgument::Kind::Resource
 					|| argument.pointerLike) {
@@ -6842,6 +6962,14 @@ namespace {
 						"deduces an address-space-qualified type");
 				}
 				value = deduceAutoType(Type(), _builder.typeOf(argument.value), "argument " + std::to_string(i + 1));
+				// vec<T, N> takes T from a vector of N components and fails to deduce from anything else.
+				if (parameter.type.isVector()) {
+					if (value.vectorWidth != parameter.type.vectorWidth || value.isMatrix() || value.isPacked
+						|| !value.namedType.empty() || !value.enumName.empty()) {
+						return false;
+					}
+					value.vectorWidth = 0;
+				}
 				// A mutable reference to a const object has T = "const float".
 				value.isConst = parameter.isMutableReference() && argument.kind == OverloadArgument::Kind::Variable
 					&& argument.inThread && !argument.changeable;
@@ -6874,13 +7002,149 @@ namespace {
 		return true;
 	}
 
-	// The instance for complete arguments, signature read and body not: one per argument list.
-	Emitter::TemplateInstance& Emitter::templateInstance(const FunctionTemplate& declaration,
-		std::vector<TemplateArgument> arguments) {
+	std::string Emitter::instanceKey(const FunctionTemplate& declaration,
+		const std::vector<TemplateArgument>& arguments) const {
 		std::string key = std::to_string(&declaration - _unit.templates.data()) + "<";
 		for (const TemplateArgument& argument: arguments) {
 			key += templateArgumentName(argument) + ",";
 		}
+		return key;
+	}
+
+	// Which instance each explicit specialization is the body of. Its arguments are the explicit ones it
+	// names and, for the rest, the types its parameters have where the primary template's name a type
+	// parameter, as C++ deduces them from the specialization's own declaration ([temp.expl.spec],
+	// [temp.deduct.decl]); defaults fill what is left. It specializes the primary templates of its name
+	// declared above it whose instance for those arguments has its return and parameter types: exactly
+	// one has to, or it is refused, as is a second specialization of one instance.
+	void Emitter::resolveSpecializations() {
+		for (const ExplicitSpecialization& specialization: _unit.specializations) {
+			const FunctionTemplate& written = specialization.declaration;
+			const FunctionDecl signature = instantiateTemplate(written, {}, false);
+			// The function types are compared as C++ does: a by-value parameter's top-level const is not part of it,
+			// and the address space and enum are, which typeName does not spell.
+			const auto sameParameter = [](const Parameter& a, const Parameter& b) {
+				Type left = a.type;
+				Type right = b.type;
+				if (!a.isReference && !left.isPointer) {
+					left.isConst = false;
+				}
+				if (!b.isReference && !right.isPointer) {
+					right.isConst = false;
+				}
+				return a.isReference == b.isReference && typeName(left) == typeName(right)
+					&& left.addressSpace == right.addressSpace && left.enumName == right.enumName;
+			};
+			std::vector<std::pair<const FunctionTemplate*, std::vector<TemplateArgument>>> matches;
+			const auto found = _templatesByName.find(written.name);
+			for (const FunctionTemplate* primary: found == _templatesByName.end()
+					? std::vector<const FunctionTemplate*>() : found->second) {
+				if (primary->order > written.order || !primary->memberOf.empty()) {
+					continue;
+				}
+				std::vector<TemplateArgument> arguments;
+				const FunctionDecl* pattern = templatePattern(*primary, specialization.given, arguments);
+				if (!pattern || pattern->parameters.size() != signature.parameters.size()) {
+					continue;
+				}
+				std::vector<bool> known(arguments.size(), false);
+				for (size_t j = 0; j < specialization.given.size(); ++j) {
+					known[j] = true;
+				}
+				bool fits = true;
+				for (size_t i = 0; i < pattern->parameters.size() && fits; ++i) {
+					const Type& wanted = pattern->parameters[i].type;
+					if (!isTemplateMarker(wanted) || wanted.isPointer || wanted.arrayLength) {
+						continue;
+					}
+					for (size_t j = 0; j < primary->parameters.size(); ++j) {
+						if (!primary->parameters[j].isType || wanted.namedType != templateMarker(primary->parameters[j])) {
+							continue;
+						}
+						Type value = signature.parameters[i].type;
+						value.isConst = false;
+						value.addressSpace = AddressSpace::None;
+						// A call cannot give these as an argument either (parseTemplateArgument, deduceTemplateArguments),
+						// and the instance's key does not tell an enum from its underlying type.
+						if (value.isPointer || value.arrayLength || value.resource != ResourceKind::None
+							|| !value.enumName.empty() || value.isVolatile) {
+							throw CompileError("the explicit specialization of \"" + written.name + "\" at line "
+								+ std::to_string(written.line) + " gives the template parameter \"" + primary->parameters[j].name
+								+ "\" a pointer, array, resource, enum or volatile type, which is not lowered");
+						}
+						if (known[j]) {
+							fits = sameValueType(arguments[j].type, value);
+						} else {
+							arguments[j].type = value;
+							known[j] = true;
+						}
+					}
+				}
+				for (size_t j = 0; j < primary->parameters.size() && fits; ++j) {
+					if (known[j] || (!primary->parameters[j].isType && !arguments[j].unbound)) {
+						continue;
+					}
+					if (!primary->parameters[j].hasDefault) {
+						fits = false;
+						break;
+					}
+					try {
+						arguments[j] = templateDefault(*primary, j, arguments);
+					} catch (const SubstitutionFailure&) {
+						fits = false;
+					}
+				}
+				if (!fits) {
+					continue;
+				}
+				FunctionDecl instance;
+				try {
+					instance = instantiateTemplate(*primary, arguments, false);
+				} catch (const SubstitutionFailure&) {
+					continue;
+				}
+				if (typeName(instance.returnType) != typeName(signature.returnType)
+					|| !std::equal(instance.parameters.begin(), instance.parameters.end(),
+						signature.parameters.begin(), signature.parameters.end(), sameParameter)) {
+					continue;
+				}
+				matches.emplace_back(primary, std::move(arguments));
+			}
+			const std::string where = "the explicit specialization of \"" + written.name + "\" at line "
+				+ std::to_string(written.line);
+			if (matches.empty()) {
+				throw CompileError(where + " matches no function template of that name declared above it");
+			}
+			if (matches.size() > 1) {
+				throw CompileError(where + " matches more than one function template of that name, and choosing "
+					"among them by partial ordering is not lowered");
+			}
+			const std::string key = instanceKey(*matches[0].first, matches[0].second);
+			if (!_specializationOf.emplace(key, &specialization).second) {
+				throw CompileError(where + " specializes an instance that is already explicitly specialized");
+			}
+		}
+	}
+
+	// The explicit specialization that is the instance's body, or null for the primary template's.
+	// Apple refuses one declared after a use of the instance, so it never stands in silently.
+	const ExplicitSpecialization* Emitter::specializationFor(const TemplateInstance& instance) const {
+		const auto found = _specializationOf.find(instanceKey(*instance.declaration, instance.arguments));
+		if (found == _specializationOf.end()) {
+			return nullptr;
+		}
+		if (found->second->declaration.order > instantiationOrder()) {
+			throw CompileError("the explicit specialization of \"" + instance.declaration->name + "\" at line "
+				+ std::to_string(found->second->declaration.line) + " is declared after a use of the instance it "
+				"specializes");
+		}
+		return found->second;
+	}
+
+	// The instance for complete arguments, signature read and body not: one per argument list.
+	Emitter::TemplateInstance& Emitter::templateInstance(const FunctionTemplate& declaration,
+		std::vector<TemplateArgument> arguments) {
+		const std::string key = instanceKey(declaration, arguments);
 		std::unique_ptr<TemplateInstance>& slot = _instances[key];
 		if (slot) {
 			return *slot;
@@ -6898,16 +7162,18 @@ namespace {
 
 	// The instance is the function a call chose: its body is read now.
 	void Emitter::commitInstance(TemplateInstance& instance) {
+		const ExplicitSpecialization* specialization = specializationFor(instance);
 		if (instance.committed) {
 			return;
 		}
+		instance.rootOrder = instantiationOrder();
 		const FunctionTemplate& declaration = *instance.declaration;
 		std::string spelled = declaration.name + "<";
 		for (size_t i = 0; i < instance.arguments.size(); ++i) {
 			spelled += (i ? ", " : "") + templateArgumentName(instance.arguments[i]);
 		}
 		spelled += ">";
-		if (!declaration.hasBody) {
+		if (!declaration.hasBody && !specialization) {
 			throw CompileError("the function template \"" + declaration.name + "\" is declared and never defined");
 		}
 		const auto caller = _instanceOf.find(_helper);
@@ -6916,7 +7182,8 @@ namespace {
 			throw CompileError("template instantiation depth exceeds " + std::to_string(kMaxInstantiationDepth)
 				+ " (instantiating " + spelled + "); Apple's limit is 1024");
 		}
-		instance.decl = instantiateTemplate(declaration, instance.arguments, true);
+		instance.decl = specialization ? instantiateTemplate(specialization->declaration, {}, true)
+			: instantiateTemplate(declaration, instance.arguments, true);
 		instance.depth = depth;
 		instance.committed = true;
 
@@ -6989,6 +7256,82 @@ namespace {
 		return false;
 	}
 
+	// Whether an argument brings no namespace to argument-dependent lookup ([basic.lookup.argdep]): it has no
+	// struct or enum type, nor has anything inside it. An operator's operands are looked into, so pointer
+	// arithmetic on a pointer to a struct is not taken for a scalar.
+	bool Emitter::bringsNoNamespace(const Expression& argument) {
+		switch (argument.kind) {
+			case ExpressionKind::Conditional:
+			case ExpressionKind::Comma:
+			case ExpressionKind::Assign:
+				return false;
+			case ExpressionKind::Binary:
+				return argument.left && argument.right && bringsNoNamespace(*argument.left)
+					&& bringsNoNamespace(*argument.right);
+			case ExpressionKind::Unary:
+				return argument.unaryOperator != UnaryOperator::AddressOf && argument.left
+					&& bringsNoNamespace(*argument.left);
+			case ExpressionKind::Call:
+				if (callsDependentTemplate(argument)) {
+					return deducedResultIsFundamental(argument);
+				}
+				break;
+			default:
+				break;
+		}
+		const std::optional<std::string> tag = enumOf(argument);
+		return !adlStructOf(argument) && tag && tag->empty();
+	}
+
+	// Whether a call to a function template, whose result is known only once deduced, has a result that brings
+	// no namespace to argument-dependent lookup, whichever function it chooses. That holds when none of its own
+	// arguments brings one, so its candidates are only those ordinary lookup finds, and each of them returns a
+	// scalar or vector: a function or a template returning a type of no struct or enum, or a template returning
+	// a type parameter deduced from a parameter of exactly that type, a reference to it included. Deduction
+	// allows no conversion there ([temp.deduct.call]), so the argument's type is the parameter's.
+	bool Emitter::deducedResultIsFundamental(const Expression& call) {
+		if (call.left->kind != ExpressionKind::Identifier) {
+			return false;
+		}
+		for (const ExpressionPtr& argument: call.arguments) {
+			if (!bringsNoNamespace(*argument)) {
+				return false;
+			}
+		}
+		const auto scalarOrVector = [](const Type& type) {
+			return type.namedType.empty() && type.enumName.empty() && type.resource == ResourceKind::None;
+		};
+		for (const HelperFunction* helper: helpersCalled(call)) {
+			if (!scalarOrVector(helper->definition->returnType)) {
+				return false;
+			}
+		}
+		for (const FunctionTemplate* declaration: templatesCalled(call)) {
+			std::vector<TemplateArgument> arguments;
+			const FunctionDecl* pattern = declaration->order > callerOrder() ? nullptr
+				: templatePattern(*declaration, call.left->templateArguments, arguments);
+			if (!pattern) {
+				continue;
+			}
+			if (!isTemplateMarker(pattern->returnType)) {
+				if (!scalarOrVector(pattern->returnType)) {
+					return false;
+				}
+				continue;
+			}
+			const std::string& marker = pattern->returnType.namedType;
+			bool deduced = false;
+			for (size_t i = 0; i < pattern->parameters.size() && i < call.arguments.size() && !deduced; ++i) {
+				const Type& type = pattern->parameters[i].type;
+				deduced = type.namedType == marker && !type.isPointer && !type.arrayLength;
+			}
+			if (!deduced) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	std::string Emitter::describeTemplate(const FunctionTemplate& declaration, const FunctionDecl& pattern) const {
 		return "template " + declaration.name + "(" + parameterSignature(pattern) + ")";
 	}
@@ -7033,7 +7376,9 @@ namespace {
 		if (expression.kind == ExpressionKind::Identifier) {
 			if (const Binding* binding = findResourceBinding(expression.name)) {
 				const bool array = binding->isPointer && binding->pointeeMsl.arrayLength
-					&& binding->storageClass == spirv::StorageClass::Function && !binding->isAddress;
+					&& (binding->storageClass == spirv::StorageClass::Function
+						|| binding->storageClass == spirv::StorageClass::Workgroup)
+					&& !binding->isAddress;
 				if (binding->pointeeMsl.resource != ResourceKind::None) {
 					argument.kind = OverloadArgument::Kind::Resource;
 				} else if (array) {
@@ -7074,10 +7419,39 @@ namespace {
 					throw CompileError("a literal 0 chooses among overloads one of which takes a pointer; the "
 						"null pointer conversion is not lowered yet");
 				}
-				if (argument.pointerLike) {
-					throw CompileError("a pointer argument other than a local array (&x, a + n, a pointer or a "
-						"buffer) chooses among overloads, which is not lowered yet");
+				// A whole buffer reaches a device or constant pointer to its element type exactly, as
+				// bufferPointerArgument takes it, adding const as a qualification conversion; it reaches no
+				// other pointer.
+				if (argument.pointerLike && argument.expression->kind == ExpressionKind::Identifier
+					&& argument.binding && argument.binding->isPointer && argument.binding->isBuffer
+					&& argument.binding->bufferPointeeType != InvalidId && !argument.expression->fileScope) {
+					if (type.addressSpace != AddressSpace::Device && type.addressSpace != AddressSpace::Constant) {
+						return none;
+					}
+					const Binding& buffer = *argument.binding;
+					const Type& given = buffer.pointeeMsl;
+					const bool canWrite = type.addressSpace == AddressSpace::Device && !type.isConst;
+					const bool fits = given.addressSpace == type.addressSpace && given.isAtomic == type.isAtomic
+						&& given.enumName == type.enumName
+						&& buffer.bufferPointeeType == bufferParamTypes(type).second
+						&& !(buffer.readOnly && canWrite);
+					return fits ? exact(type.isConst && !buffer.readOnly ? 1 : 0) : none;
 				}
+				if (argument.pointerLike) {
+					throw CompileError("a pointer argument other than a local array or a whole buffer (&x, a + n, "
+						"or a pointer) chooses among overloads, which is not lowered yet");
+				}
+				return none;
+			}
+			// A local array is in the thread address space and reaches no device or constant pointer.
+			if (type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant) {
+				return none;
+			}
+			// A local array reaches a pointer in its own address space: thread, or threadgroup for one in
+			// Workgroup storage, and no other.
+			const bool threadgroupArray = argument.binding->storageClass == spirv::StorageClass::Workgroup;
+			if ((type.addressSpace == AddressSpace::Threadgroup) != threadgroupArray
+				|| type.addressSpace == AddressSpace::Device || type.addressSpace == AddressSpace::Constant) {
 				return none;
 			}
 			return !pointerFit(*argument.binding, type).matches || (argument.binding->readOnly && !type.isConst)
@@ -7270,6 +7644,10 @@ namespace {
 			std::vector<Id> signature { helper.returnType };
 			for (size_t i = 0; i < definition.parameters.size(); ++i) {
 				const Parameter& parameter = definition.parameters[i];
+				if (i < helper.threadgroupVariables.size() && helper.threadgroupVariables[i] != InvalidId) {
+					helper.parameterTypes.push_back(InvalidId);
+					continue;
+				}
 				if (parameter.type.isPointer
 					&& (parameter.type.addressSpace == AddressSpace::Device
 						|| parameter.type.addressSpace == AddressSpace::Constant)) {
@@ -7305,7 +7683,7 @@ namespace {
 	}
 
 	// A helper with a body is emitted once per stage that reaches it, or once per entry point
-	// when it names a file-scope sampler, which is that entry point's own variable. One the unit
+	// when it names a file-scope sampler or declares a constexpr one, which is that entry point's own variable. One the unit
 	// only declares, and one a library exports, belong to no stage.
 	std::pair<Stage, const FunctionDecl*> Emitter::helperScope(const HelperFunction& helper) const {
 		if (!helper.definition->body) {
@@ -7321,10 +7699,12 @@ namespace {
 		const FunctionDecl& definition = *generic.definition;
 		noteCall(definition);
 		// The scan before emission does not follow argument-dependent lookup or template instances, so a
-		// caller it did not mark would share one body between entry points and call the first one's sampler.
-		if (_helper && _samplerDependent.count(&definition) && !_samplerDependent.count(_helper)) {
+		// caller it did not mark would share one body between entry points and call the first one's sampler. With
+		// one entry point there is no other to share it with.
+		if (_helper && _entryPoints.size() > 1 && _samplerDependent.count(&definition)
+			&& !_samplerDependent.count(_helper)) {
 			throw CompileError("\"" + _helper->name + "\" reaches \"" + definition.name + "\", which names a "
-				"file-scope sampler, only through argument-dependent lookup or a template instance; pass the sampler "
+				"file-scope sampler or declares a constexpr one, only through argument-dependent lookup or a template instance; pass the sampler "
 				"as a parameter or call it by a qualified name");
 		}
 		std::vector<Id> arrays(definition.parameters.size(), InvalidId);
@@ -7355,7 +7735,9 @@ namespace {
 			}
 
 			if (parameter.type.isPointer) {
-				operands.push_back(arrays[first + i]);
+				if (helper.parameterTypes[first + i] != InvalidId) {
+					operands.push_back(arrays[first + i]);
+				}
 				continue;
 			}
 
@@ -7491,6 +7873,7 @@ namespace {
 		size_t first, std::vector<Id>& arrays) {
 		const FunctionDecl& definition = *generic.definition;
 		std::vector<uint32_t> lengths(definition.parameters.size(), 0);
+		std::vector<Id> variables(definition.parameters.size(), InvalidId);
 		bool any = false;
 		for (size_t i = 0; i < call.arguments.size(); ++i) {
 			const Parameter& parameter = definition.parameters[first + i];
@@ -7511,13 +7894,24 @@ namespace {
 				continue;
 			}
 
+			// A threadgroup pointer takes a threadgroup local array in the same way, in Workgroup storage.
+			const bool threadgroup = parameter.type.addressSpace == AddressSpace::Threadgroup;
+			const spirv::StorageClassValue storage = threadgroup
+				? spirv::StorageClass::Workgroup : spirv::StorageClass::Function;
 			const auto binding = argument.kind == ExpressionKind::Identifier
 				? _bindings.find(argument.name) : _bindings.end();
 			if (binding == _bindings.end() || !binding->second.isPointer || !binding->second.pointeeMsl.arrayLength
-				|| binding->second.storageClass != spirv::StorageClass::Function || binding->second.isAddress) {
-				throw CompileError(what + " has to name a local array (or a pointer parameter of the calling "
-					"helper), since parameter \"" + parameter.name + "\" is a pointer to its elements; "
-					"&x, a + n and pointers into a buffer are not lowered yet");
+				|| binding->second.storageClass != storage || binding->second.isAddress) {
+				throw CompileError(what + " has to name a " + (threadgroup ? "threadgroup " : "") + "local array "
+					"(or a pointer parameter of the calling helper), since parameter \"" + parameter.name
+					+ "\" is a " + (threadgroup ? "threadgroup " : "") + "pointer to its elements; &x, a + n and "
+					"pointers into a buffer are not lowered yet");
+			}
+			// A kernel's [[threadgroup(n)]] argument is sized when the pipeline is made, so no helper
+			// specialised on a length can take it.
+			if (*binding->second.pointeeMsl.arrayLength == UINT32_MAX) {
+				throw CompileError(what + " is a threadgroup argument of the kernel, whose length the pipeline "
+					"sets, and a threadgroup pointer parameter takes only a threadgroup local array yet");
 			}
 
 			const PointerFit fit = pointerFit(binding->second, parameter.type);
@@ -7541,15 +7935,21 @@ namespace {
 
 			lengths[first + i] = *binding->second.pointeeMsl.arrayLength;
 			arrays[first + i] = binding->second.id;
+			if (threadgroup) {
+				variables[first + i] = binding->second.id;
+			}
 		}
 
 		if (!any) {
 			return generic;
 		}
 
-		const auto slot = _pointerSpecialisations.emplace(std::make_pair(generic.definition, lengths), generic);
+		std::vector<uint32_t> key = lengths;
+		key.insert(key.end(), variables.begin(), variables.end());
+		const auto slot = _pointerSpecialisations.emplace(std::make_pair(generic.definition, key), generic);
 		if (slot.second) {
 			slot.first->second.arrayLengths = lengths;
+			slot.first->second.threadgroupVariables = variables;
 		}
 		return slot.first->second;
 	}
@@ -8081,7 +8481,8 @@ namespace {
 				// function beside it or argument-dependent lookup would need the arguments' types.
 				if (expression.left->kind != ExpressionKind::Identifier || expression.left->hasTemplateArguments
 					|| _bindings.count(expression.left->name) > 0
-					|| (expression.left->besideStdlib && findMathBuiltin(expression.left->name))) {
+					|| (expression.left->besideStdlib && (findMathBuiltin(expression.left->name)
+						|| findPackBuiltin(expression.left->name)))) {
 					return std::nullopt;
 				}
 				std::set<std::string> adl;
@@ -8305,6 +8706,10 @@ namespace {
 
 		std::vector<Id> values;
 		for (size_t i = 0; i < helper.parameterTypes.size(); ++i) {
+			if (helper.parameterTypes[i] == InvalidId) {
+				values.push_back(helper.threadgroupVariables[i]);
+				continue;
+			}
 			values.push_back(_builder.emitTyped(spirv::OpFunctionParameter, helper.parameterTypes[i], { }));
 
 			// SPV_KHR_physical_storage_buffer wants exactly one of Aliased or Restrict on a
@@ -8369,7 +8774,9 @@ namespace {
 					continue;
 				}
 				const Type array = boundArray(parameter.type, helper.arrayLengths[i]);
-				bindLocal(parameter.name, values[i], arrayTypeOf(array), array);
+				bindLocal(parameter.name, values[i], arrayTypeOf(array), array,
+					parameter.type.addressSpace == AddressSpace::Threadgroup
+						? spirv::StorageClass::Workgroup : spirv::StorageClass::Function);
 				continue;
 			}
 
@@ -8400,15 +8807,87 @@ namespace {
 		_helper = nullptr;
 	}
 
+	// The operand of a return in a function returning void: an expression of type void, such as a call to another
+	// function returning void, is allowed and evaluated ([stmt.return]); any other value is an error.
+	// A comma's left operand is a statement of its own, and each value of a conditional is a return operand too.
+	void Emitter::emitVoidReturnValue(const Expression& expression, const std::string& quoted) {
+		if (isVoidCast(expression)) {
+			emitExpressionStatement(expression);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Comma) {
+			emitExpressionStatement(*expression.left);
+			emitVoidReturnValue(*expression.right, quoted);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Conditional) {
+			emitVoidConditional(expression, &quoted);
+			return;
+		}
+		if (expression.kind == ExpressionKind::Call && emitVoidCall(expression, &quoted)) {
+			return;
+		}
+		throw CompileError(quoted + " returns void, so its return cannot carry a value");
+	}
+
+	// A call that has no value, or whose value is dropped: a helper, or a builtin returning void (an atomic store,
+	// a barrier, a texture write). Returns false for any other call, which is then an expression. With
+	// returnedBy, the call is the operand of a return in that function, so a helper has to return void.
+	bool Emitter::emitVoidCall(const Expression& call, const std::string* returnedBy) {
+		const Expression* receiver = nullptr;
+		std::vector<Id> prepared;
+		if (HelperFunction* helper = findHelper(call, receiver, prepared)) {
+			if (returnedBy && !returnsVoid(*helper->definition)) {
+				throw CompileError(*returnedBy + " returns void, so its return cannot carry a value");
+			}
+			emitHelperCall(call, *helper, receiver, prepared);
+			return true;
+		}
+		const std::string name = call.left->kind == ExpressionKind::Identifier
+			? builtinCalleeName(call.left->name) : std::string();
+		if (name == "atomic_store_explicit") {
+			emitAtomicCall(call);
+			return true;
+		}
+		if (name == "threadgroup_barrier" || name == "simdgroup_barrier") {
+			emitBarrierCall(call);
+			return true;
+		}
+		if (call.left->kind == ExpressionKind::Member && call.left->memberName == "write") {
+			emitTextureWrite(call, textureReceiver(call));
+			return true;
+		}
+		return false;
+	}
+
+	// c ? a : b with no value, as the if it stands for. With returnedBy, each value is a return operand.
+	void Emitter::emitVoidConditional(const Expression& expression, const std::string* returnedBy) {
+		const Id condition = asCondition(emitExpression(*expression.left));
+		const Id thenLabel = _builder.nextId();
+		const Id elseLabel = _builder.nextId();
+		const Id mergeLabel = _builder.nextId();
+		_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
+		terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
+
+		const ControlDepthScope depth(_controlDepth);
+		for (size_t i = 0; i < 2; ++i) {
+			beginBlock(i == 0 ? thenLabel : elseLabel);
+			if (returnedBy) {
+				emitVoidReturnValue(*expression.arguments.at(i), *returnedBy);
+			} else {
+				emitExpressionStatement(*expression.arguments.at(i));
+			}
+			branchUnlessTerminated(mergeLabel);
+		}
+		beginBlock(mergeLabel);
+	}
+
 	void Emitter::emitHelperReturn(const Statement& statement) {
 		const std::string quoted = "\"" + _helper->name + "\"";
 
 		if (returnsVoid(*_helper)) {
 			if (statement.expression) {
-				if (!isVoidValued(*statement.expression)) {
-					throw CompileError(quoted + " returns void, so its return cannot carry a value");
-				}
-				emitExpressionStatement(*statement.expression);
+				emitVoidReturnValue(*statement.expression, quoted);
 			}
 
 			terminate(spirv::OpReturn, { });
@@ -8609,6 +9088,240 @@ namespace {
 		std::vector<uint32_t> operands { _glslSet, instruction };
 		operands.insert(operands.end(), values.begin(), values.end());
 		return _builder.emitTyped(spirv::OpExtInst, result, operands);
+	}
+
+	// A float constant of a scalar or vector float type: every component is the value.
+	Id Emitter::packFloatConstant(Id type, float value) {
+		uint32_t bits = 0;
+		std::memcpy(&bits, &value, sizeof bits);
+		const uint32_t width = _types.vectorWidth(type);
+		const Id component = _types.scalar(ScalarKind::Float);
+		const Id scalar = _builder.emitDeclTyped(spirv::OpConstant, component, { bits });
+		if (width <= 1) {
+			return scalar;
+		}
+		return _builder.emitDeclTyped(spirv::OpConstantComposite, type, std::vector<uint32_t>(width, scalar));
+	}
+
+	// A constant vector of 32-bit integers, one word per component.
+	Id Emitter::packConstantVector(ScalarKind kind, const std::vector<uint32_t>& words) {
+		const Id component = _types.scalar(kind);
+		std::vector<uint32_t> parts;
+		for (const uint32_t word: words) {
+			parts.push_back(_builder.emitDeclTyped(spirv::OpConstant, component, { word }));
+		}
+		return _builder.emitDeclTyped(spirv::OpConstantComposite, _types.vector(kind, uint32_t(words.size())), parts);
+	}
+
+	Id Emitter::glslInstruction(uint32_t instruction, Id type, const std::vector<Id>& operands) {
+		if (_glslSet == InvalidId) {
+			std::vector<uint32_t> setName;
+			spirv::Builder::appendString(setName, "GLSL.std.450");
+			_glslSet = _builder.emitDecl(spirv::OpExtInstImport, setName);
+		}
+		std::vector<uint32_t> words { _glslSet, instruction };
+		words.insert(words.end(), operands.begin(), operands.end());
+		return _builder.emitTyped(spirv::OpExtInst, type, words);
+	}
+
+	// a / (2^period - 1), correctly rounded, for each of count fields of a magnitude 0 <= a <= 2^period - 1.
+	// The quotient's binary expansion is a's period bits repeated without end, so its float is made from
+	// the bits rather than by a division, which Vulkan lets be 2.5 ULP out: L, the zeros ahead of a's top
+	// bit, puts the leading 1 at 2^-(L + 1), after which come a's bits rotated left by L, repeated. The
+	// first 32 of them give the 24 bits of the significand and the bit below, which rounds it up when set;
+	// the bits further on are never all 0, so there is no tie. 0 and 1 are their own values.
+	Id Emitter::normalizedQuotient(Id magnitudes, uint32_t period, uint32_t count) {
+		constexpr uint32_t kFindUMsb = 75;
+		const Id uintVector = _types.vector(ScalarKind::UInt, count);
+		const Id floatVector = _types.vector(ScalarKind::Float, count);
+		const Id boolVector = _types.vector(ScalarKind::Bool, count);
+		const auto splat = [&](uint32_t word) {
+			return packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(count, word));
+		};
+		const auto op = [&](spirv::Opcode opcode, Id a, Id b) { return _builder.emitTyped(opcode, uintVector, { a, b }); };
+		const uint32_t top = (1u << period) - 1;
+		const Id a = magnitudes;
+		// FindUMsb of 0 is -1: L is then period, whose shifts below stay in range; the lane is replaced.
+		const Id msb = _builder.emitTyped(spirv::OpBitcast, uintVector,
+			{ glslInstruction(kFindUMsb, _types.vector(ScalarKind::Int, count), { a }) });
+		const Id leading = op(spirv::OpISub, splat(period - 1), msb);
+		const Id rotated = op(spirv::OpBitwiseAnd, op(spirv::OpBitwiseOr, op(spirv::OpShiftLeftLogical, a, leading),
+			op(spirv::OpShiftRightLogical, a, op(spirv::OpISub, splat(period), leading))), splat(top));
+		Id window = InvalidId;
+		for (uint32_t k = 1;; ++k) {
+			const int shift = 32 - int(k * period);
+			const Id part = shift >= 0 ? op(spirv::OpShiftLeftLogical, rotated, splat(uint32_t(shift)))
+				: op(spirv::OpShiftRightLogical, rotated, splat(uint32_t(-shift)));
+			window = window == InvalidId ? part : op(spirv::OpBitwiseOr, window, part);
+			if (shift <= 0) {
+				break;
+			}
+		}
+		const Id significand = op(spirv::OpIAdd, op(spirv::OpShiftRightLogical, window, splat(8)),
+			op(spirv::OpBitwiseAnd, op(spirv::OpShiftRightLogical, window, splat(7)), splat(1)));
+		// The exponent field of 2^-(L + 1) is 126 - L; a significand that rounded up to 2^24 carries into it.
+		const Id bits = op(spirv::OpISub, op(spirv::OpIAdd, op(spirv::OpShiftLeftLogical,
+			op(spirv::OpISub, splat(126), leading), splat(23)), significand), splat(0x800000));
+		const Id quotient = _builder.emitTyped(spirv::OpBitcast, floatVector, { bits });
+		const Id isZero = _builder.emitTyped(spirv::OpIEqual, boolVector, { a, splat(0) });
+		const Id isOne = _builder.emitTyped(spirv::OpUGreaterThanEqual, boolVector, { a, splat(top) });
+		return _builder.emitTyped(spirv::OpSelect, floatVector, { isZero, packFloatConstant(floatVector, 0.0f),
+			_builder.emitTyped(spirv::OpSelect, floatVector, { isOne, packFloatConstant(floatVector, 1.0f), quotient }) });
+	}
+
+	// The <metal_pack> functions, written out as the conversions the MSL specification gives in 8.7.1
+	// (normalized integers) and 8.7.7 (sRGB), rather than with GLSL.std.450's Pack and Unpack
+	// instructions, whose rounding and precision Vulkan leaves to the implementation. Component i is
+	// held in bits [i * bits, (i + 1) * bits) of the uint, the first component in the lowest bits.
+	// The work is done in float; a half result is converted from it, a half argument converted to it.
+	// c / max is the correctly rounded quotient (see normalizedQuotient), as 8.7.1.2 says Metal 2's
+	// conversions round, and so exact at 0, -1 and 1 as Table 8.6 asks.
+	Id Emitter::emitPackBuiltin(const PackBuiltin& builtin, const std::vector<ExpressionPtr>& arguments) {
+		const std::string name = builtin.name;
+		if (arguments.size() != 1) {
+			throw CompileError(name + " takes 1 argument, and this call passes " + std::to_string(arguments.size()));
+		}
+		constexpr uint32_t kRoundEven = 2;
+		constexpr uint32_t kPow = 26;
+		constexpr uint32_t kNClamp = 81;
+		constexpr uint32_t kUMin = 38;
+		const uint32_t n = builtin.count;
+		const Id uintType = _types.scalar(ScalarKind::UInt);
+		const Id uintVector = _types.vector(ScalarKind::UInt, n);
+		const Id intVector = _types.vector(ScalarKind::Int, n);
+		const Id floatVector = _types.vector(ScalarKind::Float, n);
+		const Id boolVector = _types.vector(ScalarKind::Bool, n);
+		const Id floatTypeOut = _types.vector(builtin.floatKind, n);
+		std::vector<uint32_t> shiftWords;
+		for (uint32_t i = 0; i < n; ++i) {
+			shiftWords.push_back(i * builtin.bits);
+		}
+		const Id shifts = packConstantVector(ScalarKind::UInt, shiftWords);
+		const uint32_t unormMax = (1u << builtin.bits) - 1;
+		const uint32_t snormMax = (1u << (builtin.bits - 1)) - 1;
+		const std::string vectorName = std::string(scalarKindName(builtin.floatKind)) + std::to_string(n);
+
+		// sRGB keeps the alpha channel linear: the colour components come from one vector and the
+		// fourth from the other.
+		const auto colourAndAlpha = [&](Id colour, Id alpha, Id type) {
+			return _builder.emitTyped(spirv::OpVectorShuffle, type, { colour, alpha, 0, 1, 2, 7 });
+		};
+
+		if (!builtin.pack) {
+			// The argument is a uint, any other scalar converted to one as a call converts it (MSL 2.24).
+			const Id value = emitExpression(*arguments[0]);
+			const Id valueType = _builder.typeOf(value);
+			if (!_types.scalarKindOf(valueType) || _types.bitWidth(valueType) == 0) {
+				throw CompileError(name + " takes a uint");
+			}
+			const Id word = convert(value, valueType, uintType);
+			const Id words = _builder.emitTyped(spirv::OpCompositeConstruct, uintVector, std::vector<Id>(n, word));
+			Id result;
+			if (builtin.encoding == PackEncoding::Snorm) {
+				// Each field moved to the top of a word and back down with its sign: max(-1, c / max).
+				std::vector<uint32_t> up;
+				for (uint32_t i = 0; i < n; ++i) {
+					up.push_back(32 - builtin.bits - i * builtin.bits);
+				}
+				const Id raised = _builder.emitTyped(spirv::OpShiftLeftLogical, uintVector,
+					{ words, packConstantVector(ScalarKind::UInt, up) });
+				const Id signedFields = _builder.emitTyped(spirv::OpShiftRightArithmetic, intVector,
+					{ _builder.emitTyped(spirv::OpBitcast, intVector, { raised }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, 32 - builtin.bits)) });
+				// max(-1, c / max): the magnitude, at most max, over max, with the field's sign.
+				constexpr uint32_t kSAbs = 5;
+				const Id magnitudes = glslInstruction(kUMin, uintVector,
+					{ _builder.emitTyped(spirv::OpBitcast, uintVector, { glslInstruction(kSAbs, intVector, { signedFields }) }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, snormMax)) });
+				const Id quotient = normalizedQuotient(magnitudes, builtin.bits - 1, n);
+				const Id negative = _builder.emitTyped(spirv::OpSLessThan, boolVector,
+					{ signedFields, packConstantVector(ScalarKind::Int, std::vector<uint32_t>(n, 0)) });
+				result = _builder.emitTyped(spirv::OpSelect, floatVector,
+					{ negative, _builder.emitTyped(spirv::OpFNegate, floatVector, { quotient }), quotient });
+			} else {
+				// c / max for each field.
+				const Id fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
+					{ _builder.emitTyped(spirv::OpShiftRightLogical, uintVector, { words, shifts }),
+						packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
+				result = normalizedQuotient(fields, builtin.bits, n);
+				if (builtin.encoding == PackEncoding::Srgb) {
+					// c <= 0.04045 ? c / 12.92 : powr((c + 0.055) / 1.055, 2.4)
+					const Id low = _builder.emitTyped(spirv::OpFDiv, floatVector,
+						{ result, packFloatConstant(floatVector, 12.92f) });
+					const Id shifted = _builder.emitTyped(spirv::OpFDiv, floatVector,
+						{ _builder.emitTyped(spirv::OpFAdd, floatVector, { result, packFloatConstant(floatVector, 0.055f) }),
+							packFloatConstant(floatVector, 1.055f) });
+					const Id high = glslInstruction(kPow, floatVector, { shifted, packFloatConstant(floatVector, 2.4f) });
+					const Id isLow = _builder.emitTyped(spirv::OpFOrdLessThanEqual, boolVector,
+						{ result, packFloatConstant(floatVector, 0.04045f) });
+					const Id linear = _builder.emitTyped(spirv::OpSelect, floatVector, { isLow, low, high });
+					result = colourAndAlpha(linear, result, floatVector);
+				}
+			}
+			return builtin.floatKind == ScalarKind::Float ? result : convert(result, floatVector, floatTypeOut);
+		}
+
+		// A scalar fills the vector, converted as a call converts it; a vector has to be of the type (MSL 2.24).
+		Id value = emitExpression(*arguments[0]);
+		Id valueType = _builder.typeOf(value);
+		if (_types.scalarKindOf(valueType) && _types.bitWidth(valueType) != 0) {
+			value = broadcast(convert(value, valueType, _types.scalar(builtin.floatKind)), floatTypeOut);
+			valueType = floatTypeOut;
+		}
+		if (valueType != floatTypeOut) {
+			throw CompileError(name + " takes a " + vectorName);
+		}
+		const Id floats = builtin.floatKind == ScalarKind::Float ? value : convert(value, valueType, floatVector);
+		const Id zero = packFloatConstant(floatVector, 0.0f);
+		// A NaN converts to 0 (8.7.1.2 and 8.7.7), by a select rather than by NClamp's handling of it.
+		const Id isNan = _builder.emitTyped(spirv::OpIsNan, boolVector, { floats });
+		const Id cleaned = _builder.emitTyped(spirv::OpSelect, floatVector, { isNan, zero, floats });
+		Id fields;
+		if (builtin.encoding == PackEncoding::Snorm) {
+			// min(max(f * max, -max), max), rounded to nearest even.
+			const Id limit = packFloatConstant(floatVector, float(snormMax));
+			const Id clamped = glslInstruction(kNClamp, floatVector,
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { cleaned, limit }),
+					packFloatConstant(floatVector, -float(snormMax)), limit });
+			const Id rounded = glslInstruction(kRoundEven, floatVector, { clamped });
+			fields = _builder.emitTyped(spirv::OpBitwiseAnd, uintVector,
+				{ _builder.emitTyped(spirv::OpBitcast, uintVector,
+						{ _builder.emitTyped(spirv::OpConvertFToS, intVector, { rounded }) }),
+					packConstantVector(ScalarKind::UInt, std::vector<uint32_t>(n, unormMax)) });
+		} else {
+			// min(max(f * max, 0), max), rounded to nearest even.
+			const Id limit = packFloatConstant(floatVector, float(unormMax));
+			const Id clamped = glslInstruction(kNClamp, floatVector,
+				{ _builder.emitTyped(spirv::OpFMul, floatVector, { cleaned, limit }), zero, limit });
+			fields = _builder.emitTyped(spirv::OpConvertFToU, uintVector,
+				{ glslInstruction(kRoundEven, floatVector, { clamped }) });
+			if (builtin.encoding == PackEncoding::Srgb) {
+				// The colour: c clamped to [0, 1] (a NaN to 0), then c < 0.0031308 ? 12.92 * c :
+				// 1.055 * powr(c, 1 / 2.4) - 0.055, scaled to 255, plus 0.5, its fraction dropped.
+				const Id one = packFloatConstant(floatVector, 1.0f);
+				const Id c = glslInstruction(kNClamp, floatVector, { cleaned, zero, one });
+				const Id low = _builder.emitTyped(spirv::OpFMul, floatVector, { c, packFloatConstant(floatVector, 12.92f) });
+				const Id curve = glslInstruction(kPow, floatVector, { c, packFloatConstant(floatVector, 1.0f / 2.4f) });
+				const Id high = _builder.emitTyped(spirv::OpFSub, floatVector,
+					{ _builder.emitTyped(spirv::OpFMul, floatVector, { curve, packFloatConstant(floatVector, 1.055f) }),
+						packFloatConstant(floatVector, 0.055f) });
+				const Id isLow = _builder.emitTyped(spirv::OpFOrdLessThan, boolVector,
+					{ c, packFloatConstant(floatVector, 0.0031308f) });
+				const Id encoded = _builder.emitTyped(spirv::OpSelect, floatVector, { isLow, low, high });
+				const Id scaled = _builder.emitTyped(spirv::OpFAdd, floatVector,
+					{ _builder.emitTyped(spirv::OpFMul, floatVector, { encoded, packFloatConstant(floatVector, 255.0f) }),
+						packFloatConstant(floatVector, 0.5f) });
+				const Id colour = _builder.emitTyped(spirv::OpConvertFToU, uintVector, { scaled });
+				fields = colourAndAlpha(colour, fields, uintVector);
+			}
+		}
+		const Id placed = _builder.emitTyped(spirv::OpShiftLeftLogical, uintVector, { fields, shifts });
+		Id word = _builder.emitTyped(spirv::OpCompositeExtract, uintType, { placed, 0 });
+		for (uint32_t i = 1; i < n; ++i) {
+			word = _builder.emitTyped(spirv::OpBitwiseOr, uintType,
+				{ word, _builder.emitTyped(spirv::OpCompositeExtract, uintType, { placed, i }) });
+		}
+		return word;
 	}
 
 	// round(x): the whole number nearest x, a half going away from zero. Trunc
@@ -9913,6 +10626,42 @@ namespace {
 		return std::make_unique<FileScopeView>(_fileScopeViews, anyHidden);
 	}
 
+	// Whether evaluating an expression again only reads: names, literals, members, elements and arithmetic on them.
+	static bool readsWithoutEffect(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Identifier: return true;
+			case ExpressionKind::Member: return expression.left && readsWithoutEffect(*expression.left);
+			case ExpressionKind::Index:
+				return expression.left && readsWithoutEffect(*expression.left) && std::all_of(expression.arguments.begin(),
+					expression.arguments.end(), [](const ExpressionPtr& index) { return index && readsWithoutEffect(*index); });
+			case ExpressionKind::Binary:
+				return expression.left && expression.right && readsWithoutEffect(*expression.left)
+					&& readsWithoutEffect(*expression.right);
+			case ExpressionKind::Unary:
+				return (expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::Plus
+					|| expression.unaryOperator == UnaryOperator::Not || expression.unaryOperator == UnaryOperator::BitNot)
+					&& expression.left && readsWithoutEffect(*expression.left);
+			default: return false;
+		}
+	}
+
+	// Whether an assignment's left operand names an element: then its index may change with the store, and the
+	// value is loaded from the address stored to rather than read again.
+	static bool hasIndex(const Expression& left) {
+		for (const Expression* part = &left; part; part = part->left.get()) {
+			if (part->kind == ExpressionKind::Index) {
+				return true;
+			}
+			if (part->kind != ExpressionKind::Member) {
+				return false;
+			}
+		}
+		return false;
+	}
+
 	Id Emitter::emitExpression(const Expression& expression) {
 		const auto fileScopeView = viewFileScope(expression);
 		switch (expression.kind) {
@@ -9973,12 +10722,33 @@ namespace {
 					return emitInitListValue(*expression.constructType, expression);
 				}
 				break;
-			case ExpressionKind::Assign: break;
+			case ExpressionKind::Assign:
+				// The value of an assignment is its left operand once stored to ([expr.ass]), read again here, which
+				// gives that value only while reading the operand again does nothing else.
+				if (!readsWithoutEffect(*expression.left)) {
+					throw CompileError("an assignment whose left operand has a call, an increment or an assignment "
+						"in it cannot be used as a value yet; assign first, then use the variable");
+				}
+				// An element, as a[a[0]] or a[k] with k changed on the right: its address, taken where the store
+				// takes it, is the place stored to.
+				if (hasIndex(*expression.left)) {
+					if (expression.left->kind == ExpressionKind::Member && !structOf(*expression.left->left)) {
+						throw CompileError("an assignment to a swizzle of an element cannot be used as a value yet; "
+							"assign first, then use the element");
+					}
+					const Id address = emitPlaceAddress(*expression.left);
+					emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+					const Id pointee = valueTypeAt(address);
+					const auto storage = _types.storageClassOf(_builder.typeOf(address));
+					return storage == spirv::StorageClass::PhysicalStorageBuffer
+						? loadFromBuffer(address, pointee) : loadFrom(address, pointee);
+				}
+				emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+				return emitExpression(*expression.left);
 		}
 
-		// A braced list is only spelled in an initialiser, and an assignment is a
-		// statement, so reaching either here means the source used it as a value,
-		// which MSL does not allow.
+		// A braced list without a type is only spelled in an initialiser, so reaching one here means the source
+		// used it as a value, which MSL does not allow.
 		throw CompileError("this expression cannot be used as a value");
 	}
 
@@ -10804,26 +11574,31 @@ namespace {
 	//
 	// Every one in the body is reserved before the entry point is emitted, since
 	// the variable has to be in the OpEntryPoint interface, which comes first.
-	void Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used) {
+	bool Emitter::reserveLocalSamplers(const Statement& statement, const std::set<std::string>& used, bool reserve) {
+		bool any = false;
 		if (statement.declaration && statement.declaration->sampler
 			&& used.count(statement.declaration->name)) {
-			reserveSampler(*statement.declaration);
+			if (reserve) {
+				reserveSampler(*statement.declaration);
+			}
+			any = true;
 		}
 
 		for (const StatementPtr& child: statement.children) {
-			reserveLocalSamplers(*child, used);
+			any = reserveLocalSamplers(*child, used, reserve) || any;
 		}
 		for (const Statement* nested: { statement.thenBranch.get(), statement.elseBranch.get(),
 			statement.forBody.get(), statement.whileBody.get() }) {
 			if (nested) {
-				reserveLocalSamplers(*nested, used);
+				any = reserveLocalSamplers(*nested, used, reserve) || any;
 			}
 		}
 		for (const SwitchCase& kase: statement.switchCases) {
 			for (const StatementPtr& child: kase.body) {
-				reserveLocalSamplers(*child, used);
+				any = reserveLocalSamplers(*child, used, reserve) || any;
 			}
 		}
+		return any;
 	}
 
 	void Emitter::reserveThreadgroupLocals(const Statement& statement) {
@@ -10935,6 +11710,9 @@ namespace {
 		// or calls one that does, is emitted per entry point (helperScope).
 		std::map<const FunctionDecl*, std::vector<const FunctionDecl*>> callees;
 		std::set<const FunctionDecl*> naming;
+		// The helpers that declare a named constexpr sampler, in the order they are reached; theirs are reserved after
+		// the file-scope ones, which keep the bindings they had before helpers' own were lowered.
+		std::vector<const FunctionDecl*> declaring;
 		std::vector<const FunctionDecl*> pending { _entryPoint };
 		callees[_entryPoint];
 		while (!pending.empty()) {
@@ -10950,6 +11728,16 @@ namespace {
 						pending.push_back(callee);
 						if (scan(*callee)) {
 							naming.insert(callee);
+						}
+						// A constexpr sampler a helper declares and names is one of this entry point's, as one the
+						// entry point declares is, so the helper is emitted per entry point too.
+						if (callee->body) {
+							std::set<std::string> used;
+							collectIdentifiers(*callee->body, used);
+							if (reserveLocalSamplers(*callee->body, used, false)) {
+								naming.insert(callee);
+								declaring.push_back(callee);
+							}
 						}
 					}
 				}
@@ -10974,6 +11762,11 @@ namespace {
 				reserveSampler(global);
 				_fileScopeSamplerBindings[global.name] = embeddedSamplerBinding(global);
 			}
+		}
+		for (const FunctionDecl* helper: declaring) {
+			std::set<std::string> used;
+			collectIdentifiers(*helper->body, used);
+			reserveLocalSamplers(*helper->body, used);
 		}
 	}
 
@@ -12066,6 +12859,9 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.stencil) {
+				throw CompileError(what + " has [[stencil]], which is only valid on a fragment output");
+			}
 			if (field.attributes.sampleMask) {
 				throw CompileError(isInput
 					? what + " has [[sample_mask]] on a fragment input, which mslc does not lower yet"
@@ -12203,6 +12999,9 @@ namespace {
 			if (field.attributes.depthMode) {
 				throw CompileError(what + " has [[depth]], which is only valid on a fragment output");
 			}
+			if (field.attributes.stencil) {
+				throw CompileError(what + " has [[stencil]], which is only valid on a fragment output");
+			}
 			if (field.attributes.sampleMask) {
 				throw CompileError(what + " has [[sample_mask]], which is not valid on a vertex input");
 			}
@@ -12260,10 +13059,44 @@ namespace {
 		std::set<uint32_t> used;
 		bool hasDepth = false;
 		bool hasSampleMask = false;
+		bool hasStencil = false;
 
 		for (const StructField& field: decl.fields) {
 			const std::string what = "field \"" + field.name + "\" of \"" + decl.name + "\"";
 
+			if (field.attributes.stencil) {
+				// The stencil reference value, which Vulkan exports with SPV_EXT_shader_stencil_export.
+				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
+					|| field.attributes.sampleMask || field.attributes.depthMode) {
+					throw CompileError(what + " has an incompatible stencil attribute combination");
+				}
+				if (field.attributes.attributeIndex || field.attributes.userName
+					|| field.attributes.interpolation != Interpolation::None) {
+					throw CompileError(what + " combines stencil with an attribute index, user or interpolation, "
+						"which mslc does not lower");
+				}
+				if (hasStencil) {
+					throw CompileError("struct \"" + decl.name + "\" has more than one [[stencil]] field");
+				}
+				const Type& type = field.type;
+				if (type.scalar != ScalarKind::UInt || !type.isScalar() || type.isPointer
+					|| type.arrayLength || !type.namedType.empty()) {
+					throw CompileError(what + " has [[stencil]], which has to be a scalar uint");
+				}
+				hasStencil = true;
+				if (!_stencilExportDeclared) {
+					_builder.emit(spirv::OpCapability, { static_cast<uint32_t>(spirv::Capability::StencilExportEXT) });
+					std::vector<uint32_t> extension;
+					spirv::Builder::appendString(extension, "SPV_EXT_shader_stencil_export");
+					_builder.emit(spirv::OpExtension, extension);
+					_stencilExportDeclared = true;
+				}
+				variables.push_back(declareStageVariable(type, spirv::StorageClass::Output, what));
+				_builder.emit(spirv::OpDecorate, { variables.back().variable,
+					static_cast<uint32_t>(spirv::Decoration::BuiltIn),
+					static_cast<uint32_t>(spirv::BuiltIn::FragStencilRefEXT) });
+				continue;
+			}
 			if (field.attributes.depthMode) {
 				if (field.attributes.colorIndex || field.attributes.position || field.attributes.pointSize
 					|| field.attributes.sampleMask) {
@@ -12332,7 +13165,7 @@ namespace {
 				throw CompileError(what + " has [[point_size]], which is only valid on a vertex output");
 			}
 			if (!field.attributes.colorIndex) {
-				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]] or [[sample_mask]]; every field of a "
+				throw CompileError(what + " has no [[color(n)]], [[depth(mode)]], [[sample_mask]] or [[stencil]]; every field of a "
 					"fragment function's returned struct needs one");
 			}
 
@@ -12595,11 +13428,7 @@ namespace {
 		}
 
 		if (_outputs.empty()) {
-			if (!isVoidValued(*statement.expression)) {
-				throw CompileError("\"" + _entryPoint->name + "\" returns void, so its return "
-					"cannot carry a value");
-			}
-			emitExpressionStatement(*statement.expression);
+			emitVoidReturnValue(*statement.expression, "\"" + _entryPoint->name + "\"");
 			terminate(spirv::OpReturn, { });
 			return;
 		}
@@ -13776,21 +14605,7 @@ namespace {
 
 		// c ? (void)a : (void)b has no value, so it runs as the if it stands for.
 		if (expression.kind == ExpressionKind::Conditional && isVoidValued(expression)) {
-			const Id condition = asCondition(emitExpression(*expression.left));
-			const Id thenLabel = _builder.nextId();
-			const Id elseLabel = _builder.nextId();
-			const Id mergeLabel = _builder.nextId();
-			_builder.emit(spirv::OpSelectionMerge, { mergeLabel, kSelectionControlNone });
-			terminate(spirv::OpBranchConditional, { condition, thenLabel, elseLabel });
-
-			const ControlDepthScope depth(_controlDepth);
-			beginBlock(thenLabel);
-			emitExpressionStatement(*expression.arguments.at(0));
-			branchUnlessTerminated(mergeLabel);
-			beginBlock(elseLabel);
-			emitExpressionStatement(*expression.arguments.at(1));
-			branchUnlessTerminated(mergeLabel);
-			beginBlock(mergeLabel);
+			emitVoidConditional(expression, nullptr);
 			return;
 		}
 
@@ -13812,28 +14627,8 @@ namespace {
 		}
 
 		// A call whose value is dropped, which is the only way to call a void helper.
-		if (expression.kind == ExpressionKind::Call) {
-			const Expression* receiver = nullptr;
-			std::vector<Id> prepared;
-			if (HelperFunction* helper = findHelper(expression, receiver, prepared)) {
-				emitHelperCall(expression, *helper, receiver, prepared);
-				return;
-			}
-			const std::string name = expression.left->kind == ExpressionKind::Identifier
-				? builtinCalleeName(expression.left->name) : std::string();
-			if (name == "atomic_store_explicit") {
-				emitAtomicCall(expression);
-				return;
-			}
-			if (expression.left->kind == ExpressionKind::Identifier
-				&& (name == "threadgroup_barrier" || name == "simdgroup_barrier")) {
-				emitBarrierCall(expression);
-				return;
-			}
-			if (expression.left->kind == ExpressionKind::Member && expression.left->memberName == "write") {
-				emitTextureWrite(expression, textureReceiver(expression));
-				return;
-			}
+		if (expression.kind == ExpressionKind::Call && emitVoidCall(expression, nullptr)) {
+			return;
 		}
 
 		// An assignment yields an address rather than a value, so it is
@@ -14143,6 +14938,9 @@ namespace {
 	}
 
 	void Emitter::emitStatement(const Statement& statement) {
+		if (!statement.refusal.empty()) {
+			throw CompileError(statement.refusal);
+		}
 		switch (statement.kind) {
 			case StatementKind::Compound: {
 				const BindingScope scope(_bindings);
@@ -14446,6 +15244,11 @@ namespace {
 				static_cast<uint32_t>(spirv::ExecutionMode::OriginUpperLeft) });
 			if (const StructDecl* decl = structValue(_entryPoint->returnType)) {
 				for (const StructField& field: decl->fields) {
+					if (field.attributes.stencil) {
+						_builder.emit(spirv::OpExecutionMode, { _entryPointId,
+							static_cast<uint32_t>(spirv::ExecutionMode::StencilRefReplacingEXT) });
+						continue;
+					}
 					if (!field.attributes.depthMode) {
 						continue;
 					}
@@ -14536,7 +15339,7 @@ namespace {
 			if (std::any_of(entry->definition->parameters.begin(), entry->definition->parameters.end(),
 				[](const Parameter& parameter) { return parameter.type.isPointer; })) {
 				throw CompileError("\"" + entry->definition->name + "\" is declared but defined elsewhere, and "
-					"takes a pointer parameter; a thread pointer is lowered per caller, so it cannot be a "
+					"takes a pointer parameter; a thread or threadgroup pointer is lowered per caller, so it cannot be a "
 					"link-time symbol");
 			}
 			helperFunctionId(*entry);
@@ -14625,6 +15428,7 @@ namespace {
 		_functionTypes[{ _voidType }] = functionType;
 
 		_overloadedNames = overloadedNames(_unit);
+		resolveSpecializations();
 		// Where each name is first declared, so a call that finds it among several names can tell
 		// whether it is visible yet.
 		std::map<std::string, size_t> firstDeclared;

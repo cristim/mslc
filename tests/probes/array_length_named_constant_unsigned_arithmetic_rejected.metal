@@ -1,4 +1,4 @@
-// EXPECT: error unsigned or wider integer inside a constant expression
+// EXPECT: error subtracts below zero would wrap as an unsigned one
 //
 // Apple folds "N - 4" as an unsigned subtraction; mslc does not model it, so it says so
 // rather than fold it as an int.

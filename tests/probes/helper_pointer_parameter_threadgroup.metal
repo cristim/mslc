@@ -1,4 +1,7 @@
-// EXPECT: error parameter "p" of helper function "f" is a pointer outside the thread, device and constant address spaces
+// EXPECT: valid
+// DISASM-NOT: OpFunctionParameter %_ptr_Workgroup
+// A threadgroup pointer parameter takes a threadgroup local array. (This probe pinned the refusal until it was
+// lowered.)
 #include <metal_stdlib>
 using namespace metal;
 float f(threadgroup float* p) { return p[0]; }
