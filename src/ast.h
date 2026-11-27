@@ -167,6 +167,10 @@ struct Type {
 };
 
 // One argument of a template: a type, or an integer constant (a bool is 0 or 1).
+// The callee of as_type<T>(x) as the parser reads it: a name no source can spell, so no declared
+// function is taken for the builtin.
+inline constexpr const char* kAsTypeCallee = "<builtin as_type>";
+
 struct TemplateArgument {
 	bool isType = true;
 	Type type;
