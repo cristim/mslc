@@ -1481,9 +1481,10 @@ TemplateArgument Parser::parseTemplateArgument() {
 	const bool named = kind() == TokenKind::Identifier || at(TokenKind::ColonColon);
 	const std::string name = named ? peekResolved(nameTokens) : std::string();
 	const bool localHides = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && isLocal(name);
+	size_t vecTokens = 0;
 	const bool isTypeArgument = (named && (resolveTypeName(name, probe) || isTypeQualifier(name)
 			|| (_unit.findStruct(name) != nullptr && !localHides)))
-		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text));
+		|| (kind() == TokenKind::Identifier && isIntegerSpecifier(current().text)) || atLibraryVec(vecTokens);
 	if (isTypeArgument) {
 		argument.type = parseType();
 		if (argument.type.isPointer || argument.type.arrayLength || argument.type.resource != ResourceKind::None
@@ -5135,6 +5136,68 @@ void Parser::parseStdArray(Type& type, size_t nameTokens) {
 	type = element;
 }
 
+bool Parser::atLibraryVec(size_t& nameTokens) const {
+	if (kind() != TokenKind::Identifier && !at(TokenKind::ColonColon)) {
+		return false;
+	}
+	const Token& first = at(TokenKind::ColonColon) ? lookahead() : current();
+	if (first.kind != TokenKind::Identifier || (first.text != "vec" && first.text != "metal")) {
+		return false;
+	}
+	// A local or a member of the enclosing struct named vec hides the library's, unless qualified.
+	if (kind() == TokenKind::Identifier && current().text == "vec" && lookahead().kind != TokenKind::ColonColon
+		&& (isLocal("vec") || memberHidesName("vec"))) {
+		return false;
+	}
+	const std::string name = peekResolved(nameTokens);
+	if (name != "metal::vec" && (name != "vec" || _declared.count("vec"))) {
+		return false;
+	}
+	return lookahead(nameTokens).kind == TokenKind::Less;
+}
+
+// metal::vec<T, N> is the library's name for the vector of N T: vec<float, 4> is float4, so it is
+// read as that vector. The qualifiers read before it apply to the vector.
+void Parser::parseLibraryVec(Type& type, size_t nameTokens) {
+	for (size_t i = 0; i < nameTokens; ++i) {
+		advance();
+	}
+	expect(TokenKind::Less, "to open the template arguments of vec");
+	const Type element = parseType(false, false);
+	// A function template's signature is read to deduce its arguments with each type parameter left to
+	// deduce as a marker, "<T>": vec<T, N> is then the marker with the vector's width, which deduction
+	// takes apart.
+	const bool marker = element.namedType.size() > 2 && element.namedType.front() == '<'
+		&& element.namedType.back() == '>';
+	if (element.isPointer || element.isConst || element.isConstexpr || element.isStatic
+		|| element.addressSpace != AddressSpace::None || element.isAtomic || element.isPacked || element.isVector()
+		|| element.isMatrix() || element.arrayLength || element.resource != ResourceKind::None
+		|| (!element.namedType.empty() && !marker) || !element.enumName.empty()
+		|| (!marker && (element.scalar == ScalarKind::Void || element.scalar == ScalarKind::Double))) {
+		throw CompileError("vec<T, N> takes a scalar type, bool or one of the integer, half and float types, as T");
+	}
+	expect(TokenKind::Comma, "between the element type and the length of vec");
+	const ExpressionPtr length = parseAdditive();
+	if (!at(TokenKind::Greater)) {
+		throw CompileError("this vec length is not lowered: a constant that is more than an arithmetic "
+			"expression needs parentheses");
+	}
+	advance();
+	if (length->kind == ExpressionKind::Identifier && length->name.rfind("<template ", 0) == 0
+		&& !_enumConstants.count(length->name)) {
+		throw CompileError("deducing the length N of vec<T, N> from an argument is not lowered; give the template "
+			"argument explicitly");
+	}
+	const int64_t count = evaluateConstant(*length, false);
+	if (count < 2 || count > 4) {
+		throw CompileError("vec<T, " + std::to_string(count) + "> is not lowered: Metal's vectors have 2, 3 or 4 "
+			"components");
+	}
+	type.scalar = element.scalar;
+	type.namedType = element.namedType;
+	type.vectorWidth = static_cast<uint32_t>(count);
+}
+
 Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 	Type type;
 	const size_t typenameAt = _position;
@@ -5201,6 +5264,8 @@ Type Parser::parseType(bool allowResource, bool allowAuto, Type* base) {
 		parseResourceType(type);
 	} else if (size_t arrayTokens = 0; atStdArray(arrayTokens)) {
 		parseStdArray(type, arrayTokens);
+	} else if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
+		parseLibraryVec(type, vecTokens);
 	} else if (!name.empty() && resolveTypeName(name, type)) {
 		consumeName();
 	} else if (atKeyword("enum")) {
@@ -6089,7 +6154,7 @@ StatementPtr Parser::parseStatement() {
 				|| (resolveTypeName(name, typedefOf) && _unit.findStruct(typedefOf.namedType) != nullptr));
 		size_t arrayTokens = 0;
 		const bool stdArrayType = (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-			&& !isLocal(name) && atStdArray(arrayTokens);
+			&& !isLocal(name) && (atStdArray(arrayTokens) || atLibraryVec(arrayTokens));
 		const bool looksLikeType = !bracedTemporary &&
 			((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name) && (resolveTypeName(name, probe)
 				|| isTypeQualifier(name) || isResourceTypeName(name)
@@ -6534,10 +6599,12 @@ StatementPtr Parser::parseForStatement() {
 		// qualified with "::" (j8, j9; see parseStatement's identical guard).
 		const bool localHidesStruct = kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon
 			&& isLocal(name);
+		size_t vecTokens = 0;
 		const bool looksLikeType = (kind() == TokenKind::Identifier
 				&& (isIntegerSpecifier(current().text) || current().text == "auto"))
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
-				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)));
+				&& !objectHidesTag(name) && (resolveTypeName(name, probe) || (_unit.findStruct(name) != nullptr && !localHidesStruct)))
+			|| atLibraryVec(vecTokens);
 
 		if (looksLikeType) {
 			VariableDeclaration declaration;
@@ -7052,7 +7119,7 @@ ExpressionPtr Parser::parseSizeof() {
 			|| ((kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) && !objectHidesTag(name)
 				&& !(kind() == TokenKind::Identifier && lookahead().kind != TokenKind::ColonColon && memberHidesName(name))
 				&& (resolveTypeName(name, probe) || isTypeQualifier(name) || isResourceTypeName(name)
-					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && atStdArray(nameTokens))))
+					|| (_unit.findStruct(name) != nullptr && !localHidesStruct) || (!localHidesStruct && (atStdArray(nameTokens) || atLibraryVec(nameTokens)))))
 			|| atKeyword("device") || atKeyword("constant") || atKeyword("threadgroup") || atKeyword("thread");
 		if (startsType) {
 			Type type = parseType(true, false);
@@ -7273,6 +7340,30 @@ ExpressionPtr Parser::parseCast() {
 	// Read the name, which may be namespace-qualified, from just past the '('.
 	const size_t open = _position;
 	++_position;
+	// (vec<T, N>)x; a parenthesis holding more than the type, "(vec<float, 4>(a).x)", is an expression.
+	if (size_t vecTokens = 0; atLibraryVec(vecTokens)) {
+		const size_t atLine = line();
+		Type target;
+		try {
+			target = parseType(false, false);
+		} catch (...) {
+			_position = open;
+			throw;
+		}
+		if (!at(TokenKind::RParen)) {
+			_position = open;
+			return nullptr;
+		}
+		advance();
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Construct;
+		expression->line = atLine;
+		expression->constructType = target;
+		const NestingScope scope(*this);
+		expression->arguments.push_back(parseUnary());
+		measure(*expression);
+		return expression;
+	}
 	size_t nameTokens = 0;
 	std::optional<Type> type;
 	try {
@@ -7755,6 +7846,24 @@ ExpressionPtr Parser::parsePrimary() {
 		list->constructType = type;
 		list->line = atLine;
 		return list;
+	}
+
+	// vec<T, N>(...) constructs the vector, as float4(...) does.
+	if (size_t vecTokens = 0; (kind() == TokenKind::Identifier || at(TokenKind::ColonColon))
+		&& !isLocal(std::string(current().text)) && atLibraryVec(vecTokens)) {
+		const size_t atLine = line();
+		const Type type = parseType(false, false);
+		if (!at(TokenKind::LParen)) {
+			throw CompileError("expected '(' after type \"" + typeName(type) + "\"");
+		}
+		advance();
+		auto expression = std::make_unique<Expression>();
+		expression->kind = ExpressionKind::Construct;
+		expression->line = atLine;
+		expression->constructType = type;
+		expression->arguments = parseArgumentList("to close a constructor's argument list");
+		measure(*expression);
+		return expression;
 	}
 
 	if (kind() == TokenKind::Identifier || at(TokenKind::ColonColon)) {
