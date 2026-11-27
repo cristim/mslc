@@ -4352,6 +4352,11 @@ static bool containsSizeof(const Expression& expression) {
 		return (target == ScalarKind::UInt || target == ScalarKind::ULong)
 			&& expression.arguments.size() == 1 && containsSizeof(*expression.arguments.front());
 	}
+	// Either value of a conditional sets its type ([expr.cond] applies the usual arithmetic conversions).
+	if (expression.kind == ExpressionKind::Conditional && expression.arguments.size() == 2
+		&& (containsSizeof(*expression.arguments[0]) || containsSizeof(*expression.arguments[1]))) {
+		return true;
+	}
 	return (expression.left && containsSizeof(*expression.left))
 		|| (expression.right && containsSizeof(*expression.right));
 }
@@ -4493,6 +4498,15 @@ int64_t Parser::evaluateConstant(const Expression& expression, bool nested, bool
 				case BinaryOperator::LogicalOr: return left != 0 || right != 0;
 			}
 			break;
+		}
+		case ExpressionKind::Conditional: {
+			// Only the value the condition chooses is evaluated ([expr.cond]), so the other may be one no constant
+			// expression holds, such as a division by zero.
+			if (expression.arguments.size() != 2) {
+				break;
+			}
+			const int64_t condition = evaluateConstant(*expression.left, true, attribute);
+			return evaluateConstant(*expression.arguments[condition != 0 ? 0 : 1], nested, attribute);
 		}
 		case ExpressionKind::Sizeof:
 			throw CompileError("the size of an expression is worked out after parsing, so it is not an "
