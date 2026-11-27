@@ -451,6 +451,24 @@ std::optional<Type> Emitter::sizeofExpressionType(const Expression& expression) 
 					}
 					args.push_back(*arg);
 				}
+				// The fast and precise scopes declare float overloads only, and a scalar of another type converts
+				// to float (Apple types metal::fast::clamp(5, 0, 3) as float), as emitCall lowers it.
+				const bool floatScope = callee.compare(0, 13, "metal::fast::") == 0
+					|| callee.compare(0, 16, "metal::precise::") == 0;
+				const size_t operands = isSelect ? 2 : args.size();
+				const bool scalarOperands = std::none_of(args.begin(), args.begin() + operands,
+					[](const Type& arg) { return arg.isVector(); });
+				const bool takesScalarsHere = isSelect || (builtin->shape != MathShape::VectorToScalar
+					&& builtin->shape != MathShape::Vector && builtin->shape != MathShape::Dot
+					&& builtin->shape != MathShape::Refract && builtin->shape != MathShape::Cross);
+				if (floatScope && scalarOperands && takesScalarsHere
+					&& (!isSelect || (!args[2].isVector() && args[2].scalar == ScalarKind::Bool))) {
+					Type out = args[0];
+					out.scalar = ScalarKind::Float;
+					out.isConst = false;
+					out.addressSpace = AddressSpace::None;
+					return out;
+				}
 				if (isSelect) {
 					Type out = args[0].isVector() ? args[0] : args[1];
 					if ((fpSelect && !isFloatKind(out.scalar))

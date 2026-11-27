@@ -65,6 +65,10 @@ FunctionDecl Parser::parseInstance(const FunctionTemplate& declaration, const st
 	}
 	const std::string written = declaration.name.substr(declaration.name.rfind("::") == std::string::npos
 		? 0 : declaration.name.rfind("::") + 2);
+	// Apple: "invalid return type 'auto' for kernel function"; an entry point's return type is written out.
+	if (declaration.stage != Stage::None && atKeyword("auto")) {
+		throw CompileError(quoted + " is an entry point declared auto; an entry point's return type is not deduced");
+	}
 	const bool deducedReturn = deducedReturnAhead(quoted);
 	// The signature read to deduce the parameters, some of which stand for themselves: a return type that is
 	// an instance of a class template on those parameters cannot be made yet, and deduction does not need it.
