@@ -865,3 +865,12 @@ instructions are the plain function's, with the precision Vulkan gives them. Nei
 MSL specification is promised; the fast variants are what Apple's default fast math compiles the plain names
 to, so they are the closer of the two. A function both scopes declare that mslc does not lower (sinh, cospi
 and so on) is refused like its plain name. Tests: `tests/probes/math_fast_*`.
+
+Where this differs from Apple:
+
+- A function named through a using declaration or directive (`using metal::fast::clamp;`,
+  `using namespace metal::fast;`) is recorded under its bare name, so it gets the plain function's typing:
+  `clamp(5, 0, 3) / 2` is 1 where Apple, converting to float, gives 1.5. A wrong value, not a refusal; it was
+  the same before the qualified spelling was lowered.
+- False refusals: `fast::select` of two scalars of different types (`select(1, 2.0h, c)`), and a bool argument
+  (`fast::select(true, false, c)`, `fast::abs(true)`). Apple converts each to float.
