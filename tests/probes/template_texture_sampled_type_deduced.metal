@@ -1,7 +1,7 @@
 // EXPECT: valid
 // DISASM: OpTypeImage %float 2D 2 0 0 1 Unknown
 // DISASM: OpTypeImage %int 2D 2 0 0 1 Unknown
-// DISASM: OpTypeImage %uint 2D 0 0 0 2 Unknown
+// DISASM: OpTypeImage %uint 2D 2 0 0 1 Unknown
 // texture2d<T> takes T from the argument texture, as a parameter of type T does from a value (C++
 // [temp.deduct.call]): each call reads through an instance for its texture's sampled type, as the same
 // functions written for float, int and uint do.

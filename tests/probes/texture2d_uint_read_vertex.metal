@@ -1,5 +1,5 @@
 // EXPECT: valid
-// DISASM-MATCH: OpImageRead %v4uint
+// DISASM-MATCH: OpImageFetch %v4uint
 // REFLECT: "descriptor": { "set": 0, "binding": 0 }, "texture_access": "Read"
 #include <metal_stdlib>
 using namespace metal;

@@ -124,7 +124,7 @@ class Resources(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(len(first), 4 * 4 * 16)
         lines = resources.lines(a[0], a[1])
-        self.assertTrue(lines[0].startswith("storagetexture 2 1 5 4 4 "), lines)  # access::read is a storage image
+        self.assertTrue(lines[0].startswith("texture 2 1 5 4 4 "), lines)  # access::read is a sampled image fetched from
         self.assertEqual(lines[1], "sampler 1 1 6")
         self.assertTrue(resources.lines([(0, 0, 0, "f", "Sample")], [])[0].startswith("texture 0 "))
 

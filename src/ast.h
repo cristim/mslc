@@ -158,11 +158,18 @@ struct Type {
 			|| resource == ResourceKind::Texture1DArray || resource == ResourceKind::TextureCubeArray
 			|| resource == ResourceKind::TextureBuffer;
 	}
-	// A texture lowered to a storage image. A texture_buffer that is only read is a sampled
-	// texel buffer instead, fetched by index, so that its descriptor is a uniform texel buffer.
+	// A texture lowered to a storage image: one that is written. A texture that is only read
+	// (access::read) is a sampled image fetched by integer coordinate, as a storage image view has
+	// one mip level and read takes a lod; a texture_buffer that is only read is likewise a uniform
+	// texel buffer.
 	bool isStorageTexture() const {
-		return textureAccess != TextureAccess::Sample
-			&& !(resource == ResourceKind::TextureBuffer && textureAccess == TextureAccess::Read);
+		return textureAccess == TextureAccess::Write || textureAccess == TextureAccess::ReadWrite;
+	}
+	// An access::read cube or cube array, which is fetched from as the 2D array of its faces: a
+	// fetch takes no cube image.
+	bool isFetchedCube() const {
+		return textureAccess == TextureAccess::Read
+			&& (resource == ResourceKind::TextureCube || resource == ResourceKind::TextureCubeArray);
 	}
 };
 

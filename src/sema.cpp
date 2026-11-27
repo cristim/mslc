@@ -7769,7 +7769,8 @@ namespace {
 		if (type.isStorageTexture()) {
 			return _types.storageImage(type.resource, type.textureAccess, textureSampledKind(type.scalar));
 		}
-		return type.isTexture() ? _types.image(type.resource, textureSampledKind(type.scalar), type.isDepth, type.isMultisampled) : _types.samplerType();
+		return type.isTexture() ? _types.image(type.isFetchedCube() ? ResourceKind::Texture2DArray : type.resource,
+			textureSampledKind(type.scalar), type.isDepth, type.isMultisampled) : _types.samplerType();
 	}
 
 	// The variable behind a texture or sampler argument: it has to be a name for a
@@ -12008,8 +12009,6 @@ namespace {
 			const bool texelBuffer = entry.parameter->type.resource == ResourceKind::TextureBuffer;
 			if (entry.parameter->type.textureAccess == TextureAccess::Write) {
 				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonReadable) });
-			} else if (entry.parameter->type.isStorageTexture() && entry.parameter->type.textureAccess == TextureAccess::Read) {
-				_builder.emit(spirv::OpDecorate, { variable, static_cast<uint32_t>(spirv::Decoration::NonWritable) });
 			}
 
 			Binding bound;
@@ -12973,7 +12972,7 @@ namespace {
 
 	// read(uint2 coordinate [, lod]), a uint3 coordinate on a texture3d, or a uint2
 	// coordinate and a uint layer on a texture2d_array: a texel by integer
-	// coordinate, with no sampler. access::read storage images take no lod. Metal
+	// coordinate, with no sampler, at the lod given. A storage image takes no lod. Metal
 	// takes uint and ushort vectors and rejects int and float ones.
 	Id Emitter::emitTextureRead(const Expression& call, const Binding& texture) {
 		const auto& arguments = call.arguments;
@@ -12982,7 +12981,9 @@ namespace {
 		if (kind == ResourceKind::TextureBuffer && arguments.size() != 1) {
 			throw CompileError("read on a texture_buffer takes one coordinate: a texture_buffer has no mip levels");
 		}
-		const size_t layers = storage ? layerArguments(kind) : isArrayKind(kind) ? 1 : 0;
+		// A storage image or a fetched cube takes a cube's face (and layer) as a layer of its own.
+		const bool faces = storage || texture.pointeeMsl.isFetchedCube();
+		const size_t layers = faces ? layerArguments(kind) : isArrayKind(kind) ? 1 : 0;
 		const bool arrayed = layers > 0;
 		const size_t fixed = 1 + layers;
 		if (storage && arguments.size() == fixed + 1) {
@@ -12995,7 +12996,7 @@ namespace {
 				+ std::to_string(arguments.size()));
 		}
 
-		const uint32_t width = storage ? storageCoordinateWidth(kind) : textureCoordinateWidth(kind);
+		const uint32_t width = faces ? storageCoordinateWidth(kind) : textureCoordinateWidth(kind);
 		Id coordinate = emitExpression(*arguments[0]);
 		const Id coordinateType = _builder.typeOf(coordinate);
 		const bool unsignedVector = _types.vectorWidth(coordinateType) == width
@@ -13006,7 +13007,7 @@ namespace {
 			throw CompileError("the coordinate of read has to be a uint" + suffix + " or a ushort" + suffix);
 		}
 		coordinate = convert(coordinate, coordinateType, _types.vector(ScalarKind::UInt, width));
-		coordinate = appendLayers(coordinate, storage ? kind : arrayed ? ResourceKind::Texture2DArray : ResourceKind::Texture2D,
+		coordinate = appendLayers(coordinate, faces ? kind : arrayed ? ResourceKind::Texture2DArray : ResourceKind::Texture2D,
 			arguments, 1, "read");
 
 		if (storage) {
@@ -13089,7 +13090,7 @@ namespace {
 	Id Emitter::emitTextureSize(const Expression& call, const Binding& texture, SizeComponent component) {
 		const std::string& name = call.left->memberName;
 		const bool buffer = texture.pointeeMsl.resource == ResourceKind::TextureBuffer;
-		const bool storage = texture.pointeeMsl.textureAccess != TextureAccess::Sample || texture.pointeeMsl.isMultisampled;
+		const bool storage = texture.pointeeMsl.isStorageTexture() || texture.pointeeMsl.isMultisampled || buffer;
 		if (storage && !call.arguments.empty()) {
 			throw CompileError(buffer ? name + " takes no arguments: a texture_buffer has no mip levels"
 				: texture.pointeeMsl.isMultisampled
@@ -13115,9 +13116,15 @@ namespace {
 		}
 
 		const Id image = loadFrom(texture.id, texture.pointeeType);
+		// A fetched cube is the 2D array of its faces, so its size has their count as a third component.
+		const bool cubeFaces = texture.pointeeMsl.isFetchedCube();
 		const Id size = _builder.emitTyped(storage ? spirv::OpImageQuerySize : spirv::OpImageQuerySizeLod,
-			_types.vector(ScalarKind::UInt, textureSizeWidth(texture.pointeeMsl.resource)),
+			_types.vector(ScalarKind::UInt, cubeFaces ? 3 : textureSizeWidth(texture.pointeeMsl.resource)),
 			storage ? std::vector<uint32_t>{ image } : std::vector<uint32_t>{ image, lod });
+		if (cubeFaces && component == SizeComponent::ArraySize) {
+			return _builder.emitTyped(spirv::OpUDiv, _uintType,
+				{ _builder.emitTyped(spirv::OpCompositeExtract, _uintType, { size, 2u }), constantU32(6) });
+		}
 		if (texture.pointeeMsl.resource == ResourceKind::Texture1D || buffer) {
 			return size;
 		}

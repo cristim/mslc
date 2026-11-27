@@ -16,8 +16,8 @@
 //                                memory arguments: the element count of their Workgroup array; at most 8)
 //   texelbuffer <metal index> <set> <binding> uniform|storage <type> <components 1|2|4> <texels> <input file> <output file>
 //                                                                       (at most 8)
-// A texture is a 2D RGBA32F sampled image (a storagetexture: a read-only storage image, which is
-// what mslc declares for access::read) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
+// A texture is a 2D RGBA32F sampled image (mslc declares an access::read texture as one too; a
+// storagetexture is a read-only storage image) and a sampler is nearest and normalised, its address mode picked by the Metal index (0 clamp to edge, 1 repeat,
 // 2 mirrored repeat), as in metalhost. A texel buffer is a VkBufferView of <texels> texels of <components> (1, 2 or 4) components of <type>
 // (float half int uint short ushort: R32_SFLOAT, R32G32_SFLOAT, R32G32B32A32_SFLOAT, R16..., ..._SINT, ..._UINT) over a
 // buffer filled from the input file, a UNIFORM_TEXEL_BUFFER descriptor (sampled) or a STORAGE_TEXEL_BUFFER one,

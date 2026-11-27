@@ -1,10 +1,10 @@
 // EXPECT: valid
+// DISASM-MATCH: OpTypeImage %uint 2D 2 0 0 1 Unknown
 // DISASM-MATCH: OpTypeImage %uint 2D 0 0 0 2 Unknown
-// DISASM: OpCapability StorageImageReadWithoutFormat
+// DISASM-NOT: StorageImageReadWithoutFormat
 // DISASM: OpCapability StorageImageWriteWithoutFormat
-// DISASM: NonWritable
 // DISASM: NonReadable
-// DISASM-MATCH: OpImageRead %v4uint
+// DISASM-MATCH: OpImageFetch %v4uint
 // DISASM: OpImageWrite
 // REFLECT: "texture_access": "Read"
 // REFLECT: "texture_access": "Write"

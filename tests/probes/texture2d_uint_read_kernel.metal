@@ -1,13 +1,12 @@
 // EXPECT: valid
-// DISASM-MATCH: OpTypeImage %uint 2D 0 0 0 2 Unknown
-// DISASM: NonWritable
+// DISASM-MATCH: OpTypeImage %uint 2D 2 0 0 1 Unknown
+// DISASM-NOT: NonWritable
 // DISASM-NOT: NonReadable
-// DISASM: OpCapability StorageImageReadWithoutFormat
+// DISASM-NOT: StorageImageReadWithoutFormat
 // DISASM-NOT: StorageImageWriteWithoutFormat
-// DISASM-MATCH: OpImageRead %v4uint
-// DISASM-NOT: OpImageFetch
-// DISASM: OpImageQuerySize %v2uint
-// DISASM-NOT: OpImageQuerySizeLod
+// DISASM-MATCH: OpImageFetch %v4uint
+// DISASM-NOT: OpImageRead
+// DISASM: OpImageQuerySizeLod %v2uint
 // REFLECT: "metal_index": 5, "descriptor": { "set": 0, "binding": 1 }, "texture_access": "Read"
 #include <metal_stdlib>
 using namespace metal;
