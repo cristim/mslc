@@ -769,18 +769,25 @@ void Parser::parseUsing() {
 		expect(TokenKind::Semicolon, "after a using directive");
 
 		std::vector<std::string>& directives = _blocks.empty() ? _scopes[scope].directives : _blocks.back().directives;
+		// A directive for a namespace its scope already nominates changes no lookup ([namespace.udir]), so it is
+		// not recorded again: what counts the usings after a class template sees nothing new.
+		const auto record = [&directives](const std::string& nominated) {
+			if (std::find(directives.begin(), directives.end(), nominated) == directives.end()) {
+				directives.push_back(nominated);
+			}
+		};
 
 		const std::string target = namespaceOf(name, name.parts.size(), NamespaceLookup::NamespaceOnly);
 		// A lone "metal" no file namespace answers for is the standard library's own namespace,
 		// which nothing is looked up through; a nearer namespace of that name wins over it.
 		if (target.empty() && name.parts.size() == 1 && name.parts.front() == kStdlibNamespace) {
-			directives.push_back(kStdlibNamespace);
+			record(kStdlibNamespace);
 			return;
 		}
 		if (target.empty()) {
 			throw CompileError("\"" + spelled + "\" is not a namespace the file declares");
 		}
-		directives.push_back(target);
+		record(target);
 		return;
 	}
 
