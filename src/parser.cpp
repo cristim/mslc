@@ -7620,6 +7620,9 @@ ExpressionPtr Parser::parseCast() {
 			++skip;
 		}
 		if (lookahead(skip).kind == TokenKind::Identifier && isIntegerSpecifier(lookahead(skip).text)) {
+			if (skip == 1 && lookahead(2).kind == TokenKind::LParen) {
+				return nullptr;
+			}
 			advance();
 			Type type;
 			parseSpecifierRun(type);
