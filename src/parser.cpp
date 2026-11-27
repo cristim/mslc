@@ -507,6 +507,10 @@ TranslationUnit Parser::parse() {
 			declaration.file = file;
 			declaration.seeds = _seedList;
 		}
+		for (ExplicitSpecialization& specialization: _unit.specializations) {
+			specialization.declaration.file = file;
+			specialization.declaration.seeds = _seedList;
+		}
 	}
 	return std::move(_unit);
 }
@@ -1071,7 +1075,8 @@ void Parser::parseTemplateHeader(FunctionTemplate& declaration) {
 // The declarator of a function template, after its header, to the end of its body or ';': fills the
 // tokens, the signature and whether it has a body, and returns the name. A member also takes "const" after
 // its parameters.
-std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member) {
+std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t headerStart, bool member,
+	std::pair<size_t, size_t>* explicitArguments) {
 	// The declarator, up to the parameter list. The name is the identifier right before
 	// the first "(" outside angle brackets, and only a group that is followed by what a
 	// function can have after its parameters is taken as the list. Attributes are
@@ -1081,6 +1086,11 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 	const size_t declaratorStart = _position;
 	std::string name;
 	size_t angles = 0;
+	// An explicit specialization may name its arguments after the name, "f<int>(...)": the name before a
+	// "<" at the outermost level, and that group when the parameter list follows it.
+	std::string groupName;
+	size_t groupStart = 0;
+	size_t groupEnd = 0;
 	for (;;) {
 		if (at(TokenKind::EndOfFile) || at(TokenKind::Semicolon) || at(TokenKind::LBrace)
 			|| at(TokenKind::Assign)) {
@@ -1088,6 +1098,10 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 		}
 		if (at(TokenKind::LParen)) {
 			if (angles == 0) {
+				if (explicitArguments && !groupName.empty() && name.empty() && groupEnd + 1 == _position) {
+					name = groupName;
+					*explicitArguments = { groupStart, groupEnd };
+				}
 				break;
 			}
 			// A "(" inside the return type's own angle brackets, as in enable_if<(N > 2)>.
@@ -1107,11 +1121,17 @@ std::string Parser::readTemplateFunction(FunctionTemplate& declaration, size_t h
 			throw CompileError("an operator template is not lowered");
 		}
 		if (at(TokenKind::Less)) {
+			if (angles == 0) {
+				groupName = name;
+				groupStart = _position;
+			}
 			++angles;
 		} else if (at(TokenKind::Greater) && angles > 0) {
 			--angles;
+			groupEnd = angles == 0 ? _position : groupEnd;
 		} else if (at(TokenKind::ShiftRight) && angles > 1) {
 			angles -= 2;
+			groupEnd = angles == 0 ? _position : groupEnd;
 		}
 		name = kind() == TokenKind::Identifier ? std::string(current().text) : std::string();
 		advance();
@@ -1182,8 +1202,8 @@ void Parser::parseTemplateDeclaration() {
 		throw CompileError("an explicit template instantiation is not lowered");
 	}
 	if (lookahead().kind == TokenKind::Greater) {
-		throw CompileError("an explicit template specialization is not lowered; Apple accepts it, and "
-			"mslc refuses it so that the primary template is never silently used in its place");
+		parseExplicitSpecialization(_position);
+		return;
 	}
 
 	FunctionTemplate declaration;
@@ -1232,6 +1252,60 @@ void Parser::parseTemplateDeclaration() {
 		return;
 	}
 	_unit.templates.push_back(std::move(declaration));
+}
+
+// "template <>" and a function: an explicit specialization of a function template declared above. It is
+// kept as a template of no parameters, the explicit arguments taken out of its declarator, for sema to
+// match against the primary templates of its name.
+void Parser::parseExplicitSpecialization(size_t headerStart) {
+	advance();
+	advance();
+	if (atKeyword("struct") || atKeyword("class") || atKeyword("union")) {
+		throw CompileError("an explicit specialization of a class template is not lowered; Apple accepts it, and "
+			"mslc refuses it so that the primary template is never silently used in its place");
+	}
+	if (atKeyword("template")) {
+		throw CompileError("an explicit specialization of a member template is not lowered");
+	}
+	ExplicitSpecialization specialization;
+	FunctionTemplate& declaration = specialization.declaration;
+	declaration.line = line();
+	std::pair<size_t, size_t> group { 0, 0 };
+	const size_t declaratorStart = _position;
+	const std::string name = readTemplateFunction(declaration, headerStart, false, &group);
+	const std::string qualified = qualify(name);
+	if (!_unit.functionTemplates.count(qualified)) {
+		throw CompileError("\"" + qualified + "\" is explicitly specialized, and no function template of that name "
+			"is declared above it");
+	}
+	if (!declaration.hasBody) {
+		throw CompileError("the explicit specialization of \"" + qualified + "\" is declared and not defined here; "
+			"a declaration without a body is not lowered");
+	}
+	const size_t end = _position;
+	if (group.second) {
+		_position = group.first + 1;
+		while (!at(TokenKind::Greater)) {
+			specialization.given.push_back(parseTemplateArgument());
+			if (!match(TokenKind::Comma)) {
+				break;
+			}
+		}
+		if (_position != group.second) {
+			throw CompileError("the template arguments of the explicit specialization of \"" + qualified
+				+ "\" are not lowered: expected \">\" where \"" + std::string(current().text) + "\" is");
+		}
+		_position = end;
+		// The tokens without the arguments, so the declarator reads as a function's.
+		const size_t from = group.first - declaratorStart;
+		const size_t to = group.second + 1 - declaratorStart;
+		declaration.tokens.erase(declaration.tokens.begin() + from, declaration.tokens.begin() + to);
+	}
+	declaration.name = qualified;
+	declaration.order = declaration.bodyOrder = _functionOrder++;
+	declaration.globalsBefore = _unit.globals.size();
+	declaration.endAt = _position;
+	_unit.specializations.push_back(std::move(specialization));
 }
 
 // Binds the template's parameters in the innermost block: a type is a typedef, a constant an

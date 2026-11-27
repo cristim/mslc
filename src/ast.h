@@ -615,6 +615,15 @@ struct FunctionTemplate {
 	std::shared_ptr<const void> spellings;
 };
 
+// An explicit specialization of a function template, "template <> R f(...) { ... }" or "template <> R
+// f<int>(...) { ... }": a template of no parameters, its tokens without the explicit arguments, which
+// are kept apart. It is the body of the primary template's instance whose arguments it names, which
+// sema works out from its signature (see resolveSpecializations).
+struct ExplicitSpecialization {
+	FunctionTemplate declaration;
+	std::vector<TemplateArgument> given;
+};
+
 // A class template: "template <...> struct Name { ... };" kept as tokens, from the "struct" keyword to the
 // ";", and an end-of-file token. A use that names it with arguments has the tokens re-parsed in place with the
 // arguments bound, which declares an ordinary struct under the instance's name ("Name<float,4>").
@@ -693,6 +702,8 @@ struct TranslationUnit {
 	// The function templates themselves, in declaration order. A template is lowered only where
 	// a call instantiates it: instantiateTemplate re-parses its tokens with the arguments bound.
 	std::vector<FunctionTemplate> templates;
+	// The explicit specializations of function templates, in declaration order.
+	std::vector<ExplicitSpecialization> specializations;
 
 	// File-scope declarations, in the order the source declares them. A
 	// "constant" refers to the ones before it, so the order is the meaning.
