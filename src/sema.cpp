@@ -10374,6 +10374,42 @@ namespace {
 		return std::make_unique<FileScopeView>(_fileScopeViews, anyHidden);
 	}
 
+	// Whether evaluating an expression again only reads: names, literals, members, elements and arithmetic on them.
+	static bool readsWithoutEffect(const Expression& expression) {
+		switch (expression.kind) {
+			case ExpressionKind::IntLiteral:
+			case ExpressionKind::FloatLiteral:
+			case ExpressionKind::BoolLiteral:
+			case ExpressionKind::Identifier: return true;
+			case ExpressionKind::Member: return expression.left && readsWithoutEffect(*expression.left);
+			case ExpressionKind::Index:
+				return expression.left && readsWithoutEffect(*expression.left) && std::all_of(expression.arguments.begin(),
+					expression.arguments.end(), [](const ExpressionPtr& index) { return index && readsWithoutEffect(*index); });
+			case ExpressionKind::Binary:
+				return expression.left && expression.right && readsWithoutEffect(*expression.left)
+					&& readsWithoutEffect(*expression.right);
+			case ExpressionKind::Unary:
+				return (expression.unaryOperator == UnaryOperator::Negate || expression.unaryOperator == UnaryOperator::Plus
+					|| expression.unaryOperator == UnaryOperator::Not || expression.unaryOperator == UnaryOperator::BitNot)
+					&& expression.left && readsWithoutEffect(*expression.left);
+			default: return false;
+		}
+	}
+
+	// Whether an assignment's left operand names an element: then its index may change with the store, and the
+	// value is loaded from the address stored to rather than read again.
+	static bool hasIndex(const Expression& left) {
+		for (const Expression* part = &left; part; part = part->left.get()) {
+			if (part->kind == ExpressionKind::Index) {
+				return true;
+			}
+			if (part->kind != ExpressionKind::Member) {
+				return false;
+			}
+		}
+		return false;
+	}
+
 	Id Emitter::emitExpression(const Expression& expression) {
 		const auto fileScopeView = viewFileScope(expression);
 		switch (expression.kind) {
@@ -10434,12 +10470,33 @@ namespace {
 					return emitInitListValue(*expression.constructType, expression);
 				}
 				break;
-			case ExpressionKind::Assign: break;
+			case ExpressionKind::Assign:
+				// The value of an assignment is its left operand once stored to ([expr.ass]), read again here, which
+				// gives that value only while reading the operand again does nothing else.
+				if (!readsWithoutEffect(*expression.left)) {
+					throw CompileError("an assignment whose left operand has a call, an increment or an assignment "
+						"in it cannot be used as a value yet; assign first, then use the variable");
+				}
+				// An element, as a[a[0]] or a[k] with k changed on the right: its address, taken where the store
+				// takes it, is the place stored to.
+				if (hasIndex(*expression.left)) {
+					if (expression.left->kind == ExpressionKind::Member && !structOf(*expression.left->left)) {
+						throw CompileError("an assignment to a swizzle of an element cannot be used as a value yet; "
+							"assign first, then use the element");
+					}
+					const Id address = emitPlaceAddress(*expression.left);
+					emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+					const Id pointee = valueTypeAt(address);
+					const auto storage = _types.storageClassOf(_builder.typeOf(address));
+					return storage == spirv::StorageClass::PhysicalStorageBuffer
+						? loadFromBuffer(address, pointee) : loadFrom(address, pointee);
+				}
+				emitAssignment(*expression.left, *expression.right, expression.compoundOperator);
+				return emitExpression(*expression.left);
 		}
 
-		// A braced list is only spelled in an initialiser, and an assignment is a
-		// statement, so reaching either here means the source used it as a value,
-		// which MSL does not allow.
+		// A braced list without a type is only spelled in an initialiser, so reaching one here means the source
+		// used it as a value, which MSL does not allow.
 		throw CompileError("this expression cannot be used as a value");
 	}
 
