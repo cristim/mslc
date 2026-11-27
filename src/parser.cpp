@@ -5289,16 +5289,27 @@ void Parser::parseResourceType(Type& type) {
 	}
 
 	std::string component(current().text);
+	// A function template's type parameter while its signature is read to deduce it: the texture keeps the
+	// parameter's marker, from which deduction takes the argument texture's sampled type.
+	std::string deducedFrom;
 	if (isIntegerSpecifier(component)) {
 		Type channel;
 		parseSpecifierRun(channel);
 		component = typeName(channel);
 	} else {
 		advance();
+		// A template's type parameter is reached through the name its block binds.
+		if (const std::string* bound = blockName(component); bound && !bound->empty() && _typedefs.count(*bound)) {
+			component = *bound;
+		}
 		Type alias;
 		if (!_enumTypes.count(component) && resolveTypeName(component, alias) && !alias.isVector() && !alias.isMatrix() && alias.namedType.empty()) {
 			alias.isConst = false;
 			component = typeName(alias);
+		} else if (!_enumTypes.count(component) && resolveTypeName(component, alias) && isDeductionMarker(alias)
+			&& !alias.isVector() && !alias.isMatrix() && !alias.isPointer && !alias.arrayLength) {
+			deducedFrom = alias.namedType;
+			component = "float";
 		}
 	}
 	static const std::map<std::string_view, ScalarKind> elements = {
@@ -5371,6 +5382,7 @@ void Parser::parseResourceType(Type& type) {
 		: access == "read" ? TextureAccess::Read
 		: access == "read_write" ? TextureAccess::ReadWrite : TextureAccess::Sample;
 	type.scalar = element->second;
+	type.namedType = deducedFrom;
 }
 
 Parameter Parser::parseParameter(const std::string& helperName) {

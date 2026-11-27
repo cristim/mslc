@@ -6798,6 +6798,19 @@ namespace {
 				}
 				value.addressSpace = AddressSpace::None;
 				value.isConst = argument.binding->readOnly && !parameter.type.isConst;
+			} else if (parameter.type.isTexture() && !parameter.type.arrayLength) {
+				// texture2d<T> takes T from a texture of the same kind, depth, multisampling and access.
+				if (argument.kind != OverloadArgument::Kind::Resource) {
+					return false;
+				}
+				const Type& texture = argument.binding->pointeeMsl;
+				if (texture.resource != parameter.type.resource || texture.isDepth != parameter.type.isDepth
+					|| texture.isMultisampled != parameter.type.isMultisampled
+					|| texture.textureAccess != parameter.type.textureAccess || texture.arrayLength) {
+					return false;
+				}
+				value = Type();
+				value.scalar = texture.scalar;
 			} else {
 				if (parameter.type.arrayLength || parameter.type.resource != ResourceKind::None) {
 					throw refuse(i, "to a parameter that is an array or a texture");
